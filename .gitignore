@@ -1,0 +1,7 @@
+config.json
+*.log
+__pycache__/
+build/
+*.spec
+OBSAutoRecorder.exe
+.claude/

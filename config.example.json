@@ -1,0 +1,40 @@
+{
+    "watched_games": [
+        "cs2.exe",
+        "valorant.exe",
+        "rocketleague.exe",
+        "forzahorizon5.exe",
+        "league of legends.exe"
+    ],
+    "poll_interval_seconds": 1.5,
+    "steam": {
+        "enabled": true,
+        "allowed_drives": ["C", "D"],
+        "exclude_keywords": [
+            "_commonredist",
+            "easyanticheat",
+            "battleye",
+            "vc_redist",
+            "directx",
+            "dxsetup",
+            "unins0",
+            "crashreport",
+            "crashhandler",
+            "unitycrashhandler",
+            "steamworks",
+            "wallpaper_engine"
+        ]
+    },
+    "obs": {
+        "process_name": "obs64.exe",
+        "path": "C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe",
+        "launch_args": ["--minimize-to-tray"],
+        "startup_wait_seconds": 15,
+        "websocket": {
+            "host": "localhost",
+            "port": 4455,
+            "password": "YOUR_OBS_WEBSOCKET_PASSWORD"
+        }
+    },
+    "log_file": "autostart_script.log"
+}
