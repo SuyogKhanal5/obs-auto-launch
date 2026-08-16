@@ -6,6 +6,13 @@
         "forzahorizon5.exe",
         "league of legends.exe"
     ],
+    "watched_windows": [
+        {
+            "process_name": "javaw.exe",
+            "title_contains": "minecraft",
+            "display_name": "Minecraft"
+        }
+    ],
     "poll_interval_seconds": 1.5,
     "steam": {
         "enabled": true,

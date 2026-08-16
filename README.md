@@ -41,6 +41,7 @@ Edit `config.json`:
 | Field | Description |
 |---|---|
 | `watched_games` | Process names (case-insensitive) to trigger recording, e.g. `"cs2.exe"` |
+| `watched_windows` | For games that share a generic process name (e.g. Java Edition Minecraft runs as `javaw.exe`, same as any Java app) — matches by process name **and** a substring of its window title. See below. |
 | `poll_interval_seconds` | How often to check running processes |
 | `steam.enabled` | Auto-detect any game running from a Steam library folder |
 | `steam.allowed_drives` | Only scan Steam libraries on these drive letters |
@@ -51,7 +52,21 @@ Edit `config.json`:
 | `obs.websocket.host` / `port` / `password` | Must match OBS's WebSocket Server Settings |
 | `log_file` | Log file name (relative to the exe's folder, or an absolute path) |
 
-`config.json` is gitignored since it contains your WebSocket password — never commit it.
+`config.json` is gitignored since it contains your WebSocket password, never commit it in any forks of this repo.
+
+**`watched_windows` example** (Java Edition Minecraft, launched via any launcher):
+
+```json
+"watched_windows": [
+    {
+        "process_name": "javaw.exe",
+        "title_contains": "minecraft",
+        "display_name": "Minecraft"
+    }
+]
+```
+
+`display_name` is optional and controls the game name used in the recording filename and log messages; without it, the process name is used instead. This costs a little extra overhead per poll (a window-title scan), so it's only used as a fallback after `watched_games` and Steam detection both miss.
 
 ### 3. Get the app running
 

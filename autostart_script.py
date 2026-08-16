@@ -82,10 +82,31 @@ def get_running_processes():
         try:
             name = proc.info.get("name")
             if name:
-                processes.append((name, proc.info.get("exe") or ""))
+                processes.append((name, proc.info.get("exe") or "", proc.pid))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
     return processes
+
+
+def get_window_titles():
+    titles = {}
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+    def callback(hwnd, lparam):
+        if not ctypes.windll.user32.IsWindowVisible(hwnd):
+            return 1
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return 1
+        buf = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        titles.setdefault(pid.value, []).append(buf.value)
+        return 1
+
+    ctypes.windll.user32.EnumWindows(EnumWindowsProc(callback), 0)
+    return titles
 
 
 def get_steam_install_path():
@@ -140,14 +161,24 @@ def is_steam_game_exe(exe_path, steam_common_dirs, exclude_keywords):
     return False
 
 
-def find_target_process(watched_games, steam_common_dirs, exclude_keywords, processes):
-    for name, exe in processes:
+def find_target_process(watched_games, steam_common_dirs, exclude_keywords, watched_windows, processes):
+    for name, exe, pid in processes:
         if name.lower() in watched_games:
-            return name, exe
-    for name, exe in processes:
+            return name, exe, pid, None
+    for name, exe, pid in processes:
         if is_steam_game_exe(exe, steam_common_dirs, exclude_keywords):
-            return name, exe
-    return None, None
+            return name, exe, pid, None
+    if watched_windows:
+        window_titles = get_window_titles()
+        for name, exe, pid in processes:
+            name_lower = name.lower()
+            for entry in watched_windows:
+                if name_lower != entry["process_name"].lower():
+                    continue
+                needle = entry["title_contains"].lower()
+                if any(needle in t.lower() for t in window_titles.get(pid, [])):
+                    return name, exe, pid, entry.get("display_name")
+    return None, None, None, None
 
 
 INVALID_FILENAME_CHARS = '<>:"/\\|?*'
@@ -173,21 +204,13 @@ def sanitize_filename_part(text):
     return cleaned.strip()
 
 
-def is_process_running(name, exe, processes):
-    exe_lower = exe.lower() if exe else None
-    name_lower = name.lower()
-    for proc_name, proc_exe in processes:
-        if exe_lower:
-            if proc_exe.lower() == exe_lower:
-                return True
-        elif proc_name.lower() == name_lower:
-            return True
-    return False
+def is_process_running(pid):
+    return psutil.pid_exists(pid)
 
 
 def is_obs_running(process_name, processes):
     process_name_lower = process_name.lower()
-    return any(name.lower() == process_name_lower for name, _ in processes)
+    return any(name.lower() == process_name_lower for name, _, _ in processes)
 
 
 def clear_obs_crash_sentinel():
@@ -356,6 +379,7 @@ def watcher_loop(icon, status, stop_event):
 def _watcher_loop_impl(icon, status, stop_event):
     config = load_config()
     watched_games = {g.lower() for g in config["watched_games"]}
+    watched_windows = config.get("watched_windows", [])
     poll_interval = config.get("poll_interval_seconds", 1.5)
     obs_config = config["obs"]
     steam_config = config.get("steam", {})
@@ -363,33 +387,40 @@ def _watcher_loop_impl(icon, status, stop_event):
     steam_common_dirs = get_steam_common_dirs(steam_config)
 
     logging.info("Watching for processes: %s", ", ".join(sorted(watched_games)))
+    if watched_windows:
+        logging.info(
+            "Watching for window titles: %s",
+            ", ".join(f"{w['process_name']} containing '{w['title_contains']}'" for w in watched_windows),
+        )
     set_status(icon, status, "Watching")
 
     obs_client = None
     active_name = None
-    active_exe = None
+    active_pid = None
     active_display_name = None
 
     while not stop_event.is_set():
         processes = get_running_processes()
 
         if active_name is None:
-            name, exe = find_target_process(watched_games, steam_common_dirs, exclude_keywords, processes)
+            name, exe, pid, display_override = find_target_process(
+                watched_games, steam_common_dirs, exclude_keywords, watched_windows, processes
+            )
             if name:
                 logging.info("Detected watched game: %s", exe or name)
                 # obs_event_client is unused directly; kept referenced so its listener thread isn't GC'd.
                 obs_client, obs_event_client = ensure_obs_ready(obs_config, processes, icon, status)
                 if obs_client and start_recording(obs_client):
-                    active_name, active_exe = name, exe
-                    active_display_name = get_game_display_name(name, exe, steam_common_dirs)
+                    active_name, active_pid = name, pid
+                    active_display_name = display_override or get_game_display_name(name, exe, steam_common_dirs)
                     status["recording"] = True
                     set_status(icon, status, f"Recording {active_display_name}")
         else:
-            if not is_process_running(active_name, active_exe, processes):
-                logging.info("%s has exited.", active_exe or active_name)
+            if not is_process_running(active_pid):
+                logging.info("%s has exited.", active_display_name or active_name)
                 if obs_client:
                     stop_recording(obs_client, active_display_name)
-                active_name, active_exe, active_display_name = None, None, None
+                active_name, active_pid, active_display_name = None, None, None
                 status["recording"] = False
                 set_status(icon, status, "Watching")
 
