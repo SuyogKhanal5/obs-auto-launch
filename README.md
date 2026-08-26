@@ -6,6 +6,7 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 
 - Watches for a configurable list of game processes (e.g. `cs2.exe`, `valorant.exe`, `league of legends.exe`)
 - Also auto-detects **any game installed via Steam**, by scanning your Steam library folders — no need to list every Steam game by hand
+- Also auto-detects **any game installed via the Epic Games Launcher**, by reading its install manifests — same idea, no need to list every Epic game by hand
 - Launches OBS automatically if it isn't running, and connects to it over OBS's WebSocket API
 - Starts recording when a watched game launches, stops when it exits
 - Renames the finished recording to `"<Game Name> - <original filename>.mp4"`
@@ -46,6 +47,8 @@ Edit `config.json`:
 | `steam.enabled` | Auto-detect any game running from a Steam library folder |
 | `steam.allowed_drives` | Only scan Steam libraries on these drive letters |
 | `steam.exclude_keywords` | Substrings in an exe's path that disqualify it from being treated as a game (anti-cheat installers, redistributables, background apps like Wallpaper Engine, etc.) |
+| `epic.enabled` | Auto-detect any game installed via the Epic Games Launcher |
+| `epic.exclude_keywords` | Substrings in an installed title's display name that disqualify it from being treated as a game (e.g. Unreal Engine editor installs) |
 | `obs.path` | Full path to `obs64.exe` |
 | `obs.launch_args` | Extra command-line args OBS is launched with |
 | `obs.startup_wait_seconds` | How long to wait after launching OBS before trying to connect |
@@ -66,7 +69,7 @@ Edit `config.json`:
 ]
 ```
 
-`display_name` is optional and controls the game name used in the recording filename and log messages; without it, the process name is used instead. This costs a little extra overhead per poll (a window-title scan), so it's only used as a fallback after `watched_games` and Steam detection both miss.
+`display_name` is optional and controls the game name used in the recording filename and log messages; without it, the process name is used instead. This costs a little extra overhead per poll (a window-title scan), so it's only used as a fallback after `watched_games`, Steam detection, and Epic detection all miss.
 
 ### 3. Get the app running
 
@@ -119,6 +122,6 @@ You can optionally enable OBS's file-splitting so a long session isn't stuck in 
 
 ## Known limitations
 
-- Only the *final* segment of a split recording gets the game-name prefix; earlier split segments keep OBS's default filename.
 - Windows has one system tray total — it isn't per-monitor. Use the floating overlay if you need status visible on a specific monitor.
 - Steam-game auto-detection matches by folder location, not a games database, so a handful of non-game Steam apps may need adding to `steam.exclude_keywords` if they cause false positives (Wallpaper Engine is excluded by default).
+- Epic-game auto-detection reads the Epic Games Launcher's local install manifests (`%PROGRAMDATA%\Epic\EpicGamesLauncher\Data\Manifests`), so a game only shows up once it's been installed at least once through the launcher.

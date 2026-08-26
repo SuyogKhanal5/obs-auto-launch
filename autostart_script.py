@@ -161,13 +161,70 @@ def is_steam_game_exe(exe_path, steam_common_dirs, exclude_keywords):
     return False
 
 
-def find_target_process(watched_games, steam_common_dirs, exclude_keywords, watched_windows, processes):
+def get_epic_manifest_dir():
+    root = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+    return os.path.join(root, "Epic", "EpicGamesLauncher", "Data", "Manifests")
+
+
+def get_epic_installed_games(epic_config):
+    if not epic_config.get("enabled", True):
+        return []
+
+    manifest_dir = get_epic_manifest_dir()
+    if not os.path.isdir(manifest_dir):
+        logging.info("No Epic Games manifests found at %s", manifest_dir)
+        return []
+
+    exclude_keywords = [k.lower() for k in epic_config.get("exclude_keywords", [])]
+    games = []
+    for entry in os.listdir(manifest_dir):
+        if not entry.lower().endswith(".item"):
+            continue
+        try:
+            with open(os.path.join(manifest_dir, entry), "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        install_dir = manifest.get("InstallLocation")
+        display_name = manifest.get("DisplayName")
+        if not install_dir or not display_name or not manifest.get("LaunchExecutable"):
+            continue
+        if any(kw in display_name.lower() for kw in exclude_keywords):
+            continue
+
+        games.append({"install_dir": os.path.normpath(install_dir).lower(), "display_name": display_name})
+
+    logging.info(
+        "Watching Epic Games installs: %s", ", ".join(g["display_name"] for g in games) if games else "none found"
+    )
+    return games
+
+
+def get_epic_game_for_exe(exe_path, epic_games):
+    if not exe_path:
+        return None
+    exe_lower = os.path.normpath(exe_path).lower()
+    for game in epic_games:
+        prefix = game["install_dir"] if game["install_dir"].endswith(os.sep) else game["install_dir"] + os.sep
+        if exe_lower.startswith(prefix):
+            return game["display_name"]
+    return None
+
+
+def find_target_process(
+    watched_games, steam_common_dirs, exclude_keywords, epic_games, watched_windows, processes
+):
     for name, exe, pid in processes:
         if name.lower() in watched_games:
             return name, exe, pid, None
     for name, exe, pid in processes:
         if is_steam_game_exe(exe, steam_common_dirs, exclude_keywords):
             return name, exe, pid, None
+    for name, exe, pid in processes:
+        epic_display_name = get_epic_game_for_exe(exe, epic_games)
+        if epic_display_name:
+            return name, exe, pid, epic_display_name
     if watched_windows:
         window_titles = get_window_titles()
         for name, exe, pid in processes:
@@ -260,22 +317,42 @@ def connect_obs(ws_config, retries=5, delay=2):
     return None
 
 
-def connect_obs_events(ws_config, icon, status):
+RECORD_STARTED_STATE = "OBS_WEBSOCKET_OUTPUT_STARTED"
+
+
+def connect_obs_events(ws_config, icon, status, audio_state, recording_state):
     try:
         event_client = obsws.EventClient(
             host=ws_config["host"],
             port=ws_config["port"],
             password=ws_config["password"],
+            subs=obsws.Subs.LOW_VOLUME | obsws.Subs.INPUTVOLUMEMETERS,
             timeout=3,
         )
     except Exception as exc:
         logging.warning("Could not connect OBS event listener; split-flash disabled: %s", exc)
         return None
 
+    def on_record_state_changed(data):
+        if getattr(data, "output_state", "") != RECORD_STARTED_STATE:
+            return
+        output_path = getattr(data, "output_path", None)
+        if output_path:
+            recording_state["current_path"] = output_path
+
     def on_record_file_changed(data):
-        logging.info("Recording file split detected: %s", getattr(data, "new_output_path", ""))
+        new_path = getattr(data, "new_output_path", "")
+        if new_path == recording_state.get("current_path"):
+            # OBS emits RecordFileChanged twice for a single split; ignore the duplicate.
+            return
+        logging.info("Recording file split detected: %s", new_path)
         status["flash_until"] = time.time() + SPLIT_FLASH_SECONDS
         icon.icon = build_tray_image(current_color(status))
+
+        old_path = recording_state.get("current_path")
+        if old_path:
+            rename_with_game_prefix(old_path, recording_state.get("display_name"))
+        recording_state["current_path"] = new_path
 
         def revert():
             icon.icon = build_tray_image(current_color(status))
@@ -284,18 +361,33 @@ def connect_obs_events(ws_config, icon, status):
         timer.daemon = True
         timer.start()
 
+    def on_input_volume_meters(data):
+        levels = {}
+        for entry in data.inputs:
+            name = entry.get("inputName")
+            if not name:
+                continue
+            peak = 0.0
+            for channel in entry.get("inputLevelsMul") or []:
+                if len(channel) >= 2:
+                    peak = max(peak, channel[1])
+            levels[name] = peak
+        audio_state["levels"] = levels
+
+    event_client.callback.register(on_record_state_changed)
     event_client.callback.register(on_record_file_changed)
+    event_client.callback.register(on_input_volume_meters)
     return event_client
 
 
-def ensure_obs_ready(obs_config, processes, icon, status):
+def ensure_obs_ready(obs_config, processes, icon, status, audio_state, recording_state):
     if not is_obs_running(obs_config["process_name"], processes):
         if not launch_obs(obs_config):
             return None, None
     client = connect_obs(obs_config["websocket"])
     if not client:
         return None, None
-    event_client = connect_obs_events(obs_config["websocket"], icon, status)
+    event_client = connect_obs_events(obs_config["websocket"], icon, status, audio_state, recording_state)
     return client, event_client
 
 
@@ -321,15 +413,7 @@ def start_recording(client, retries=6, delay=2):
     return False
 
 
-def stop_recording(client, game_display_name=None):
-    try:
-        resp = client.stop_record()
-        logging.info("Recording stopped.")
-    except Exception as exc:
-        logging.error("Failed to stop recording: %s", exc)
-        return
-
-    output_path = getattr(resp, "output_path", None)
+def rename_with_game_prefix(output_path, game_display_name):
     if not output_path or not game_display_name:
         return
 
@@ -354,15 +438,30 @@ def stop_recording(client, game_display_name=None):
             logging.error("Failed to rename recording file: %s", exc)
 
 
+def stop_recording(client, game_display_name=None, recording_state=None):
+    try:
+        resp = client.stop_record()
+        logging.info("Recording stopped.")
+    except Exception as exc:
+        logging.error("Failed to stop recording: %s", exc)
+        return
+
+    # OBS's StopRecord response reports the pre-split filename after a split has
+    # occurred, so prefer the path we've tracked live from split/start events.
+    tracked_path = recording_state.get("current_path") if recording_state else None
+    output_path = tracked_path or getattr(resp, "output_path", None)
+    rename_with_game_prefix(output_path, game_display_name)
+
+
 def set_status(icon, status, text):
     status["text"] = text
     icon.title = f"OBS Auto Recorder - {text}"
     icon.icon = build_tray_image(current_color(status))
 
 
-def watcher_loop(icon, status, stop_event):
+def watcher_loop(icon, status, audio_state, recording_state, stop_event):
     try:
-        _watcher_loop_impl(icon, status, stop_event)
+        _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event)
     except Exception:
         logging.exception("Watcher thread crashed unexpectedly.")
         status["recording"] = False
@@ -376,7 +475,7 @@ def watcher_loop(icon, status, stop_event):
         icon.stop()
 
 
-def _watcher_loop_impl(icon, status, stop_event):
+def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
     config = load_config()
     watched_games = {g.lower() for g in config["watched_games"]}
     watched_windows = config.get("watched_windows", [])
@@ -385,6 +484,7 @@ def _watcher_loop_impl(icon, status, stop_event):
     steam_config = config.get("steam", {})
     exclude_keywords = [k.lower() for k in steam_config.get("exclude_keywords", [])]
     steam_common_dirs = get_steam_common_dirs(steam_config)
+    epic_games = get_epic_installed_games(config.get("epic", {}))
 
     logging.info("Watching for processes: %s", ", ".join(sorted(watched_games)))
     if watched_windows:
@@ -404,23 +504,28 @@ def _watcher_loop_impl(icon, status, stop_event):
 
         if active_name is None:
             name, exe, pid, display_override = find_target_process(
-                watched_games, steam_common_dirs, exclude_keywords, watched_windows, processes
+                watched_games, steam_common_dirs, exclude_keywords, epic_games, watched_windows, processes
             )
             if name:
                 logging.info("Detected watched game: %s", exe or name)
                 # obs_event_client is unused directly; kept referenced so its listener thread isn't GC'd.
-                obs_client, obs_event_client = ensure_obs_ready(obs_config, processes, icon, status)
+                obs_client, obs_event_client = ensure_obs_ready(
+                    obs_config, processes, icon, status, audio_state, recording_state
+                )
                 if obs_client and start_recording(obs_client):
                     active_name, active_pid = name, pid
                     active_display_name = display_override or get_game_display_name(name, exe, steam_common_dirs)
+                    recording_state["display_name"] = active_display_name
                     status["recording"] = True
                     set_status(icon, status, f"Recording {active_display_name}")
         else:
             if not is_process_running(active_pid):
                 logging.info("%s has exited.", active_display_name or active_name)
                 if obs_client:
-                    stop_recording(obs_client, active_display_name)
+                    stop_recording(obs_client, active_display_name, recording_state)
                 active_name, active_pid, active_display_name = None, None, None
+                recording_state["display_name"] = None
+                recording_state["current_path"] = None
                 status["recording"] = False
                 set_status(icon, status, "Watching")
 
@@ -428,48 +533,130 @@ def _watcher_loop_impl(icon, status, stop_event):
 
     if active_name is not None and obs_client:
         logging.info("Quit requested while recording; stopping recording.")
-        stop_recording(obs_client, active_display_name)
+        stop_recording(obs_client, active_display_name, recording_state)
 
 
 OVERLAY_SIZE = 26
 OVERLAY_MARGIN = 16
 
+METER_WIDTH = 180
+METER_ROW_HEIGHT = 18
+METER_GAP = 8
+METER_LABEL_CHARS = 18
+METER_LOW_COLOR = "#2ecc40"
+METER_MID_COLOR = "#ffd700"
+METER_HIGH_COLOR = "#ff4136"
+METER_BG_COLOR = "#1a1a1a"
+METER_TRACK_COLOR = "#333333"
 
-def run_overlay(monitors, overlay_state, status, stop_event):
+
+def meter_bar_color(peak):
+    if peak >= 0.9:
+        return METER_HIGH_COLOR
+    if peak >= 0.6:
+        return METER_MID_COLOR
+    return METER_LOW_COLOR
+
+
+def run_overlay(monitors, overlay_state, audio_state, status, stop_event):
     root = tk.Tk()
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
-    try:
-        root.attributes("-toolwindow", True)
-    except tk.TclError:
-        pass
     root.withdraw()
 
-    shown_index = [None]
+    dot_window = tk.Toplevel(root)
+    dot_window.overrideredirect(True)
+    dot_window.attributes("-topmost", True)
+    try:
+        dot_window.attributes("-toolwindow", True)
+    except tk.TclError:
+        pass
+    dot_window.withdraw()
+
+    meter_window = tk.Toplevel(root)
+    meter_window.overrideredirect(True)
+    meter_window.attributes("-topmost", True)
+    try:
+        meter_window.attributes("-toolwindow", True)
+    except tk.TclError:
+        pass
+    meter_window.withdraw()
+    meter_canvas = tk.Canvas(meter_window, bg=METER_BG_COLOR, highlightthickness=0)
+    meter_canvas.pack(fill="both", expand=True)
+
+    dot_shown_index = [None]
+    meter_shown_index = [None]
+    meter_row_count = [0]
+
+    def poll_dot():
+        index = overlay_state["monitor_index"]
+        if index != dot_shown_index[0]:
+            dot_shown_index[0] = index
+            if index is None or index >= len(monitors):
+                dot_window.withdraw()
+            else:
+                mon = monitors[index]
+                x = mon["right"] - OVERLAY_SIZE - OVERLAY_MARGIN
+                y = mon["top"] + OVERLAY_MARGIN
+                dot_window.geometry(f"{OVERLAY_SIZE}x{OVERLAY_SIZE}+{x}+{y}")
+                dot_window.deiconify()
+
+        if dot_shown_index[0] is not None:
+            dot_window.configure(bg=color_to_hex(current_color(status)))
+
+    def poll_meters():
+        show = audio_state["enabled"] and status["recording"]
+        index = overlay_state["monitor_index"] if show else None
+        levels = audio_state["levels"]
+        row_count = max(len(levels), 1)
+
+        if index != meter_shown_index[0] or row_count != meter_row_count[0]:
+            meter_shown_index[0] = index
+            meter_row_count[0] = row_count
+            if index is None or index >= len(monitors):
+                meter_window.withdraw()
+            else:
+                mon = monitors[index]
+                height = row_count * METER_ROW_HEIGHT
+                x = mon["right"] - METER_WIDTH - OVERLAY_MARGIN
+                y = mon["top"] + OVERLAY_MARGIN + OVERLAY_SIZE + METER_GAP
+                meter_window.geometry(f"{METER_WIDTH}x{height}+{x}+{y}")
+                meter_canvas.configure(width=METER_WIDTH, height=height)
+                meter_window.deiconify()
+
+        if meter_shown_index[0] is not None:
+            meter_canvas.delete("all")
+            if not levels:
+                meter_canvas.create_text(
+                    8, METER_ROW_HEIGHT // 2, anchor="w", fill="#888888", text="No active audio sources"
+                )
+            else:
+                for i, (name, peak) in enumerate(levels.items()):
+                    top = i * METER_ROW_HEIGHT
+                    label = name if len(name) <= METER_LABEL_CHARS else name[: METER_LABEL_CHARS - 1] + "…"
+                    bar_x = 90
+                    bar_w = METER_WIDTH - bar_x - 8
+                    fill_w = max(0, min(1.0, peak)) * bar_w
+                    meter_canvas.create_text(
+                        6, top + METER_ROW_HEIGHT // 2, anchor="w", fill="#dddddd", text=label
+                    )
+                    meter_canvas.create_rectangle(
+                        bar_x, top + 3, bar_x + bar_w, top + METER_ROW_HEIGHT - 3,
+                        fill=METER_TRACK_COLOR, outline="",
+                    )
+                    if fill_w > 0:
+                        meter_canvas.create_rectangle(
+                            bar_x, top + 3, bar_x + fill_w, top + METER_ROW_HEIGHT - 3,
+                            fill=meter_bar_color(peak), outline="",
+                        )
 
     def poll():
         if stop_event.is_set():
             root.destroy()
             return
+        poll_dot()
+        poll_meters()
+        root.after(120, poll)
 
-        index = overlay_state["monitor_index"]
-        if index != shown_index[0]:
-            shown_index[0] = index
-            if index is None or index >= len(monitors):
-                root.withdraw()
-            else:
-                mon = monitors[index]
-                x = mon["right"] - OVERLAY_SIZE - OVERLAY_MARGIN
-                y = mon["top"] + OVERLAY_MARGIN
-                root.geometry(f"{OVERLAY_SIZE}x{OVERLAY_SIZE}+{x}+{y}")
-                root.deiconify()
-
-        if shown_index[0] is not None:
-            root.configure(bg=color_to_hex(current_color(status)))
-
-        root.after(250, poll)
-
-    root.after(250, poll)
+    root.after(120, poll)
     root.mainloop()
 
 
@@ -496,6 +683,8 @@ def main():
 
     monitors = get_monitor_rects()
     overlay_state = {"monitor_index": None}
+    audio_state = {"enabled": False, "levels": {}}
+    recording_state = {"display_name": None, "current_path": None}
 
     def on_quit(icon, menu_item):
         logging.info("Quit requested from tray icon.")
@@ -512,6 +701,13 @@ def main():
             return overlay_state["monitor_index"] == index
         return checked
 
+    def toggle_audio_levels(icon, menu_item):
+        audio_state["enabled"] = not audio_state["enabled"]
+        logging.info("Audio mixer levels overlay %s", "enabled" if audio_state["enabled"] else "disabled")
+
+    def audio_levels_checked(menu_item):
+        return audio_state["enabled"]
+
     overlay_items = [pystray.MenuItem("Off", select_monitor(None), radio=True, checked=is_selected(None))]
     for i, mon in enumerate(monitors):
         overlay_items.append(
@@ -522,6 +718,7 @@ def main():
         pystray.MenuItem(lambda item: status["text"], None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Overlay Monitor", pystray.Menu(*overlay_items)),
+        pystray.MenuItem("Show Audio Mixer Levels While Recording", toggle_audio_levels, checked=audio_levels_checked),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", on_quit),
     )
@@ -535,8 +732,12 @@ def main():
 
     def setup(icon):
         icon.visible = True
-        threading.Thread(target=watcher_loop, args=(icon, status, stop_event), daemon=True).start()
-        threading.Thread(target=run_overlay, args=(monitors, overlay_state, status, stop_event), daemon=True).start()
+        threading.Thread(
+            target=watcher_loop, args=(icon, status, audio_state, recording_state, stop_event), daemon=True
+        ).start()
+        threading.Thread(
+            target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event), daemon=True
+        ).start()
 
     icon.run(setup=setup)
 

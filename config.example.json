@@ -32,6 +32,13 @@
             "wallpaper_engine"
         ]
     },
+    "epic": {
+        "enabled": true,
+        "exclude_keywords": [
+            "unreal engine",
+            "epic online services"
+        ]
+    },
     "obs": {
         "process_name": "obs64.exe",
         "path": "C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe",
