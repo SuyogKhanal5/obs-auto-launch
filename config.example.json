@@ -48,6 +48,14 @@
             "host": "localhost",
             "port": 4455,
             "password": "YOUR_OBS_WEBSOCKET_PASSWORD"
+        },
+        "auto_split": {
+            "enabled": false,
+            "by": "time",
+            "minutes": 20,
+            "tolerance_seconds": 8,
+            "megabytes": 4096,
+            "tolerance_megabytes": 50
         }
     },
     "log_file": "autostart_script.log"
