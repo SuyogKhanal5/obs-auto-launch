@@ -53,6 +53,10 @@ Edit `config.json`:
 | `obs.launch_args` | Extra command-line args OBS is launched with |
 | `obs.startup_wait_seconds` | How long to wait after launching OBS before trying to connect |
 | `obs.websocket.host` / `port` / `password` | Must match OBS's WebSocket Server Settings |
+| `obs.auto_split.enabled` | Set to `true` if you've enabled OBS's **Automatically split file** option (see below), so its splits aren't mislabeled as manual |
+| `obs.auto_split.by` | `"time"` or `"size"` — must match what you set in OBS's automatic split setting |
+| `obs.auto_split.minutes` / `tolerance_seconds` | When `by` is `"time"`: the split interval you set in OBS, and how many seconds of slack to allow when matching a split against it |
+| `obs.auto_split.megabytes` / `tolerance_megabytes` | When `by` is `"size"`: the split size you set in OBS, and how much overshoot to allow when matching a split against it |
 | `log_file` | Log file name (relative to the exe's folder, or an absolute path) |
 
 `config.json` is gitignored since it contains your WebSocket password, never commit it in any forks of this repo.
@@ -117,8 +121,10 @@ Icon colors:
 
 You can optionally enable OBS's file-splitting so a long session isn't stuck in one giant file. Once set up, your existing **Split Recording File** hotkey can be used while in-game to split off a new file at any time — the tray icon (and overlay, if enabled) will flash gold for a few seconds each time a split happens.
 
-- **Manual**: OBS Settings → Hotkeys → set a **Split Recording File** hotkey.
+- **Manual**: OBS Settings → Hotkeys → set a **Split Recording File** hotkey. Files from a manual split are renamed with a `Split N` tag (e.g. `Game - Split 1 - filename.mp4`), and if any manual split happened during the session, the final segment gets a `Split N` tag too.
 - **Automatic**: OBS Settings → Output (Advanced mode) → Recording → enable **Automatically split file**, with a time or size limit.
+
+OBS's WebSocket API doesn't report *why* a file split happened, so the script can't natively tell a manual split from an automatic one. If you use OBS's automatic splitting, set `obs.auto_split` in `config.json` to match it (interval/size and, optionally, its trigger-matching tolerance) so the script can recognize those splits and skip labeling them — any split that doesn't match your configured automatic settings is assumed to be manual. Leave `obs.auto_split.enabled` at `false` (the default) if you only use the manual hotkey; every split will then be treated as manual.
 
 ## Known limitations
 

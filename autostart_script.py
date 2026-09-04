@@ -320,7 +320,29 @@ def connect_obs(ws_config, retries=5, delay=2):
 RECORD_STARTED_STATE = "OBS_WEBSOCKET_OUTPUT_STARTED"
 
 
-def connect_obs_events(ws_config, icon, status, audio_state, recording_state):
+def is_automatic_split(recording_state, old_path, auto_split_config):
+    if not auto_split_config or not auto_split_config.get("enabled"):
+        return False
+
+    by = auto_split_config.get("by", "time")
+    if by == "size":
+        if not old_path:
+            return False
+        try:
+            size_mb = os.path.getsize(old_path) / (1024 * 1024)
+        except OSError:
+            return False
+        target_mb = auto_split_config.get("megabytes", 0)
+        tolerance_mb = auto_split_config.get("tolerance_megabytes", 50)
+        return target_mb > 0 and target_mb <= size_mb <= target_mb + tolerance_mb
+
+    elapsed = time.time() - recording_state.get("segment_start_time", time.time())
+    target_seconds = auto_split_config.get("minutes", 0) * 60
+    tolerance_seconds = auto_split_config.get("tolerance_seconds", 8)
+    return target_seconds > 0 and target_seconds <= elapsed <= target_seconds + tolerance_seconds
+
+
+def connect_obs_events(ws_config, icon, status, audio_state, recording_state, auto_split_config):
     try:
         event_client = obsws.EventClient(
             host=ws_config["host"],
@@ -339,20 +361,35 @@ def connect_obs_events(ws_config, icon, status, audio_state, recording_state):
         output_path = getattr(data, "output_path", None)
         if output_path:
             recording_state["current_path"] = output_path
+            recording_state["part_index"] = 1
+            recording_state["did_split"] = False
+            recording_state["segment_start_time"] = time.time()
 
     def on_record_file_changed(data):
         new_path = getattr(data, "new_output_path", "")
         if new_path == recording_state.get("current_path"):
             # OBS emits RecordFileChanged twice for a single split; ignore the duplicate.
             return
-        logging.info("Recording file split detected: %s", new_path)
+
+        old_path = recording_state.get("current_path")
+        manual = not is_automatic_split(recording_state, old_path, auto_split_config)
+        logging.info(
+            "Recording file split detected (%s): %s", "manual" if manual else "automatic", new_path
+        )
         status["flash_until"] = time.time() + SPLIT_FLASH_SECONDS
         icon.icon = build_tray_image(current_color(status))
 
-        old_path = recording_state.get("current_path")
-        if old_path:
+        if manual:
+            part_index = recording_state.get("part_index", 1)
+            if old_path:
+                rename_with_game_prefix(old_path, recording_state.get("display_name"), part_index)
+            recording_state["did_split"] = True
+            recording_state["part_index"] = part_index + 1
+        elif old_path:
             rename_with_game_prefix(old_path, recording_state.get("display_name"))
+
         recording_state["current_path"] = new_path
+        recording_state["segment_start_time"] = time.time()
 
         def revert():
             icon.icon = build_tray_image(current_color(status))
@@ -387,7 +424,9 @@ def ensure_obs_ready(obs_config, processes, icon, status, audio_state, recording
     client = connect_obs(obs_config["websocket"])
     if not client:
         return None, None
-    event_client = connect_obs_events(obs_config["websocket"], icon, status, audio_state, recording_state)
+    event_client = connect_obs_events(
+        obs_config["websocket"], icon, status, audio_state, recording_state, obs_config.get("auto_split", {})
+    )
     return client, event_client
 
 
@@ -413,7 +452,7 @@ def start_recording(client, retries=6, delay=2):
     return False
 
 
-def rename_with_game_prefix(output_path, game_display_name):
+def rename_with_game_prefix(output_path, game_display_name, split_part=None):
     if not output_path or not game_display_name:
         return
 
@@ -424,7 +463,11 @@ def rename_with_game_prefix(output_path, game_display_name):
     if not prefix:
         return
 
-    new_path = os.path.join(directory, f"{prefix} - {filename}")
+    if split_part:
+        new_name = f"{prefix} - Split {split_part} - {filename}"
+    else:
+        new_name = f"{prefix} - {filename}"
+    new_path = os.path.join(directory, new_name)
     retries, delay = 5, 1
     for attempt in range(1, retries + 1):
         try:
@@ -450,7 +493,8 @@ def stop_recording(client, game_display_name=None, recording_state=None):
     # occurred, so prefer the path we've tracked live from split/start events.
     tracked_path = recording_state.get("current_path") if recording_state else None
     output_path = tracked_path or getattr(resp, "output_path", None)
-    rename_with_game_prefix(output_path, game_display_name)
+    split_part = recording_state.get("part_index") if recording_state and recording_state.get("did_split") else None
+    rename_with_game_prefix(output_path, game_display_name, split_part)
 
 
 def set_status(icon, status, text):
@@ -526,6 +570,9 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
                 active_name, active_pid, active_display_name = None, None, None
                 recording_state["display_name"] = None
                 recording_state["current_path"] = None
+                recording_state["part_index"] = 1
+                recording_state["did_split"] = False
+                recording_state["segment_start_time"] = None
                 status["recording"] = False
                 set_status(icon, status, "Watching")
 
@@ -684,7 +731,13 @@ def main():
     monitors = get_monitor_rects()
     overlay_state = {"monitor_index": None}
     audio_state = {"enabled": False, "levels": {}}
-    recording_state = {"display_name": None, "current_path": None}
+    recording_state = {
+        "display_name": None,
+        "current_path": None,
+        "part_index": 1,
+        "did_split": False,
+        "segment_start_time": None,
+    }
 
     def on_quit(icon, menu_item):
         logging.info("Quit requested from tray icon.")
