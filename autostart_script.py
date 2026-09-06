@@ -441,8 +441,16 @@ def connect_obs_events(ws_config, icon, status, audio_state, recording_state, au
     return event_client
 
 
-OBS_RECOVERY_COOLDOWN_SECONDS = 30
-OBS_MEMORY_LIMIT_BYTES = 5 * 1024 ** 3
+DEFAULT_OBS_RECOVERY_COOLDOWN_SECONDS = 30
+DEFAULT_OBS_MEMORY_LIMIT_GB = 5
+
+
+def get_obs_recovery_cooldown_seconds(obs_config):
+    return obs_config.get("recovery", {}).get("cooldown_seconds", DEFAULT_OBS_RECOVERY_COOLDOWN_SECONDS)
+
+
+def get_obs_memory_limit_bytes(obs_config):
+    return obs_config.get("recovery", {}).get("memory_limit_gb", DEFAULT_OBS_MEMORY_LIMIT_GB) * 1024 ** 3
 
 
 def ensure_obs_ready(obs_config, processes, icon, status, audio_state, recording_state, obs_recovery_state):
@@ -454,7 +462,7 @@ def ensure_obs_ready(obs_config, processes, icon, status, audio_state, recording
         client = connect_obs(obs_config["websocket"])
         if not client:
             now = time.time()
-            if now - obs_recovery_state["last_attempt"] < OBS_RECOVERY_COOLDOWN_SECONDS:
+            if now - obs_recovery_state["last_attempt"] < get_obs_recovery_cooldown_seconds(obs_config):
                 logging.warning("OBS WebSocket still unresponsive; recovery was attempted recently, waiting before retrying.")
                 return None, None
             obs_recovery_state["last_attempt"] = now
@@ -594,9 +602,9 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
 
         if active_name is None:
             memory_bytes = get_process_memory_bytes(obs_config["process_name"], processes)
-            if memory_bytes > OBS_MEMORY_LIMIT_BYTES:
+            if memory_bytes > get_obs_memory_limit_bytes(obs_config):
                 now = time.time()
-                if now - obs_recovery_state["last_attempt"] >= OBS_RECOVERY_COOLDOWN_SECONDS:
+                if now - obs_recovery_state["last_attempt"] >= get_obs_recovery_cooldown_seconds(obs_config):
                     obs_recovery_state["last_attempt"] = now
                     logging.warning(
                         "OBS is using %.1f GB of memory while idle; restarting it.",

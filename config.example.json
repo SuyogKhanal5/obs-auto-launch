@@ -56,6 +56,10 @@
             "tolerance_seconds": 8,
             "megabytes": 4096,
             "tolerance_megabytes": 50
+        },
+        "recovery": {
+            "memory_limit_gb": 5,
+            "cooldown_seconds": 30
         }
     },
     "log_file": "autostart_script.log"

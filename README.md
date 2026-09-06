@@ -58,6 +58,8 @@ Edit `config.json`:
 | `obs.auto_split.by` | `"time"` or `"size"` — must match what you set in OBS's automatic split setting |
 | `obs.auto_split.minutes` / `tolerance_seconds` | When `by` is `"time"`: the split interval you set in OBS, and how many seconds of slack to allow when matching a split against it |
 | `obs.auto_split.megabytes` / `tolerance_megabytes` | When `by` is `"size"`: the split size you set in OBS, and how much overshoot to allow when matching a split against it |
+| `obs.recovery.memory_limit_gb` | Restart OBS if its memory usage exceeds this while idle (see [OBS health recovery](#obs-health-recovery)). Defaults to `5` if omitted |
+| `obs.recovery.cooldown_seconds` | Minimum time between automatic OBS restarts, whether triggered by a hang or by memory. Defaults to `30` if omitted |
 | `log_file` | Log file name (relative to the exe's folder, or an absolute path) |
 
 `config.json` is gitignored since it contains your WebSocket password, never commit it in any forks of this repo.
@@ -123,9 +125,9 @@ Icon colors:
 OBS can sometimes stay running as a process while no longer working properly — frozen with its WebSocket server unresponsive, or ballooned in memory after a long session. Left alone, this would mean recordings silently never start. The watcher guards against both:
 
 - **Hung OBS**: if a watched game launches and OBS's process is present but its WebSocket won't connect after retries, the watcher kills and relaunches OBS before trying again.
-- **Bloated OBS**: while idle (no game running), if OBS's memory usage exceeds 5 GB, the watcher preemptively kills and relaunches it.
+- **Bloated OBS**: while idle (no game running), if OBS's memory usage exceeds `obs.recovery.memory_limit_gb` (default `5`), the watcher preemptively kills and relaunches it.
 
-Both cases flash the tray icon orange and log a warning. To avoid restart loops, either kind of restart is followed by a 30-second cooldown before another is attempted. These thresholds are currently hardcoded in `autostart_script.py` (`OBS_MEMORY_LIMIT_BYTES`, `OBS_RECOVERY_COOLDOWN_SECONDS`), not exposed in `config.json`.
+Both cases flash the tray icon orange and log a warning. To avoid restart loops, either kind of restart is followed by an `obs.recovery.cooldown_seconds` cooldown (default `30`) before another is attempted.
 
 ## Optional: split recording files
 
