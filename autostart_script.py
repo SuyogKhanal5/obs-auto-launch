@@ -270,6 +270,17 @@ def is_obs_running(process_name, processes):
     return any(name.lower() == process_name_lower for name, _, _ in processes)
 
 
+def kill_process_by_name(process_name):
+    process_name_lower = process_name.lower()
+    for proc in psutil.process_iter(["name"]):
+        try:
+            if (proc.info.get("name") or "").lower() == process_name_lower:
+                proc.kill()
+                proc.wait(timeout=5)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+            pass
+
+
 def clear_obs_crash_sentinel():
     appdata = os.environ.get("APPDATA")
     if not appdata:
@@ -417,11 +428,31 @@ def connect_obs_events(ws_config, icon, status, audio_state, recording_state, au
     return event_client
 
 
-def ensure_obs_ready(obs_config, processes, icon, status, audio_state, recording_state):
+OBS_RECOVERY_COOLDOWN_SECONDS = 30
+
+
+def ensure_obs_ready(obs_config, processes, icon, status, audio_state, recording_state, obs_recovery_state):
     if not is_obs_running(obs_config["process_name"], processes):
         if not launch_obs(obs_config):
             return None, None
-    client = connect_obs(obs_config["websocket"])
+        client = connect_obs(obs_config["websocket"])
+    else:
+        client = connect_obs(obs_config["websocket"])
+        if not client:
+            now = time.time()
+            if now - obs_recovery_state["last_attempt"] < OBS_RECOVERY_COOLDOWN_SECONDS:
+                logging.warning("OBS WebSocket still unresponsive; recovery was attempted recently, waiting before retrying.")
+                return None, None
+            obs_recovery_state["last_attempt"] = now
+            logging.warning(
+                "OBS process is running but its WebSocket is unresponsive (likely hung); restarting OBS."
+            )
+            kill_process_by_name(obs_config["process_name"])
+            time.sleep(2)
+            if not launch_obs(obs_config):
+                return None, None
+            client = connect_obs(obs_config["websocket"])
+
     if not client:
         return None, None
     event_client = connect_obs_events(
@@ -542,6 +573,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
     active_name = None
     active_pid = None
     active_display_name = None
+    obs_recovery_state = {"last_attempt": 0}
 
     while not stop_event.is_set():
         processes = get_running_processes()
@@ -554,7 +586,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
                 logging.info("Detected watched game: %s", exe or name)
                 # obs_event_client is unused directly; kept referenced so its listener thread isn't GC'd.
                 obs_client, obs_event_client = ensure_obs_ready(
-                    obs_config, processes, icon, status, audio_state, recording_state
+                    obs_config, processes, icon, status, audio_state, recording_state, obs_recovery_state
                 )
                 if obs_client and start_recording(obs_client):
                     active_name, active_pid = name, pid
@@ -562,6 +594,13 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
                     recording_state["display_name"] = active_display_name
                     status["recording"] = True
                     set_status(icon, status, f"Recording {active_display_name}")
+                else:
+                    logging.error("Could not get OBS ready to record; will keep retrying while %s runs.", exe or name)
+                    status["text"] = "Error - OBS unreachable, see log"
+                    icon.title = "OBS Auto Recorder - Error, OBS unreachable"
+                    icon.icon = build_tray_image(ERROR_COLOR)
+            elif status["text"].startswith("Error"):
+                set_status(icon, status, "Watching")
         else:
             if not is_process_running(active_pid):
                 logging.info("%s has exited.", active_display_name or active_name)
