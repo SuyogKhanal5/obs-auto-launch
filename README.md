@@ -11,7 +11,8 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - Starts recording when a watched game launches, stops when it exits
 - Renames the finished recording to `"<Game Name> - <original filename>.mp4"`
 - Clears OBS's "unclean shutdown" crash-recovery sentinel before launching, so a prior forced close (e.g. Task Manager, crash, power loss) doesn't pop OBS's crash dialog and stall automation
-- System tray icon showing live status (gray = watching, red = recording, gold = recording file just split, orange = internal error — check the log)
+- Detects a hung OBS (process running but its WebSocket stops responding) or a memory-bloated idle OBS, and automatically kills and relaunches it instead of silently failing to record
+- System tray icon showing live status (gray = watching, red = recording, gold = recording file just split, orange = internal error or OBS recovery in progress — check the log)
 - Optional floating always-on-top overlay, pinned to any monitor of your choice via the tray icon's right-click menu, showing the same status color
 - Packaged as a single standalone `OBSAutoRecorder.exe` so it's easy to identify and kill in Task Manager (not a generic `python.exe`/`pythonw.exe` process)
 
@@ -115,7 +116,16 @@ Icon colors:
 - **Gray** — watching, idle
 - **Red** — recording
 - **Gold** (~5s) — a recording file just auto-split
-- **Orange** — the watcher crashed; check `autostart_script.log`
+- **Orange** — the watcher crashed, or it's restarting a hung/bloated OBS; check `autostart_script.log`
+
+## OBS health recovery
+
+OBS can sometimes stay running as a process while no longer working properly — frozen with its WebSocket server unresponsive, or ballooned in memory after a long session. Left alone, this would mean recordings silently never start. The watcher guards against both:
+
+- **Hung OBS**: if a watched game launches and OBS's process is present but its WebSocket won't connect after retries, the watcher kills and relaunches OBS before trying again.
+- **Bloated OBS**: while idle (no game running), if OBS's memory usage exceeds 5 GB, the watcher preemptively kills and relaunches it.
+
+Both cases flash the tray icon orange and log a warning. To avoid restart loops, either kind of restart is followed by a 30-second cooldown before another is attempted. These thresholds are currently hardcoded in `autostart_script.py` (`OBS_MEMORY_LIMIT_BYTES`, `OBS_RECOVERY_COOLDOWN_SECONDS`), not exposed in `config.json`.
 
 ## Optional: split recording files
 
