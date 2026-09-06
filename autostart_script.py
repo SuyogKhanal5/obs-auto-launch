@@ -270,6 +270,19 @@ def is_obs_running(process_name, processes):
     return any(name.lower() == process_name_lower for name, _, _ in processes)
 
 
+def get_process_memory_bytes(process_name, processes):
+    process_name_lower = process_name.lower()
+    total = 0
+    for name, _, pid in processes:
+        if name.lower() != process_name_lower:
+            continue
+        try:
+            total += psutil.Process(pid).memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return total
+
+
 def kill_process_by_name(process_name):
     process_name_lower = process_name.lower()
     for proc in psutil.process_iter(["name"]):
@@ -429,6 +442,7 @@ def connect_obs_events(ws_config, icon, status, audio_state, recording_state, au
 
 
 OBS_RECOVERY_COOLDOWN_SECONDS = 30
+OBS_MEMORY_LIMIT_BYTES = 5 * 1024 ** 3
 
 
 def ensure_obs_ready(obs_config, processes, icon, status, audio_state, recording_state, obs_recovery_state):
@@ -579,6 +593,23 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
         processes = get_running_processes()
 
         if active_name is None:
+            memory_bytes = get_process_memory_bytes(obs_config["process_name"], processes)
+            if memory_bytes > OBS_MEMORY_LIMIT_BYTES:
+                now = time.time()
+                if now - obs_recovery_state["last_attempt"] >= OBS_RECOVERY_COOLDOWN_SECONDS:
+                    obs_recovery_state["last_attempt"] = now
+                    logging.warning(
+                        "OBS is using %.1f GB of memory while idle; restarting it.",
+                        memory_bytes / (1024 ** 3),
+                    )
+                    status["text"] = "Error - restarting bloated OBS"
+                    icon.title = "OBS Auto Recorder - Error, restarting OBS"
+                    icon.icon = build_tray_image(ERROR_COLOR)
+                    kill_process_by_name(obs_config["process_name"])
+                    launch_obs(obs_config)
+                    processes = get_running_processes()
+                    set_status(icon, status, "Watching")
+
             name, exe, pid, display_override = find_target_process(
                 watched_games, steam_common_dirs, exclude_keywords, epic_games, watched_windows, processes
             )
