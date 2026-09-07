@@ -63,7 +63,7 @@ Edit `config.json`:
 | `obs.recovery.cooldown_seconds` | Minimum time between automatic OBS restarts, whether triggered by a hang or by memory. Defaults to `30` if omitted |
 | `obs.game_audio_capture.enabled` | Repoint an existing **Application Audio Capture** source at the detected game each time recording starts, to isolate its audio (see [Optional: isolate game audio](#optional-isolate-game-audio)) |
 | `obs.game_audio_capture.input_name` | Name of that source in your OBS scene, exactly as it appears in OBS |
-| `log_file` | Log file name (relative to the exe's folder, or an absolute path) |
+| `log_file` | Log file name (relative to the exe's folder, or an absolute path). Capped at the most recent 10,000 lines — older lines are dropped as new ones are added |
 
 `config.json` is gitignored since it contains your WebSocket password, never commit it in any forks of this repo.
 

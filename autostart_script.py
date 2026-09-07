@@ -28,6 +28,34 @@ def load_config():
         return json.load(f)
 
 
+MAX_LOG_LINES = 10000
+
+
+class LineCappedFileHandler(logging.Handler):
+    """Appends to a log file, trimming the oldest lines once it exceeds max_lines."""
+
+    def __init__(self, filename, max_lines=MAX_LOG_LINES, encoding="utf-8"):
+        super().__init__()
+        self.filename = filename
+        self.max_lines = max_lines
+        self.encoding = encoding
+
+    def emit(self, record):
+        try:
+            with open(self.filename, "a", encoding=self.encoding, newline="\n") as f:
+                f.write(self.format(record) + "\n")
+            self._trim_if_needed()
+        except Exception:
+            self.handleError(record)
+
+    def _trim_if_needed(self):
+        with open(self.filename, "r", encoding=self.encoding, errors="replace") as f:
+            lines = f.readlines()
+        if len(lines) > self.max_lines:
+            with open(self.filename, "w", encoding=self.encoding, newline="\n") as f:
+                f.writelines(lines[-self.max_lines:])
+
+
 IDLE_COLOR = (90, 90, 90, 255)
 RECORDING_COLOR = (220, 30, 30, 255)
 SPLIT_COLOR = (255, 210, 0, 255)
@@ -813,7 +841,7 @@ def main():
         log_path = config["log_file"]
         if not os.path.isabs(log_path):
             log_path = os.path.join(SCRIPT_DIR, log_path)
-        handlers.append(logging.FileHandler(log_path))
+        handlers.append(LineCappedFileHandler(log_path))
 
     logging.basicConfig(
         level=logging.INFO,
