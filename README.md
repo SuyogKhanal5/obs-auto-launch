@@ -67,6 +67,8 @@ Edit `config.json`:
 
 `config.json` is gitignored since it contains your WebSocket password, never commit it in any forks of this repo.
 
+Editing `config.json` never requires rebuilding `OBSAutoRecorder.exe` — it's a plain file read from disk, not baked into the executable. It's only read once at startup, though, so **restart the app** (Quit from the tray icon, then relaunch) for a config change to take effect. Rebuilding is only needed after editing `autostart_script.py` itself.
+
 **`watched_windows` example** (Java Edition Minecraft, launched via any launcher):
 
 ```json
