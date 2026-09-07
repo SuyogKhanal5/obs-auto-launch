@@ -857,6 +857,12 @@ def main():
     def audio_levels_checked(menu_item):
         return audio_state["enabled"]
 
+    def on_kill_obs(icon, menu_item):
+        logging.info("Kill OBS requested from tray icon.")
+        threading.Thread(
+            target=kill_process_by_name, args=(config["obs"]["process_name"],), daemon=True
+        ).start()
+
     overlay_items = [pystray.MenuItem("Off", select_monitor(None), radio=True, checked=is_selected(None))]
     for i, mon in enumerate(monitors):
         overlay_items.append(
@@ -869,6 +875,7 @@ def main():
         pystray.MenuItem("Overlay Monitor", pystray.Menu(*overlay_items)),
         pystray.MenuItem("Show Audio Mixer Levels While Recording", toggle_audio_levels, checked=audio_levels_checked),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Kill OBS", on_kill_obs),
         pystray.MenuItem("Quit", on_quit),
     )
 
