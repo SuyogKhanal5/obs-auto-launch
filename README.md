@@ -21,7 +21,7 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 
 - Windows 10/11
 - [OBS Studio](https://obsproject.com/) with the built-in WebSocket server (OBS 28+)
-- Python 3.10+ (only needed if you want to run from source or rebuild the `.exe`)
+- Python 3.10+ (only needed if you want to run from source or build the `.exe` yourself — not needed to use the [prebuilt releases](../../releases/latest))
 
 ## Setup
 
@@ -33,7 +33,7 @@ In OBS: **Tools → WebSocket Server Settings**
 
 ### 2. Configure
 
-Copy the example config and fill in your values:
+Get `config.example.json` — it's attached to each [Release](../../releases/latest) alongside the exe, or you can grab it from this repo. Put it next to `OBSAutoRecorder.exe` and rename your copy to `config.json`:
 
 ```
 copy config.example.json config.json
@@ -85,7 +85,7 @@ Editing `config.json` never requires rebuilding `OBSAutoRecorder.exe` — it's a
 
 ### 3. Get the app running
 
-**Option A — use the prebuilt exe** (if `OBSAutoRecorder.exe` is already present): just run it.
+**Option A — use the prebuilt exe**: download `OBSAutoRecorder.exe` from the [Releases page](../../releases/latest) and run it. No Python needed.
 
 **Option B — build it yourself**:
 
@@ -95,6 +95,8 @@ pyinstaller --onefile --noconsole --name OBSAutoRecorder --distpath . --workpath
 ```
 
 This produces `OBSAutoRecorder.exe` in the project folder, alongside `config.json` (it reads config from its own directory). Rebuild any time you change `autostart_script.py`.
+
+Pushing a `vX.Y.Z` tag also triggers a GitHub Actions workflow ([.github/workflows/build-release.yml](.github/workflows/build-release.yml)) that builds the exe and publishes it, alongside `config.example.json`, to a new GitHub Release automatically.
 
 You can also run it directly without building, for testing:
 
