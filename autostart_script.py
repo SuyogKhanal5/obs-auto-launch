@@ -505,6 +505,21 @@ def start_recording(client, retries=6, delay=2):
     return False
 
 
+WINDOW_MATCH_PRIORITY_EXE_FALLBACK = 2
+
+
+def set_game_audio_capture_target(client, input_name, process_name):
+    try:
+        client.set_input_settings(
+            input_name,
+            {"window": f"::{process_name}", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK},
+            True,
+        )
+        logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
+    except Exception as exc:
+        logging.warning("Could not point '%s' audio capture at %s: %s", input_name, process_name, exc)
+
+
 def rename_with_game_prefix(output_path, game_display_name, split_part=None):
     if not output_path or not game_display_name:
         return
@@ -582,6 +597,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
     exclude_keywords = [k.lower() for k in steam_config.get("exclude_keywords", [])]
     steam_common_dirs = get_steam_common_dirs(steam_config)
     epic_games = get_epic_installed_games(config.get("epic", {}))
+    game_audio_config = obs_config.get("game_audio_capture", {})
 
     logging.info("Watching for processes: %s", ", ".join(sorted(watched_games)))
     if watched_windows:
@@ -633,6 +649,8 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
                     recording_state["display_name"] = active_display_name
                     status["recording"] = True
                     set_status(icon, status, f"Recording {active_display_name}")
+                    if game_audio_config.get("enabled"):
+                        set_game_audio_capture_target(obs_client, game_audio_config["input_name"], name)
                 else:
                     logging.error("Could not get OBS ready to record; will keep retrying while %s runs.", exe or name)
                     status["text"] = "Error - OBS unreachable, see log"

@@ -12,6 +12,7 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - Renames the finished recording to `"<Game Name> - <original filename>.mp4"`
 - Clears OBS's "unclean shutdown" crash-recovery sentinel before launching, so a prior forced close (e.g. Task Manager, crash, power loss) doesn't pop OBS's crash dialog and stall automation
 - Detects a hung OBS (process running but its WebSocket stops responding) or a memory-bloated idle OBS, and automatically kills and relaunches it instead of silently failing to record
+- Optionally repoints an OBS Application Audio Capture source at each detected game, to isolate its audio from Discord/Spotify/etc. (see [Isolating game audio](#isolating-game-audio))
 - System tray icon showing live status (gray = watching, red = recording, gold = recording file just split, orange = internal error or OBS recovery in progress — check the log)
 - Optional floating always-on-top overlay, pinned to any monitor of your choice via the tray icon's right-click menu, showing the same status color
 - Packaged as a single standalone `OBSAutoRecorder.exe` so it's easy to identify and kill in Task Manager (not a generic `python.exe`/`pythonw.exe` process)
@@ -60,6 +61,8 @@ Edit `config.json`:
 | `obs.auto_split.megabytes` / `tolerance_megabytes` | When `by` is `"size"`: the split size you set in OBS, and how much overshoot to allow when matching a split against it |
 | `obs.recovery.memory_limit_gb` | Restart OBS if its memory usage exceeds this while idle (see [OBS health recovery](#obs-health-recovery)). Defaults to `5` if omitted |
 | `obs.recovery.cooldown_seconds` | Minimum time between automatic OBS restarts, whether triggered by a hang or by memory. Defaults to `30` if omitted |
+| `obs.game_audio_capture.enabled` | Repoint an existing **Application Audio Capture** source at the detected game each time recording starts, to isolate its audio (see [Isolating game audio](#isolating-game-audio)) |
+| `obs.game_audio_capture.input_name` | Name of that source in your OBS scene, exactly as it appears in OBS |
 | `log_file` | Log file name (relative to the exe's folder, or an absolute path) |
 
 `config.json` is gitignored since it contains your WebSocket password, never commit it in any forks of this repo.
@@ -128,6 +131,17 @@ OBS can sometimes stay running as a process while no longer working properly —
 - **Bloated OBS**: while idle (no game running), if OBS's memory usage exceeds `obs.recovery.memory_limit_gb` (default `5`), the watcher preemptively kills and relaunches it.
 
 Both cases flash the tray icon orange and log a warning. To avoid restart loops, either kind of restart is followed by an `obs.recovery.cooldown_seconds` cooldown (default `30`) before another is attempted.
+
+## Isolating game audio
+
+If your recordings pick up Discord, Spotify, or other background app audio alongside the game, OBS's **Application Audio Capture** source can isolate just the game's audio — it captures a chosen process's audio output directly, regardless of what else is playing. This script can point that source at whichever game it just detected, so you don't have to re-target it by hand every time you switch games:
+
+1. In OBS, add an **Application Audio Capture** source to your scene (any window it's currently pointed at doesn't matter — it'll be overwritten automatically), and give it a name, e.g. `Game Audio`.
+2. In `config.json`, set `obs.game_audio_capture.enabled` to `true` and `obs.game_audio_capture.input_name` to that exact name.
+
+From then on, whenever a watched game starts recording, the script repoints that source at the game's process by executable name (not by window title), so it keeps working even if the game's window title changes mid-session or it has no visible window at all.
+
+Mute or remove your desktop/system audio source in OBS if you don't want it recorded alongside the isolated game audio.
 
 ## Optional: split recording files
 
