@@ -96,7 +96,9 @@ pyinstaller --onefile --noconsole --name OBSAutoRecorder --distpath . --workpath
 
 This produces `OBSAutoRecorder.exe` in the project folder, alongside `config.json` (it reads config from its own directory). Rebuild any time you change `autostart_script.py`.
 
-Pushing a `vX.Y.Z` tag also triggers a GitHub Actions workflow ([.github/workflows/build-release.yml](.github/workflows/build-release.yml)) that builds the exe and publishes it, alongside `config.example.json`, to a new GitHub Release automatically.
+A GitHub Actions workflow ([.github/workflows/build-release.yml](.github/workflows/build-release.yml)) does this automatically:
+- Pushing a `vX.Y.Z` tag builds the exe and publishes it, alongside `config.example.json`, as a new versioned GitHub Release.
+- Every push to `main` builds the exe and republishes it to a rolling [`latest`](../../releases/tag/latest) pre-release, so the newest code is always available even between tagged versions. The [Releases page](../../releases/latest) itself still points at the newest *tagged* release, since the rolling build is marked as a pre-release.
 
 You can also run it directly without building, for testing:
 
