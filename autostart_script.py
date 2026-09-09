@@ -11,6 +11,7 @@ import time
 import tkinter as tk
 import winreg
 from ctypes import wintypes
+from tkinter import filedialog, messagebox, ttk
 
 import obsws_python as obsws
 import psutil
@@ -870,7 +871,20 @@ def set_status(icon, status, text):
     icon.icon = build_tray_image(current_color(status))
 
 
-def watcher_loop(icon, status, audio_state, recording_state, runtime_state, stop_event):
+def reset_recording_state(recording_state):
+    recording_state["display_name"] = None
+    recording_state["current_path"] = None
+    recording_state["part_index"] = 1
+    recording_state["did_split"] = False
+    recording_state["segment_start_time"] = None
+    recording_state["session_start_time"] = None
+    recording_state["segment_files"] = []
+    recording_state["heard_any_audio"] = False
+    recording_state["last_audio_peak_time"] = None
+    recording_state["silent_warning_sent"] = False
+
+
+def watcher_loop(icon, status, audio_state, recording_state, runtime_state, stop_event, on_stopped):
     try:
         _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state, stop_event)
     except Exception:
@@ -883,7 +897,7 @@ def watcher_loop(icon, status, audio_state, recording_state, runtime_state, stop
         except Exception:
             pass
     finally:
-        icon.stop()
+        on_stopped()
 
 
 def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state, stop_event):
@@ -1007,13 +1021,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                     if kept:
                         notify(icon, notifications_config, "Recording stopped", active_display_name or active_name)
                 active_name, active_pid, active_display_name = None, None, None
-                recording_state["display_name"] = None
-                recording_state["current_path"] = None
-                recording_state["part_index"] = 1
-                recording_state["did_split"] = False
-                recording_state["segment_start_time"] = None
-                recording_state["session_start_time"] = None
-                recording_state["segment_files"] = []
+                reset_recording_state(recording_state)
                 status["recording"] = False
                 set_status(icon, status, "Watching")
 
@@ -1150,6 +1158,550 @@ def run_overlay(monitors, overlay_state, audio_state, status, stop_event):
     root.mainloop()
 
 
+def parse_csv_field(text):
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def format_csv_field(items):
+    return ", ".join(items or [])
+
+
+def make_scrollable_tab(notebook, title):
+    outer = tk.Frame(notebook)
+    notebook.add(outer, text=title)
+    canvas = tk.Canvas(outer, highlightthickness=0)
+    scrollbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    inner = tk.Frame(canvas)
+
+    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    def on_enter(_event):
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+    def on_leave(_event):
+        canvas.unbind_all("<MouseWheel>")
+
+    canvas.bind("<Enter>", on_enter)
+    canvas.bind("<Leave>", on_leave)
+    return inner
+
+
+def add_labeled_entry(parent, row, label_text, var, width=36):
+    tk.Label(parent, text=label_text, anchor="w").grid(row=row, column=0, sticky="w", padx=(10, 6), pady=4)
+    entry = tk.Entry(parent, textvariable=var, width=width)
+    entry.grid(row=row, column=1, sticky="we", padx=(0, 10), pady=4)
+    return entry
+
+
+def add_checkbox(parent, row, label_text, var, columnspan=2):
+    tk.Checkbutton(parent, text=label_text, variable=var).grid(
+        row=row, column=0, columnspan=columnspan, sticky="w", padx=10, pady=4
+    )
+
+
+def add_browse_button(parent, row, var, mode="file", filetypes=(("Executable", "*.exe"), ("All files", "*.*"))):
+    def browse():
+        path = filedialog.askopenfilename(filetypes=filetypes) if mode == "file" else filedialog.askdirectory()
+        if path:
+            var.set(os.path.normpath(path))
+
+    tk.Button(parent, text="Browse...", command=browse).grid(row=row, column=2, padx=(0, 10), pady=4)
+
+
+def add_section_label(parent, row, text):
+    tk.Label(parent, text=text, font=("Segoe UI", 9, "bold")).grid(
+        row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(14, 2)
+    )
+
+
+def build_watched_games_editor(parent, initial_games):
+    tk.Label(parent, text="Watched game processes (exact exe name, e.g. cs2.exe)", anchor="w").pack(
+        anchor="w", padx=10, pady=(10, 2)
+    )
+    frame = tk.Frame(parent)
+    frame.pack(fill="x", padx=10, pady=(0, 10))
+    listbox = tk.Listbox(frame, height=8, width=32, exportselection=False)
+    listbox.pack(side="left", fill="both", expand=True)
+    for g in initial_games:
+        listbox.insert("end", g)
+
+    controls = tk.Frame(frame)
+    controls.pack(side="left", fill="y", padx=(10, 0))
+    entry_var = tk.StringVar()
+    tk.Entry(controls, textvariable=entry_var, width=22).pack(pady=(0, 4))
+
+    def add_game():
+        value = entry_var.get().strip()
+        if value:
+            listbox.insert("end", value)
+            entry_var.set("")
+
+    def remove_selected():
+        for index in reversed(listbox.curselection()):
+            listbox.delete(index)
+
+    tk.Button(controls, text="Add", command=add_game).pack(fill="x")
+    tk.Button(controls, text="Remove Selected", command=remove_selected).pack(fill="x", pady=(4, 0))
+    return listbox
+
+
+def build_watched_windows_editor(parent, initial_rows):
+    tk.Label(
+        parent, text="Window-title rules (for games sharing a generic process name, e.g. javaw.exe)", anchor="w"
+    ).pack(anchor="w", padx=10, pady=(10, 2))
+
+    header = tk.Frame(parent)
+    header.pack(fill="x", padx=10)
+    for text, w in (("Process name", 16), ("Title contains", 16), ("Display name", 16)):
+        tk.Label(header, text=text, width=w, anchor="w").pack(side="left", padx=2)
+
+    container = tk.Frame(parent)
+    container.pack(fill="x", padx=10)
+    rows = []
+
+    def add_row(process="", title="", display=""):
+        row_frame = tk.Frame(container)
+        row_frame.pack(fill="x", pady=2)
+        process_var = tk.StringVar(value=process)
+        title_var = tk.StringVar(value=title)
+        display_var = tk.StringVar(value=display)
+        tk.Entry(row_frame, textvariable=process_var, width=16).pack(side="left", padx=2)
+        tk.Entry(row_frame, textvariable=title_var, width=16).pack(side="left", padx=2)
+        tk.Entry(row_frame, textvariable=display_var, width=16).pack(side="left", padx=2)
+        entry = {"process": process_var, "title": title_var, "display": display_var}
+
+        def remove():
+            row_frame.destroy()
+            rows.remove(entry)
+
+        tk.Button(row_frame, text="Remove", command=remove).pack(side="left", padx=4)
+        rows.append(entry)
+
+    for w in initial_rows:
+        add_row(w.get("process_name", ""), w.get("title_contains", ""), w.get("display_name", ""))
+
+    tk.Button(parent, text="+ Add Window Rule", command=lambda: add_row()).pack(anchor="w", padx=10, pady=(4, 10))
+    return rows
+
+
+def build_launcher_section(parent, row, title, launcher_config, include_install_dirs):
+    add_section_label(parent, row, title)
+    row += 1
+    enabled_var = tk.BooleanVar(value=launcher_config.get("enabled", True))
+    add_checkbox(parent, row, "Enabled", enabled_var)
+    row += 1
+    install_dirs_var = None
+    if include_install_dirs:
+        install_dirs_var = tk.StringVar(value=format_csv_field(launcher_config.get("install_dirs", [])))
+        add_labeled_entry(parent, row, "Install folders (comma-separated)", install_dirs_var)
+        row += 1
+    exclude_var = tk.StringVar(value=format_csv_field(launcher_config.get("exclude_keywords", [])))
+    add_labeled_entry(parent, row, "Exclude keywords (comma-separated)", exclude_var)
+    row += 1
+    return row, {"enabled": enabled_var, "install_dirs": install_dirs_var, "exclude_keywords": exclude_var}
+
+
+def open_config_editor_window(editor_state, restart_watcher_callback, restart_app_callback):
+    if editor_state.get("open"):
+        logging.info("Settings editor is already open.")
+        return
+    editor_state["open"] = True
+
+    def run():
+        try:
+            _run_config_editor(restart_watcher_callback, restart_app_callback)
+        except Exception:
+            logging.exception("Settings editor crashed.")
+        finally:
+            editor_state["open"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _run_config_editor(restart_watcher_callback, restart_app_callback):
+    config = load_config()
+
+    root = tk.Tk()
+    root.title("OBS Auto Recorder - Settings")
+    root.geometry("620x560")
+    root.minsize(520, 420)
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True)
+
+    # --- General ---
+    general_tab = make_scrollable_tab(notebook, "General")
+    general_tab.columnconfigure(1, weight=1)
+    poll_interval_var = tk.StringVar(value=str(config.get("poll_interval_seconds", 1.5)))
+    add_labeled_entry(general_tab, 0, "Poll interval (seconds)", poll_interval_var)
+    subfolders_var = tk.BooleanVar(value=config.get("organize_into_game_subfolders", False))
+    add_checkbox(general_tab, 1, "Organize recordings into per-game subfolders", subfolders_var)
+    log_file_var = tk.StringVar(value=config.get("log_file", "") or "")
+    add_labeled_entry(general_tab, 2, "Log file", log_file_var)
+
+    # --- Games ---
+    games_tab = make_scrollable_tab(notebook, "Watched Games")
+    games_listbox = build_watched_games_editor(games_tab, config.get("watched_games", []))
+    window_rows = build_watched_windows_editor(games_tab, config.get("watched_windows", []))
+
+    # --- Launchers ---
+    launchers_tab = make_scrollable_tab(notebook, "Launchers")
+    launchers_tab.columnconfigure(1, weight=1)
+    row = 0
+    row, steam_vars = build_launcher_section(launchers_tab, row, "Steam", config.get("steam", {}), False)
+    steam_drives_var = tk.StringVar(value=format_csv_field(config.get("steam", {}).get("allowed_drives", [])))
+    add_labeled_entry(launchers_tab, row, "Allowed drives (comma-separated, e.g. C, D)", steam_drives_var)
+    row += 1
+    row, epic_vars = build_launcher_section(launchers_tab, row, "Epic Games", config.get("epic", {}), False)
+    row, gog_vars = build_launcher_section(launchers_tab, row, "GOG Galaxy", config.get("gog", {}), False)
+    row, xbox_vars = build_launcher_section(launchers_tab, row, "Xbox / PC Game Pass", config.get("xbox", {}), True)
+    row, battlenet_vars = build_launcher_section(launchers_tab, row, "Battle.net", config.get("battlenet", {}), True)
+
+    # --- OBS ---
+    obs_tab = make_scrollable_tab(notebook, "OBS")
+    obs_tab.columnconfigure(1, weight=1)
+    obs_config = config.get("obs", {})
+    row = 0
+    obs_process_var = tk.StringVar(value=obs_config.get("process_name", "obs64.exe"))
+    add_labeled_entry(obs_tab, row, "Process name", obs_process_var)
+    row += 1
+    obs_path_var = tk.StringVar(value=obs_config.get("path", ""))
+    add_labeled_entry(obs_tab, row, "OBS executable path", obs_path_var)
+    add_browse_button(obs_tab, row, obs_path_var)
+    row += 1
+    obs_launch_args_var = tk.StringVar(value=format_csv_field(obs_config.get("launch_args", [])))
+    add_labeled_entry(obs_tab, row, "Launch args (comma-separated)", obs_launch_args_var)
+    row += 1
+    obs_startup_wait_var = tk.StringVar(value=str(obs_config.get("startup_wait_seconds", 8)))
+    add_labeled_entry(obs_tab, row, "Startup wait (seconds)", obs_startup_wait_var)
+    row += 1
+
+    ws_config = obs_config.get("websocket", {})
+    add_section_label(obs_tab, row, "WebSocket")
+    row += 1
+    ws_host_var = tk.StringVar(value=ws_config.get("host", "localhost"))
+    add_labeled_entry(obs_tab, row, "Host", ws_host_var)
+    row += 1
+    ws_port_var = tk.StringVar(value=str(ws_config.get("port", 4455)))
+    add_labeled_entry(obs_tab, row, "Port", ws_port_var)
+    row += 1
+    ws_password_var = tk.StringVar(value=ws_config.get("password", ""))
+    add_labeled_entry(obs_tab, row, "Password", ws_password_var)
+    row += 1
+
+    auto_split_config = obs_config.get("auto_split", {})
+    add_section_label(obs_tab, row, "Automatic Split Matching")
+    row += 1
+    auto_split_enabled_var = tk.BooleanVar(value=auto_split_config.get("enabled", False))
+    add_checkbox(obs_tab, row, "OBS's automatic file splitting is enabled", auto_split_enabled_var)
+    row += 1
+    auto_split_by_var = tk.StringVar(value=auto_split_config.get("by", "time"))
+    tk.Label(obs_tab, text="Split by", anchor="w").grid(row=row, column=0, sticky="w", padx=(10, 6), pady=4)
+    ttk.Combobox(
+        obs_tab, textvariable=auto_split_by_var, values=["time", "size"], state="readonly", width=10
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    auto_split_minutes_var = tk.StringVar(value=str(auto_split_config.get("minutes", 20)))
+    add_labeled_entry(obs_tab, row, "Minutes (if split by time)", auto_split_minutes_var)
+    row += 1
+    auto_split_tolerance_seconds_var = tk.StringVar(value=str(auto_split_config.get("tolerance_seconds", 8)))
+    add_labeled_entry(obs_tab, row, "Tolerance seconds", auto_split_tolerance_seconds_var)
+    row += 1
+    auto_split_megabytes_var = tk.StringVar(value=str(auto_split_config.get("megabytes", 4096)))
+    add_labeled_entry(obs_tab, row, "Megabytes (if split by size)", auto_split_megabytes_var)
+    row += 1
+    auto_split_tolerance_megabytes_var = tk.StringVar(value=str(auto_split_config.get("tolerance_megabytes", 50)))
+    add_labeled_entry(obs_tab, row, "Tolerance megabytes", auto_split_tolerance_megabytes_var)
+    row += 1
+
+    recovery_config = obs_config.get("recovery", {})
+    add_section_label(obs_tab, row, "OBS Health Recovery")
+    row += 1
+    memory_limit_var = tk.StringVar(value=str(recovery_config.get("memory_limit_gb", DEFAULT_OBS_MEMORY_LIMIT_GB)))
+    add_labeled_entry(obs_tab, row, "Memory limit (GB)", memory_limit_var)
+    row += 1
+    recovery_cooldown_var = tk.StringVar(
+        value=str(recovery_config.get("cooldown_seconds", DEFAULT_OBS_RECOVERY_COOLDOWN_SECONDS))
+    )
+    add_labeled_entry(obs_tab, row, "Restart cooldown (seconds)", recovery_cooldown_var)
+    row += 1
+
+    game_audio_config = obs_config.get("game_audio_capture", {})
+    add_section_label(obs_tab, row, "Game Audio Isolation")
+    row += 1
+    game_audio_enabled_var = tk.BooleanVar(value=game_audio_config.get("enabled", False))
+    add_checkbox(obs_tab, row, "Repoint Application Audio Capture at the detected game", game_audio_enabled_var)
+    row += 1
+    game_audio_input_var = tk.StringVar(value=game_audio_config.get("input_name", "Game Audio"))
+    add_labeled_entry(obs_tab, row, "Input source name", game_audio_input_var)
+    row += 1
+
+    replay_buffer_config = obs_config.get("replay_buffer", {})
+    add_section_label(obs_tab, row, "Replay Buffer")
+    row += 1
+    replay_buffer_enabled_var = tk.BooleanVar(value=replay_buffer_config.get("enabled", False))
+    add_checkbox(obs_tab, row, "Start/stop OBS's replay buffer with recording", replay_buffer_enabled_var)
+    row += 1
+
+    # --- Cleanup & Guards ---
+    cleanup_tab = make_scrollable_tab(notebook, "Cleanup & Guards")
+    cleanup_tab.columnconfigure(1, weight=1)
+    disk_guard_config = config.get("disk_space_guard", {})
+    row = 0
+    add_section_label(cleanup_tab, row, "Disk Space Guard")
+    row += 1
+    disk_guard_enabled_var = tk.BooleanVar(value=disk_guard_config.get("enabled", False))
+    add_checkbox(cleanup_tab, row, "Skip starting a recording if disk space is low", disk_guard_enabled_var)
+    row += 1
+    disk_guard_min_gb_var = tk.StringVar(
+        value=str(disk_guard_config.get("minimum_free_gb", DEFAULT_DISK_SPACE_MINIMUM_GB))
+    )
+    add_labeled_entry(cleanup_tab, row, "Minimum free space (GB)", disk_guard_min_gb_var)
+    row += 1
+    disk_guard_path_var = tk.StringVar(value=disk_guard_config.get("path", "") or "")
+    add_labeled_entry(cleanup_tab, row, "Drive/folder to check (optional)", disk_guard_path_var)
+    add_browse_button(cleanup_tab, row, disk_guard_path_var, mode="dir")
+    row += 1
+
+    short_clip_config = config.get("cleanup", {}).get("delete_short_clips", {})
+    add_section_label(cleanup_tab, row, "Delete Short Clips")
+    row += 1
+    short_clip_enabled_var = tk.BooleanVar(value=short_clip_config.get("enabled", False))
+    add_checkbox(cleanup_tab, row, "Delete recordings shorter than the minimum below", short_clip_enabled_var)
+    row += 1
+    short_clip_minimum_var = tk.StringVar(value=str(short_clip_config.get("minimum_seconds", 20)))
+    add_labeled_entry(cleanup_tab, row, "Minimum session length (seconds)", short_clip_minimum_var)
+    row += 1
+
+    silent_config = config.get("cleanup", {}).get("flag_silent_recordings", {})
+    add_section_label(cleanup_tab, row, "Flag Silent Recordings")
+    row += 1
+    silent_enabled_var = tk.BooleanVar(value=silent_config.get("enabled", False))
+    add_checkbox(cleanup_tab, row, "Warn and tag recordings with no detected audio", silent_enabled_var)
+    row += 1
+    silent_threshold_var = tk.StringVar(value=str(silent_config.get("peak_threshold", 0.02)))
+    add_labeled_entry(cleanup_tab, row, "Peak threshold (0.0 - 1.0)", silent_threshold_var)
+    row += 1
+    silent_warn_after_var = tk.StringVar(value=str(silent_config.get("warn_after_seconds", 30)))
+    add_labeled_entry(cleanup_tab, row, "Warn after (seconds)", silent_warn_after_var)
+    row += 1
+
+    # --- Post-processing & Notifications ---
+    post_tab = make_scrollable_tab(notebook, "Post-Processing")
+    post_tab.columnconfigure(1, weight=1)
+    transcode_config = config.get("post_record_transcode", {})
+    row = 0
+    add_section_label(post_tab, row, "Post-Record Transcode (ffmpeg)")
+    row += 1
+    transcode_enabled_var = tk.BooleanVar(value=transcode_config.get("enabled", False))
+    add_checkbox(post_tab, row, "Run finished recordings through ffmpeg", transcode_enabled_var)
+    row += 1
+    transcode_ffmpeg_path_var = tk.StringVar(value=transcode_config.get("ffmpeg_path", "ffmpeg"))
+    add_labeled_entry(post_tab, row, "ffmpeg path", transcode_ffmpeg_path_var)
+    add_browse_button(post_tab, row, transcode_ffmpeg_path_var)
+    row += 1
+    transcode_args_var = tk.StringVar(
+        value=" ".join(transcode_config.get("args", ["-c:v", "libx264", "-crf", "23", "-c:a", "aac"]))
+    )
+    add_labeled_entry(post_tab, row, "ffmpeg args (space-separated)", transcode_args_var, width=44)
+    row += 1
+    transcode_suffix_var = tk.StringVar(value=transcode_config.get("suffix", "_compressed"))
+    add_labeled_entry(post_tab, row, "Output filename suffix", transcode_suffix_var)
+    row += 1
+    transcode_delete_original_var = tk.BooleanVar(value=transcode_config.get("delete_original", False))
+    add_checkbox(post_tab, row, "Delete original after a successful transcode", transcode_delete_original_var)
+    row += 1
+
+    add_section_label(post_tab, row, "Notifications")
+    row += 1
+    notifications_enabled_var = tk.BooleanVar(value=config.get("notifications", {}).get("enabled", False))
+    add_checkbox(post_tab, row, "Show Windows toast notifications for key events", notifications_enabled_var)
+    row += 1
+
+    # --- Save / Cancel ---
+    status_label = tk.Label(root, text="", fg="#b00020", anchor="w")
+    status_label.pack(fill="x", padx=10)
+
+    def collect_config():
+        errors = []
+
+        def read_float(var, field_name, default):
+            try:
+                return float(var.get())
+            except ValueError:
+                errors.append(f"'{field_name}' must be a number")
+                return default
+
+        def read_int(var, field_name, default):
+            try:
+                return int(float(var.get()))
+            except ValueError:
+                errors.append(f"'{field_name}' must be a whole number")
+                return default
+
+        new_config = json.loads(json.dumps(config))
+
+        new_config["watched_games"] = list(games_listbox.get(0, "end"))
+        new_config["watched_windows"] = []
+        for row_vars in window_rows:
+            process = row_vars["process"].get().strip()
+            title = row_vars["title"].get().strip()
+            if not process or not title:
+                continue
+            entry = {"process_name": process, "title_contains": title}
+            display = row_vars["display"].get().strip()
+            if display:
+                entry["display_name"] = display
+            new_config["watched_windows"].append(entry)
+
+        new_config["poll_interval_seconds"] = read_float(
+            poll_interval_var, "Poll interval", new_config.get("poll_interval_seconds", 1.5)
+        )
+        new_config["organize_into_game_subfolders"] = subfolders_var.get()
+        new_config["log_file"] = log_file_var.get().strip() or None
+
+        steam = new_config.setdefault("steam", {})
+        steam["enabled"] = steam_vars["enabled"].get()
+        steam["allowed_drives"] = parse_csv_field(steam_drives_var.get())
+        steam["exclude_keywords"] = parse_csv_field(steam_vars["exclude_keywords"].get())
+
+        epic = new_config.setdefault("epic", {})
+        epic["enabled"] = epic_vars["enabled"].get()
+        epic["exclude_keywords"] = parse_csv_field(epic_vars["exclude_keywords"].get())
+
+        gog = new_config.setdefault("gog", {})
+        gog["enabled"] = gog_vars["enabled"].get()
+        gog["exclude_keywords"] = parse_csv_field(gog_vars["exclude_keywords"].get())
+
+        xbox = new_config.setdefault("xbox", {})
+        xbox["enabled"] = xbox_vars["enabled"].get()
+        xbox["install_dirs"] = parse_csv_field(xbox_vars["install_dirs"].get())
+        xbox["exclude_keywords"] = parse_csv_field(xbox_vars["exclude_keywords"].get())
+
+        battlenet = new_config.setdefault("battlenet", {})
+        battlenet["enabled"] = battlenet_vars["enabled"].get()
+        battlenet["install_dirs"] = parse_csv_field(battlenet_vars["install_dirs"].get())
+        battlenet["exclude_keywords"] = parse_csv_field(battlenet_vars["exclude_keywords"].get())
+
+        obs = new_config.setdefault("obs", {})
+        obs["process_name"] = obs_process_var.get().strip() or obs.get("process_name", "obs64.exe")
+        obs["path"] = obs_path_var.get().strip()
+        obs["launch_args"] = parse_csv_field(obs_launch_args_var.get())
+        obs["startup_wait_seconds"] = read_int(
+            obs_startup_wait_var, "Startup wait", obs.get("startup_wait_seconds", 8)
+        )
+
+        ws = obs.setdefault("websocket", {})
+        ws["host"] = ws_host_var.get().strip() or "localhost"
+        ws["port"] = read_int(ws_port_var, "WebSocket port", ws.get("port", 4455))
+        ws["password"] = ws_password_var.get()
+
+        auto_split = obs.setdefault("auto_split", {})
+        auto_split["enabled"] = auto_split_enabled_var.get()
+        auto_split["by"] = auto_split_by_var.get()
+        auto_split["minutes"] = read_int(auto_split_minutes_var, "Split minutes", auto_split.get("minutes", 20))
+        auto_split["tolerance_seconds"] = read_int(
+            auto_split_tolerance_seconds_var, "Split tolerance seconds", auto_split.get("tolerance_seconds", 8)
+        )
+        auto_split["megabytes"] = read_int(
+            auto_split_megabytes_var, "Split megabytes", auto_split.get("megabytes", 4096)
+        )
+        auto_split["tolerance_megabytes"] = read_int(
+            auto_split_tolerance_megabytes_var, "Split tolerance megabytes", auto_split.get("tolerance_megabytes", 50)
+        )
+
+        recovery = obs.setdefault("recovery", {})
+        recovery["memory_limit_gb"] = read_float(
+            memory_limit_var, "Memory limit", recovery.get("memory_limit_gb", DEFAULT_OBS_MEMORY_LIMIT_GB)
+        )
+        recovery["cooldown_seconds"] = read_int(
+            recovery_cooldown_var,
+            "Recovery cooldown",
+            recovery.get("cooldown_seconds", DEFAULT_OBS_RECOVERY_COOLDOWN_SECONDS),
+        )
+
+        game_audio = obs.setdefault("game_audio_capture", {})
+        game_audio["enabled"] = game_audio_enabled_var.get()
+        game_audio["input_name"] = game_audio_input_var.get().strip() or "Game Audio"
+
+        replay_buffer = obs.setdefault("replay_buffer", {})
+        replay_buffer["enabled"] = replay_buffer_enabled_var.get()
+
+        disk_guard = new_config.setdefault("disk_space_guard", {})
+        disk_guard["enabled"] = disk_guard_enabled_var.get()
+        disk_guard["minimum_free_gb"] = read_float(
+            disk_guard_min_gb_var,
+            "Minimum free space",
+            disk_guard.get("minimum_free_gb", DEFAULT_DISK_SPACE_MINIMUM_GB),
+        )
+        disk_guard_path_value = disk_guard_path_var.get().strip()
+        if disk_guard_path_value:
+            disk_guard["path"] = disk_guard_path_value
+        else:
+            disk_guard.pop("path", None)
+
+        cleanup = new_config.setdefault("cleanup", {})
+        short_clip = cleanup.setdefault("delete_short_clips", {})
+        short_clip["enabled"] = short_clip_enabled_var.get()
+        short_clip["minimum_seconds"] = read_int(
+            short_clip_minimum_var, "Short clip minimum seconds", short_clip.get("minimum_seconds", 20)
+        )
+
+        silent = cleanup.setdefault("flag_silent_recordings", {})
+        silent["enabled"] = silent_enabled_var.get()
+        silent["peak_threshold"] = read_float(
+            silent_threshold_var, "Silent peak threshold", silent.get("peak_threshold", 0.02)
+        )
+        silent["warn_after_seconds"] = read_int(
+            silent_warn_after_var, "Silent warn-after seconds", silent.get("warn_after_seconds", 30)
+        )
+
+        transcode = new_config.setdefault("post_record_transcode", {})
+        transcode["enabled"] = transcode_enabled_var.get()
+        transcode["ffmpeg_path"] = transcode_ffmpeg_path_var.get().strip() or "ffmpeg"
+        transcode["args"] = transcode_args_var.get().split()
+        transcode["suffix"] = transcode_suffix_var.get()
+        transcode["delete_original"] = transcode_delete_original_var.get()
+
+        notifications = new_config.setdefault("notifications", {})
+        notifications["enabled"] = notifications_enabled_var.get()
+
+        return new_config, errors
+
+    def do_save(restart_app):
+        new_config, errors = collect_config()
+        if errors:
+            status_label.config(text="; ".join(errors))
+            return
+        if not new_config.get("obs", {}).get("path"):
+            status_label.config(text="'OBS executable path' is required")
+            return
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(new_config, f, indent=4)
+        except OSError as exc:
+            messagebox.showerror("Save failed", f"Could not write config.json:\n{exc}", parent=root)
+            return
+        logging.info("config.json updated via the Settings editor.")
+        root.destroy()
+        if restart_app:
+            restart_app_callback()
+        else:
+            restart_watcher_callback()
+
+    button_bar = tk.Frame(root)
+    button_bar.pack(fill="x", padx=10, pady=10)
+    tk.Button(button_bar, text="Cancel", command=root.destroy).pack(side="right")
+    tk.Button(button_bar, text="Save & Restart Watcher", command=lambda: do_save(False)).pack(side="right", padx=8)
+    tk.Button(button_bar, text="Save & Restart App", command=lambda: do_save(True)).pack(side="right")
+
+    root.mainloop()
+
+
 def main():
     config = load_config()
 
@@ -1169,28 +1721,60 @@ def main():
     )
 
     status = {"text": "Starting...", "recording": False}
-    stop_event = threading.Event()
+    app_stop_event = threading.Event()
 
     monitors = get_monitor_rects()
     overlay_state = {"monitor_index": None}
     audio_state = {"enabled": False, "levels": {}}
-    recording_state = {
-        "display_name": None,
-        "current_path": None,
-        "part_index": 1,
-        "did_split": False,
-        "segment_start_time": None,
-        "session_start_time": None,
-        "segment_files": [],
-        "heard_any_audio": False,
-        "last_audio_peak_time": None,
-        "silent_warning_sent": False,
-    }
+    recording_state = {}
+    reset_recording_state(recording_state)
     runtime_state = {"obs_client": None}
+    editor_state = {"open": False}
+    watcher_ctl = {"stop_event": threading.Event(), "restart_requested": False}
+
+    def start_watcher_thread():
+        watcher_ctl["stop_event"] = threading.Event()
+        threading.Thread(
+            target=watcher_loop,
+            args=(
+                icon, status, audio_state, recording_state, runtime_state,
+                watcher_ctl["stop_event"], on_watcher_stopped,
+            ),
+            daemon=True,
+        ).start()
+
+    def on_watcher_stopped():
+        if watcher_ctl["restart_requested"]:
+            watcher_ctl["restart_requested"] = False
+            reset_recording_state(recording_state)
+            logging.info("Watcher restarted with updated settings.")
+            start_watcher_thread()
+        else:
+            app_stop_event.set()
+            icon.stop()
 
     def on_quit(icon, menu_item):
         logging.info("Quit requested from tray icon.")
-        stop_event.set()
+        watcher_ctl["stop_event"].set()
+
+    def restart_watcher():
+        logging.info("Restarting watcher to apply updated settings.")
+        watcher_ctl["restart_requested"] = True
+        watcher_ctl["stop_event"].set()
+
+    def do_restart_app():
+        logging.info("Restarting app to apply updated settings.")
+        try:
+            if getattr(sys, "frozen", False):
+                subprocess.Popen([sys.executable], cwd=SCRIPT_DIR)
+            else:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=SCRIPT_DIR)
+        except Exception:
+            logging.exception("Failed to relaunch after config save.")
+        watcher_ctl["stop_event"].set()
+
+    def on_edit_settings(icon, menu_item):
+        open_config_editor_window(editor_state, restart_watcher, do_restart_app)
 
     def on_open_recordings_folder(icon, menu_item):
         client = runtime_state.get("obs_client")
@@ -1268,6 +1852,9 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Open Recordings Folder", on_open_recordings_folder),
         pystray.MenuItem("Open Log File", on_open_log_file),
+        pystray.MenuItem(
+            "Edit Settings...", on_edit_settings, enabled=lambda item: not editor_state["open"]
+        ),
     ]
     if config.get("obs", {}).get("replay_buffer", {}).get("enabled"):
         menu_items.append(pystray.MenuItem("Save Replay Buffer", on_save_replay))
@@ -1287,13 +1874,9 @@ def main():
 
     def setup(icon):
         icon.visible = True
+        start_watcher_thread()
         threading.Thread(
-            target=watcher_loop,
-            args=(icon, status, audio_state, recording_state, runtime_state, stop_event),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event), daemon=True
+            target=run_overlay, args=(monitors, overlay_state, audio_state, status, app_stop_event), daemon=True
         ).start()
 
     icon.run(setup=setup)

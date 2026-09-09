@@ -20,6 +20,7 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - Detects a hung OBS (process running but its WebSocket stops responding) or a memory-bloated idle OBS, and automatically kills and relaunches it instead of silently failing to record
 - Optionally repoints an OBS Application Audio Capture source at each detected game, to isolate its audio from Discord/Spotify/etc. (see [Optional: isolate game audio](#optional-isolate-game-audio))
 - System tray icon showing live status (gray = watching, red = recording, gold = recording file just split, orange = internal error or OBS recovery in progress — check the log), plus shortcuts to open the recordings folder and log file
+- Built-in GUI settings editor (tray icon → **Edit Settings...**) for every `config.json` option — no manual JSON editing required (see [Optional: settings editor](#optional-settings-editor))
 - Optional floating always-on-top overlay, pinned to any monitor of your choice via the tray icon's right-click menu, showing the same status color
 - Packaged as a single standalone `OBSAutoRecorder.exe` so it's easy to identify and kill in Task Manager (not a generic `python.exe`/`pythonw.exe` process)
 
@@ -154,6 +155,7 @@ Right-click the tray icon (it may be tucked under the "show hidden icons" `^` ch
 - **Show Audio Mixer Levels While Recording** — toggle live mixer levels on the overlay
 - **Open Recordings Folder** — opens OBS's current recording output folder (queried live from OBS; only available once OBS has connected)
 - **Open Log File** — opens `log_file` in your default text editor
+- **Edit Settings...** — opens a GUI settings window covering every `config.json` option (watched games/windows, launchers, OBS connection, cleanup/guards, post-processing, notifications) organized into tabs, with **Save & Restart Watcher** (applies immediately, in place) and **Save & Restart App** (a full relaunch, for the couple of settings that need it). No manual JSON editing needed. See [Optional: settings editor](#optional-settings-editor)
 - **Save Replay Buffer** — only shown if `obs.replay_buffer.enabled` is `true`; saves the last few minutes of the replay buffer immediately
 - **Kill OBS** — force-kills any running `obs.process_name` process (e.g. if it's hung); the watcher will relaunch it the next time a watched game starts
 - **Quit** — stops any active recording cleanly, then exits
@@ -172,6 +174,17 @@ OBS can sometimes stay running as a process while no longer working properly —
 - **Bloated OBS**: while idle (no game running), if OBS's memory usage exceeds `obs.recovery.memory_limit_gb` (default `5`), the watcher preemptively kills and relaunches it.
 
 Both cases flash the tray icon orange and log a warning. To avoid restart loops, either kind of restart is followed by an `obs.recovery.cooldown_seconds` cooldown (default `30`) before another is attempted.
+
+## Optional: settings editor
+
+Instead of hand-editing `config.json`, right-click the tray icon → **Edit Settings...** for a tabbed GUI covering every option in this README's config table: General, Watched Games (including the window-title rules), Launchers, OBS (path, WebSocket, auto-split, health recovery, game audio, replay buffer), Cleanup & Guards, and Post-Processing/Notifications.
+
+- **Save & Restart Watcher** writes `config.json` and immediately restarts the watcher in place (stops any active recording first) so almost every setting takes effect right away — the tray icon and its menu stay up the whole time.
+- **Save & Restart App** writes `config.json` and does a full app relaunch instead — needed for the handful of settings only read once at startup (`log_file`, and whether the "Save Replay Buffer" menu item is shown).
+- Only one editor window can be open at a time; the menu item disables itself while one is open.
+- List-like fields (exclude keywords, install folders, launch args) are entered comma-separated; `ffmpeg` arguments are space-separated.
+
+The editor always reloads `config.json` fresh when opened and only overwrites the fields shown in the form, so any advanced/unlisted key you've hand-added is left untouched.
 
 ## Optional: isolate game audio
 
