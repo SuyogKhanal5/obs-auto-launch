@@ -105,6 +105,15 @@
             "enabled": false,
             "input_name": "Game Audio"
         },
+        "multi_track_audio": {
+            "enabled": false,
+            "profile_name": "OBS Auto Recorder",
+            "tracks": [
+                {"input_name": "Mic/Aux", "track": 1},
+                {"input_name": "Desktop Audio", "track": 2},
+                {"input_name": "Game Audio", "track": 3}
+            ]
+        },
         "replay_buffer": {
             "enabled": false
         }

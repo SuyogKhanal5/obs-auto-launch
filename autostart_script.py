@@ -463,6 +463,7 @@ def set_startup_shortcut_enabled(enabled):
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
             capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logging.error("Failed to create startup shortcut: %s", exc)
@@ -707,6 +708,8 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
 
     if not client:
         return None, None
+    sync_multi_track_audio(client, obs_config.get("multi_track_audio", {}))
+    apply_output_folder(client, obs_config.get("output_folder"))
     event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
     return client, event_client
 
@@ -746,6 +749,246 @@ def set_game_audio_capture_target(client, input_name, process_name):
         logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
     except Exception as exc:
         logging.warning("Could not point '%s' audio capture at %s: %s", input_name, process_name, exc)
+
+
+def apply_output_folder(client, output_folder):
+    """Best-effort override of OBS's recording directory for whichever profile is currently
+    active (the dedicated multi-track profile if that ran first, otherwise whatever the user
+    has selected) -- an explicit `obs.output_folder` always wins over whatever the profile
+    already had, including a cloned-over value from multi-track's profile setup."""
+    if not output_folder:
+        return
+    try:
+        os.makedirs(output_folder, exist_ok=True)
+    except OSError as exc:
+        logging.warning("Could not create recording output folder '%s': %s", output_folder, exc)
+        return
+
+    try:
+        current = client.get_record_directory().record_directory
+    except Exception as exc:
+        logging.warning("Could not read OBS's current recording directory: %s", exc)
+        current = None
+
+    if current and os.path.normpath(current) == os.path.normpath(output_folder):
+        return
+
+    try:
+        client.set_record_directory(output_folder)
+        logging.info("Set OBS's recording output folder to %s", output_folder)
+    except Exception as exc:
+        logging.error("Could not set OBS's recording output folder to '%s': %s", output_folder, exc)
+
+
+DEFAULT_MULTI_TRACK_PROFILE_NAME = "OBS Auto Recorder"
+# Formats OBS has reliably muxed every enabled recording track into. Others (mp4, mov, flv, ...)
+# have historically only embedded track 1 in some OBS versions -- routing still happens either way,
+# this is just used to decide whether to warn about it.
+MULTI_TRACK_SAFE_FORMATS = {"mkv", "fragmented_mkv", "hybrid_mp4"}
+
+
+def normalize_track_entries(tracks_config):
+    """Validates config['obs']['multi_track_audio']['tracks'] into (input_name, track_number) pairs,
+    dropping anything malformed rather than raising -- this runs on every recording start."""
+    entries = []
+    for t in tracks_config or []:
+        name = (t.get("input_name") or "").strip()
+        if not name:
+            continue
+        try:
+            track = int(t.get("track"))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= track <= 6:
+            entries.append((name, track))
+    return entries
+
+
+def get_profile_parameter_value(client, category, name, default=None):
+    try:
+        resp = client.get_profile_parameter(category, name)
+        value = resp.parameter_value
+        return value if value is not None else default
+    except Exception:
+        return default
+
+
+def snapshot_recording_source_settings(client):
+    """Reads the handful of profile settings worth carrying over when creating the dedicated
+    multi-track profile, so it starts out recording to the same place, at the same quality, in
+    the same format the user already had in their current profile -- we only add track routing
+    on top of that, never reinvent their encoder/path setup."""
+    settings = {}
+    try:
+        settings["video"] = client.get_video_settings()
+    except Exception as exc:
+        logging.warning("Could not read video settings to carry over to the dedicated profile: %s", exc)
+    try:
+        settings["record_directory"] = client.get_record_directory().record_directory
+    except Exception as exc:
+        logging.warning("Could not read recording directory to carry over to the dedicated profile: %s", exc)
+    settings["rec_format"] = (
+        get_profile_parameter_value(client, "AdvOut", "RecFormat2")
+        or get_profile_parameter_value(client, "AdvOut", "RecFormat")
+        or get_profile_parameter_value(client, "SimpleOutput", "RecFormat2")
+        or get_profile_parameter_value(client, "SimpleOutput", "RecFormat")
+    )
+    return settings
+
+
+def apply_recording_source_settings(client, settings):
+    video = settings.get("video")
+    if video:
+        try:
+            client.set_video_settings(
+                video.fps_numerator, video.fps_denominator,
+                video.base_width, video.base_height,
+                video.output_width, video.output_height,
+            )
+        except Exception as exc:
+            logging.warning("Could not apply carried-over video settings to the dedicated profile: %s", exc)
+    record_directory = settings.get("record_directory")
+    if record_directory:
+        try:
+            client.set_record_directory(record_directory)
+        except Exception as exc:
+            logging.warning("Could not apply carried-over recording directory to the dedicated profile: %s", exc)
+    rec_format = settings.get("rec_format")
+    if rec_format:
+        try:
+            client.set_profile_parameter("AdvOut", "RecFormat2", rec_format)
+        except Exception as exc:
+            logging.warning("Could not apply carried-over recording format to the dedicated profile: %s", exc)
+
+
+def ensure_dedicated_profile(client, profile_name):
+    """Makes sure OBS is on `profile_name`, creating it (cloned from whatever profile is
+    currently active) the first time. All multi-track changes only ever land on this profile,
+    so the user's own profile is never modified."""
+    try:
+        profiles = client.get_profile_list()
+    except Exception as exc:
+        logging.warning("Could not read the OBS profile list: %s", exc)
+        return False
+
+    if profiles.current_profile_name == profile_name:
+        return True
+
+    if profile_name in profiles.profiles:
+        try:
+            client.set_current_profile(profile_name)
+            logging.info("Switched OBS to the dedicated '%s' profile.", profile_name)
+        except Exception as exc:
+            logging.error("Could not switch OBS to the '%s' profile: %s", profile_name, exc)
+            return False
+        return True
+
+    logging.info(
+        "Creating a dedicated '%s' OBS profile for multi-track audio, cloned from your current "
+        "profile ('%s') so its recording path/quality/format carry over unchanged.",
+        profile_name, profiles.current_profile_name,
+    )
+    source_settings = snapshot_recording_source_settings(client)
+    try:
+        client.create_profile(profile_name)
+    except Exception as exc:
+        logging.error("Could not create the '%s' OBS profile: %s", profile_name, exc)
+        return False
+    apply_recording_source_settings(client, source_settings)
+    return True
+
+
+def sync_multi_track_output_settings(client, entries, profile_name):
+    """Ensures Advanced output mode (required for multi-track recording) and a recording-track
+    bitmask covering every track referenced in `entries` -- both scoped to the currently active
+    (dedicated) profile only."""
+    current_mode = get_profile_parameter_value(client, "Output", "Mode", "Simple")
+    if current_mode != "Advanced":
+        try:
+            client.set_profile_parameter("Output", "Mode", "Advanced")
+            logging.warning(
+                "Switched the dedicated multi-track profile's Output Mode to Advanced (required for "
+                "multi-track recording; it was '%s'). If you want to fine-tune recording quality/encoder "
+                "for this profile, do it in OBS's Settings > Output while '%s' is the active profile -- "
+                "your original profile is untouched.",
+                current_mode, profile_name,
+            )
+        except Exception as exc:
+            logging.error("Could not switch Output Mode to Advanced: %s", exc)
+            return False
+
+    track_numbers = sorted({track for _, track in entries})
+    bitmask = 0
+    for track in track_numbers:
+        bitmask |= 1 << (track - 1)
+
+    current_bitmask = get_profile_parameter_value(client, "AdvOut", "RecTracks")
+    if str(current_bitmask) != str(bitmask):
+        try:
+            client.set_profile_parameter("AdvOut", "RecTracks", str(bitmask))
+            logging.info("Set OBS recording track bitmask to %s (tracks %s).", bitmask, track_numbers)
+        except Exception as exc:
+            logging.error("Could not set the recording track bitmask: %s", exc)
+            return False
+
+    rec_format = (
+        get_profile_parameter_value(client, "AdvOut", "RecFormat2")
+        or get_profile_parameter_value(client, "AdvOut", "RecFormat")
+    )
+    if rec_format and rec_format.lower() not in MULTI_TRACK_SAFE_FORMATS:
+        logging.warning(
+            "The dedicated profile's recording format is '%s', which hasn't always embedded every "
+            "audio track reliably in OBS. Tracks are still being routed independently, but if your "
+            "recordings only end up with one audio track, switch this profile's Recording Format to "
+            "MKV in OBS's Settings > Output (Recording Format) while '%s' is active.",
+            rec_format, profile_name,
+        )
+    return True
+
+
+def apply_multi_track_routing(client, entries):
+    """Routes each configured input to exactly the track(s) listed for it, clearing any track
+    not listed -- read-modify-write against GetInputAudioTracks so we never guess at the shape
+    of tracks we're not touching."""
+    by_input = {}
+    for name, track in entries:
+        by_input.setdefault(name, set()).add(track)
+
+    for input_name, desired_tracks in by_input.items():
+        desired = {str(i): (i in desired_tracks) for i in range(1, 7)}
+        try:
+            current = client.get_input_audio_tracks(input_name).input_audio_tracks
+        except Exception as exc:
+            logging.warning(
+                "Could not route audio input '%s' to track(s) %s -- no input with that exact name "
+                "exists in the current scene collection (%s). Add it, or fix the name in Settings.",
+                input_name, sorted(desired_tracks), exc,
+            )
+            continue
+        if {str(k): bool(v) for k, v in current.items()} == desired:
+            continue
+        try:
+            client.set_input_audio_tracks(input_name, desired)
+            logging.info("Routed audio input '%s' to track(s) %s.", input_name, sorted(desired_tracks))
+        except Exception as exc:
+            logging.warning("Could not set audio track routing for input '%s': %s", input_name, exc)
+
+
+def sync_multi_track_audio(client, multi_track_config):
+    if not multi_track_config.get("enabled"):
+        return
+    entries = normalize_track_entries(multi_track_config.get("tracks"))
+    if not entries:
+        return
+    profile_name = multi_track_config.get("profile_name") or DEFAULT_MULTI_TRACK_PROFILE_NAME
+    try:
+        if not ensure_dedicated_profile(client, profile_name):
+            return
+        if not sync_multi_track_output_settings(client, entries, profile_name):
+            return
+        apply_multi_track_routing(client, entries)
+    except Exception:
+        logging.exception("Unexpected error while syncing multi-track audio settings.")
 
 
 DEFAULT_DISK_SPACE_MINIMUM_GB = 10
@@ -1349,7 +1592,98 @@ def open_process_picker(parent, on_add, multiselect=True, already_selected=None)
     filter_entry.bind("<Return>", lambda e: add_selected())
 
 
-def build_watched_games_editor(parent, initial_games):
+# Popular games worth a one-click add -- picked for exe names that are stable and well-known,
+# prioritizing ones this app's launcher auto-detection (Steam/Epic/GOG/Xbox) can't find on its
+# own (Riot's client, standalone launchers) plus a few other very common titles. Not meant to be
+# exhaustive: "Pick Running..." (while the game is open) or typing the exe name by hand always
+# still works for anything not listed here. Minecraft: Java Edition needs a window-title rule
+# rather than a plain exe entry since javaw.exe is shared by any Java app.
+COMMON_GAMES = [
+    {"name": "League of Legends", "process_name": "league of legends.exe"},
+    {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
+    {"name": "Valorant", "process_name": "VALORANT-Win64-Shipping.exe"},
+    {"name": "Warframe", "process_name": "Warframe.x64.exe"},
+    {"name": "Minecraft: Java Edition", "process_name": "javaw.exe", "title_contains": "minecraft"},
+    {"name": "Minecraft: Bedrock Edition", "process_name": "Minecraft.Windows.exe"},
+    {"name": "Fortnite", "process_name": "FortniteClient-Win64-Shipping.exe"},
+    {"name": "Apex Legends", "process_name": "r5apex.exe"},
+    {"name": "Overwatch 2", "process_name": "Overwatch.exe"},
+    {"name": "Counter-Strike 2", "process_name": "cs2.exe"},
+    {"name": "Rocket League", "process_name": "RocketLeague.exe"},
+    {"name": "Roblox", "process_name": "RobloxPlayerBeta.exe"},
+    {"name": "Genshin Impact", "process_name": "GenshinImpact.exe"},
+]
+
+
+def open_common_games_picker(parent, insert_unique, current_watched_lower, add_window_row, current_window_keys):
+    """Lets the user one-click-add from COMMON_GAMES, routing plain-exe entries into the watched
+    games list and window-title entries (e.g. Minecraft) into the window-rule editor -- same
+    dialog either way, the caller-provided callbacks handle where each kind actually lands."""
+
+    def is_already_added(game):
+        if "title_contains" in game:
+            return (game["process_name"].lower(), game["title_contains"].lower()) in current_window_keys()
+        return game["process_name"].lower() in current_watched_lower()
+
+    picker = tk.Toplevel(parent)
+    picker.title("Add Common Game")
+    picker.geometry("340x420")
+    picker.transient(parent.winfo_toplevel())
+    picker.grab_set()
+
+    tk.Label(picker, text="Filter", anchor="w").pack(fill="x", padx=10, pady=(10, 0))
+    filter_var = tk.StringVar()
+    filter_entry = tk.Entry(picker, textvariable=filter_var)
+    filter_entry.pack(fill="x", padx=10, pady=(0, 6))
+    filter_entry.focus_set()
+
+    list_frame = tk.Frame(picker)
+    list_frame.pack(fill="both", expand=True, padx=10)
+    scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+    listbox = tk.Listbox(
+        list_frame, selectmode="extended", yscrollcommand=scrollbar.set, exportselection=False,
+    )
+    scrollbar.config(command=listbox.yview)
+    listbox.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    shown = []
+
+    def refresh_list(*_args):
+        needle = filter_var.get().lower()
+        listbox.delete(0, "end")
+        shown.clear()
+        for game in COMMON_GAMES:
+            if needle not in game["name"].lower():
+                continue
+            already = is_already_added(game)
+            listbox.insert("end", f"{game['name']}  (already watching)" if already else game["name"])
+            if already:
+                listbox.itemconfig("end", fg="#888888")
+            shown.append(game)
+
+    filter_var.trace_add("write", refresh_list)
+    refresh_list()
+
+    def add_selected():
+        for index in listbox.curselection():
+            game = shown[index]
+            if "title_contains" in game:
+                if not is_already_added(game):
+                    add_window_row(game["process_name"], game["title_contains"], game["name"])
+            else:
+                insert_unique(game["process_name"])
+        picker.destroy()
+
+    button_bar = tk.Frame(picker)
+    button_bar.pack(fill="x", padx=10, pady=10)
+    tk.Button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
+    tk.Button(button_bar, text="Add Selected", command=add_selected).pack(side="right", padx=8)
+    listbox.bind("<Double-Button-1>", lambda e: add_selected())
+    filter_entry.bind("<Return>", lambda e: add_selected())
+
+
+def build_watched_games_editor(parent, initial_games, on_pick_common=None):
     tk.Label(parent, text="Watched game processes (exact exe name, e.g. cs2.exe)", anchor="w").pack(
         anchor="w", padx=10, pady=(10, 2)
     )
@@ -1392,6 +1726,10 @@ def build_watched_games_editor(parent, initial_games):
     tk.Button(controls, text="Add", command=add_game).pack(fill="x")
     tk.Button(controls, text="Remove Selected", command=remove_selected).pack(fill="x", pady=(4, 0))
     tk.Button(controls, text="Pick Running...", command=pick_from_running).pack(fill="x", pady=(4, 0))
+    if on_pick_common:
+        tk.Button(
+            controls, text="Common Games...", command=lambda: on_pick_common(insert_unique, current_watched_lower)
+        ).pack(fill="x", pady=(4, 0))
     return listbox
 
 
@@ -1438,6 +1776,117 @@ def build_watched_windows_editor(parent, initial_rows):
         add_row(w.get("process_name", ""), w.get("title_contains", ""), w.get("display_name", ""))
 
     tk.Button(parent, text="+ Add Window Rule", command=lambda: add_row()).pack(anchor="w", padx=10, pady=(4, 10))
+    return rows, add_row
+
+
+def open_obs_input_picker(parent, get_ws_config, on_pick):
+    """Connects to OBS with whatever WebSocket settings are currently in the form (not
+    necessarily saved yet) and lets the user pick an existing input by name, instead of typing
+    it in from memory. Best-effort: if OBS isn't reachable, tells the user and lets them type
+    the name in manually instead, same as this field always supported."""
+    try:
+        ws_config = get_ws_config()
+    except Exception:
+        ws_config = None
+
+    client = connect_obs(ws_config, retries=1, delay=0) if ws_config else None
+    if not client:
+        messagebox.showwarning(
+            "Can't reach OBS",
+            "Could not connect to OBS over its WebSocket using the settings above. Make sure OBS is "
+            "running and the host/port/password are correct, or just type the input's exact name in "
+            "by hand.",
+            parent=parent,
+        )
+        return
+
+    try:
+        inputs = sorted({i["inputName"] for i in client.get_input_list().inputs}, key=str.lower)
+    except Exception as exc:
+        messagebox.showwarning("Can't list OBS inputs", str(exc), parent=parent)
+        return
+    finally:
+        client.disconnect()
+
+    if not inputs:
+        messagebox.showinfo(
+            "No inputs found", "OBS reported no inputs in the current scene collection.", parent=parent
+        )
+        return
+
+    picker = tk.Toplevel(parent)
+    picker.title("Pick OBS Input")
+    picker.geometry("320x380")
+    picker.transient(parent.winfo_toplevel())
+    picker.grab_set()
+
+    list_frame = tk.Frame(picker)
+    list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+    scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+    listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, exportselection=False)
+    scrollbar.config(command=listbox.yview)
+    listbox.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    for name in inputs:
+        listbox.insert("end", name)
+
+    def select():
+        selection = listbox.curselection()
+        if selection:
+            on_pick(inputs[selection[0]])
+        picker.destroy()
+
+    button_bar = tk.Frame(picker)
+    button_bar.pack(fill="x", padx=10, pady=(0, 10))
+    tk.Button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
+    tk.Button(button_bar, text="Select", command=select).pack(side="right", padx=8)
+    listbox.bind("<Double-Button-1>", lambda e: select())
+
+
+def build_multi_track_audio_editor(parent, initial_rows, get_ws_config):
+    tk.Label(
+        parent, text="Which input feeds which recording track, in the dedicated profile below", anchor="w"
+    ).pack(anchor="w", padx=10, pady=(10, 2))
+
+    header = tk.Frame(parent)
+    header.pack(fill="x", padx=10)
+    tk.Label(header, text="Input name (exact, as in OBS)", width=30, anchor="w").pack(side="left", padx=2)
+    tk.Label(header, text="Track", width=6, anchor="w").pack(side="left", padx=2)
+
+    container = tk.Frame(parent)
+    container.pack(fill="x", padx=10)
+    rows = []
+
+    def add_row(input_name="", track=1):
+        row_frame = tk.Frame(container)
+        row_frame.pack(fill="x", pady=2)
+        name_var = tk.StringVar(value=input_name)
+        track_var = tk.StringVar(value=str(track))
+        tk.Entry(row_frame, textvariable=name_var, width=30).pack(side="left", padx=2)
+        ttk.Combobox(
+            row_frame, textvariable=track_var, values=[str(i) for i in range(1, 7)],
+            state="readonly", width=4,
+        ).pack(side="left", padx=2)
+        entry = {"input_name": name_var, "track": track_var}
+
+        def pick():
+            open_obs_input_picker(parent, get_ws_config, on_pick=lambda name: name_var.set(name))
+
+        tk.Button(row_frame, text="Pick...", command=pick).pack(side="left", padx=2)
+
+        def remove():
+            row_frame.destroy()
+            rows.remove(entry)
+
+        tk.Button(row_frame, text="Remove", command=remove).pack(side="left", padx=4)
+        rows.append(entry)
+
+    for t in initial_rows:
+        add_row(t.get("input_name", ""), t.get("track", 1))
+
+    tk.Button(parent, text="+ Add Track Mapping", command=lambda: add_row()).pack(
+        anchor="w", padx=10, pady=(4, 10)
+    )
     return rows
 
 
@@ -1521,8 +1970,27 @@ def _run_config_editor(restart_callback):
 
     # --- Games ---
     games_tab = make_scrollable_tab(notebook, "Watched Games")
-    games_listbox = build_watched_games_editor(games_tab, config.get("watched_games", []))
-    window_rows = build_watched_windows_editor(games_tab, config.get("watched_windows", []))
+
+    # build_watched_windows_editor() (and the add_window_row it returns) doesn't exist yet at the
+    # point the games editor above it needs to wire up its "Common Games..." button -- filled in
+    # right after both editors are built, below. Only called once the button is actually clicked.
+    window_editor_ref = {"add_row": None, "rows": None}
+
+    def on_pick_common(insert_unique, current_watched_lower):
+        def current_window_keys():
+            return {
+                (row["process"].get().strip().lower(), row["title"].get().strip().lower())
+                for row in window_editor_ref["rows"]
+            }
+
+        open_common_games_picker(
+            games_tab, insert_unique, current_watched_lower, window_editor_ref["add_row"], current_window_keys
+        )
+
+    games_listbox = build_watched_games_editor(games_tab, config.get("watched_games", []), on_pick_common)
+    window_rows, window_add_row = build_watched_windows_editor(games_tab, config.get("watched_windows", []))
+    window_editor_ref["add_row"] = window_add_row
+    window_editor_ref["rows"] = window_rows
 
     # --- Launchers ---
     launchers_tab = make_scrollable_tab(notebook, "Launchers")
@@ -1554,6 +2022,10 @@ def _run_config_editor(restart_callback):
     row += 1
     obs_startup_wait_var = tk.StringVar(value=str(obs_config.get("startup_wait_seconds", 8)))
     add_labeled_entry(obs_tab, row, "Startup wait (seconds)", obs_startup_wait_var)
+    row += 1
+    output_folder_var = tk.StringVar(value=obs_config.get("output_folder", "") or "")
+    add_labeled_entry(obs_tab, row, "Recording output folder (optional)", output_folder_var)
+    add_browse_button(obs_tab, row, output_folder_var, mode="dir")
     row += 1
 
     ws_config = obs_config.get("websocket", {})
@@ -1614,6 +2086,43 @@ def _run_config_editor(restart_callback):
     row += 1
     game_audio_input_var = tk.StringVar(value=game_audio_config.get("input_name", "Game Audio"))
     add_labeled_entry(obs_tab, row, "Input source name", game_audio_input_var)
+    row += 1
+
+    multi_track_config = obs_config.get("multi_track_audio", {})
+    add_section_label(obs_tab, row, "Multi-Track Audio (Advanced)")
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "Routes selected inputs (mic, desktop audio, isolated game audio, etc.) to their own "
+            "recording track, so you get separate audio per source for editing later. Applied only to "
+            "a dedicated OBS profile below, created automatically and cloned from your current "
+            "profile's recording path/quality/format -- your existing profile is never touched."
+        ),
+        anchor="w", justify="left", wraplength=520,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+    row += 1
+    multi_track_enabled_var = tk.BooleanVar(value=multi_track_config.get("enabled", False))
+    add_checkbox(obs_tab, row, "Record selected inputs to separate audio tracks", multi_track_enabled_var)
+    row += 1
+    multi_track_profile_var = tk.StringVar(
+        value=multi_track_config.get("profile_name", DEFAULT_MULTI_TRACK_PROFILE_NAME)
+    )
+    add_labeled_entry(obs_tab, row, "Dedicated OBS profile name", multi_track_profile_var)
+    row += 1
+
+    def get_current_ws_config():
+        try:
+            port = int(float(ws_port_var.get()))
+        except ValueError:
+            port = 4455
+        return {"host": ws_host_var.get().strip() or "localhost", "port": port, "password": ws_password_var.get()}
+
+    multi_track_list_frame = tk.Frame(obs_tab)
+    multi_track_list_frame.grid(row=row, column=0, columnspan=3, sticky="we")
+    multi_track_rows = build_multi_track_audio_editor(
+        multi_track_list_frame, multi_track_config.get("tracks", []), get_current_ws_config
+    )
     row += 1
 
     replay_buffer_config = obs_config.get("replay_buffer", {})
@@ -1770,6 +2279,11 @@ def _run_config_editor(restart_callback):
         obs["startup_wait_seconds"] = read_int(
             obs_startup_wait_var, "Startup wait", obs.get("startup_wait_seconds", 8)
         )
+        output_folder_value = output_folder_var.get().strip()
+        if output_folder_value:
+            obs["output_folder"] = output_folder_value
+        else:
+            obs.pop("output_folder", None)
 
         ws = obs.setdefault("websocket", {})
         ws["host"] = ws_host_var.get().strip() or "localhost"
@@ -1803,6 +2317,23 @@ def _run_config_editor(restart_callback):
         game_audio = obs.setdefault("game_audio_capture", {})
         game_audio["enabled"] = game_audio_enabled_var.get()
         game_audio["input_name"] = game_audio_input_var.get().strip() or "Game Audio"
+
+        multi_track_audio = obs.setdefault("multi_track_audio", {})
+        multi_track_audio["enabled"] = multi_track_enabled_var.get()
+        multi_track_audio["profile_name"] = (
+            multi_track_profile_var.get().strip() or DEFAULT_MULTI_TRACK_PROFILE_NAME
+        )
+        multi_track_tracks = []
+        for row_vars in multi_track_rows:
+            name = row_vars["input_name"].get().strip()
+            if not name:
+                continue
+            try:
+                track_num = int(row_vars["track"].get())
+            except ValueError:
+                continue
+            multi_track_tracks.append({"input_name": name, "track": track_num})
+        multi_track_audio["tracks"] = multi_track_tracks
 
         replay_buffer = obs.setdefault("replay_buffer", {})
         replay_buffer["enabled"] = replay_buffer_enabled_var.get()
@@ -1994,6 +2525,10 @@ def main():
             target=kill_process_by_name, args=(config["obs"]["process_name"],), daemon=True
         ).start()
 
+    def on_restart_app(icon, menu_item):
+        logging.info("Restart requested from tray icon.")
+        do_restart()
+
     overlay_items = [pystray.MenuItem("Off", select_monitor(None), radio=True, checked=is_selected(None))]
     for i, mon in enumerate(monitors):
         overlay_items.append(
@@ -2017,6 +2552,7 @@ def main():
     menu_items += [
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Kill OBS", on_kill_obs),
+        pystray.MenuItem("Restart App", on_restart_app),
         pystray.MenuItem("Quit", on_quit),
     ]
     menu = pystray.Menu(*menu_items)
@@ -2028,18 +2564,32 @@ def main():
         menu=menu,
     )
 
+    watcher_thread = threading.Thread(
+        target=watcher_loop,
+        args=(icon, status, audio_state, recording_state, runtime_state, stop_event),
+        daemon=True,
+    )
+    overlay_thread = threading.Thread(
+        target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event), daemon=True
+    )
+
     def setup(icon):
         icon.visible = True
-        threading.Thread(
-            target=watcher_loop,
-            args=(icon, status, audio_state, recording_state, runtime_state, stop_event),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event), daemon=True
-        ).start()
+        watcher_thread.start()
+        overlay_thread.start()
 
     icon.run(setup=setup)
+
+    # icon.run() returns as soon as icon.stop() fires (from watcher_loop's finally, once
+    # stop_event is set), which can happen before the overlay thread's Tk mainloop -- polling
+    # stop_event only every 120ms -- has actually destroyed its root and released Tcl/Tk. Onefile
+    # PyInstaller builds extract their DLLs (including Tcl/Tk) to a temp dir and try to remove it
+    # right after the interpreter shuts down; if that thread (and its Tcl interpreter) is still
+    # winding down when the process exits, that removal can fail. Give both threads a moment to
+    # actually finish instead of leaving them to be hard-killed mid-shutdown.
+    stop_event.set()
+    watcher_thread.join(timeout=5)
+    overlay_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - Clears OBS's "unclean shutdown" crash-recovery sentinel before launching, so a prior forced close (e.g. Task Manager, crash, power loss) doesn't pop OBS's crash dialog and stall automation
 - Detects a hung OBS (process running but its WebSocket stops responding) or a memory-bloated idle OBS, and automatically kills and relaunches it instead of silently failing to record
 - Optionally repoints an OBS Application Audio Capture source at each detected game, to isolate its audio from Discord/Spotify/etc. (see [Optional: isolate game audio](#optional-isolate-game-audio))
+- Optional multi-track audio: routes mic/desktop/game audio (or any inputs you pick) to separate recording tracks for editing later, entirely inside its own dedicated OBS profile so your existing profile is never touched (see [Optional: multi-track audio](#optional-multi-track-audio))
 - System tray icon showing live status (gray = watching, red = recording, gold = recording file just split, orange = internal error or OBS recovery in progress — check the log), plus shortcuts to open the recordings folder and log file
 - Built-in GUI settings editor (tray icon → **Edit Settings...**) for every `config.json` option — no manual JSON editing required (see [Optional: settings editor](#optional-settings-editor))
 - Optional floating always-on-top overlay, pinned to any monitor of your choice via the tray icon's right-click menu, showing the same status color
@@ -101,6 +102,7 @@ Edit `config.json`:
 | `obs.path` | Full path to `obs64.exe` |
 | `obs.launch_args` | Extra command-line args OBS is launched with |
 | `obs.startup_wait_seconds` | How long to wait after launching OBS before trying to connect |
+| `obs.output_folder` | Recording output folder to enforce in OBS (created automatically if missing). Leave unset/blank to leave OBS's own recording folder setting alone |
 | `obs.websocket.host` / `port` / `password` | Must match OBS's WebSocket Server Settings |
 | `obs.auto_split.enabled` | Set to `true` if you've enabled OBS's **Automatically split file** option (see below), so its splits aren't mislabeled as manual |
 | `obs.auto_split.by` | `"time"` or `"size"` — must match what you set in OBS's automatic split setting |
@@ -110,6 +112,9 @@ Edit `config.json`:
 | `obs.recovery.cooldown_seconds` | Minimum time between automatic OBS restarts, whether triggered by a hang or by memory. Defaults to `30` if omitted |
 | `obs.game_audio_capture.enabled` | Repoint an existing **Application Audio Capture** source at the detected game each time recording starts, to isolate its audio (see [Optional: isolate game audio](#optional-isolate-game-audio)) |
 | `obs.game_audio_capture.input_name` | Name of that source in your OBS scene, exactly as it appears in OBS |
+| `obs.multi_track_audio.enabled` | Route configured inputs to separate recording tracks, inside a dedicated OBS profile (see [Optional: multi-track audio](#optional-multi-track-audio)) |
+| `obs.multi_track_audio.profile_name` | Name of the dedicated OBS profile to create/use for this — created automatically the first time, cloned from whatever profile is active then. Defaults to `"OBS Auto Recorder"` if omitted |
+| `obs.multi_track_audio.tracks` | List of `{"input_name": "...", "track": N}` entries (`N` is `1`-`6`) — which OBS input feeds which recording track. Names must match an existing OBS input exactly |
 | `obs.replay_buffer.enabled` | Start/stop OBS's replay buffer alongside recording, and add a "Save Replay Buffer" tray action (see [Optional: replay buffer](#optional-replay-buffer)) |
 | `log_file` | Log file name (relative to the exe's folder, or an absolute path). Capped at the most recent 10,000 lines — older lines are dropped as new ones are added |
 
@@ -186,6 +191,7 @@ Right-click the tray icon (it may be tucked under the "show hidden icons" `^` ch
 - **Edit Settings...** — opens a GUI settings window covering every `config.json` option (watched games/windows, launchers, OBS connection, cleanup/guards, post-processing, notifications) organized into tabs, with **Save** and **Save and Restart** buttons. No manual JSON editing needed. See [Optional: settings editor](#optional-settings-editor)
 - **Save Replay Buffer** — only shown if `obs.replay_buffer.enabled` is `true`; saves the last few minutes of the replay buffer immediately
 - **Kill OBS** — force-kills any running `obs.process_name` process (e.g. if it's hung); the watcher will relaunch it the next time a watched game starts
+- **Restart App** — stops any active recording cleanly, then relaunches the whole app. Same as **Save and Restart** in the settings editor, without needing to open it — useful after hand-editing `config.json`, or just to recover from a stuck state
 - **Quit** — stops any active recording cleanly, then exits
 
 Icon colors:
@@ -205,13 +211,15 @@ Both cases flash the tray icon orange and log a warning. To avoid restart loops,
 
 ## Optional: settings editor
 
-Instead of hand-editing `config.json`, right-click the tray icon → **Edit Settings...** for a tabbed GUI covering every option in this README's config table: General (including "launch at Windows startup" — see [Run automatically at login](#4-run-automatically-at-login)), Watched Games (including the window-title rules), Launchers, OBS (path, WebSocket, auto-split, health recovery, game audio, replay buffer), Cleanup & Guards, and Post-Processing/Notifications.
+Instead of hand-editing `config.json`, right-click the tray icon → **Edit Settings...** for a tabbed GUI covering every option in this README's config table: General (including "launch at Windows startup" — see [Run automatically at login](#4-run-automatically-at-login)), Watched Games (including the window-title rules), Launchers, OBS (path, output folder, WebSocket, auto-split, health recovery, game audio, multi-track audio, replay buffer), Cleanup & Guards, and Post-Processing/Notifications.
 
 - **Save** writes `config.json` and closes the window, with a reminder that a restart may be necessary for some settings to take effect (config is only read at startup, so changes don't apply to the already-running watcher).
 - **Save and Restart** writes `config.json` and immediately relaunches the whole app (stops any active recording first, same as a normal Quit) so every setting takes effect right away.
 - Only one editor window can be open at a time; the menu item disables itself while one is open.
 - List-like fields (exclude keywords, install folders, launch args) are entered comma-separated; `ffmpeg` arguments are space-separated.
 - On the Watched Games tab, **Pick Running...** opens a filterable list of currently running process names to add from, instead of typing an exact exe name from memory — processes already in your watched list are shown greyed out with an "(already watching)" marker. The same picker is available per-row on the window-title rules.
+- Also on the Watched Games tab, **Common Games...** opens a filterable list of popular games (League of Legends, Valorant, Wizard101, Warframe, Fortnite, Minecraft, etc.) to add with one click, without needing to have the game running first — useful for games this app's launcher auto-detection can't see (e.g. Riot's client) or that need a window-title rule (Minecraft: Java Edition). Not exhaustive; anything not listed can still be added via **Pick Running...** or by typing the exe name in by hand.
+- On the OBS tab's Multi-Track Audio section, **Pick...** (per row) connects to OBS live with whatever WebSocket settings are currently in the form and lists its actual current inputs to choose from, instead of typing a name from memory.
 
 The editor always reloads `config.json` fresh when opened and only overwrites the fields shown in the form, so any advanced/unlisted key you've hand-added is left untouched.
 
@@ -225,6 +233,39 @@ If your recordings pick up Discord, Spotify, or other background app audio along
 From then on, whenever a watched game starts recording, the script repoints that source at the game's process by executable name (not by window title), so it keeps working even if the game's window title changes mid-session or it has no visible window at all.
 
 Mute or remove your desktop/system audio source in OBS if you don't want it recorded alongside the isolated game audio.
+
+## Optional: multi-track audio
+
+Records selected OBS inputs (mic, desktop audio, isolated game audio, Discord, etc.) each to their own separate audio track inside the recording, so you can mute/adjust/remove any one of them afterward in your editor instead of being stuck with a single pre-mixed track.
+
+**It never touches your existing OBS profile.** The first time it runs, the watcher creates a separate, dedicated OBS profile (named `obs.multi_track_audio.profile_name`, default `"OBS Auto Recorder"`) cloned from whatever profile was active at that moment — same recording folder, same quality, same file format — and only ever makes further changes inside that dedicated profile. Every time a watched game starts recording, OBS is switched into it first; your own profile(s) are left exactly as you set them up, and switching profiles doesn't touch your scenes/sources (those live in your scene collection, which is separate from profiles in OBS).
+
+Setup:
+
+1. In `config.json` (or the settings editor's OBS tab → **Multi-Track Audio**), set `obs.multi_track_audio.enabled` to `true`.
+2. List which input feeds which track in `obs.multi_track_audio.tracks`, e.g.:
+
+```json
+"multi_track_audio": {
+    "enabled": true,
+    "profile_name": "OBS Auto Recorder",
+    "tracks": [
+        {"input_name": "Mic/Aux", "track": 1},
+        {"input_name": "Desktop Audio", "track": 2},
+        {"input_name": "Game Audio", "track": 3}
+    ]
+}
+```
+
+Input names must match an existing OBS input exactly (case-sensitive) — use the settings editor's **Pick...** button per row to choose from OBS's actual current inputs instead of typing one from memory. An input that doesn't exist yet (e.g. you haven't set up [game audio isolation](#optional-isolate-game-audio)) is skipped with a warning in the log rather than blocking recording — add it whenever you're ready and it'll pick it up on the next recording start.
+
+What this changes, all scoped to the dedicated profile only:
+
+- **Output Mode** is switched to **Advanced** if it wasn't already — OBS only supports recording multiple audio tracks into one file in Advanced mode. If your original profile used Simple mode, the dedicated profile falls back to OBS's default Advanced-mode encoder settings; fine-tune quality/bitrate in OBS's Settings → Output while `"OBS Auto Recorder"` is the active profile if needed.
+- The recording's enabled tracks are set to match whichever track numbers you've used.
+- Each listed input's own track routing is set so it feeds *only* the track(s) you assigned it — nothing is left multiplexed onto every track by default.
+
+**Recording format**: your existing format/container choice is carried over as-is and never forced — this feature works with whichever one you use. That said, only some formats have reliably embedded every enabled track in every OBS version; **MKV** is the one that always has. If you use a different format (MP4, MOV, etc.) and only see one audio track in the finished file, switch this profile's Recording Format to MKV in OBS's Settings → Output. The log also warns about this the first time it detects a format outside the reliable set.
 
 ## Optional: split recording files
 
@@ -285,3 +326,4 @@ Setting `notifications.enabled` to `true` shows a Windows toast notification (vi
 - Battle.net auto-detection requires manually configuring `battlenet.install_dirs` — there's no manifest or shared install root to read automatically.
 - The silent-recording check only looks at OBS's own input audio meters; if a source is capturing audio but OBS itself reports zero level (e.g. a genuinely misconfigured capture), it'll correctly flag as silent, but it can't detect audio that's present but wrong (e.g. a completely different application's audio).
 - The installer's automatic OBS WebSocket configuration only works if OBS has been run at least once already (so its settings folder exists) and isn't currently running at install time; otherwise the installer falls back to showing you the password to paste in manually. It also only writes to OBS's *default* settings profile.
+- Multi-track audio's recording-folder handoff (`obs.multi_track_audio`) and `obs.output_folder` both need obs-websocket 5.3+ (bundled with OBS 29+); on older OBS versions the dedicated multi-track profile is still created but its recording folder isn't cloned from your original profile, and `obs.output_folder` silently has no effect (check the log). Track routing and Advanced-mode/track-count setup work on any OBS 28+ install.

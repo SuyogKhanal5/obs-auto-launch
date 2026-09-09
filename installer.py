@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 import winreg
 from tkinter import filedialog, messagebox
 
@@ -31,6 +32,7 @@ DEFAULT_OBS_PATHS = [
     r"C:\Program Files\obs-studio\bin\64bit\obs64.exe",
     r"C:\Program Files (x86)\obs-studio\bin\64bit\obs64.exe",
 ]
+OBS_DOWNLOAD_URL = "https://obsproject.com/download"
 
 
 def resource_path(name):
@@ -58,6 +60,7 @@ def create_shortcut(link_path, target, working_dir):
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
             capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -169,6 +172,9 @@ def build_config(template, obs_path, password, options):
     config["cleanup"]["delete_short_clips"]["enabled"] = options["delete_short_clips"]
     config["notifications"]["enabled"] = options["notifications"]
     config["organize_into_game_subfolders"] = options["per_game_folders"]
+    config["obs"]["multi_track_audio"]["enabled"] = options["multi_track_audio"]
+    if options["output_folder"]:
+        config["obs"]["output_folder"] = options["output_folder"]
     return config
 
 
@@ -369,15 +375,17 @@ def main():
     def refresh_obs_status():
         if obs_var.get() and os.path.isfile(obs_var.get()):
             obs_status.config(text=f"\u2713  Found: {obs_var.get()}", fg="#15803d")
+            download_link.pack_forget()
         else:
             obs_status.config(
                 text=(
                     "Couldn't find OBS automatically. If it's already installed, click Browse "
-                    "below and find obs64.exe. Don't have OBS yet? That's fine — install it later "
-                    "from obsproject.com, then point to it from this app's Settings."
+                    "to find obs64.exe. Don't have OBS yet? That's fine — install it now with the "
+                    "link below, or later from obsproject.com, then point to it from this app's Settings."
                 ),
                 fg="#b45309",
             )
+            download_link.pack(side="left", padx=(16, 0))
 
     def browse_obs():
         chosen = filedialog.askopenfilename(
@@ -387,7 +395,15 @@ def main():
             obs_var.set(chosen)
             refresh_obs_status()
 
-    tk.Button(obs_page, text="Browse for obs64.exe...", command=browse_obs).pack(anchor="w", pady=(0, 8))
+    obs_buttons_row = tk.Frame(obs_page, bg=PAGE_BG)
+    obs_buttons_row.pack(anchor="w", pady=(0, 8))
+    tk.Button(obs_buttons_row, text="Browse for obs64.exe...", command=browse_obs).pack(side="left")
+    download_link = tk.Label(
+        obs_buttons_row, text="Don't have OBS? Download it here ↗", bg=PAGE_BG, fg="#2563eb",
+        font=("Segoe UI", 10, "underline"), cursor="hand2",
+    )
+    download_link.bind("<Button-1>", lambda _event: webbrowser.open(OBS_DOWNLOAD_URL))
+
     refresh_obs_status()
 
     # ---------- Quick options ----------
@@ -419,6 +435,36 @@ def main():
         options_page, text="Put each game's recordings in its own folder",
         variable=folders_var, bg=PAGE_BG,
     ).pack(anchor="w", pady=4)
+
+    multi_track_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(
+        options_page, text="Record mic, desktop, and game audio to separate tracks (advanced)",
+        variable=multi_track_var, bg=PAGE_BG,
+    ).pack(anchor="w", pady=4)
+    tk.Label(
+        options_page,
+        text="    Uses its own dedicated OBS profile, so this never changes your existing OBS setup.",
+        bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w",
+    ).pack(anchor="w")
+
+    tk.Label(
+        options_page, text="Recording output folder (optional)", bg=PAGE_BG, font=("Segoe UI", 10), anchor="w",
+    ).pack(anchor="w", pady=(12, 2))
+    output_folder_row = tk.Frame(options_page, bg=PAGE_BG)
+    output_folder_row.pack(fill="x")
+    output_folder_var = tk.StringVar(value="")
+    tk.Entry(output_folder_row, textvariable=output_folder_var, width=44).pack(side="left", fill="x", expand=True)
+
+    def browse_output_folder():
+        chosen = filedialog.askdirectory(initialdir=output_folder_var.get() or "C:\\")
+        if chosen:
+            output_folder_var.set(os.path.normpath(chosen))
+
+    tk.Button(output_folder_row, text="Browse...", command=browse_output_folder).pack(side="left", padx=(8, 0))
+    tk.Label(
+        options_page, text="    Leave blank to use OBS's own recording folder setting.",
+        bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w",
+    ).pack(anchor="w")
 
     # ---------- Ready / progress ----------
     ready_page = page_frame()
@@ -511,6 +557,8 @@ def main():
             "delete_short_clips": short_var.get(),
             "notifications": notify_var.get(),
             "per_game_folders": folders_var.get(),
+            "multi_track_audio": multi_track_var.get(),
+            "output_folder": output_folder_var.get().strip(),
         }
 
     def go_to_index(index):
