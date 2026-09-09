@@ -408,6 +408,72 @@ def clear_obs_crash_sentinel():
             pass
 
 
+STARTUP_SHORTCUT_NAME = "OBSAutoRecorder.lnk"
+
+
+def get_startup_shortcut_path():
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", STARTUP_SHORTCUT_NAME)
+
+
+def is_startup_shortcut_enabled():
+    path = get_startup_shortcut_path()
+    return bool(path and os.path.isfile(path))
+
+
+def _ps_single_quote(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def set_startup_shortcut_enabled(enabled):
+    """Adds or removes a Startup-folder shortcut so the app launches at login.
+    Only works from the built exe (nothing standalone to point a shortcut at when
+    running from source)."""
+    path = get_startup_shortcut_path()
+    if not path:
+        logging.warning("Could not resolve the Startup folder; cannot manage the startup shortcut.")
+        return False
+
+    if not enabled:
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                logging.info("Removed startup shortcut.")
+            except OSError as exc:
+                logging.error("Failed to remove startup shortcut: %s", exc)
+                return False
+        return True
+
+    if not getattr(sys, "frozen", False):
+        logging.warning("Cannot create a startup shortcut while running from source; use the built .exe.")
+        return False
+
+    target = sys.executable
+    working_dir = os.path.dirname(target)
+    ps_script = (
+        "$WshShell = New-Object -ComObject WScript.Shell; "
+        f"$Shortcut = $WshShell.CreateShortcut({_ps_single_quote(path)}); "
+        f"$Shortcut.TargetPath = {_ps_single_quote(target)}; "
+        f"$Shortcut.WorkingDirectory = {_ps_single_quote(working_dir)}; "
+        "$Shortcut.Save()"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logging.error("Failed to create startup shortcut: %s", exc)
+        return False
+    if result.returncode != 0:
+        logging.error("Failed to create startup shortcut: %s", result.stderr.strip())
+        return False
+    logging.info("Created startup shortcut at %s", path)
+    return True
+
+
 def launch_obs(obs_config):
     path = obs_config["path"]
     if not os.path.isfile(path):
@@ -884,7 +950,7 @@ def reset_recording_state(recording_state):
     recording_state["silent_warning_sent"] = False
 
 
-def watcher_loop(icon, status, audio_state, recording_state, runtime_state, stop_event, on_stopped):
+def watcher_loop(icon, status, audio_state, recording_state, runtime_state, stop_event):
     try:
         _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state, stop_event)
     except Exception:
@@ -897,7 +963,7 @@ def watcher_loop(icon, status, audio_state, recording_state, runtime_state, stop
         except Exception:
             pass
     finally:
-        on_stopped()
+        icon.stop()
 
 
 def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state, stop_event):
@@ -1218,6 +1284,71 @@ def add_section_label(parent, row, text):
     )
 
 
+def open_process_picker(parent, on_add, multiselect=True, already_selected=None):
+    """Small dialog listing current running process names, filterable, with entries
+    already present in the caller's list (already_selected, a callable returning a
+    lowercase set) visually marked so the picker stays in sync with what's configured."""
+    already_selected = already_selected or (lambda: set())
+    processes = sorted({name for name, _, _ in get_running_processes()}, key=str.lower)
+
+    picker = tk.Toplevel(parent)
+    picker.title("Pick Running Process")
+    picker.geometry("340x420")
+    picker.transient(parent.winfo_toplevel())
+    picker.grab_set()
+
+    tk.Label(picker, text="Filter", anchor="w").pack(fill="x", padx=10, pady=(10, 0))
+    filter_var = tk.StringVar()
+    filter_entry = tk.Entry(picker, textvariable=filter_var)
+    filter_entry.pack(fill="x", padx=10, pady=(0, 6))
+    filter_entry.focus_set()
+
+    list_frame = tk.Frame(picker)
+    list_frame.pack(fill="both", expand=True, padx=10)
+    scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+    listbox = tk.Listbox(
+        list_frame, selectmode="extended" if multiselect else "browse",
+        yscrollcommand=scrollbar.set, exportselection=False,
+    )
+    scrollbar.config(command=listbox.yview)
+    listbox.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    shown = []
+
+    def refresh_list(*_args):
+        needle = filter_var.get().lower()
+        watching = already_selected()
+        listbox.delete(0, "end")
+        shown.clear()
+        for name in processes:
+            if needle not in name.lower():
+                continue
+            already = name.lower() in watching
+            listbox.insert("end", f"{name}  (already watching)" if already else name)
+            if already:
+                listbox.itemconfig("end", fg="#888888")
+            shown.append(name)
+
+    filter_var.trace_add("write", refresh_list)
+    refresh_list()
+
+    def add_selected():
+        selected = [shown[i] for i in listbox.curselection()]
+        if selected:
+            on_add(selected)
+        picker.destroy()
+
+    button_bar = tk.Frame(picker)
+    button_bar.pack(fill="x", padx=10, pady=10)
+    tk.Button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
+    tk.Button(button_bar, text="Add Selected" if multiselect else "Select", command=add_selected).pack(
+        side="right", padx=8
+    )
+    listbox.bind("<Double-Button-1>", lambda e: add_selected())
+    filter_entry.bind("<Return>", lambda e: add_selected())
+
+
 def build_watched_games_editor(parent, initial_games):
     tk.Label(parent, text="Watched game processes (exact exe name, e.g. cs2.exe)", anchor="w").pack(
         anchor="w", padx=10, pady=(10, 2)
@@ -1234,18 +1365,33 @@ def build_watched_games_editor(parent, initial_games):
     entry_var = tk.StringVar()
     tk.Entry(controls, textvariable=entry_var, width=22).pack(pady=(0, 4))
 
-    def add_game():
-        value = entry_var.get().strip()
-        if value:
+    def current_watched_lower():
+        return {listbox.get(i).lower() for i in range(listbox.size())}
+
+    def insert_unique(value):
+        value = value.strip()
+        if value and value.lower() not in current_watched_lower():
             listbox.insert("end", value)
-            entry_var.set("")
+
+    def add_game():
+        insert_unique(entry_var.get())
+        entry_var.set("")
 
     def remove_selected():
         for index in reversed(listbox.curselection()):
             listbox.delete(index)
 
+    def pick_from_running():
+        open_process_picker(
+            parent,
+            on_add=lambda names: [insert_unique(n) for n in names],
+            multiselect=True,
+            already_selected=current_watched_lower,
+        )
+
     tk.Button(controls, text="Add", command=add_game).pack(fill="x")
     tk.Button(controls, text="Remove Selected", command=remove_selected).pack(fill="x", pady=(4, 0))
+    tk.Button(controls, text="Pick Running...", command=pick_from_running).pack(fill="x", pady=(4, 0))
     return listbox
 
 
@@ -1273,6 +1419,13 @@ def build_watched_windows_editor(parent, initial_rows):
         tk.Entry(row_frame, textvariable=title_var, width=16).pack(side="left", padx=2)
         tk.Entry(row_frame, textvariable=display_var, width=16).pack(side="left", padx=2)
         entry = {"process": process_var, "title": title_var, "display": display_var}
+
+        def pick():
+            open_process_picker(
+                parent, on_add=lambda names: process_var.set(names[0]) if names else None, multiselect=False
+            )
+
+        tk.Button(row_frame, text="Pick...", command=pick).pack(side="left", padx=2)
 
         def remove():
             row_frame.destroy()
@@ -1305,7 +1458,7 @@ def build_launcher_section(parent, row, title, launcher_config, include_install_
     return row, {"enabled": enabled_var, "install_dirs": install_dirs_var, "exclude_keywords": exclude_var}
 
 
-def open_config_editor_window(editor_state, restart_watcher_callback, restart_app_callback):
+def open_config_editor_window(editor_state, restart_callback):
     if editor_state.get("open"):
         logging.info("Settings editor is already open.")
         return
@@ -1313,7 +1466,7 @@ def open_config_editor_window(editor_state, restart_watcher_callback, restart_ap
 
     def run():
         try:
-            _run_config_editor(restart_watcher_callback, restart_app_callback)
+            _run_config_editor(restart_callback)
         except Exception:
             logging.exception("Settings editor crashed.")
         finally:
@@ -1322,7 +1475,7 @@ def open_config_editor_window(editor_state, restart_watcher_callback, restart_ap
     threading.Thread(target=run, daemon=True).start()
 
 
-def _run_config_editor(restart_watcher_callback, restart_app_callback):
+def _run_config_editor(restart_callback):
     config = load_config()
 
     root = tk.Tk()
@@ -1342,6 +1495,16 @@ def _run_config_editor(restart_watcher_callback, restart_app_callback):
     add_checkbox(general_tab, 1, "Organize recordings into per-game subfolders", subfolders_var)
     log_file_var = tk.StringVar(value=config.get("log_file", "") or "")
     add_labeled_entry(general_tab, 2, "Log file", log_file_var)
+
+    is_frozen = getattr(sys, "frozen", False)
+    startup_var = tk.BooleanVar(value=is_startup_shortcut_enabled())
+    startup_label = "Launch automatically when Windows starts"
+    if not is_frozen:
+        startup_label += " (only available from the built .exe)"
+    startup_checkbox = tk.Checkbutton(general_tab, text=startup_label, variable=startup_var)
+    startup_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=4)
+    if not is_frozen:
+        startup_checkbox.config(state="disabled")
 
     # --- Games ---
     games_tab = make_scrollable_tab(notebook, "Watched Games")
@@ -1672,7 +1835,7 @@ def _run_config_editor(restart_watcher_callback, restart_app_callback):
 
         return new_config, errors
 
-    def do_save(restart_app):
+    def do_save(and_restart):
         new_config, errors = collect_config()
         if errors:
             status_label.config(text="; ".join(errors))
@@ -1686,18 +1849,25 @@ def _run_config_editor(restart_watcher_callback, restart_app_callback):
         except OSError as exc:
             messagebox.showerror("Save failed", f"Could not write config.json:\n{exc}", parent=root)
             return
+        if is_frozen:
+            set_startup_shortcut_enabled(startup_var.get())
         logging.info("config.json updated via the Settings editor.")
-        root.destroy()
-        if restart_app:
-            restart_app_callback()
+        if and_restart:
+            root.destroy()
+            restart_callback()
         else:
-            restart_watcher_callback()
+            messagebox.showinfo(
+                "Settings saved",
+                "Settings saved. A restart may be necessary for some settings to take effect.",
+                parent=root,
+            )
+            root.destroy()
 
     button_bar = tk.Frame(root)
     button_bar.pack(fill="x", padx=10, pady=10)
     tk.Button(button_bar, text="Cancel", command=root.destroy).pack(side="right")
-    tk.Button(button_bar, text="Save & Restart Watcher", command=lambda: do_save(False)).pack(side="right", padx=8)
-    tk.Button(button_bar, text="Save & Restart App", command=lambda: do_save(True)).pack(side="right")
+    tk.Button(button_bar, text="Save", command=lambda: do_save(False)).pack(side="right", padx=8)
+    tk.Button(button_bar, text="Save and Restart", command=lambda: do_save(True)).pack(side="right")
 
     root.mainloop()
 
@@ -1721,7 +1891,7 @@ def main():
     )
 
     status = {"text": "Starting...", "recording": False}
-    app_stop_event = threading.Event()
+    stop_event = threading.Event()
 
     monitors = get_monitor_rects()
     overlay_state = {"monitor_index": None}
@@ -1730,39 +1900,12 @@ def main():
     reset_recording_state(recording_state)
     runtime_state = {"obs_client": None}
     editor_state = {"open": False}
-    watcher_ctl = {"stop_event": threading.Event(), "restart_requested": False}
-
-    def start_watcher_thread():
-        watcher_ctl["stop_event"] = threading.Event()
-        threading.Thread(
-            target=watcher_loop,
-            args=(
-                icon, status, audio_state, recording_state, runtime_state,
-                watcher_ctl["stop_event"], on_watcher_stopped,
-            ),
-            daemon=True,
-        ).start()
-
-    def on_watcher_stopped():
-        if watcher_ctl["restart_requested"]:
-            watcher_ctl["restart_requested"] = False
-            reset_recording_state(recording_state)
-            logging.info("Watcher restarted with updated settings.")
-            start_watcher_thread()
-        else:
-            app_stop_event.set()
-            icon.stop()
 
     def on_quit(icon, menu_item):
         logging.info("Quit requested from tray icon.")
-        watcher_ctl["stop_event"].set()
+        stop_event.set()
 
-    def restart_watcher():
-        logging.info("Restarting watcher to apply updated settings.")
-        watcher_ctl["restart_requested"] = True
-        watcher_ctl["stop_event"].set()
-
-    def do_restart_app():
+    def do_restart():
         logging.info("Restarting app to apply updated settings.")
         try:
             if getattr(sys, "frozen", False):
@@ -1771,10 +1914,10 @@ def main():
                 subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=SCRIPT_DIR)
         except Exception:
             logging.exception("Failed to relaunch after config save.")
-        watcher_ctl["stop_event"].set()
+        stop_event.set()
 
     def on_edit_settings(icon, menu_item):
-        open_config_editor_window(editor_state, restart_watcher, do_restart_app)
+        open_config_editor_window(editor_state, do_restart)
 
     def on_open_recordings_folder(icon, menu_item):
         client = runtime_state.get("obs_client")
@@ -1874,9 +2017,13 @@ def main():
 
     def setup(icon):
         icon.visible = True
-        start_watcher_thread()
         threading.Thread(
-            target=run_overlay, args=(monitors, overlay_state, audio_state, status, app_stop_event), daemon=True
+            target=watcher_loop,
+            args=(icon, status, audio_state, recording_state, runtime_state, stop_event),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event), daemon=True
         ).start()
 
     icon.run(setup=setup)

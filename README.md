@@ -139,12 +139,14 @@ python autostart_script.py
 
 ### 4. Run automatically at login
 
-Create a shortcut to `OBSAutoRecorder.exe` in your Startup folder:
+Easiest: right-click the tray icon → **Edit Settings...** → General tab → check **Launch automatically when Windows starts**, then **Save**. This adds/removes a shortcut in your Startup folder for you (only available when running the built `.exe`, not `python autostart_script.py`).
+
+To do it by hand instead:
 
 1. Press `Win+R`, enter `shell:startup`, hit Enter
 2. Create a shortcut there pointing to `OBSAutoRecorder.exe`
 
-It will now launch silently (no console window) every time you log in.
+Either way, it will launch silently (no console window) every time you log in.
 
 ## Using the tray icon
 
@@ -155,7 +157,7 @@ Right-click the tray icon (it may be tucked under the "show hidden icons" `^` ch
 - **Show Audio Mixer Levels While Recording** — toggle live mixer levels on the overlay
 - **Open Recordings Folder** — opens OBS's current recording output folder (queried live from OBS; only available once OBS has connected)
 - **Open Log File** — opens `log_file` in your default text editor
-- **Edit Settings...** — opens a GUI settings window covering every `config.json` option (watched games/windows, launchers, OBS connection, cleanup/guards, post-processing, notifications) organized into tabs, with **Save & Restart Watcher** (applies immediately, in place) and **Save & Restart App** (a full relaunch, for the couple of settings that need it). No manual JSON editing needed. See [Optional: settings editor](#optional-settings-editor)
+- **Edit Settings...** — opens a GUI settings window covering every `config.json` option (watched games/windows, launchers, OBS connection, cleanup/guards, post-processing, notifications) organized into tabs, with **Save** and **Save and Restart** buttons. No manual JSON editing needed. See [Optional: settings editor](#optional-settings-editor)
 - **Save Replay Buffer** — only shown if `obs.replay_buffer.enabled` is `true`; saves the last few minutes of the replay buffer immediately
 - **Kill OBS** — force-kills any running `obs.process_name` process (e.g. if it's hung); the watcher will relaunch it the next time a watched game starts
 - **Quit** — stops any active recording cleanly, then exits
@@ -177,12 +179,13 @@ Both cases flash the tray icon orange and log a warning. To avoid restart loops,
 
 ## Optional: settings editor
 
-Instead of hand-editing `config.json`, right-click the tray icon → **Edit Settings...** for a tabbed GUI covering every option in this README's config table: General, Watched Games (including the window-title rules), Launchers, OBS (path, WebSocket, auto-split, health recovery, game audio, replay buffer), Cleanup & Guards, and Post-Processing/Notifications.
+Instead of hand-editing `config.json`, right-click the tray icon → **Edit Settings...** for a tabbed GUI covering every option in this README's config table: General (including "launch at Windows startup" — see [Run automatically at login](#4-run-automatically-at-login)), Watched Games (including the window-title rules), Launchers, OBS (path, WebSocket, auto-split, health recovery, game audio, replay buffer), Cleanup & Guards, and Post-Processing/Notifications.
 
-- **Save & Restart Watcher** writes `config.json` and immediately restarts the watcher in place (stops any active recording first) so almost every setting takes effect right away — the tray icon and its menu stay up the whole time.
-- **Save & Restart App** writes `config.json` and does a full app relaunch instead — needed for the handful of settings only read once at startup (`log_file`, and whether the "Save Replay Buffer" menu item is shown).
+- **Save** writes `config.json` and closes the window, with a reminder that a restart may be necessary for some settings to take effect (config is only read at startup, so changes don't apply to the already-running watcher).
+- **Save and Restart** writes `config.json` and immediately relaunches the whole app (stops any active recording first, same as a normal Quit) so every setting takes effect right away.
 - Only one editor window can be open at a time; the menu item disables itself while one is open.
 - List-like fields (exclude keywords, install folders, launch args) are entered comma-separated; `ffmpeg` arguments are space-separated.
+- On the Watched Games tab, **Pick Running...** opens a filterable list of currently running process names to add from, instead of typing an exact exe name from memory — processes already in your watched list are shown greyed out with an "(already watching)" marker. The same picker is available per-row on the window-title rules.
 
 The editor always reloads `config.json` fresh when opened and only overwrites the fields shown in the form, so any advanced/unlisted key you've hand-added is left untouched.
 
