@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -178,15 +179,90 @@ def get_steam_common_dirs(steam_config):
     return common_dirs
 
 
-def is_steam_game_exe(exe_path, steam_common_dirs, exclude_keywords):
+def is_exe_under_dirs(exe_path, common_dirs, exclude_keywords):
+    """True if exe_path lives under one of common_dirs and isn't excluded.
+
+    Shared by any launcher whose games each get their own top-level folder
+    under a common root (Steam, Xbox/Game Pass, Battle.net).
+    """
     if not exe_path:
         return False
     exe_lower = exe_path.lower()
-    for common_dir in steam_common_dirs:
+    for common_dir in common_dirs:
         prefix = common_dir if common_dir.endswith(os.sep) else common_dir + os.sep
         if exe_lower.startswith(prefix):
             return not any(kw in exe_lower for kw in exclude_keywords)
     return False
+
+
+def get_display_name_from_dirs(exe_path, common_dirs):
+    if not exe_path:
+        return None
+    exe_lower = exe_path.lower()
+    for common_dir in common_dirs:
+        prefix = common_dir if common_dir.endswith(os.sep) else common_dir + os.sep
+        if exe_lower.startswith(prefix):
+            remainder = exe_path[len(prefix):]
+            folder = remainder.split(os.sep)[0]
+            return folder or None
+    return None
+
+
+def get_xbox_install_dirs(xbox_config):
+    if not xbox_config.get("enabled", True):
+        return []
+    configured = xbox_config.get("install_dirs") or [r"C:\XboxGames"]
+    dirs = sorted({os.path.normpath(d).lower() for d in configured if os.path.isdir(d)})
+    logging.info("Watching Xbox/Game Pass folders: %s", ", ".join(dirs) if dirs else "none found")
+    return dirs
+
+
+def get_battlenet_install_dirs(battlenet_config):
+    if not battlenet_config.get("enabled", True):
+        return []
+    configured = battlenet_config.get("install_dirs") or []
+    dirs = sorted({os.path.normpath(d).lower() for d in configured if os.path.isdir(d)})
+    if dirs:
+        logging.info("Watching Battle.net folders: %s", ", ".join(dirs))
+    else:
+        logging.info("No Battle.net install_dirs configured; Battle.net auto-detection is inactive.")
+    return dirs
+
+
+def get_gog_installed_games(gog_config):
+    if not gog_config.get("enabled", True):
+        return []
+
+    exclude_keywords = [k.lower() for k in gog_config.get("exclude_keywords", [])]
+    games = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\GOG.com\Games") as games_key:
+            index = 0
+            while True:
+                try:
+                    subkey_name = winreg.EnumKey(games_key, index)
+                except OSError:
+                    break
+                index += 1
+                try:
+                    with winreg.OpenKey(games_key, subkey_name) as subkey:
+                        install_dir = winreg.QueryValueEx(subkey, "path")[0]
+                        display_name = winreg.QueryValueEx(subkey, "gameName")[0]
+                except OSError:
+                    continue
+                if not install_dir or not display_name:
+                    continue
+                if any(kw in display_name.lower() for kw in exclude_keywords):
+                    continue
+                games.append({"install_dir": os.path.normpath(install_dir).lower(), "display_name": display_name})
+    except OSError:
+        logging.info("No GOG Galaxy installs found in registry.")
+        return []
+
+    logging.info(
+        "Watching GOG Galaxy installs: %s", ", ".join(g["display_name"] for g in games) if games else "none found"
+    )
+    return games
 
 
 def get_epic_manifest_dir():
@@ -229,11 +305,12 @@ def get_epic_installed_games(epic_config):
     return games
 
 
-def get_epic_game_for_exe(exe_path, epic_games):
+def find_game_by_install_dir(exe_path, manifest_games):
+    """Matches an exe against launchers that list exact install dirs (Epic, GOG)."""
     if not exe_path:
         return None
     exe_lower = os.path.normpath(exe_path).lower()
-    for game in epic_games:
+    for game in manifest_games:
         prefix = game["install_dir"] if game["install_dir"].endswith(os.sep) else game["install_dir"] + os.sep
         if exe_lower.startswith(prefix):
             return game["display_name"]
@@ -241,18 +318,18 @@ def get_epic_game_for_exe(exe_path, epic_games):
 
 
 def find_target_process(
-    watched_games, steam_common_dirs, exclude_keywords, epic_games, watched_windows, processes
+    watched_games, root_common_dirs, root_exclude_keywords, manifest_games, watched_windows, processes
 ):
     for name, exe, pid in processes:
         if name.lower() in watched_games:
             return name, exe, pid, None
     for name, exe, pid in processes:
-        if is_steam_game_exe(exe, steam_common_dirs, exclude_keywords):
+        if is_exe_under_dirs(exe, root_common_dirs, root_exclude_keywords):
             return name, exe, pid, None
     for name, exe, pid in processes:
-        epic_display_name = get_epic_game_for_exe(exe, epic_games)
-        if epic_display_name:
-            return name, exe, pid, epic_display_name
+        manifest_display_name = find_game_by_install_dir(exe, manifest_games)
+        if manifest_display_name:
+            return name, exe, pid, manifest_display_name
     if watched_windows:
         window_titles = get_window_titles()
         for name, exe, pid in processes:
@@ -269,16 +346,10 @@ def find_target_process(
 INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 
 
-def get_game_display_name(name, exe, steam_common_dirs):
-    if exe:
-        exe_lower = exe.lower()
-        for common_dir in steam_common_dirs:
-            prefix = common_dir if common_dir.endswith(os.sep) else common_dir + os.sep
-            if exe_lower.startswith(prefix):
-                remainder = exe[len(prefix):]
-                folder = remainder.split(os.sep)[0]
-                if folder:
-                    return folder
+def get_game_display_name(name, exe, root_common_dirs):
+    folder = get_display_name_from_dirs(exe, root_common_dirs)
+    if folder:
+        return folder
 
     base = name[:-4] if name.lower().endswith(".exe") else name
     return base.title()
@@ -394,7 +465,31 @@ def is_automatic_split(recording_state, old_path, auto_split_config):
     return target_seconds > 0 and target_seconds <= elapsed <= target_seconds + tolerance_seconds
 
 
-def connect_obs_events(ws_config, icon, status, audio_state, recording_state, auto_split_config):
+def is_segment_silent(recording_state, silent_config):
+    if not silent_config.get("enabled"):
+        return False
+    return not recording_state.get("heard_any_audio", False)
+
+
+def reset_segment_audio_tracking(recording_state):
+    recording_state["heard_any_audio"] = False
+    recording_state["last_audio_peak_time"] = time.time()
+    recording_state["silent_warning_sent"] = False
+
+
+def maybe_transcode(path, transcode_config):
+    if transcode_config.get("enabled") and path:
+        threading.Thread(target=transcode_recording, args=(path, transcode_config), daemon=True).start()
+
+
+def connect_obs_events(config, icon, status, audio_state, recording_state):
+    ws_config = config["obs"]["websocket"]
+    auto_split_config = config["obs"].get("auto_split", {})
+    silent_config = config.get("cleanup", {}).get("flag_silent_recordings", {})
+    transcode_config = config.get("post_record_transcode", {})
+    notifications_config = config.get("notifications", {})
+    subfolders_enabled = config.get("organize_into_game_subfolders", False)
+
     try:
         event_client = obsws.EventClient(
             host=ws_config["host"],
@@ -416,6 +511,9 @@ def connect_obs_events(ws_config, icon, status, audio_state, recording_state, au
             recording_state["part_index"] = 1
             recording_state["did_split"] = False
             recording_state["segment_start_time"] = time.time()
+            recording_state["session_start_time"] = time.time()
+            recording_state["segment_files"] = []
+            reset_segment_audio_tracking(recording_state)
 
     def on_record_file_changed(data):
         new_path = getattr(data, "new_output_path", "")
@@ -431,17 +529,28 @@ def connect_obs_events(ws_config, icon, status, audio_state, recording_state, au
         status["flash_until"] = time.time() + SPLIT_FLASH_SECONDS
         icon.icon = build_tray_image(current_color(status))
 
+        silent = is_segment_silent(recording_state, silent_config)
+        finalized_path = None
         if manual:
             part_index = recording_state.get("part_index", 1)
             if old_path:
-                rename_with_game_prefix(old_path, recording_state.get("display_name"), part_index)
+                finalized_path = rename_with_game_prefix(
+                    old_path, recording_state.get("display_name"), part_index, silent, subfolders_enabled
+                )
             recording_state["did_split"] = True
             recording_state["part_index"] = part_index + 1
         elif old_path:
-            rename_with_game_prefix(old_path, recording_state.get("display_name"))
+            finalized_path = rename_with_game_prefix(
+                old_path, recording_state.get("display_name"), None, silent, subfolders_enabled
+            )
+
+        if finalized_path:
+            recording_state.setdefault("segment_files", []).append(finalized_path)
+            maybe_transcode(finalized_path, transcode_config)
 
         recording_state["current_path"] = new_path
         recording_state["segment_start_time"] = time.time()
+        reset_segment_audio_tracking(recording_state)
 
         def revert():
             icon.icon = build_tray_image(current_color(status))
@@ -452,6 +561,7 @@ def connect_obs_events(ws_config, icon, status, audio_state, recording_state, au
 
     def on_input_volume_meters(data):
         levels = {}
+        peak_overall = 0.0
         for entry in data.inputs:
             name = entry.get("inputName")
             if not name:
@@ -461,7 +571,31 @@ def connect_obs_events(ws_config, icon, status, audio_state, recording_state, au
                 if len(channel) >= 2:
                     peak = max(peak, channel[1])
             levels[name] = peak
+            peak_overall = max(peak_overall, peak)
         audio_state["levels"] = levels
+
+        if not (silent_config.get("enabled") and status["recording"]):
+            return
+        threshold = silent_config.get("peak_threshold", 0.02)
+        if peak_overall >= threshold:
+            recording_state["heard_any_audio"] = True
+            recording_state["last_audio_peak_time"] = time.time()
+            return
+
+        if recording_state.get("silent_warning_sent"):
+            return
+        last_peak = recording_state.get("last_audio_peak_time")
+        warn_after = silent_config.get("warn_after_seconds", 30)
+        if last_peak is not None and time.time() - last_peak >= warn_after:
+            recording_state["silent_warning_sent"] = True
+            game = recording_state.get("display_name") or "the current recording"
+            logging.warning("No audio detected for %ds while recording %s.", warn_after, game)
+            notify(
+                icon,
+                notifications_config,
+                "No audio detected",
+                f"No audio for {warn_after}s while recording {game}. Check your audio capture source.",
+            )
 
     event_client.callback.register(on_record_state_changed)
     event_client.callback.register(on_record_file_changed)
@@ -481,7 +615,8 @@ def get_obs_memory_limit_bytes(obs_config):
     return obs_config.get("recovery", {}).get("memory_limit_gb", DEFAULT_OBS_MEMORY_LIMIT_GB) * 1024 ** 3
 
 
-def ensure_obs_ready(obs_config, processes, icon, status, audio_state, recording_state, obs_recovery_state):
+def ensure_obs_ready(config, processes, icon, status, audio_state, recording_state, obs_recovery_state):
+    obs_config = config["obs"]
     if not is_obs_running(obs_config["process_name"], processes):
         if not launch_obs(obs_config):
             return None, None
@@ -505,9 +640,7 @@ def ensure_obs_ready(obs_config, processes, icon, status, audio_state, recording
 
     if not client:
         return None, None
-    event_client = connect_obs_events(
-        obs_config["websocket"], icon, status, audio_state, recording_state, obs_config.get("auto_split", {})
-    )
+    event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
     return client, event_client
 
 
@@ -548,49 +681,187 @@ def set_game_audio_capture_target(client, input_name, process_name):
         logging.warning("Could not point '%s' audio capture at %s: %s", input_name, process_name, exc)
 
 
-def rename_with_game_prefix(output_path, game_display_name, split_part=None):
-    if not output_path or not game_display_name:
+DEFAULT_DISK_SPACE_MINIMUM_GB = 10
+
+
+def has_sufficient_disk_space(disk_guard_config, fallback_path):
+    if not disk_guard_config.get("enabled"):
+        return True
+    check_path = disk_guard_config.get("path") or fallback_path
+    try:
+        free_gb = shutil.disk_usage(check_path).free / (1024 ** 3)
+    except OSError as exc:
+        logging.warning("Disk space guard: could not check free space at %s: %s", check_path, exc)
+        return True
+    minimum_gb = disk_guard_config.get("minimum_free_gb", DEFAULT_DISK_SPACE_MINIMUM_GB)
+    return free_gb >= minimum_gb
+
+
+def start_replay_buffer(client):
+    try:
+        client.start_replay_buffer()
+        logging.info("Replay buffer started.")
+    except Exception as exc:
+        logging.warning("Could not start replay buffer: %s", exc)
+
+
+def stop_replay_buffer(client):
+    try:
+        client.stop_replay_buffer()
+        logging.info("Replay buffer stopped.")
+    except Exception as exc:
+        logging.warning("Could not stop replay buffer: %s", exc)
+
+
+def save_replay_buffer(client):
+    try:
+        client.save_replay_buffer()
+        logging.info("Replay buffer saved.")
+    except Exception as exc:
+        logging.error("Could not save replay buffer: %s", exc)
+
+
+def notify(icon, notifications_config, title, message):
+    if not (notifications_config or {}).get("enabled"):
         return
+    try:
+        icon.notify(message, title)
+    except Exception as exc:
+        logging.debug("Notification failed: %s", exc)
+
+
+def delete_recording_files(paths):
+    for path in paths:
+        if not path:
+            continue
+        try:
+            os.remove(path)
+            logging.info("Deleted short recording: %s", os.path.basename(path))
+        except OSError as exc:
+            logging.error("Failed to delete short recording %s: %s", path, exc)
+
+
+def transcode_recording(input_path, transcode_config):
+    ffmpeg_path = transcode_config.get("ffmpeg_path", "ffmpeg")
+    args = transcode_config.get("args", ["-c:v", "libx264", "-crf", "23", "-c:a", "aac"])
+    suffix = transcode_config.get("suffix", "_compressed")
+    delete_original = transcode_config.get("delete_original", False)
+
+    directory = os.path.dirname(input_path)
+    base, ext = os.path.splitext(os.path.basename(input_path))
+    output_path = os.path.join(directory, f"{base}{suffix}{ext}")
+
+    cmd = [ffmpeg_path, "-y", "-i", input_path] + list(args) + [output_path]
+    logging.info("Transcoding %s with ffmpeg...", os.path.basename(input_path))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        logging.error("ffmpeg not found at '%s'; skipping post-record transcode.", ffmpeg_path)
+        return
+    if result.returncode != 0:
+        logging.error("ffmpeg transcode failed for %s: %s", input_path, result.stderr[-2000:])
+        return
+    logging.info("Transcoded to %s", os.path.basename(output_path))
+    if delete_original:
+        try:
+            os.remove(input_path)
+        except OSError as exc:
+            logging.warning("Could not delete original after transcode: %s", exc)
+
+
+def rename_with_game_prefix(output_path, game_display_name, split_part=None, silent=False, use_subfolder=False):
+    """Renames (and optionally relocates) a finished recording. Returns the resulting path,
+    or the original path if renaming was skipped/failed."""
+    if not output_path or not game_display_name:
+        return output_path
 
     output_path = os.path.normpath(output_path)
     directory = os.path.dirname(output_path)
     filename = os.path.basename(output_path)
     prefix = sanitize_filename_part(game_display_name)
     if not prefix:
-        return
+        return output_path
 
+    name_parts = []
+    if silent:
+        name_parts.append("[NO AUDIO]")
+    if not use_subfolder:
+        name_parts.append(prefix)
     if split_part:
-        new_name = f"{prefix} - Split {split_part} - {filename}"
-    else:
-        new_name = f"{prefix} - {filename}"
-    new_path = os.path.join(directory, new_name)
+        name_parts.append(f"Split {split_part}")
+    new_name = f"{' - '.join(name_parts)} - {filename}" if name_parts else filename
+
+    target_dir = directory
+    if use_subfolder:
+        target_dir = os.path.join(directory, prefix)
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as exc:
+            logging.error("Failed to create game subfolder %s: %s", target_dir, exc)
+            target_dir = directory
+
+    new_path = os.path.join(target_dir, new_name)
     retries, delay = 5, 1
     for attempt in range(1, retries + 1):
         try:
             os.rename(output_path, new_path)
-            logging.info("Renamed recording to %s", os.path.basename(new_path))
-            return
+            logging.info("Renamed recording to %s", os.path.relpath(new_path, directory))
+            return new_path
         except OSError as exc:
             if attempt < retries:
                 time.sleep(delay)
                 continue
             logging.error("Failed to rename recording file: %s", exc)
+            return output_path
 
 
-def stop_recording(client, game_display_name=None, recording_state=None):
+def stop_recording(client, icon, game_display_name=None, recording_state=None, config=None):
+    """Stops recording and finalizes the file. Returns True if a recording was kept,
+    False if it failed to stop or was deleted (short-clip cleanup)."""
     try:
         resp = client.stop_record()
         logging.info("Recording stopped.")
     except Exception as exc:
         logging.error("Failed to stop recording: %s", exc)
-        return
+        return False
+
+    config = config or {}
+    notifications_config = config.get("notifications", {})
 
     # OBS's StopRecord response reports the pre-split filename after a split has
     # occurred, so prefer the path we've tracked live from split/start events.
     tracked_path = recording_state.get("current_path") if recording_state else None
     output_path = tracked_path or getattr(resp, "output_path", None)
     split_part = recording_state.get("part_index") if recording_state and recording_state.get("did_split") else None
-    rename_with_game_prefix(output_path, game_display_name, split_part)
+
+    short_clip_config = config.get("cleanup", {}).get("delete_short_clips", {})
+    session_start = recording_state.get("session_start_time") if recording_state else None
+    if short_clip_config.get("enabled") and session_start is not None:
+        duration = time.time() - session_start
+        minimum_seconds = short_clip_config.get("minimum_seconds", 20)
+        if duration < minimum_seconds:
+            logging.info(
+                "Recording session for %s lasted %.1fs (< %ds minimum); deleting instead of keeping.",
+                game_display_name or "game", duration, minimum_seconds,
+            )
+            segment_files = list(recording_state.get("segment_files", [])) if recording_state else []
+            delete_recording_files(segment_files + [output_path])
+            notify(
+                icon, notifications_config, "Short clip deleted",
+                f"Recording of {game_display_name or 'game'} was under {minimum_seconds}s; deleted.",
+            )
+            return False
+
+    silent_config = config.get("cleanup", {}).get("flag_silent_recordings", {})
+    silent = bool(recording_state) and is_segment_silent(recording_state, silent_config)
+    subfolders_enabled = config.get("organize_into_game_subfolders", False)
+
+    new_path = rename_with_game_prefix(output_path, game_display_name, split_part, silent, subfolders_enabled)
+    if recording_state is not None and new_path:
+        recording_state.setdefault("segment_files", []).append(new_path)
+
+    maybe_transcode(new_path, config.get("post_record_transcode", {}))
+    return True
 
 
 def set_status(icon, status, text):
@@ -599,9 +870,9 @@ def set_status(icon, status, text):
     icon.icon = build_tray_image(current_color(status))
 
 
-def watcher_loop(icon, status, audio_state, recording_state, stop_event):
+def watcher_loop(icon, status, audio_state, recording_state, runtime_state, stop_event):
     try:
-        _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event)
+        _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state, stop_event)
     except Exception:
         logging.exception("Watcher thread crashed unexpectedly.")
         status["recording"] = False
@@ -615,17 +886,31 @@ def watcher_loop(icon, status, audio_state, recording_state, stop_event):
         icon.stop()
 
 
-def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
+def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state, stop_event):
     config = load_config()
     watched_games = {g.lower() for g in config["watched_games"]}
     watched_windows = config.get("watched_windows", [])
     poll_interval = config.get("poll_interval_seconds", 1.5)
     obs_config = config["obs"]
     steam_config = config.get("steam", {})
-    exclude_keywords = [k.lower() for k in steam_config.get("exclude_keywords", [])]
+    xbox_config = config.get("xbox", {})
+    battlenet_config = config.get("battlenet", {})
     steam_common_dirs = get_steam_common_dirs(steam_config)
+    xbox_common_dirs = get_xbox_install_dirs(xbox_config)
+    battlenet_common_dirs = get_battlenet_install_dirs(battlenet_config)
+    root_common_dirs = steam_common_dirs + xbox_common_dirs + battlenet_common_dirs
+    root_exclude_keywords = sorted(set(
+        [k.lower() for k in steam_config.get("exclude_keywords", [])]
+        + [k.lower() for k in xbox_config.get("exclude_keywords", [])]
+        + [k.lower() for k in battlenet_config.get("exclude_keywords", [])]
+    ))
     epic_games = get_epic_installed_games(config.get("epic", {}))
+    gog_games = get_gog_installed_games(config.get("gog", {}))
+    manifest_games = epic_games + gog_games
     game_audio_config = obs_config.get("game_audio_capture", {})
+    replay_buffer_config = obs_config.get("replay_buffer", {})
+    disk_guard_config = config.get("disk_space_guard", {})
+    notifications_config = config.get("notifications", {})
 
     logging.info("Watching for processes: %s", ", ".join(sorted(watched_games)))
     if watched_windows:
@@ -657,46 +942,78 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
                     status["text"] = "Error - restarting bloated OBS"
                     icon.title = "OBS Auto Recorder - Error, restarting OBS"
                     icon.icon = build_tray_image(ERROR_COLOR)
+                    notify(
+                        icon, notifications_config, "OBS restarted",
+                        f"OBS was using {memory_bytes / (1024 ** 3):.1f} GB while idle and has been restarted.",
+                    )
                     kill_process_by_name(obs_config["process_name"])
                     launch_obs(obs_config)
                     processes = get_running_processes()
                     set_status(icon, status, "Watching")
 
             name, exe, pid, display_override = find_target_process(
-                watched_games, steam_common_dirs, exclude_keywords, epic_games, watched_windows, processes
+                watched_games, root_common_dirs, root_exclude_keywords, manifest_games, watched_windows, processes
             )
             if name:
+                display_name = display_override or get_game_display_name(name, exe, root_common_dirs)
+                if not has_sufficient_disk_space(disk_guard_config, os.path.dirname(obs_config["path"])):
+                    minimum_gb = disk_guard_config.get("minimum_free_gb", DEFAULT_DISK_SPACE_MINIMUM_GB)
+                    logging.error(
+                        "Insufficient disk space (< %s GB free); not starting recording for %s.",
+                        minimum_gb, exe or name,
+                    )
+                    status["text"] = "Error - low disk space"
+                    icon.title = "OBS Auto Recorder - Error, low disk space"
+                    icon.icon = build_tray_image(ERROR_COLOR)
+                    notify(
+                        icon, notifications_config, "Low disk space",
+                        f"Not enough free disk space to start recording {display_name}.",
+                    )
+                    stop_event.wait(poll_interval)
+                    continue
+
                 logging.info("Detected watched game: %s", exe or name)
                 # obs_event_client is unused directly; kept referenced so its listener thread isn't GC'd.
                 obs_client, obs_event_client = ensure_obs_ready(
-                    obs_config, processes, icon, status, audio_state, recording_state, obs_recovery_state
+                    config, processes, icon, status, audio_state, recording_state, obs_recovery_state
                 )
+                runtime_state["obs_client"] = obs_client
                 if obs_client and start_recording(obs_client):
                     active_name, active_pid = name, pid
-                    active_display_name = display_override or get_game_display_name(name, exe, steam_common_dirs)
+                    active_display_name = display_name
                     recording_state["display_name"] = active_display_name
                     status["recording"] = True
                     set_status(icon, status, f"Recording {active_display_name}")
+                    notify(icon, notifications_config, "Recording started", active_display_name)
                     if game_audio_config.get("enabled"):
                         set_game_audio_capture_target(obs_client, game_audio_config["input_name"], name)
+                    if replay_buffer_config.get("enabled"):
+                        start_replay_buffer(obs_client)
                 else:
                     logging.error("Could not get OBS ready to record; will keep retrying while %s runs.", exe or name)
                     status["text"] = "Error - OBS unreachable, see log"
                     icon.title = "OBS Auto Recorder - Error, OBS unreachable"
                     icon.icon = build_tray_image(ERROR_COLOR)
+                    notify(icon, notifications_config, "OBS error", "Could not get OBS ready to record.")
             elif status["text"].startswith("Error"):
                 set_status(icon, status, "Watching")
         else:
             if not is_process_running(active_pid):
                 logging.info("%s has exited.", active_display_name or active_name)
                 if obs_client:
-                    stop_recording(obs_client, active_display_name, recording_state)
+                    if replay_buffer_config.get("enabled"):
+                        stop_replay_buffer(obs_client)
+                    kept = stop_recording(obs_client, icon, active_display_name, recording_state, config)
+                    if kept:
+                        notify(icon, notifications_config, "Recording stopped", active_display_name or active_name)
                 active_name, active_pid, active_display_name = None, None, None
                 recording_state["display_name"] = None
                 recording_state["current_path"] = None
                 recording_state["part_index"] = 1
                 recording_state["did_split"] = False
                 recording_state["segment_start_time"] = None
+                recording_state["session_start_time"] = None
+                recording_state["segment_files"] = []
                 status["recording"] = False
                 set_status(icon, status, "Watching")
 
@@ -704,7 +1021,9 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, stop_event):
 
     if active_name is not None and obs_client:
         logging.info("Quit requested while recording; stopping recording.")
-        stop_recording(obs_client, active_display_name, recording_state)
+        if replay_buffer_config.get("enabled"):
+            stop_replay_buffer(obs_client)
+        stop_recording(obs_client, icon, active_display_name, recording_state, config)
 
 
 OVERLAY_SIZE = 26
@@ -861,11 +1180,55 @@ def main():
         "part_index": 1,
         "did_split": False,
         "segment_start_time": None,
+        "session_start_time": None,
+        "segment_files": [],
+        "heard_any_audio": False,
+        "last_audio_peak_time": None,
+        "silent_warning_sent": False,
     }
+    runtime_state = {"obs_client": None}
 
     def on_quit(icon, menu_item):
         logging.info("Quit requested from tray icon.")
         stop_event.set()
+
+    def on_open_recordings_folder(icon, menu_item):
+        client = runtime_state.get("obs_client")
+        folder = None
+        if client:
+            try:
+                folder = client.get_record_directory().record_directory
+            except Exception as exc:
+                logging.warning("Could not get OBS recording directory: %s", exc)
+        if not folder:
+            logging.warning("Recordings folder unknown (OBS not connected yet).")
+            return
+        try:
+            os.startfile(folder)
+        except OSError as exc:
+            logging.error("Could not open recordings folder %s: %s", folder, exc)
+
+    def on_open_log_file(icon, menu_item):
+        log_path = config.get("log_file")
+        if not log_path:
+            logging.warning("No log file configured.")
+            return
+        if not os.path.isabs(log_path):
+            log_path = os.path.join(SCRIPT_DIR, log_path)
+        if not os.path.isfile(log_path):
+            logging.warning("Log file does not exist yet: %s", log_path)
+            return
+        try:
+            os.startfile(log_path)
+        except OSError as exc:
+            logging.error("Could not open log file %s: %s", log_path, exc)
+
+    def on_save_replay(icon, menu_item):
+        client = runtime_state.get("obs_client")
+        if not client:
+            logging.warning("Save Replay Buffer requested but OBS is not connected.")
+            return
+        threading.Thread(target=save_replay_buffer, args=(client,), daemon=True).start()
 
     def select_monitor(index):
         def action(icon, menu_item):
@@ -897,15 +1260,23 @@ def main():
             pystray.MenuItem(mon["label"], select_monitor(i), radio=True, checked=is_selected(i))
         )
 
-    menu = pystray.Menu(
+    menu_items = [
         pystray.MenuItem(lambda item: status["text"], None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Overlay Monitor", pystray.Menu(*overlay_items)),
         pystray.MenuItem("Show Audio Mixer Levels While Recording", toggle_audio_levels, checked=audio_levels_checked),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Open Recordings Folder", on_open_recordings_folder),
+        pystray.MenuItem("Open Log File", on_open_log_file),
+    ]
+    if config.get("obs", {}).get("replay_buffer", {}).get("enabled"):
+        menu_items.append(pystray.MenuItem("Save Replay Buffer", on_save_replay))
+    menu_items += [
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Kill OBS", on_kill_obs),
         pystray.MenuItem("Quit", on_quit),
-    )
+    ]
+    menu = pystray.Menu(*menu_items)
 
     icon = pystray.Icon(
         "OBSAutoRecorder",
@@ -917,7 +1288,9 @@ def main():
     def setup(icon):
         icon.visible = True
         threading.Thread(
-            target=watcher_loop, args=(icon, status, audio_state, recording_state, stop_event), daemon=True
+            target=watcher_loop,
+            args=(icon, status, audio_state, recording_state, runtime_state, stop_event),
+            daemon=True,
         ).start()
         threading.Thread(
             target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event), daemon=True

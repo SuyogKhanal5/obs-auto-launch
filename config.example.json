@@ -14,6 +14,7 @@
         }
     ],
     "poll_interval_seconds": 1.5,
+    "organize_into_game_subfolders": false,
     "steam": {
         "enabled": true,
         "allowed_drives": ["C", "D"],
@@ -38,6 +39,45 @@
             "unreal engine",
             "epic online services"
         ]
+    },
+    "gog": {
+        "enabled": true,
+        "exclude_keywords": []
+    },
+    "xbox": {
+        "enabled": true,
+        "install_dirs": ["C:\\XboxGames"],
+        "exclude_keywords": []
+    },
+    "battlenet": {
+        "enabled": false,
+        "install_dirs": [],
+        "exclude_keywords": []
+    },
+    "disk_space_guard": {
+        "enabled": false,
+        "minimum_free_gb": 10
+    },
+    "cleanup": {
+        "delete_short_clips": {
+            "enabled": false,
+            "minimum_seconds": 20
+        },
+        "flag_silent_recordings": {
+            "enabled": false,
+            "peak_threshold": 0.02,
+            "warn_after_seconds": 30
+        }
+    },
+    "notifications": {
+        "enabled": false
+    },
+    "post_record_transcode": {
+        "enabled": false,
+        "ffmpeg_path": "ffmpeg",
+        "args": ["-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k"],
+        "suffix": "_compressed",
+        "delete_original": false
     },
     "obs": {
         "process_name": "obs64.exe",
@@ -64,6 +104,9 @@
         "game_audio_capture": {
             "enabled": false,
             "input_name": "Game Audio"
+        },
+        "replay_buffer": {
+            "enabled": false
         }
     },
     "log_file": "autostart_script.log"
