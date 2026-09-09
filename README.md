@@ -37,7 +37,7 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 For most people, this is the whole setup:
 
 1. Download **`OBSAutoRecorderInstaller.exe`** from the [Releases page](../../releases/latest) and run it.
-2. Click through the wizard — pick where to install (defaults to Program Files), it'll try to find OBS Studio automatically, and offers a few plain-language yes/no preferences (all changeable later).
+2. Click through the wizard — pick where to install (defaults to Program Files), it'll try to find OBS Studio automatically, and offers a few plain-language yes/no preferences (all changeable later). An **Advanced options** page covers multi-track audio, game audio isolation, the replay buffer, the disk space guard, and a custom recording folder — everything on it is off by default, and there's a **Skip this page** link if none of it applies to you.
 3. Click Install, then Finish.
 
 That's it — no editing files, no copying passwords by hand. The installer even tries to configure OBS's WebSocket server for you automatically (if OBS has been run at least once already); if it can't, it'll tell you the one manual step left and the password to use.
@@ -168,6 +168,16 @@ python autostart_script.py
 python installer.py
 ```
 
+### Running the test suite
+
+```
+python -m unittest discover -s tests -v
+```
+
+No extra dependencies beyond `requirements.txt` — the tests use the standard library's `unittest` and a small fake OBS WebSocket client ([tests/fakes.py](tests/fakes.py)) instead of a real OBS connection, so they run in well under a second and don't need OBS, a GUI, or any game running. They cover the pure logic that's cheapest to get wrong silently: game/launcher detection and matching priority ([tests/test_detection.py](tests/test_detection.py)), multi-track audio routing and profile setup — including that removing an input from `obs.multi_track_audio.tracks` actually clears its routing in OBS rather than leaving it stale ([tests/test_multi_track_audio.py](tests/test_multi_track_audio.py)), the multi-track quick-setup wizard's track-building/source-creation logic ([tests/test_quick_setup.py](tests/test_quick_setup.py)), the installer's config-building logic ([tests/test_installer.py](tests/test_installer.py)), and auto-split/disk-guard/config-parsing helpers ([tests/test_config_helpers.py](tests/test_config_helpers.py)). The GitHub Actions workflow runs this suite before every build, so a regression fails CI instead of shipping.
+
+These intentionally don't cover the tray icon, the settings editor GUI, or anything requiring a live OBS/Windows session — that's still best verified manually (run the app, watch the log, check the tray).
+
 ### 4. Run automatically at login
 
 If you used the installer, you already chose this on the Install location page. To change it later: right-click the tray icon → **Edit Settings...** → General tab → check/uncheck **Launch automatically when Windows starts**, then **Save**. This adds/removes a shortcut in your Startup folder for you (only available when running the built `.exe`, not `python autostart_script.py`).
@@ -220,6 +230,7 @@ Instead of hand-editing `config.json`, right-click the tray icon → **Edit Sett
 - On the Watched Games tab, **Pick Running...** opens a filterable list of currently running process names to add from, instead of typing an exact exe name from memory — processes already in your watched list are shown greyed out with an "(already watching)" marker. The same picker is available per-row on the window-title rules.
 - Also on the Watched Games tab, **Common Games...** opens a filterable list of popular games (League of Legends, Valorant, Wizard101, Warframe, Fortnite, Minecraft, etc.) to add with one click, without needing to have the game running first — useful for games this app's launcher auto-detection can't see (e.g. Riot's client) or that need a window-title rule (Minecraft: Java Edition). Not exhaustive; anything not listed can still be added via **Pick Running...** or by typing the exe name in by hand.
 - On the OBS tab's Multi-Track Audio section, **Pick...** (per row) connects to OBS live with whatever WebSocket settings are currently in the form and lists its actual current inputs to choose from, instead of typing a name from memory — each one is shown with its kind (e.g. "Scarlet — Microphone/Aux", "Discord — Application Audio Capture") so you can tell multiple similarly-named devices apart, such as two microphones, when deciding which one to route.
+- Also on the Multi-Track Audio section, **Quick Setup...** builds the whole track layout for you in one dialog — pick your desktop/mic devices from dropdowns and tick common apps (Discord, Spotify, Chrome, etc.), and it creates whatever OBS sources are missing and fills in the track list (see [Optional: multi-track audio](#optional-multi-track-audio)).
 
 The editor always reloads `config.json` fresh when opened and only overwrites the fields shown in the form, so any advanced/unlisted key you've hand-added is left untouched.
 
@@ -240,7 +251,9 @@ Records selected OBS inputs (mic, desktop audio, isolated game audio, Discord, e
 
 **It never touches your existing OBS profile.** The first time it runs, the watcher creates a separate, dedicated OBS profile (named `obs.multi_track_audio.profile_name`, default `"OBS Auto Recorder"`) cloned from whatever profile was active at that moment — same recording folder, same quality, same file format — and only ever makes further changes inside that dedicated profile. Every time a watched game starts recording, OBS is switched into it first; your own profile(s) are left exactly as you set them up, and switching profiles doesn't touch your scenes/sources (those live in your scene collection, which is separate from profiles in OBS).
 
-Setup:
+**Quick setup (recommended):** in the settings editor's OBS tab → **Multi-Track Audio** → **Quick Setup...**, pick your desktop audio device and microphone from dropdowns (populated live from OBS), tick whichever common apps you use — Discord/Slack/Zoom, Spotify/Apple Music/YouTube Music, Chrome/Firefox/Edge — and click **Apply**. It creates an Application Audio Capture source in OBS for any app you picked that doesn't already have one (reusing an existing one by name instead of duplicating it), fills in the track list below with the same layout below, and turns the feature on — no hand-typing input names or track numbers. Game audio is included automatically on track 3 if [game audio isolation](#optional-isolate-game-audio) is already enabled above; anything not in the common-apps list can still be added afterward with **+ Add Track Mapping**.
+
+Manual setup:
 
 1. In `config.json` (or the settings editor's OBS tab → **Multi-Track Audio**), set `obs.multi_track_audio.enabled` to `true`.
 2. List which input feeds which track in `obs.multi_track_audio.tracks`, e.g.:

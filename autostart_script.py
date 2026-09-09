@@ -1425,8 +1425,44 @@ def meter_bar_color(peak):
 
 
 def run_overlay(monitors, overlay_state, audio_state, status, stop_event):
-    root = tk.Tk()
+    # Without this wrapper, an exception anywhere in here (Tk init, widget construction, the
+    # poll loop) kills the thread completely silently in a --noconsole build -- no stderr to
+    # print a traceback to -- permanently disabling both the overlay AND Settings (which now
+    # depends on this same interpreter) with zero trace in the log. Matches watcher_loop's
+    # own try/except-wrapping-impl pattern below.
+    try:
+        _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event)
+    except Exception:
+        logging.exception("Overlay thread crashed unexpectedly; overlay and Settings are unavailable this session.")
+
+
+def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
+    # A Tk() failure right after a relaunch (before the fix to stop inheriting a stale
+    # TCL_LIBRARY/TK_LIBRARY from the parent process) is the one failure mode transient enough
+    # to be worth retrying rather than just logging once and giving up.
+    root = None
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            root = tk.Tk()
+            break
+        except Exception as exc:
+            last_exc = exc
+            logging.warning("Overlay Tk initialization attempt %d/3 failed: %s", attempt, exc)
+            time.sleep(1)
+    if root is None:
+        logging.error(
+            "Overlay could not initialize Tk after 3 attempts (%s); the overlay and Settings "
+            "editor are unavailable this session. Restarting the app may resolve it.", last_exc,
+        )
+        return
     root.withdraw()
+    # Exposed so the Settings editor can be built as a Toplevel of this same interpreter
+    # instead of spinning up a second, independent tk.Tk() on another thread -- PyInstaller's
+    # bundled Tcl/Tk isn't reliably safe for that (observed as everything from a silent hang to
+    # a hard process crash), whereas a second top-level window on the one interpreter that's
+    # already running here is the normal, well-supported way to do this in Tkinter.
+    overlay_state["root"] = root
 
     dot_window = tk.Toplevel(root)
     dot_window.overrideredirect(True)
@@ -1918,6 +1954,194 @@ def open_obs_input_picker(parent, get_ws_config, on_pick):
     listbox.bind("<Double-Button-1>", lambda e: select())
 
 
+# Curated common apps for the multi-track quick-setup wizard, grouped into the same category
+# scheme the app's own author ended up hand-building: voice chat on one track, music on another,
+# browsers on a third. Not exhaustive -- anything not listed can still be added by hand via
+# "+ Add Track Mapping", this just covers what most people actually run.
+COMMON_AUDIO_APPS = [
+    {"name": "Discord", "process_name": "Discord.exe", "category": "Voice Chat"},
+    {"name": "Slack", "process_name": "slack.exe", "category": "Voice Chat"},
+    {"name": "Zoom", "process_name": "Zoom.exe", "category": "Voice Chat"},
+    {"name": "Spotify", "process_name": "Spotify.exe", "category": "Music"},
+    {"name": "Apple Music", "process_name": "AppleMusic.exe", "category": "Music"},
+    {"name": "YouTube Music", "process_name": "YouTubeMusic.exe", "category": "Music"},
+    {"name": "Chrome", "process_name": "chrome.exe", "category": "Browser"},
+    {"name": "Firefox", "process_name": "firefox.exe", "category": "Browser"},
+    {"name": "Edge", "process_name": "msedge.exe", "category": "Browser"},
+]
+QUICK_SETUP_CATEGORY_TRACKS = {"Voice Chat": 4, "Music": 5, "Browser": 6}
+
+
+def compute_quick_setup_tracks(client, desktop_name, mic_name, game_audio_name, selected_apps):
+    """Core logic behind the multi-track quick-setup wizard's Apply button: builds the
+    resulting track-mapping list, creating an OBS Application Audio Capture input for any
+    selected app that doesn't already exist under that exact name (existing ones are reused,
+    never duplicated). Kept separate from the dialog so it's exercisable directly against a
+    fake OBS client in tests, without needing a real GUI or OBS connection.
+
+    desktop_name/mic_name/game_audio_name are input names to route to tracks 1(+2)/3, or None
+    to skip that track. selected_apps is a list of COMMON_AUDIO_APPS-shaped dicts to route to
+    their category's track, creating each one's source first if it isn't already present.
+    """
+    tracks = []
+    created = []
+    current_inputs = {i["inputName"] for i in client.get_input_list().inputs}
+    scene = client.get_current_program_scene().current_program_scene_name
+
+    if desktop_name:
+        tracks.append({"input_name": desktop_name, "track": 1})
+    if mic_name:
+        tracks.append({"input_name": mic_name, "track": 1})
+        tracks.append({"input_name": mic_name, "track": 2})
+    if game_audio_name:
+        tracks.append({"input_name": game_audio_name, "track": 3})
+
+    for app in selected_apps:
+        name = app["name"]
+        if name not in current_inputs:
+            client.create_input(
+                scene, name, "wasapi_process_output_capture",
+                {"window": f"::{app['process_name']}", "priority": 2}, True,
+            )
+            created.append(name)
+        tracks.append({"input_name": name, "track": QUICK_SETUP_CATEGORY_TRACKS[app["category"]]})
+
+    return tracks, created
+
+
+def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_apply):
+    """Reproduces the manual multi-track setup this app's own author needed by hand (pick a
+    mic, add capture sources for common apps, route everything to a sensible track layout) for
+    anyone in a few clicks: desktop+mic -> track 1, mic alone -> track 2, game audio (if already
+    configured) -> track 3, voice chat -> 4, music -> 5, browsers -> 6. Reuses an existing OBS
+    input by name instead of duplicating it; only creates one for an app that isn't there yet."""
+    try:
+        ws_config = get_ws_config()
+    except Exception:
+        ws_config = None
+    client = connect_obs(ws_config, retries=1, delay=0) if ws_config else None
+    if not client:
+        messagebox.showwarning(
+            "Can't reach OBS",
+            "Could not connect to OBS over its WebSocket using the settings above. Make sure OBS "
+            "is running and the host/port/password are correct, then try again.",
+            parent=parent,
+        )
+        return
+
+    try:
+        inputs = {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
+    except Exception as exc:
+        messagebox.showwarning("Can't read OBS state", str(exc), parent=parent)
+        return
+    finally:
+        client.disconnect()
+
+    desktop_options = ["(none)"] + sorted(
+        (n for n, k in inputs.items() if k == "wasapi_output_capture"), key=str.lower
+    )
+    mic_options = ["(none)"] + sorted(
+        (n for n, k in inputs.items() if k == "wasapi_input_capture"), key=str.lower
+    )
+
+    dialog = tk.Toplevel(parent)
+    dialog.title("Quick Multi-Track Setup")
+    dialog.geometry("440x580")
+    dialog.transient(parent.winfo_toplevel())
+    dialog.grab_set()
+
+    tk.Label(
+        dialog,
+        text=(
+            "Sets up separate recording tracks for a mic, desktop audio, game audio, and any "
+            "common apps you pick below -- creating their OBS sources if they don't exist yet, "
+            "and routing everything into the dedicated multi-track profile."
+        ),
+        anchor="w", justify="left", wraplength=410,
+    ).pack(fill="x", padx=10, pady=(10, 8))
+
+    form = tk.Frame(dialog)
+    form.pack(fill="x", padx=10)
+    tk.Label(form, text="Desktop audio:", anchor="w", width=14).grid(row=0, column=0, sticky="w", pady=2)
+    desktop_var = tk.StringVar(value=desktop_options[1] if len(desktop_options) > 1 else desktop_options[0])
+    ttk.Combobox(form, textvariable=desktop_var, values=desktop_options, state="readonly", width=26).grid(
+        row=0, column=1, sticky="w", pady=2
+    )
+    tk.Label(form, text="Microphone:", anchor="w", width=14).grid(row=1, column=0, sticky="w", pady=2)
+    mic_var = tk.StringVar(value=mic_options[1] if len(mic_options) > 1 else mic_options[0])
+    ttk.Combobox(form, textvariable=mic_var, values=mic_options, state="readonly", width=26).grid(
+        row=1, column=1, sticky="w", pady=2
+    )
+
+    game_audio_enabled = bool(game_audio_config.get("enabled"))
+    game_audio_name = game_audio_config.get("input_name", "Game Audio")
+    game_audio_note = (
+        f"Game audio ('{game_audio_name}') will be routed to track 3 automatically."
+        if game_audio_enabled else
+        "Game audio isolation isn't enabled above, so track 3 is left out for now -- enable "
+        "\"Game Audio Isolation\" above first if you want it included."
+    )
+    tk.Label(dialog, text=game_audio_note, anchor="w", justify="left", wraplength=410, fg="#555555").pack(
+        fill="x", padx=10, pady=(8, 4)
+    )
+
+    app_vars = {}
+    for category in ("Voice Chat", "Music", "Browser"):
+        track = QUICK_SETUP_CATEGORY_TRACKS[category]
+        tk.Label(dialog, text=f"{category}  (track {track})", font=("Segoe UI", 9, "bold"), anchor="w").pack(
+            fill="x", padx=10, pady=(8, 2)
+        )
+        apps_row = tk.Frame(dialog)
+        apps_row.pack(fill="x", padx=10)
+        for app in COMMON_AUDIO_APPS:
+            if app["category"] != category:
+                continue
+            var = tk.BooleanVar(value=False)
+            label = app["name"] if app["name"] in inputs else f"{app['name']} (will create)"
+            tk.Checkbutton(apps_row, text=label, variable=var).pack(anchor="w")
+            app_vars[app["name"]] = (var, app)
+
+    status_label = tk.Label(dialog, text="", fg="#b00020", anchor="w", justify="left", wraplength=410)
+    status_label.pack(fill="x", padx=10, pady=(6, 0))
+
+    def do_apply():
+        try:
+            apply_ws_config = get_ws_config()
+        except Exception:
+            apply_ws_config = None
+        apply_client = connect_obs(apply_ws_config, retries=1, delay=0) if apply_ws_config else None
+        if not apply_client:
+            status_label.config(text="Could not connect to OBS -- check the WebSocket settings above and try again.")
+            return
+
+        selected_apps = [app for var, app in app_vars.values() if var.get()]
+        try:
+            tracks, created = compute_quick_setup_tracks(
+                apply_client,
+                desktop_var.get() if desktop_var.get() != "(none)" else None,
+                mic_var.get() if mic_var.get() != "(none)" else None,
+                game_audio_name if game_audio_enabled else None,
+                selected_apps,
+            )
+        except Exception as exc:
+            status_label.config(text=f"Something went wrong talking to OBS: {exc}")
+            apply_client.disconnect()
+            return
+        apply_client.disconnect()
+
+        on_apply(tracks)
+        dialog.destroy()
+        summary = f"Applied {len(tracks)} track mapping(s)."
+        if created:
+            summary += f" Created new OBS sources: {', '.join(created)}."
+        messagebox.showinfo("Quick setup applied", summary, parent=parent)
+
+    button_bar = tk.Frame(dialog)
+    button_bar.pack(fill="x", padx=10, pady=10, side="bottom")
+    tk.Button(button_bar, text="Cancel", command=dialog.destroy).pack(side="right")
+    tk.Button(button_bar, text="Apply", command=do_apply).pack(side="right", padx=8)
+
+
 def build_multi_track_audio_editor(parent, initial_rows, get_ws_config):
     tk.Label(
         parent, text="Which input feeds which recording track, in the dedicated profile below", anchor="w"
@@ -1954,7 +2178,13 @@ def build_multi_track_audio_editor(parent, initial_rows, get_ws_config):
             rows.remove(entry)
 
         tk.Button(row_frame, text="Remove", command=remove).pack(side="left", padx=4)
+        entry["frame"] = row_frame
         rows.append(entry)
+
+    def clear_rows():
+        for entry in list(rows):
+            entry["frame"].destroy()
+        rows.clear()
 
     for t in initial_rows:
         add_row(t.get("input_name", ""), t.get("track", 1))
@@ -1962,7 +2192,7 @@ def build_multi_track_audio_editor(parent, initial_rows, get_ws_config):
     tk.Button(parent, text="+ Add Track Mapping", command=lambda: add_row()).pack(
         anchor="w", padx=10, pady=(4, 10)
     )
-    return rows
+    return rows, add_row, clear_rows
 
 
 def build_launcher_section(parent, row, title, launcher_config, include_install_dirs):
@@ -1982,43 +2212,59 @@ def build_launcher_section(parent, row, title, launcher_config, include_install_
     return row, {"enabled": enabled_var, "install_dirs": install_dirs_var, "exclude_keywords": exclude_var}
 
 
-def open_config_editor_window(editor_state, restart_callback):
-    if editor_state.get("open"):
-        logging.info("Settings editor is already open.")
-        return
-    editor_state["open"] = True
+EDITOR_STUCK_TIMEOUT_SECONDS = 300
 
-    def run():
-        previous_default_root = tk._default_root
+
+def open_config_editor_window(editor_state, restart_callback, overlay_state):
+    if editor_state.get("open"):
+        if time.time() - editor_state.get("opened_at", 0) < EDITOR_STUCK_TIMEOUT_SECONDS:
+            logging.info("Settings editor is already open.")
+            return
+        logging.warning(
+            "Settings editor has appeared open for over %d seconds without closing; assuming "
+            "it's stuck and allowing a new attempt.", EDITOR_STUCK_TIMEOUT_SECONDS,
+        )
+
+    overlay_root = overlay_state.get("root")
+    if not overlay_root:
+        logging.warning("Overlay isn't ready yet; can't open Settings. Try again in a moment.")
+        return
+
+    editor_state["open"] = True
+    editor_state["opened_at"] = time.time()
+
+    def on_close():
+        editor_state["open"] = False
+
+    def build():
         try:
-            _run_config_editor(restart_callback)
+            _run_config_editor(overlay_root, restart_callback, on_close)
         except Exception:
             logging.exception("Settings editor crashed.")
-        finally:
-            tk._default_root = previous_default_root
-            editor_state["open"] = False
+            on_close()
 
-    threading.Thread(target=run, daemon=True).start()
+    # Runs the whole editor (window construction, and everything that happens on it -- Pick...
+    # dialogs, Save, etc.) as a Toplevel of the overlay's already-running interpreter, scheduled
+    # via .after() so it executes on that interpreter's own thread rather than this caller's
+    # (pystray's) thread -- Tkinter widgets need to be built on the thread that owns their
+    # interpreter's event loop. This used to spin up a second, fully independent tk.Tk() on its
+    # own thread instead; PyInstaller's bundled Tcl/Tk turned out not to reliably support that
+    # (a hang at best, a hard process crash -- the "failed to remove temp dir" message being a
+    # symptom of that abrupt exit -- at worst). One interpreter, one thread, no more of that.
+    overlay_root.after(0, build)
 
 
-def _run_config_editor(restart_callback):
+def _run_config_editor(master_root, restart_callback, on_close):
     config = load_config()
 
-    root = tk.Tk()
-
-    # The overlay thread already created its own persistent Tk() root at app startup,
-    # which tkinter keeps as the process-wide "default root". Every StringVar/BooleanVar
-    # created below without an explicit master binds to whatever _default_root is right
-    # now, not to this window's own interpreter -- so without forcing it here, every
-    # field would silently read/write the overlay's interpreter instead of this one's,
-    # and every widget would show its default (blank/unchecked) state regardless of
-    # config.json's actual values. open_config_editor_window() restores the previous
-    # default root once this window closes (even if construction raises).
-    tk._default_root = root
+    root = tk.Toplevel(master_root)
+    root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
 
     root.title("OBS Auto Recorder - Settings")
     root.geometry("620x560")
     root.minsize(520, 420)
+    root.lift()
+    root.focus_force()
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
@@ -2193,9 +2439,27 @@ def _run_config_editor(restart_callback):
             port = 4455
         return {"host": ws_host_var.get().strip() or "localhost", "port": port, "password": ws_password_var.get()}
 
+    def open_quick_setup():
+        def on_quick_setup_apply(tracks):
+            multi_track_clear_rows()
+            for t in tracks:
+                multi_track_add_row(t["input_name"], t["track"])
+            multi_track_enabled_var.set(True)
+
+        open_multi_track_quick_setup(
+            obs_tab, get_current_ws_config,
+            {"enabled": game_audio_enabled_var.get(), "input_name": game_audio_input_var.get().strip() or "Game Audio"},
+            on_quick_setup_apply,
+        )
+
+    tk.Button(obs_tab, text="Quick Setup...", command=open_quick_setup).grid(
+        row=row, column=0, sticky="w", padx=10, pady=(0, 6)
+    )
+    row += 1
+
     multi_track_list_frame = tk.Frame(obs_tab)
     multi_track_list_frame.grid(row=row, column=0, columnspan=3, sticky="we")
-    multi_track_rows = build_multi_track_audio_editor(
+    multi_track_rows, multi_track_add_row, multi_track_clear_rows = build_multi_track_audio_editor(
         multi_track_list_frame, multi_track_config.get("tracks", []), get_current_ws_config
     )
     row += 1
@@ -2488,8 +2752,6 @@ def _run_config_editor(restart_callback):
     tk.Button(button_bar, text="Save", command=lambda: do_save(False)).pack(side="right", padx=8)
     tk.Button(button_bar, text="Save and Restart", command=lambda: do_save(True)).pack(side="right")
 
-    root.mainloop()
-
 
 def main():
     config = load_config()
@@ -2527,16 +2789,27 @@ def main():
     def do_restart():
         logging.info("Restarting app to apply updated settings.")
         try:
+            # A frozen build's PyInstaller runtime hook points TCL_LIBRARY/TK_LIBRARY at *this*
+            # process's onefile extraction folder (sys._MEIPASS). subprocess.Popen inherits the
+            # environment by default, so without stripping these, the relaunched child starts
+            # out pointed at a temp folder that gets deleted the moment this process exits --
+            # its own copy of that same runtime hook only overwrites them if its own extraction
+            # folder already exists at that point, so the stale inherited value can win the
+            # race and crash Tk() with a "can't find init.tcl" error. Dropping them here forces
+            # the child to always compute its own, regardless of that timing.
+            env = os.environ.copy()
+            env.pop("TCL_LIBRARY", None)
+            env.pop("TK_LIBRARY", None)
             if getattr(sys, "frozen", False):
-                subprocess.Popen([sys.executable], cwd=SCRIPT_DIR)
+                subprocess.Popen([sys.executable], cwd=SCRIPT_DIR, env=env)
             else:
-                subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=SCRIPT_DIR)
+                subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=SCRIPT_DIR, env=env)
         except Exception:
             logging.exception("Failed to relaunch after config save.")
         stop_event.set()
 
     def on_edit_settings(icon, menu_item):
-        open_config_editor_window(editor_state, do_restart)
+        open_config_editor_window(editor_state, do_restart, overlay_state)
 
     def on_open_recordings_folder(icon, menu_item):
         client = runtime_state.get("obs_client")

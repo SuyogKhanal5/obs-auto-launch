@@ -175,6 +175,14 @@ def build_config(template, obs_path, password, options):
     config["obs"]["multi_track_audio"]["enabled"] = options["multi_track_audio"]
     if options["output_folder"]:
         config["obs"]["output_folder"] = options["output_folder"]
+    config["obs"]["game_audio_capture"]["enabled"] = options["game_audio_isolation"]
+    config["obs"]["replay_buffer"]["enabled"] = options["replay_buffer"]
+    config["disk_space_guard"]["enabled"] = options["disk_space_guard"]
+    if options["disk_space_guard_min_gb"]:
+        try:
+            config["disk_space_guard"]["minimum_free_gb"] = float(options["disk_space_guard_min_gb"])
+        except ValueError:
+            pass
     return config
 
 
@@ -436,21 +444,69 @@ def main():
         variable=folders_var, bg=PAGE_BG,
     ).pack(anchor="w", pady=4)
 
+    # ---------- Advanced (optional, skippable) ----------
+    advanced_page = page_frame()
+    register("advanced", advanced_page)
+    heading(advanced_page, "Advanced options (optional)")
+    body_text(
+        advanced_page,
+        "Everything here is off by default and fine to leave alone — skip straight to Install if "
+        "you don't need any of it. All of it can be turned on later from the app's Settings too.",
+    )
+    skip_advanced_link = tk.Label(
+        advanced_page, text="Skip this page \u2192", bg=PAGE_BG, fg="#2563eb",
+        font=("Segoe UI", 10, "underline"), cursor="hand2",
+    )
+    skip_advanced_link.pack(anchor="w", pady=(0, 10))
+
     multi_track_var = tk.BooleanVar(value=False)
     tk.Checkbutton(
-        options_page, text="Record mic, desktop, and game audio to separate tracks (advanced)",
+        advanced_page, text="Record mic, desktop, and game audio to separate tracks",
         variable=multi_track_var, bg=PAGE_BG,
     ).pack(anchor="w", pady=4)
     tk.Label(
-        options_page,
+        advanced_page,
         text="    Uses its own dedicated OBS profile, so this never changes your existing OBS setup.",
         bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w",
     ).pack(anchor="w")
 
+    game_audio_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(
+        advanced_page, text="Isolate game audio from Discord/Spotify/etc.",
+        variable=game_audio_var, bg=PAGE_BG,
+    ).pack(anchor="w", pady=(10, 4))
     tk.Label(
-        options_page, text="Recording output folder (optional)", bg=PAGE_BG, font=("Segoe UI", 10), anchor="w",
-    ).pack(anchor="w", pady=(12, 2))
-    output_folder_row = tk.Frame(options_page, bg=PAGE_BG)
+        advanced_page,
+        text="    Requires an Application Audio Capture source named \"Game Audio\" in OBS — add "
+        "one now or later; this just tells the app to use it once it's there.",
+        bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w", justify="left", wraplength=490,
+    ).pack(anchor="w")
+
+    replay_buffer_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(
+        advanced_page, text="Start OBS's replay buffer alongside recording",
+        variable=replay_buffer_var, bg=PAGE_BG,
+    ).pack(anchor="w", pady=(10, 4))
+    tk.Label(
+        advanced_page,
+        text="    Configure the buffer's length and save location in OBS's own Settings \u2192 Output.",
+        bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w",
+    ).pack(anchor="w")
+
+    disk_guard_var = tk.BooleanVar(value=False)
+    disk_guard_row = tk.Frame(advanced_page, bg=PAGE_BG)
+    disk_guard_row.pack(fill="x", pady=(10, 0))
+    tk.Checkbutton(
+        disk_guard_row, text="Don't start recording if free disk space is below", variable=disk_guard_var, bg=PAGE_BG,
+    ).pack(side="left")
+    disk_guard_min_gb_var = tk.StringVar(value="")
+    tk.Entry(disk_guard_row, textvariable=disk_guard_min_gb_var, width=5).pack(side="left", padx=(4, 4))
+    tk.Label(disk_guard_row, text="GB (blank = 10)", bg=PAGE_BG).pack(side="left")
+
+    tk.Label(
+        advanced_page, text="Recording output folder", bg=PAGE_BG, font=("Segoe UI", 10), anchor="w",
+    ).pack(anchor="w", pady=(14, 2))
+    output_folder_row = tk.Frame(advanced_page, bg=PAGE_BG)
     output_folder_row.pack(fill="x")
     output_folder_var = tk.StringVar(value="")
     tk.Entry(output_folder_row, textvariable=output_folder_var, width=44).pack(side="left", fill="x", expand=True)
@@ -462,7 +518,7 @@ def main():
 
     tk.Button(output_folder_row, text="Browse...", command=browse_output_folder).pack(side="left", padx=(8, 0))
     tk.Label(
-        options_page, text="    Leave blank to use OBS's own recording folder setting.",
+        advanced_page, text="    Leave blank to use OBS's own recording folder setting.",
         bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w",
     ).pack(anchor="w")
 
@@ -520,7 +576,7 @@ def main():
     launch_check.pack(anchor="w", pady=(8, 0))
 
     # ---------- Navigation ----------
-    order = ["welcome", "location", "obs", "options", "ready", "finish"]
+    order = ["welcome", "location", "obs", "options", "advanced", "ready", "finish"]
     current = {"index": 0, "install_dir": DEFAULT_INSTALL_DIR, "on_existing": False}
 
     back_btn = tk.Button(nav, text="< Back")
@@ -559,6 +615,10 @@ def main():
             "per_game_folders": folders_var.get(),
             "multi_track_audio": multi_track_var.get(),
             "output_folder": output_folder_var.get().strip(),
+            "game_audio_isolation": game_audio_var.get(),
+            "replay_buffer": replay_buffer_var.get(),
+            "disk_space_guard": disk_guard_var.get(),
+            "disk_space_guard_min_gb": disk_guard_min_gb_var.get().strip(),
         }
 
     def go_to_index(index):
@@ -723,6 +783,7 @@ def main():
     different_folder_btn.config(command=on_different_folder_clicked)
     back_btn.config(command=go_back)
     next_btn.config(command=go_next)
+    skip_advanced_link.bind("<Button-1>", lambda _event: go_to_index(order.index("ready")))
 
     def finish():
         if launch_var.get() and current["install_dir"]:
