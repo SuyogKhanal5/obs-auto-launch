@@ -24,20 +24,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 
-      - name: Build exe
+      - name: Build app exe
         run: pyinstaller --onefile --noconsole --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
 
-      - name: Upload build artifact
+      - name: Build installer exe
+        # --add-data source paths are resolved relative to --specpath, not the working
+        # directory, so they must be absolute here.
+        run: pyinstaller --onefile --noconsole --uac-admin --name OBSAutoRecorderInstaller --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}\dist\OBSAutoRecorder.exe;." --add-data "${{ github.workspace }}\config.example.json;." installer.py
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: OBSAutoRecorder
-          path: dist/OBSAutoRecorder.exe
+          path: |
+            dist/OBSAutoRecorder.exe
+            dist/OBSAutoRecorderInstaller.exe
 
       - name: Create versioned GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/OBSAutoRecorder.exe config.example.json --title "${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.exe config.example.json --title "${{ github.ref_name }}" --generate-notes
 
       - name: Publish rolling "latest" build (main branch)
         if: github.ref == 'refs/heads/main'
@@ -48,7 +55,7 @@ jobs:
           git tag -f latest
           git push origin latest --force
           gh release delete latest --yes || true
-          gh release create latest dist/OBSAutoRecorder.exe config.example.json \
+          gh release create latest dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.exe config.example.json \
             --title "Latest build (main)" \
             --notes "Automatically built from the latest commit on main (${{ github.sha }}). May be less stable than a tagged release." \
             --prerelease

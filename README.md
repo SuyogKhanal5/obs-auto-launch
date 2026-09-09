@@ -23,20 +23,37 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - Built-in GUI settings editor (tray icon → **Edit Settings...**) for every `config.json` option — no manual JSON editing required (see [Optional: settings editor](#optional-settings-editor))
 - Optional floating always-on-top overlay, pinned to any monitor of your choice via the tray icon's right-click menu, showing the same status color
 - Packaged as a single standalone `OBSAutoRecorder.exe` so it's easy to identify and kill in Task Manager (not a generic `python.exe`/`pythonw.exe` process)
+- A plain-language installer (`OBSAutoRecorderInstaller.exe`) for non-technical users: picks an install folder, finds (or lets you browse to) OBS, offers a few simple preferences, optionally creates a desktop icon and/or sets up auto-start, and even tries to configure OBS's WebSocket server for you automatically — see [Quick install](#quick-install-recommended)
 
 ## Requirements
 
 - Windows 10/11
-- [OBS Studio](https://obsproject.com/) with the built-in WebSocket server (OBS 28+)
-- Python 3.10+ (only needed if you want to run from source or build the `.exe` yourself — not needed to use the [prebuilt releases](../../releases/latest))
+- [OBS Studio](https://obsproject.com/) with the built-in WebSocket server (OBS 28+) — doesn't need to be installed before you run the installer, just before you actually want to record
+- Python 3.10+ (only needed if you want to run from source or build the exes yourself — not needed to use the [prebuilt releases](../../releases/latest))
 
-## Setup
+## Quick install (recommended)
+
+For most people, this is the whole setup:
+
+1. Download **`OBSAutoRecorderInstaller.exe`** from the [Releases page](../../releases/latest) and run it.
+2. Click through the wizard — pick where to install (defaults to Program Files), it'll try to find OBS Studio automatically, and offers a few plain-language yes/no preferences (all changeable later).
+3. Click Install, then Finish.
+
+That's it — no editing files, no copying passwords by hand. The installer even tries to configure OBS's WebSocket server for you automatically (if OBS has been run at least once already); if it can't, it'll tell you the one manual step left and the password to use.
+
+Running the installer again later lets you update or uninstall — it detects an existing install and asks which you want, and an update never touches your existing settings.
+
+Everything below is for people who want more control: building from source, installing by hand, or understanding every `config.json` option (the same options are also available from the app's own **Edit Settings...** tray menu once it's running).
+
+## Manual setup
 
 ### 1. Enable OBS WebSocket
 
 In OBS: **Tools → WebSocket Server Settings**
 - Enable WebSocket server
 - Note the **port** (default `4455`) and set/copy the **password**
+
+(The installer above tries to do this step for you automatically — only needed if you're setting up by hand, or the automatic step couldn't find OBS's config.)
 
 ### 2. Configure
 
@@ -116,7 +133,7 @@ Editing `config.json` never requires rebuilding `OBSAutoRecorder.exe` — it's a
 
 ### 3. Get the app running
 
-**Option A — use the prebuilt exe**: download `OBSAutoRecorder.exe` from the [Releases page](../../releases/latest) and run it. No Python needed.
+**Option A — use the prebuilt exe directly** (no installer, e.g. for a portable/USB setup): download `OBSAutoRecorder.exe` from the [Releases page](../../releases/latest), put it in its own folder alongside a `config.json` (see step 2), and run it. No Python needed.
 
 **Option B — build it yourself**:
 
@@ -127,19 +144,28 @@ pyinstaller --onefile --noconsole --name OBSAutoRecorder --distpath . --workpath
 
 This produces `OBSAutoRecorder.exe` in the project folder, alongside `config.json` (it reads config from its own directory). Rebuild any time you change `autostart_script.py`.
 
-A GitHub Actions workflow ([.github/workflows/build-release.yml](.github/workflows/build-release.yml)) does this automatically:
-- Pushing a `vX.Y.Z` tag builds the exe and publishes it, alongside `config.example.json`, as a new versioned GitHub Release.
-- Every push to `main` builds the exe and republishes it to a rolling [`latest`](../../releases/tag/latest) pre-release, so the newest code is always available even between tagged versions. The [Releases page](../../releases/latest) itself still points at the newest *tagged* release, since the rolling build is marked as a pre-release.
+To also build the installer (`OBSAutoRecorderInstaller.exe`), build the app exe first as above, then:
 
-You can also run it directly without building, for testing:
+```
+pyinstaller --onefile --noconsole --uac-admin --name OBSAutoRecorderInstaller --distpath . --workpath build --specpath build --add-data "<full path to OBSAutoRecorder.exe>;." --add-data "<full path to config.example.json>;." installer.py
+```
+
+The `--add-data` source paths must be absolute (PyInstaller resolves relative ones against `--specpath`, not your working directory). `--uac-admin` makes the installer prompt for admin rights on launch, needed for its default install location (Program Files).
+
+A GitHub Actions workflow ([.github/workflows/build-release.yml](.github/workflows/build-release.yml)) does all of this automatically:
+- Pushing a `vX.Y.Z` tag builds both exes and publishes them, alongside `config.example.json`, as a new versioned GitHub Release.
+- Every push to `main` builds both exes and republishes them to a rolling [`latest`](../../releases/tag/latest) pre-release, so the newest code is always available even between tagged versions. The [Releases page](../../releases/latest) itself still points at the newest *tagged* release, since the rolling build is marked as a pre-release.
+
+You can also run either one directly without building, for testing:
 
 ```
 python autostart_script.py
+python installer.py
 ```
 
 ### 4. Run automatically at login
 
-Easiest: right-click the tray icon → **Edit Settings...** → General tab → check **Launch automatically when Windows starts**, then **Save**. This adds/removes a shortcut in your Startup folder for you (only available when running the built `.exe`, not `python autostart_script.py`).
+If you used the installer, you already chose this on the Install location page. To change it later: right-click the tray icon → **Edit Settings...** → General tab → check/uncheck **Launch automatically when Windows starts**, then **Save**. This adds/removes a shortcut in your Startup folder for you (only available when running the built `.exe`, not `python autostart_script.py`).
 
 To do it by hand instead:
 
@@ -258,3 +284,4 @@ Setting `notifications.enabled` to `true` shows a Windows toast notification (vi
 - GOG Galaxy auto-detection reads from the registry, so a game only shows up once it's been installed at least once through GOG Galaxy.
 - Battle.net auto-detection requires manually configuring `battlenet.install_dirs` — there's no manifest or shared install root to read automatically.
 - The silent-recording check only looks at OBS's own input audio meters; if a source is capturing audio but OBS itself reports zero level (e.g. a genuinely misconfigured capture), it'll correctly flag as silent, but it can't detect audio that's present but wrong (e.g. a completely different application's audio).
+- The installer's automatic OBS WebSocket configuration only works if OBS has been run at least once already (so its settings folder exists) and isn't currently running at install time; otherwise the installer falls back to showing you the password to paste in manually. It also only writes to OBS's *default* settings profile.
