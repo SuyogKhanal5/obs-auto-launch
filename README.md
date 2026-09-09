@@ -20,7 +20,7 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - Detects a hung OBS (process running but its WebSocket stops responding) or a memory-bloated idle OBS, and automatically kills and relaunches it instead of silently failing to record
 - Optionally repoints an OBS Application Audio Capture source at each detected game, to isolate its audio from Discord/Spotify/etc. (see [Optional: isolate game audio](#optional-isolate-game-audio))
 - Optional multi-track audio: routes mic/desktop/game audio (or any inputs you pick) to separate recording tracks for editing later, entirely inside its own dedicated OBS profile so your existing profile is never touched (see [Optional: multi-track audio](#optional-multi-track-audio))
-- System tray icon showing live status (gray = watching, red = recording, gold = recording file just split, orange = internal error or OBS recovery in progress — check the log), plus shortcuts to open the recordings folder and log file
+- System tray icon showing live status (gray = watching, red = recording, green = recording file just split, orange = internal error or OBS recovery in progress — check the log), plus shortcuts to open the recordings folder and log file
 - Built-in GUI settings editor (tray icon → **Edit Settings...**) for every `config.json` option — no manual JSON editing required (see [Optional: settings editor](#optional-settings-editor))
 - Optional floating always-on-top overlay, pinned to any monitor of your choice via the tray icon's right-click menu, showing the same status color
 - Packaged as a single standalone `OBSAutoRecorder.exe` so it's easy to identify and kill in Task Manager (not a generic `python.exe`/`pythonw.exe` process)
@@ -219,7 +219,7 @@ Instead of hand-editing `config.json`, right-click the tray icon → **Edit Sett
 - List-like fields (exclude keywords, install folders, launch args) are entered comma-separated; `ffmpeg` arguments are space-separated.
 - On the Watched Games tab, **Pick Running...** opens a filterable list of currently running process names to add from, instead of typing an exact exe name from memory — processes already in your watched list are shown greyed out with an "(already watching)" marker. The same picker is available per-row on the window-title rules.
 - Also on the Watched Games tab, **Common Games...** opens a filterable list of popular games (League of Legends, Valorant, Wizard101, Warframe, Fortnite, Minecraft, etc.) to add with one click, without needing to have the game running first — useful for games this app's launcher auto-detection can't see (e.g. Riot's client) or that need a window-title rule (Minecraft: Java Edition). Not exhaustive; anything not listed can still be added via **Pick Running...** or by typing the exe name in by hand.
-- On the OBS tab's Multi-Track Audio section, **Pick...** (per row) connects to OBS live with whatever WebSocket settings are currently in the form and lists its actual current inputs to choose from, instead of typing a name from memory.
+- On the OBS tab's Multi-Track Audio section, **Pick...** (per row) connects to OBS live with whatever WebSocket settings are currently in the form and lists its actual current inputs to choose from, instead of typing a name from memory — each one is shown with its kind (e.g. "Scarlet — Microphone/Aux", "Discord — Application Audio Capture") so you can tell multiple similarly-named devices apart, such as two microphones, when deciding which one to route.
 
 The editor always reloads `config.json` fresh when opened and only overwrites the fields shown in the form, so any advanced/unlisted key you've hand-added is left untouched.
 
@@ -259,17 +259,19 @@ Setup:
 
 Input names must match an existing OBS input exactly (case-sensitive) — use the settings editor's **Pick...** button per row to choose from OBS's actual current inputs instead of typing one from memory. An input that doesn't exist yet (e.g. you haven't set up [game audio isolation](#optional-isolate-game-audio)) is skipped with a warning in the log rather than blocking recording — add it whenever you're ready and it'll pick it up on the next recording start.
 
+The same input can appear more than once, on different tracks (e.g. a mic on both a "mic only" track and a combined "everything" track), and multiple inputs can share the same track number to get mixed together on it (e.g. two music sources both on track 5) — list as many rows per input as you need.
+
 What this changes, all scoped to the dedicated profile only:
 
 - **Output Mode** is switched to **Advanced** if it wasn't already — OBS only supports recording multiple audio tracks into one file in Advanced mode. If your original profile used Simple mode, the dedicated profile falls back to OBS's default Advanced-mode encoder settings; fine-tune quality/bitrate in OBS's Settings → Output while `"OBS Auto Recorder"` is the active profile if needed.
 - The recording's enabled tracks are set to match whichever track numbers you've used.
-- Each listed input's own track routing is set so it feeds *only* the track(s) you assigned it — nothing is left multiplexed onto every track by default.
+- Each listed input's own track routing is set so it feeds *only* the track(s) you assigned it — nothing is left multiplexed onto every track by default. Any other Desktop Audio/microphone/Application Audio Capture input in the scene collection that *isn't* listed has its track routing cleared too, so removing a row here actually takes effect in OBS instead of leaving its old routing in place.
 
 **Recording format**: your existing format/container choice is carried over as-is and never forced — this feature works with whichever one you use. That said, only some formats have reliably embedded every enabled track in every OBS version; **MKV** is the one that always has. If you use a different format (MP4, MOV, etc.) and only see one audio track in the finished file, switch this profile's Recording Format to MKV in OBS's Settings → Output. The log also warns about this the first time it detects a format outside the reliable set.
 
 ## Optional: split recording files
 
-You can optionally enable OBS's file-splitting so a long session isn't stuck in one giant file. Once set up, your existing **Split Recording File** hotkey can be used while in-game to split off a new file at any time — the tray icon (and overlay, if enabled) will flash gold for a few seconds each time a split happens.
+You can optionally enable OBS's file-splitting so a long session isn't stuck in one giant file. Once set up, your existing **Split Recording File** hotkey can be used while in-game to split off a new file at any time — the tray icon (and overlay, if enabled) will flash green for a few seconds each time a split happens.
 
 - **Manual**: OBS Settings → Hotkeys → set a **Split Recording File** hotkey. Files from a manual split are renamed with a `Split N` tag (e.g. `Game - Split 1 - filename.mp4`), and if any manual split happened during the session, the final segment gets a `Split N` tag too.
 - **Automatic**: OBS Settings → Output (Advanced mode) → Recording → enable **Automatically split file**, with a time or size limit.

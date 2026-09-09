@@ -60,7 +60,7 @@ class LineCappedFileHandler(logging.Handler):
 
 IDLE_COLOR = (90, 90, 90, 255)
 RECORDING_COLOR = (220, 30, 30, 255)
-SPLIT_COLOR = (255, 210, 0, 255)
+SPLIT_COLOR = (34, 197, 94, 255)
 ERROR_COLOR = (230, 160, 20, 255)
 SPLIT_FLASH_SECONDS = 5
 
@@ -946,10 +946,23 @@ def sync_multi_track_output_settings(client, entries, profile_name):
     return True
 
 
+# Input kinds whose track routing this feature manages. Used to clear stale routing left over
+# on an input that used to be listed in obs.multi_track_audio.tracks and no longer is -- without
+# this, removing a mapping in Settings has no effect in OBS, since SetInputAudioTracks is only
+# ever called for inputs actually listed. Deliberately narrow (not every input kind) so a device
+# with no business being track-routed (e.g. a pure video source) is never touched.
+AUDIO_TRACK_MANAGED_KINDS = {
+    "wasapi_output_capture",  # Desktop Audio
+    "wasapi_input_capture",  # Mic/Aux and other microphone devices
+    "wasapi_process_output_capture",  # Application Audio Capture (Discord, Spotify, browsers, ...)
+}
+
+
 def apply_multi_track_routing(client, entries):
     """Routes each configured input to exactly the track(s) listed for it, clearing any track
     not listed -- read-modify-write against GetInputAudioTracks so we never guess at the shape
-    of tracks we're not touching."""
+    of tracks we're not touching. Also clears routing on any other audio-capable input in the
+    scene collection that isn't listed at all, so removing a mapping actually takes effect."""
     by_input = {}
     for name, track in entries:
         by_input.setdefault(name, set()).add(track)
@@ -972,6 +985,29 @@ def apply_multi_track_routing(client, entries):
             logging.info("Routed audio input '%s' to track(s) %s.", input_name, sorted(desired_tracks))
         except Exception as exc:
             logging.warning("Could not set audio track routing for input '%s': %s", input_name, exc)
+
+    try:
+        all_inputs = client.get_input_list().inputs
+    except Exception as exc:
+        logging.warning("Could not list OBS inputs to clear stale track routing: %s", exc)
+        return
+
+    cleared = {str(i): False for i in range(1, 7)}
+    for input_info in all_inputs:
+        name = input_info.get("inputName")
+        if not name or name in by_input or input_info.get("inputKind") not in AUDIO_TRACK_MANAGED_KINDS:
+            continue
+        try:
+            current = client.get_input_audio_tracks(name).input_audio_tracks
+        except Exception:
+            continue
+        if not any(current.values()):
+            continue
+        try:
+            client.set_input_audio_tracks(name, cleared)
+            logging.info("Cleared stale track routing on '%s' (no longer in multi_track_audio.tracks).", name)
+        except Exception as exc:
+            logging.warning("Could not clear stale track routing on '%s': %s", name, exc)
 
 
 def sync_multi_track_audio(client, multi_track_config):
@@ -1244,10 +1280,11 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     set_status(icon, status, "Watching")
 
     obs_client = None
+    obs_event_client = None
     active_name = None
     active_pid = None
     active_display_name = None
-    obs_recovery_state = {"last_attempt": 0}
+    obs_recovery_state = {"last_attempt": 0, "last_start_failure": 0}
 
     while not stop_event.is_set():
         processes = get_running_processes()
@@ -1295,8 +1332,29 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                     stop_event.wait(poll_interval)
                     continue
 
+                now = time.time()
+                if now - obs_recovery_state["last_start_failure"] < get_obs_recovery_cooldown_seconds(obs_config):
+                    stop_event.wait(poll_interval)
+                    continue
+
                 logging.info("Detected watched game: %s", exe or name)
-                # obs_event_client is unused directly; kept referenced so its listener thread isn't GC'd.
+                # A previous attempt this session may have connected but failed to start
+                # recording (e.g. OBS was slow to respond) -- disconnect it before reconnecting
+                # instead of leaking it. obsws_python's EventClient in particular keeps a
+                # background thread blocked on recv() alive for as long as it's connected, so
+                # retrying every poll without this would pile up leaked connections/threads on
+                # every failed attempt for as long as the game stays open, eventually bogging
+                # OBS down for real.
+                if obs_client:
+                    try:
+                        obs_client.disconnect()
+                    except Exception:
+                        pass
+                if obs_event_client:
+                    try:
+                        obs_event_client.disconnect()
+                    except Exception:
+                        pass
                 obs_client, obs_event_client = ensure_obs_ready(
                     config, processes, icon, status, audio_state, recording_state, obs_recovery_state
                 )
@@ -1313,6 +1371,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                     if replay_buffer_config.get("enabled"):
                         start_replay_buffer(obs_client)
                 else:
+                    obs_recovery_state["last_start_failure"] = now
                     logging.error("Could not get OBS ready to record; will keep retrying while %s runs.", exe or name)
                     status["text"] = "Error - OBS unreachable, see log"
                     icon.title = "OBS Auto Recorder - Error, OBS unreachable"
@@ -1779,6 +1838,21 @@ def build_watched_windows_editor(parent, initial_rows):
     return rows, add_row
 
 
+# Friendly labels for OBS's audio-relevant input kinds, shown in the input picker so multiple
+# similarly-named devices (e.g. two microphones) can actually be told apart when picking one --
+# raw kind strings like "wasapi_input_capture" mean nothing to most users. Anything not listed
+# here just falls back to showing its raw kind string.
+INPUT_KIND_LABELS = {
+    "wasapi_output_capture": "Desktop Audio",
+    "wasapi_input_capture": "Microphone/Aux",
+    "wasapi_process_output_capture": "Application Audio Capture",
+    "dshow_input": "Video Capture Device",
+    "browser_source": "Browser Source",
+    "ffmpeg_source": "Media Source",
+    "vlc_source": "Media Source (VLC)",
+}
+
+
 def open_obs_input_picker(parent, get_ws_config, on_pick):
     """Connects to OBS with whatever WebSocket settings are currently in the form (not
     necessarily saved yet) and lets the user pick an existing input by name, instead of typing
@@ -1801,7 +1875,8 @@ def open_obs_input_picker(parent, get_ws_config, on_pick):
         return
 
     try:
-        inputs = sorted({i["inputName"] for i in client.get_input_list().inputs}, key=str.lower)
+        by_name = {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
+        inputs = sorted(by_name.items(), key=lambda kv: kv[0].lower())
     except Exception as exc:
         messagebox.showwarning("Can't list OBS inputs", str(exc), parent=parent)
         return
@@ -1816,7 +1891,7 @@ def open_obs_input_picker(parent, get_ws_config, on_pick):
 
     picker = tk.Toplevel(parent)
     picker.title("Pick OBS Input")
-    picker.geometry("320x380")
+    picker.geometry("360x380")
     picker.transient(parent.winfo_toplevel())
     picker.grab_set()
 
@@ -1827,13 +1902,13 @@ def open_obs_input_picker(parent, get_ws_config, on_pick):
     scrollbar.config(command=listbox.yview)
     listbox.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
-    for name in inputs:
-        listbox.insert("end", name)
+    for name, kind in inputs:
+        listbox.insert("end", f"{name}  —  {INPUT_KIND_LABELS.get(kind, kind)}")
 
     def select():
         selection = listbox.curselection()
         if selection:
-            on_pick(inputs[selection[0]])
+            on_pick(inputs[selection[0]][0])
         picker.destroy()
 
     button_bar = tk.Frame(picker)
