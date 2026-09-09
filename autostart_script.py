@@ -1465,11 +1465,13 @@ def open_config_editor_window(editor_state, restart_callback):
     editor_state["open"] = True
 
     def run():
+        previous_default_root = tk._default_root
         try:
             _run_config_editor(restart_callback)
         except Exception:
             logging.exception("Settings editor crashed.")
         finally:
+            tk._default_root = previous_default_root
             editor_state["open"] = False
 
     threading.Thread(target=run, daemon=True).start()
@@ -1479,6 +1481,17 @@ def _run_config_editor(restart_callback):
     config = load_config()
 
     root = tk.Tk()
+
+    # The overlay thread already created its own persistent Tk() root at app startup,
+    # which tkinter keeps as the process-wide "default root". Every StringVar/BooleanVar
+    # created below without an explicit master binds to whatever _default_root is right
+    # now, not to this window's own interpreter -- so without forcing it here, every
+    # field would silently read/write the overlay's interpreter instead of this one's,
+    # and every widget would show its default (blank/unchecked) state regardless of
+    # config.json's actual values. open_config_editor_window() restores the previous
+    # default root once this window closes (even if construction raises).
+    tk._default_root = root
+
     root.title("OBS Auto Recorder - Settings")
     root.geometry("620x560")
     root.minsize(520, 420)
