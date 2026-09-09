@@ -27,27 +27,38 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
-      - name: Build app exe
-        run: pyinstaller --onefile --noconsole --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
+      - name: Build app (onedir)
+        # onedir, not onefile: onefile re-extracts itself to a fresh %TEMP% folder on every
+        # single launch, which antivirus real-time scanning can intermittently fail to clean up
+        # (a widely-reported PyInstaller/Defender interaction -- shows up as OBS Auto Recorder
+        # itself restarting on every settings save). Onedir runs directly from where it's
+        # installed, so that failure mode doesn't exist. Produces dist/OBSAutoRecorder/ (an exe
+        # plus an _internal/ support-files folder), not a single exe.
+        run: pyinstaller --onedir --noconsole --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
+
+      - name: Zip the app folder for direct/portable download
+        run: Compress-Archive -Path dist/OBSAutoRecorder/* -DestinationPath dist/OBSAutoRecorder.zip
 
       - name: Build installer exe
         # --add-data source paths are resolved relative to --specpath, not the working
-        # directory, so they must be absolute here.
-        run: pyinstaller --onefile --noconsole --uac-admin --name OBSAutoRecorderInstaller --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}\dist\OBSAutoRecorder.exe;." --add-data "${{ github.workspace }}\config.example.json;." installer.py
+        # directory, so they must be absolute here. The installer itself stays onefile (it's a
+        # single short-lived download-and-run, not something that relaunches itself repeatedly)
+        # and embeds the whole onedir app folder as one data resource.
+        run: pyinstaller --onefile --noconsole --uac-admin --name OBSAutoRecorderInstaller --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}\dist\OBSAutoRecorder;OBSAutoRecorder" --add-data "${{ github.workspace }}\config.example.json;." installer.py
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: OBSAutoRecorder
           path: |
-            dist/OBSAutoRecorder.exe
+            dist/OBSAutoRecorder.zip
             dist/OBSAutoRecorderInstaller.exe
 
       - name: Create versioned GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.exe config.example.json --title "${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.zip config.example.json --title "${{ github.ref_name }}" --generate-notes
 
       - name: Publish rolling "latest" build (main branch)
         if: github.ref == 'refs/heads/main'
@@ -58,7 +69,7 @@ jobs:
           git tag -f latest
           git push origin latest --force
           gh release delete latest --yes || true
-          gh release create latest dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.exe config.example.json \
+          gh release create latest dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.zip config.example.json \
             --title "Latest build (main)" \
             --notes "Automatically built from the latest commit on main (${{ github.sha }}). May be less stable than a tagged release." \
             --prerelease

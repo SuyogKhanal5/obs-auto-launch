@@ -19,7 +19,7 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - Clears OBS's "unclean shutdown" crash-recovery sentinel before launching, so a prior forced close (e.g. Task Manager, crash, power loss) doesn't pop OBS's crash dialog and stall automation
 - Detects a hung OBS (process running but its WebSocket stops responding) or a memory-bloated idle OBS, and automatically kills and relaunches it instead of silently failing to record
 - Optionally repoints an OBS Application Audio Capture source at each detected game, to isolate its audio from Discord/Spotify/etc. (see [Optional: isolate game audio](#optional-isolate-game-audio))
-- Optional multi-track audio: routes mic/desktop/game audio (or any inputs you pick) to separate recording tracks for editing later, entirely inside its own dedicated OBS profile so your existing profile is never touched (see [Optional: multi-track audio](#optional-multi-track-audio))
+- Optional multi-track audio: routes mic/desktop/game audio (or any inputs you pick) to separate recording tracks for editing later, entirely inside its own dedicated OBS profile so your existing profile is never touched — use **MKV** as the recording format if you turn this on (see [Optional: multi-track audio](#optional-multi-track-audio))
 - System tray icon showing live status (gray = watching, red = recording, green = recording file just split, orange = internal error or OBS recovery in progress — check the log), plus shortcuts to open the recordings folder and log file
 - Built-in GUI settings editor (tray icon → **Edit Settings...**) for every `config.json` option — no manual JSON editing required (see [Optional: settings editor](#optional-settings-editor))
 - Optional floating always-on-top overlay, pinned to any monitor of your choice via the tray icon's right-click menu, showing the same status color
@@ -34,17 +34,39 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 
 ## Quick install (recommended)
 
-For most people, this is the whole setup:
+This is the whole setup for most people — five minutes, no file editing, nothing to type by hand:
 
-1. Download **`OBSAutoRecorderInstaller.exe`** from the [Releases page](../../releases/latest) and run it.
-2. Click through the wizard — pick where to install (defaults to Program Files), it'll try to find OBS Studio automatically, and offers a few plain-language yes/no preferences (all changeable later). An **Advanced options** page covers multi-track audio, game audio isolation, the replay buffer, the disk space guard, and a custom recording folder — everything on it is off by default, and there's a **Skip this page** link if none of it applies to you.
-3. Click Install, then Finish.
+1. **Install OBS Studio first**, if you haven't already — [obsproject.com](https://obsproject.com/) (the installer will offer to open this page for you in step 3 if it can't find OBS). You don't need to configure anything inside it yet.
+2. Download **`OBSAutoRecorderInstaller.exe`** from the [Releases page](../../releases/latest) and run it.
+3. Click through the wizard:
+   - **Choose where to install** — the default (Program Files) is fine for almost everyone.
+   - **Locate OBS Studio** — it finds this automatically in the common install locations; if it can't, click **Browse...** and point it at `obs64.exe` (or install OBS now via the link on this page).
+   - **A few quick preferences** — plain yes/no toggles (split long recordings, delete accidental short clips, notifications, per-game folders). All changeable later.
+   - **Advanced options** — multi-track audio, game audio isolation, the replay buffer, the disk space guard, a custom recording folder. Everything here is off by default and safe to skip entirely with the **Skip this page** link — come back to it later from **Edit Settings...** once you know you want one of these.
+4. Click **Install**, then **Finish** (leave "Launch OBS Auto Recorder now" checked).
+5. **Check it worked**: launch any game installed via Steam, Epic, GOG, or the Xbox app — these are auto-detected, nothing to configure first. The tray icon should turn red within a couple of seconds, and OBS should start recording. Close the game and confirm a new recording file appears, renamed with the game's name, in OBS's recording folder. (A game from somewhere else, e.g. Riot's client or a standalone installer? Add it via **Edit Settings... → Watched Games → Common Games...** or **Pick Running...** first — see [Optional: settings editor](#optional-settings-editor).)
 
-That's it — no editing files, no copying passwords by hand. The installer even tries to configure OBS's WebSocket server for you automatically (if OBS has been run at least once already); if it can't, it'll tell you the one manual step left and the password to use.
+The installer also tries to configure OBS's WebSocket server for you automatically (needs OBS to have been run at least once already, and to not be running during install). If it can't, it tells you the one manual step left — see the [Steps to take inside OBS](#steps-to-take-inside-obs) table below for exactly what to click.
 
 Running the installer again later lets you update or uninstall — it detects an existing install and asks which you want, and an update never touches your existing settings.
 
-Everything below is for people who want more control: building from source, installing by hand, or understanding every `config.json` option (the same options are also available from the app's own **Edit Settings...** tray menu once it's running).
+Everything below is for people who want more control: what (if anything) needs setting up inside OBS itself, building from source, installing by hand, or understanding every `config.json` option (the same options are also available from the app's own **Edit Settings...** tray menu once it's running).
+
+## Steps to take inside OBS
+
+Nothing here is required for basic recording — the app auto-configures OBS's WebSocket connection for you and works out of the box. These are the *only* things you'd ever do by hand directly inside OBS itself, and only if you want the specific feature next to them:
+
+| If you want to... | Do this inside OBS |
+|---|---|
+| Just record games automatically (the basics) | Nothing — skip this whole table |
+| Fix the WebSocket connection, if the installer's auto-setup couldn't | **Tools → WebSocket Server Settings** → enable it, note the port/password. See [Enable OBS WebSocket](#1-enable-obs-websocket) |
+| [Isolate game audio](#optional-isolate-game-audio) from Discord/Spotify/etc. | Add an **Application Audio Capture** source to your scene, named e.g. `Game Audio` |
+| Use [multi-track audio](#optional-multi-track-audio) (separate audio per source) | Nothing to add manually — the **Quick Setup** wizard (in **Edit Settings...**) creates any OBS sources it needs for you. **Set your recording format to `mkv`** though (easiest: the app's own **Settings → OBS → Recording format** field, not OBS's UI — see below) |
+| Use [automatic file splitting](#optional-split-recording-files) | **Settings → Output** (Advanced mode) → **Recording** → enable **Automatically split file** |
+| Set a manual **split** hotkey instead | **Settings → Hotkeys** → set **Split Recording File** |
+| Use the [replay buffer](#optional-replay-buffer) | **Settings → Output** → **Replay Buffer** → set its length and save location |
+
+**About that MKV recommendation:** if you turn on multi-track audio, only some recording formats reliably embed *every* separate audio track in every OBS version — MKV always has. Rather than digging into OBS's own Advanced Output settings, just set this app's own `obs.recording_format` to `mkv` (**Edit Settings... → OBS tab → Recording format**, or type `mkv` directly in `config.json`) — the app applies it to OBS for you, the same way it applies the recording folder. If you skip this and only ever see one audio track in your finished recordings, this is almost certainly why.
 
 ## Manual setup
 
@@ -103,6 +125,7 @@ Edit `config.json`:
 | `obs.launch_args` | Extra command-line args OBS is launched with |
 | `obs.startup_wait_seconds` | How long to wait after launching OBS before trying to connect |
 | `obs.output_folder` | Recording output folder to enforce in OBS (created automatically if missing). Leave unset/blank to leave OBS's own recording folder setting alone |
+| `obs.recording_format` | Recording container format to enforce in OBS, using OBS's own internal format code (`mp4`, `mkv`, `mov`, `hybrid_mp4`, `fragmented_mp4`, `fragmented_mov`, `flv`, `ts`, `hls`, or any other code your OBS version supports). Leave unset/blank to leave OBS's own format setting alone |
 | `obs.websocket.host` / `port` / `password` | Must match OBS's WebSocket Server Settings |
 | `obs.auto_split.enabled` | Set to `true` if you've enabled OBS's **Automatically split file** option (see below), so its splits aren't mislabeled as manual |
 | `obs.auto_split.by` | `"time"` or `"size"` — must match what you set in OBS's automatic split setting |
@@ -138,21 +161,23 @@ Editing `config.json` never requires rebuilding `OBSAutoRecorder.exe` — it's a
 
 ### 3. Get the app running
 
-**Option A — use the prebuilt exe directly** (no installer, e.g. for a portable/USB setup): download `OBSAutoRecorder.exe` from the [Releases page](../../releases/latest), put it in its own folder alongside a `config.json` (see step 2), and run it. No Python needed.
+**Option A — use the prebuilt build directly** (no installer, e.g. for a portable/USB setup): download `OBSAutoRecorder.zip` from the [Releases page](../../releases/latest), extract it (an `OBSAutoRecorder.exe` alongside an `_internal/` folder — both need to stay together, in their own folder), add a `config.json` next to the exe (see step 2), and run it. No Python needed.
 
 **Option B — build it yourself**:
 
 ```
 pip install -r requirements.txt
-pyinstaller --onefile --noconsole --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py
+pyinstaller --onedir --noconsole --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py
 ```
 
-This produces `OBSAutoRecorder.exe` in the project folder, alongside `config.json` (it reads config from its own directory). Rebuild any time you change `autostart_script.py`.
+This produces an `OBSAutoRecorder/` folder in the project folder (an exe plus an `_internal/` support-files folder — both required, don't separate them), with `config.json` read from that same folder. Rebuild any time you change `autostart_script.py`.
 
-To also build the installer (`OBSAutoRecorderInstaller.exe`), build the app exe first as above, then:
+Built as onedir rather than onefile deliberately: a onefile exe re-extracts itself to a fresh `%TEMP%` folder on *every single launch*, and antivirus real-time scanning can intermittently fail to release a newly-extracted file in time for that folder to be cleaned up afterward — a widely-reported PyInstaller/Windows Defender interaction, not a bug specific to this app, but one this app hits particularly often since it relaunches itself on every settings save (the Settings editor's "Save and Restart", and "Restart App" from the tray menu). Onedir runs directly from wherever it's installed, so that whole failure mode doesn't exist. The tradeoff is a folder instead of a single file — the installer hides that from end users by embedding and installing the whole folder, so downloading and running `OBSAutoRecorderInstaller.exe` is still a one-file experience.
+
+To also build the installer (`OBSAutoRecorderInstaller.exe`), build the app as above, then:
 
 ```
-pyinstaller --onefile --noconsole --uac-admin --name OBSAutoRecorderInstaller --distpath . --workpath build --specpath build --add-data "<full path to OBSAutoRecorder.exe>;." --add-data "<full path to config.example.json>;." installer.py
+pyinstaller --onefile --noconsole --uac-admin --name OBSAutoRecorderInstaller --distpath . --workpath build --specpath build --add-data "<full path to the OBSAutoRecorder folder>;OBSAutoRecorder" --add-data "<full path to config.example.json>;." installer.py
 ```
 
 The `--add-data` source paths must be absolute (PyInstaller resolves relative ones against `--specpath`, not your working directory). `--uac-admin` makes the installer prompt for admin rights on launch, needed for its default install location (Program Files).
@@ -195,12 +220,12 @@ Right-click the tray icon (it may be tucked under the "show hidden icons" `^` ch
 
 - Current status (watching / recording which game)
 - **Overlay Monitor** — pick a monitor to pin a small floating color-status square to, or "Off" to disable it
-- **Show Audio Mixer Levels While Recording** — toggle live mixer levels on the overlay
+- **Show Audio Mixer Levels** — toggle live mixer levels on the overlay; connects to OBS for this whenever it's running, independent of whether a game is currently being recorded (shows "No active audio sources" only if OBS itself isn't running yet)
 - **Open Recordings Folder** — opens OBS's current recording output folder (queried live from OBS; only available once OBS has connected)
 - **Open Log File** — opens `log_file` in your default text editor
 - **Edit Settings...** — opens a GUI settings window covering every `config.json` option (watched games/windows, launchers, OBS connection, cleanup/guards, post-processing, notifications) organized into tabs, with **Save** and **Save and Restart** buttons. No manual JSON editing needed. See [Optional: settings editor](#optional-settings-editor)
 - **Save Replay Buffer** — only shown if `obs.replay_buffer.enabled` is `true`; saves the last few minutes of the replay buffer immediately
-- **Kill OBS** — force-kills any running `obs.process_name` process (e.g. if it's hung); the watcher will relaunch it the next time a watched game starts
+- **Kill OBS** / **Start OBS** — swaps between the two depending on whether OBS is currently running: force-kills it if it is (e.g. if it's hung; the watcher will relaunch it the next time a watched game starts), or launches it manually if it isn't (e.g. to use the audio mixer overlay or OBS itself without waiting for a game to be detected)
 - **Restart App** — stops any active recording cleanly, then relaunches the whole app. Same as **Save and Restart** in the settings editor, without needing to open it — useful after hand-editing `config.json`, or just to recover from a stuck state
 - **Quit** — stops any active recording cleanly, then exits
 
@@ -221,7 +246,7 @@ Both cases flash the tray icon orange and log a warning. To avoid restart loops,
 
 ## Optional: settings editor
 
-Instead of hand-editing `config.json`, right-click the tray icon → **Edit Settings...** for a tabbed GUI covering every option in this README's config table: General (including "launch at Windows startup" — see [Run automatically at login](#4-run-automatically-at-login)), Watched Games (including the window-title rules), Launchers, OBS (path, output folder, WebSocket, auto-split, health recovery, game audio, multi-track audio, replay buffer), Cleanup & Guards, and Post-Processing/Notifications.
+Instead of hand-editing `config.json`, right-click the tray icon → **Edit Settings...** for a tabbed GUI covering every option in this README's config table: General (including "launch at Windows startup" — see [Run automatically at login](#4-run-automatically-at-login)), Watched Games (including the window-title rules), Launchers, OBS (path, output folder, recording format, WebSocket, auto-split, health recovery, game audio, multi-track audio, replay buffer), Cleanup & Guards, and Post-Processing/Notifications.
 
 - **Save** writes `config.json` and closes the window, with a reminder that a restart may be necessary for some settings to take effect (config is only read at startup, so changes don't apply to the already-running watcher).
 - **Save and Restart** writes `config.json` and immediately relaunches the whole app (stops any active recording first, same as a normal Quit) so every setting takes effect right away.
@@ -251,7 +276,7 @@ Records selected OBS inputs (mic, desktop audio, isolated game audio, Discord, e
 
 **It never touches your existing OBS profile.** The first time it runs, the watcher creates a separate, dedicated OBS profile (named `obs.multi_track_audio.profile_name`, default `"OBS Auto Recorder"`) cloned from whatever profile was active at that moment — same recording folder, same quality, same file format — and only ever makes further changes inside that dedicated profile. Every time a watched game starts recording, OBS is switched into it first; your own profile(s) are left exactly as you set them up, and switching profiles doesn't touch your scenes/sources (those live in your scene collection, which is separate from profiles in OBS).
 
-**Quick setup (recommended):** in the settings editor's OBS tab → **Multi-Track Audio** → **Quick Setup...**, pick your desktop audio device and microphone from dropdowns (populated live from OBS), tick whichever common apps you use — Discord/Slack/Zoom, Spotify/Apple Music/YouTube Music, Chrome/Firefox/Edge — and click **Apply**. It creates an Application Audio Capture source in OBS for any app you picked that doesn't already have one (reusing an existing one by name instead of duplicating it), fills in the track list below with the same layout below, and turns the feature on — no hand-typing input names or track numbers. Game audio is included automatically on track 3 if [game audio isolation](#optional-isolate-game-audio) is already enabled above; anything not in the common-apps list can still be added afterward with **+ Add Track Mapping**.
+**Quick setup (recommended):** in the settings editor's OBS tab → **Multi-Track Audio** → **Quick Setup...**, pick your desktop audio device and microphone from dropdowns (populated live from OBS), tick whichever common apps you use — Discord/Slack/Zoom, Spotify/Apple Music, Chrome/Firefox/Edge — and click **Apply**. It creates an Application Audio Capture source in OBS for any app you picked that doesn't already have one (reusing an existing one by name instead of duplicating it), fills in the track list below with the same layout below, and turns the feature on — no hand-typing input names or track numbers. Game audio is included automatically on track 3 if [game audio isolation](#optional-isolate-game-audio) is already enabled above; anything not in the common-apps list can still be added afterward with **+ Add Track Mapping**. While you're on that tab, also set **Recording format** to `mkv` — see below for why.
 
 Manual setup:
 
@@ -280,7 +305,7 @@ What this changes, all scoped to the dedicated profile only:
 - The recording's enabled tracks are set to match whichever track numbers you've used.
 - Each listed input's own track routing is set so it feeds *only* the track(s) you assigned it — nothing is left multiplexed onto every track by default. Any other Desktop Audio/microphone/Application Audio Capture input in the scene collection that *isn't* listed has its track routing cleared too, so removing a row here actually takes effect in OBS instead of leaving its old routing in place.
 
-**Recording format**: your existing format/container choice is carried over as-is and never forced — this feature works with whichever one you use. That said, only some formats have reliably embedded every enabled track in every OBS version; **MKV** is the one that always has. If you use a different format (MP4, MOV, etc.) and only see one audio track in the finished file, switch this profile's Recording Format to MKV in OBS's Settings → Output. The log also warns about this the first time it detects a format outside the reliable set.
+**Recording format — use MKV.** Your existing format/container choice is carried over as-is and never forced by this feature — it works with whichever one you use — but only some formats have reliably embedded *every* enabled track in every OBS version, and **MKV** is the one that always has. Set `obs.recording_format` to `mkv` (**Edit Settings... → OBS tab → Recording format**, or directly in `config.json`) and the app applies it for you; no need to dig through OBS's own Advanced Output settings. Skip this and only ever see one audio track in your finished recordings? This is almost certainly why — the log also warns about it the first time it detects a format outside the reliable set.
 
 ## Optional: split recording files
 

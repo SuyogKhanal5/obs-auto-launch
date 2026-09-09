@@ -408,6 +408,36 @@ def clear_obs_crash_sentinel():
             pass
 
 
+def cleanup_orphaned_pyinstaller_temp_dirs():
+    """A frozen onefile build extracts to a fresh %TEMP%\\_MEI<pid> folder every launch and
+    normally deletes it again on clean exit. That delete can fail -- most commonly because
+    antivirus real-time scanning still has a newly-extracted DLL open for scanning at that exact
+    moment (a widely-reported PyInstaller/Windows Defender interaction, not specific to this
+    app) -- leaving the folder orphaned. Left unchecked these just accumulate indefinitely.
+    Only removes a folder whose PID no longer belongs to any running process (regardless of
+    which app it came from), so a still-running process's own folder is never touched."""
+    temp_dir = os.environ.get("TEMP") or os.environ.get("TMP")
+    if not temp_dir or not os.path.isdir(temp_dir):
+        return
+    removed = 0
+    try:
+        entries = os.listdir(temp_dir)
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.startswith("_MEI"):
+            continue
+        pid_part = entry[len("_MEI"):]
+        if not pid_part.isdigit() or psutil.pid_exists(int(pid_part)):
+            continue
+        entry_path = os.path.join(temp_dir, entry)
+        shutil.rmtree(entry_path, ignore_errors=True)
+        if not os.path.isdir(entry_path):
+            removed += 1
+    if removed:
+        logging.info("Cleaned up %d orphaned PyInstaller temp folder(s) from a previous run.", removed)
+
+
 STARTUP_SHORTCUT_NAME = "OBSAutoRecorder.lnk"
 
 
@@ -548,6 +578,18 @@ def reset_segment_audio_tracking(recording_state):
 def maybe_transcode(path, transcode_config):
     if transcode_config.get("enabled") and path:
         threading.Thread(target=transcode_recording, args=(path, transcode_config), daemon=True).start()
+
+
+def is_event_client_connected(event_client):
+    """Best-effort liveness check for an obsws_python EventClient -- e.g. OBS was closed while
+    the idle audio-mixer connection was open, silently dropping the socket. Used to decide
+    whether to reconnect rather than trusting a held reference forever. Assumes connected if the
+    underlying attribute can't be inspected (a version/API mismatch shouldn't itself force
+    unnecessary reconnect churn)."""
+    try:
+        return bool(event_client.base_client.ws.connected)
+    except Exception:
+        return True
 
 
 def connect_obs_events(config, icon, status, audio_state, recording_state):
@@ -710,6 +752,7 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
         return None, None
     sync_multi_track_audio(client, obs_config.get("multi_track_audio", {}))
     apply_output_folder(client, obs_config.get("output_folder"))
+    apply_recording_format(client, obs_config.get("recording_format"))
     event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
     return client, event_client
 
@@ -778,6 +821,31 @@ def apply_output_folder(client, output_folder):
         logging.info("Set OBS's recording output folder to %s", output_folder)
     except Exception as exc:
         logging.error("Could not set OBS's recording output folder to '%s': %s", output_folder, exc)
+
+
+# OBS's internal RecFormat2 codes shown in the settings editor's Recording format field. Not
+# necessarily exhaustive across every OBS version -- the field stays editable (not a locked
+# dropdown) so a value outside this list can still be typed in and used as-is.
+RECORDING_FORMAT_OPTIONS = ["mp4", "mkv", "mov", "hybrid_mp4", "fragmented_mp4", "fragmented_mov", "flv", "ts", "hls"]
+
+
+def apply_recording_format(client, recording_format):
+    """Best-effort override of OBS's recording container format for whichever profile is
+    currently active -- same precedence as apply_output_folder: an explicit
+    `obs.recording_format` always wins, including over a cloned-over value from multi-track's
+    profile setup. `recording_format` is OBS's own internal format code (e.g. "mkv", "mp4",
+    "hybrid_mp4"), not a display label -- whatever value ends up applied, the multi-track sync's
+    own format-safety warning (see MULTI_TRACK_SAFE_FORMATS) still fires against it if relevant."""
+    if not recording_format:
+        return
+    current = get_profile_parameter_value(client, "AdvOut", "RecFormat2")
+    if current == recording_format:
+        return
+    try:
+        client.set_profile_parameter("AdvOut", "RecFormat2", recording_format)
+        logging.info("Set OBS's recording format to '%s'.", recording_format)
+    except Exception as exc:
+        logging.error("Could not set OBS's recording format to '%s': %s", recording_format, exc)
 
 
 DEFAULT_MULTI_TRACK_PROFILE_NAME = "OBS Auto Recorder"
@@ -1285,11 +1353,51 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     active_pid = None
     active_display_name = None
     obs_recovery_state = {"last_attempt": 0, "last_start_failure": 0}
+    obs_running_last_known = None
 
     while not stop_event.is_set():
         processes = get_running_processes()
 
+        # pystray only rebuilds the native tray menu right after a menu item is clicked, not
+        # every time it's opened (see pystray.Icon.update_menu's docstring) -- so the tray's
+        # dynamic "Kill OBS"/"Start OBS" label would otherwise show whatever OBS's state was
+        # the last time *any* menu item was clicked, not its actual current state. Explicitly
+        # refresh whenever OBS's running state actually changes, regardless of what changed it
+        # (a watched game auto-launching it, the memory-bloat recovery restart, the user closing
+        # it by hand, or the tray button itself).
+        obs_running_now = is_obs_running(obs_config["process_name"], processes)
+        if obs_running_now != obs_running_last_known:
+            obs_running_last_known = obs_running_now
+            icon.update_menu()
+
         if active_name is None:
+            # The recording-driven obs_event_client (established below once a watched game is
+            # detected) also feeds the audio-mixer overlay, but while idle nothing has
+            # established a connection yet -- without this, the overlay would show "No active
+            # audio sources" any time OBS is merely running with nothing being recorded, even
+            # though OBS itself is live and metering fine. Only touches things while idle: once
+            # a game is detected below, that path owns obs_event_client's lifecycle exclusively.
+            if audio_state.get("enabled"):
+                if obs_event_client and not is_event_client_connected(obs_event_client):
+                    # Connection died (OBS closed/killed, including via the tray's own "Kill
+                    # OBS") -- without clearing levels here, the overlay just keeps showing
+                    # whatever it last received forever, looking exactly like a freeze instead
+                    # of reverting to "No active audio sources".
+                    obs_event_client = None
+                    audio_state["levels"] = {}
+                if not obs_event_client:
+                    if obs_running_now:
+                        obs_event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
+                    else:
+                        audio_state["levels"] = {}
+            elif obs_event_client:
+                try:
+                    obs_event_client.disconnect()
+                except Exception:
+                    pass
+                obs_event_client = None
+                audio_state["levels"] = {}
+
             memory_bytes = get_process_memory_bytes(obs_config["process_name"], processes)
             if memory_bytes > get_obs_memory_limit_bytes(obs_config):
                 now = time.time()
@@ -1505,7 +1613,12 @@ def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
             dot_window.configure(bg=color_to_hex(current_color(status)))
 
     def poll_meters():
-        show = audio_state["enabled"] and status["recording"]
+        # No longer gated on status["recording"] -- OBS streams live input levels continuously
+        # once subscribed, independent of whether a file is actually being recorded, so there's
+        # no reason to hide the overlay just because recording hasn't started (or has stopped)
+        # while OBS is still connected. Naturally shows nothing if there's no active OBS
+        # connection yet (audio_state["levels"] stays empty until one exists).
+        show = audio_state["enabled"]
         index = overlay_state["monitor_index"] if show else None
         levels = audio_state["levels"]
         row_count = max(len(levels), 1)
@@ -1964,7 +2077,10 @@ COMMON_AUDIO_APPS = [
     {"name": "Zoom", "process_name": "Zoom.exe", "category": "Voice Chat"},
     {"name": "Spotify", "process_name": "Spotify.exe", "category": "Music"},
     {"name": "Apple Music", "process_name": "AppleMusic.exe", "category": "Music"},
-    {"name": "YouTube Music", "process_name": "YouTubeMusic.exe", "category": "Music"},
+    # YouTube Music deliberately excluded: it runs as a browser tab for most people, not a
+    # standalone process, so it's already covered by the Browser category -- listing it
+    # separately either does nothing (no such process to capture) or double-captures the same
+    # audio once a browser is also selected.
     {"name": "Chrome", "process_name": "chrome.exe", "category": "Browser"},
     {"name": "Firefox", "process_name": "firefox.exe", "category": "Browser"},
     {"name": "Edge", "process_name": "msedge.exe", "category": "Browser"},
@@ -2348,6 +2464,24 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_labeled_entry(obs_tab, row, "Recording output folder (optional)", output_folder_var)
     add_browse_button(obs_tab, row, output_folder_var, mode="dir")
     row += 1
+    recording_format_var = tk.StringVar(value=obs_config.get("recording_format", "") or "")
+    tk.Label(obs_tab, text="Recording format (optional)", anchor="w").grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        obs_tab, textvariable=recording_format_var, values=RECORDING_FORMAT_OPTIONS, width=16,
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    Leave blank to use whatever OBS already has set. mkv/hybrid_mp4 are the "
+            "reliable choices if multi-track audio is on; you can also type in any other format "
+            "code OBS supports."
+        ),
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
 
     ws_config = obs_config.get("websocket", {})
     add_section_label(obs_tab, row, "WebSocket")
@@ -2624,6 +2758,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
         else:
             obs.pop("output_folder", None)
 
+        recording_format_value = recording_format_var.get().strip()
+        if recording_format_value:
+            obs["recording_format"] = recording_format_value
+        else:
+            obs.pop("recording_format", None)
+
         ws = obs.setdefault("websocket", {})
         ws["host"] = ws_host_var.get().strip() or "localhost"
         ws["port"] = read_int(ws_port_var, "WebSocket port", ws.get("port", 4455))
@@ -2770,6 +2910,7 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=handlers,
     )
+    cleanup_orphaned_pyinstaller_temp_dirs()
 
     status = {"text": "Starting...", "recording": False}
     stop_event = threading.Event()
@@ -2867,11 +3008,26 @@ def main():
     def audio_levels_checked(menu_item):
         return audio_state["enabled"]
 
-    def on_kill_obs(icon, menu_item):
-        logging.info("Kill OBS requested from tray icon.")
-        threading.Thread(
-            target=kill_process_by_name, args=(config["obs"]["process_name"],), daemon=True
-        ).start()
+    def obs_is_currently_running():
+        return is_obs_running(config["obs"]["process_name"], get_running_processes())
+
+    def obs_toggle_text(menu_item):
+        return "Kill OBS" if obs_is_currently_running() else "Start OBS"
+
+    def on_obs_toggle(icon, menu_item):
+        if obs_is_currently_running():
+            logging.info("Kill OBS requested from tray icon.")
+            # Give the overlay instant feedback instead of waiting up to one poll_interval for
+            # the watcher thread to notice the connection died -- it'll naturally stay cleared
+            # since nothing is running to feed it, until OBS (or the watcher's own idle
+            # reconnect) is back.
+            audio_state["levels"] = {}
+            threading.Thread(
+                target=kill_process_by_name, args=(config["obs"]["process_name"],), daemon=True
+            ).start()
+        else:
+            logging.info("Start OBS requested from tray icon.")
+            threading.Thread(target=launch_obs, args=(config["obs"],), daemon=True).start()
 
     def on_restart_app(icon, menu_item):
         logging.info("Restart requested from tray icon.")
@@ -2887,7 +3043,7 @@ def main():
         pystray.MenuItem(lambda item: status["text"], None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Overlay Monitor", pystray.Menu(*overlay_items)),
-        pystray.MenuItem("Show Audio Mixer Levels While Recording", toggle_audio_levels, checked=audio_levels_checked),
+        pystray.MenuItem("Show Audio Mixer Levels", toggle_audio_levels, checked=audio_levels_checked),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Open Recordings Folder", on_open_recordings_folder),
         pystray.MenuItem("Open Log File", on_open_log_file),
@@ -2899,7 +3055,7 @@ def main():
         menu_items.append(pystray.MenuItem("Save Replay Buffer", on_save_replay))
     menu_items += [
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Kill OBS", on_kill_obs),
+        pystray.MenuItem(obs_toggle_text, on_obs_toggle),
         pystray.MenuItem("Restart App", on_restart_app),
         pystray.MenuItem("Quit", on_quit),
     ]

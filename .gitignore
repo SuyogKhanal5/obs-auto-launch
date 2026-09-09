@@ -2,6 +2,7 @@ config.json
 *.log
 __pycache__/
 build/
+dist/
 *.spec
 OBSAutoRecorder.exe
 OBSAutoRecorderInstaller*.exe

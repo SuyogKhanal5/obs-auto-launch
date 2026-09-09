@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -125,6 +126,42 @@ class HasSufficientDiskSpaceTests(unittest.TestCase):
         # starts -- fail open (allow) rather than block indefinitely on a bad/missing drive.
         with patch("shutil.disk_usage", side_effect=OSError("no such drive")):
             self.assertTrue(a.has_sufficient_disk_space({"enabled": True, "minimum_free_gb": 10}, "Z:\\"))
+
+
+class CleanupOrphanedPyinstallerTempDirsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        patcher = patch.dict(os.environ, {"TEMP": self.tmpdir.name, "TMP": self.tmpdir.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_dir(self, name):
+        path = os.path.join(self.tmpdir.name, name)
+        os.mkdir(path)
+        return path
+
+    def test_removes_folder_whose_pid_is_not_running(self):
+        dead = self.make_dir("_MEI999999")
+        with patch("psutil.pid_exists", return_value=False):
+            a.cleanup_orphaned_pyinstaller_temp_dirs()
+        self.assertFalse(os.path.isdir(dead))
+
+    def test_leaves_folder_whose_pid_is_still_running(self):
+        alive = self.make_dir(f"_MEI{os.getpid()}")
+        with patch("psutil.pid_exists", return_value=True):
+            a.cleanup_orphaned_pyinstaller_temp_dirs()
+        self.assertTrue(os.path.isdir(alive))
+
+    def test_ignores_non_mei_folders(self):
+        other = self.make_dir("SomeOtherApp")
+        with patch("psutil.pid_exists", return_value=False):
+            a.cleanup_orphaned_pyinstaller_temp_dirs()
+        self.assertTrue(os.path.isdir(other))
+
+    def test_missing_temp_env_var_does_not_raise(self):
+        with patch.dict(os.environ, {}, clear=True):
+            a.cleanup_orphaned_pyinstaller_temp_dirs()  # must not raise
 
 
 if __name__ == "__main__":

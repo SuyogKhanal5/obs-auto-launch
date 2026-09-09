@@ -27,6 +27,8 @@ import psutil
 
 APP_NAME = "OBS Auto Recorder"
 EXE_NAME = "OBSAutoRecorder.exe"
+APP_FOLDER_NAME = "OBSAutoRecorder"  # onedir build folder embedded in this installer's data
+APP_INTERNAL_DIR_NAME = "_internal"  # PyInstaller onedir's support-files subfolder
 DEFAULT_INSTALL_DIR = r"C:\Program Files\OBSAutoRecorder"
 DEFAULT_OBS_PATHS = [
     r"C:\Program Files\obs-studio\bin\64bit\obs64.exe",
@@ -195,7 +197,14 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
     os.makedirs(install_dir, exist_ok=True)
 
     on_progress("Copying application files...")
-    shutil.copy2(resource_path(EXE_NAME), os.path.join(install_dir, EXE_NAME))
+    # The app ships as a PyInstaller onedir build (an exe plus an _internal/ folder of support
+    # files) rather than onefile -- deliberately, since onefile re-extracts itself to a fresh
+    # %TEMP% folder on every single launch, which antivirus real-time scanning can intermittently
+    # fail to clean up (a widely-reported PyInstaller/Defender interaction). Onedir runs directly
+    # from where it's installed, so that whole failure mode doesn't exist. Embedded here as a
+    # whole folder (APP_FOLDER_NAME) rather than a single file; dirs_exist_ok=True lets Update
+    # overwrite an existing install in place.
+    shutil.copytree(resource_path(APP_FOLDER_NAME), install_dir, dirs_exist_ok=True)
 
     password = None
     obs_ws_configured = None
@@ -244,6 +253,9 @@ def do_uninstall(install_dir, keep_config, on_progress):
             pass
 
     on_progress("Removing application files...")
+    internal_dir = os.path.join(install_dir, APP_INTERNAL_DIR_NAME)
+    if os.path.isdir(internal_dir):
+        shutil.rmtree(internal_dir, ignore_errors=True)
     for name in (EXE_NAME, "autostart_script.log"):
         try:
             path = os.path.join(install_dir, name)
