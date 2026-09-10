@@ -676,10 +676,20 @@ def connect_obs_events(config, icon, status, audio_state, recording_state):
             name = entry.get("inputName")
             if not name:
                 continue
+            # Each channel entry in inputLevelsMul is a [magnitude, peak, inputPeak]-shaped
+            # triplet (all on the same 0-1 multiplier scale, per the "Mul" in the field name) --
+            # take the max across every value in every channel rather than assuming index 1 is
+            # always the meaningful one, for whichever of the three ends up largest. An
+            # Application Audio Capture input pointed at a stale, specific window (rather than
+            # an exe-only match) can also report an empty inputLevelsMul entirely -- nothing to
+            # take a max of at all -- which looks the same in the overlay (a permanently silent
+            # row) but isn't something this parsing can fix; re-pointing the input's capture
+            # target (see set_game_audio_capture_target's exe-only pattern) is what resolves that.
             peak = 0.0
             for channel in entry.get("inputLevelsMul") or []:
-                if len(channel) >= 2:
-                    peak = max(peak, channel[1])
+                for value in channel:
+                    if isinstance(value, (int, float)) and value > peak:
+                        peak = value
             levels[name] = peak
             peak_overall = max(peak_overall, peak)
         audio_state["levels"] = levels
@@ -780,18 +790,38 @@ def start_recording(client, retries=6, delay=2):
 
 
 WINDOW_MATCH_PRIORITY_EXE_FALLBACK = 2
+OBS_RESOURCE_NOT_FOUND_CODE = 600
 
 
 def set_game_audio_capture_target(client, input_name, process_name):
+    """Points the game-audio-isolation input at the detected game's process, creating that
+    Application Audio Capture input in OBS first if it doesn't exist yet -- so obs.game_audio_capture
+    works without needing to add the OBS source by hand first, the same way the multi-track
+    quick-setup wizard self-creates sources for common apps."""
+    settings = {"window": f"::{process_name}", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}
     try:
-        client.set_input_settings(
-            input_name,
-            {"window": f"::{process_name}", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK},
-            True,
-        )
+        client.set_input_settings(input_name, settings, True)
         logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
+        return
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
+            logging.warning("Could not point '%s' audio capture at %s: %s", input_name, process_name, exc)
+            return
     except Exception as exc:
         logging.warning("Could not point '%s' audio capture at %s: %s", input_name, process_name, exc)
+        return
+
+    # Input doesn't exist yet -- create it with the target already set, instead of requiring it
+    # be added by hand in OBS first.
+    try:
+        scene = client.get_current_program_scene().current_program_scene_name
+        client.create_input(scene, input_name, "wasapi_process_output_capture", settings, True)
+        logging.info(
+            "Created Application Audio Capture input '%s' in OBS and pointed it at %s.",
+            input_name, process_name,
+        )
+    except Exception as exc:
+        logging.warning("Could not create '%s' audio capture input in OBS: %s", input_name, exc)
 
 
 def apply_output_folder(client, output_folder):

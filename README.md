@@ -18,7 +18,7 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - Optional Windows toast notifications for key events (recording started/stopped, OBS restarted, low disk space, no audio detected) via the tray icon (see [Optional: notifications](#optional-notifications))
 - Clears OBS's "unclean shutdown" crash-recovery sentinel before launching, so a prior forced close (e.g. Task Manager, crash, power loss) doesn't pop OBS's crash dialog and stall automation
 - Detects a hung OBS (process running but its WebSocket stops responding) or a memory-bloated idle OBS, and automatically kills and relaunches it instead of silently failing to record
-- Optionally repoints an OBS Application Audio Capture source at each detected game, to isolate its audio from Discord/Spotify/etc. (see [Optional: isolate game audio](#optional-isolate-game-audio))
+- Optionally isolates each detected game's audio from Discord/Spotify/etc. by repointing an OBS Application Audio Capture source at it — creating that source automatically if it doesn't exist yet (see [Optional: isolate game audio](#optional-isolate-game-audio))
 - Optional multi-track audio: routes mic/desktop/game audio (or any inputs you pick) to separate recording tracks for editing later, entirely inside its own dedicated OBS profile so your existing profile is never touched — use **MKV** as the recording format if you turn this on (see [Optional: multi-track audio](#optional-multi-track-audio))
 - System tray icon showing live status (gray = watching, red = recording, green = recording file just split, orange = internal error or OBS recovery in progress — check the log), plus shortcuts to open the recordings folder and log file
 - Built-in GUI settings editor (tray icon → **Edit Settings...**) for every `config.json` option — no manual JSON editing required (see [Optional: settings editor](#optional-settings-editor))
@@ -60,7 +60,7 @@ Nothing here is required for basic recording — the app auto-configures OBS's W
 |---|---|
 | Just record games automatically (the basics) | Nothing — skip this whole table |
 | Fix the WebSocket connection, if the installer's auto-setup couldn't | **Tools → WebSocket Server Settings** → enable it, note the port/password. See [Enable OBS WebSocket](#1-enable-obs-websocket) |
-| [Isolate game audio](#optional-isolate-game-audio) from Discord/Spotify/etc. | Add an **Application Audio Capture** source to your scene, named e.g. `Game Audio` |
+| [Isolate game audio](#optional-isolate-game-audio) from Discord/Spotify/etc. | Nothing — the app creates the Application Audio Capture source in OBS for you |
 | Use [multi-track audio](#optional-multi-track-audio) (separate audio per source) | Nothing to add manually — the **Quick Setup** wizard (in **Edit Settings...**) creates any OBS sources it needs for you. **Set your recording format to `mkv`** though (easiest: the app's own **Settings → OBS → Recording format** field, not OBS's UI — see below) |
 | Use [automatic file splitting](#optional-split-recording-files) | **Settings → Output** (Advanced mode) → **Recording** → enable **Automatically split file** |
 | Set a manual **split** hotkey instead | **Settings → Hotkeys** → set **Split Recording File** |
@@ -261,10 +261,7 @@ The editor always reloads `config.json` fresh when opened and only overwrites th
 
 ## Optional: isolate game audio
 
-If your recordings pick up Discord, Spotify, or other background app audio alongside the game, OBS's **Application Audio Capture** source can isolate just the game's audio — it captures a chosen process's audio output directly, regardless of what else is playing. This script can optionally point that source at whichever game it just detected, so you don't have to re-target it by hand every time you switch games:
-
-1. In OBS, add an **Application Audio Capture** source to your scene (any window it's currently pointed at doesn't matter — it'll be overwritten automatically), and give it a name, e.g. `Game Audio`.
-2. In `config.json`, set `obs.game_audio_capture.enabled` to `true` and `obs.game_audio_capture.input_name` to that exact name.
+If your recordings pick up Discord, Spotify, or other background app audio alongside the game, OBS's **Application Audio Capture** source can isolate just the game's audio — it captures a chosen process's audio output directly, regardless of what else is playing. This script can optionally point that source at whichever game it just detected, so you don't have to re-target it by hand every time you switch games. Just set `obs.game_audio_capture.enabled` to `true` in `config.json` (or **Edit Settings... → OBS tab → Game Audio Isolation**) — the app creates the `Game Audio` **Application Audio Capture** source in OBS for you automatically the first time it's needed, nothing to add by hand. Set `obs.game_audio_capture.input_name` if you'd rather it use a different name (e.g. because you already have a similarly-purposed source under a different one).
 
 From then on, whenever a watched game starts recording, the script repoints that source at the game's process by executable name (not by window title), so it keeps working even if the game's window title changes mid-session or it has no visible window at all.
 

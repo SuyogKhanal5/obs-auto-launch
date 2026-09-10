@@ -7,6 +7,10 @@ full reimplementation of the OBS WebSocket protocol.
 
 from types import SimpleNamespace
 
+from obsws_python.error import OBSSDKRequestError
+
+RESOURCE_NOT_FOUND_CODE = 600
+
 
 class FakeObsError(Exception):
     """Stands in for obsws_python.error.OBSSDKRequestError."""
@@ -112,8 +116,29 @@ class FakeObsClient:
         self.inputs[name]["tracks"] = dict(track)
         self.calls.append(("set_input_audio_tracks", name, dict(track)))
 
+    def get_input_settings(self, name):
+        if name not in self.inputs:
+            raise OBSSDKRequestError(
+                "GetInputSettings", RESOURCE_NOT_FOUND_CODE, f"No source was found by the name of `{name}`"
+            )
+        return SimpleNamespace(input_settings=dict(self.inputs[name].get("settings", {})))
+
+    def set_input_settings(self, name, settings, overlay):
+        if name not in self.inputs:
+            raise OBSSDKRequestError(
+                "SetInputSettings", RESOURCE_NOT_FOUND_CODE, f"No source was found by the name of `{name}`"
+            )
+        current = self.inputs[name].setdefault("settings", {})
+        if overlay:
+            current.update(settings)
+        else:
+            self.inputs[name]["settings"] = dict(settings)
+        self.calls.append(("set_input_settings", name, dict(settings), overlay))
+
     def create_input(self, sceneName, inputName, inputKind, inputSettings, sceneItemEnabled):
-        self.inputs[inputName] = {"kind": inputKind, "tracks": {str(i): False for i in range(1, 7)}}
+        self.inputs[inputName] = {
+            "kind": inputKind, "tracks": {str(i): False for i in range(1, 7)}, "settings": dict(inputSettings),
+        }
         self.calls.append(("create_input", sceneName, inputName, inputKind, inputSettings))
         return SimpleNamespace(scene_item_id=len(self.inputs))
 
