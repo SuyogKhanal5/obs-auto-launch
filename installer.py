@@ -356,7 +356,7 @@ HEADER_FG = "#ffffff"
 def main():
     root = tk.Tk()
     root.title(f"{APP_NAME} Setup")
-    root.geometry("580x480")
+    root.geometry("580x600")
     root.resizable(False, False)
 
     header = tk.Frame(root, bg=HEADER_BG, height=64)
@@ -366,13 +366,18 @@ def main():
         header, text=f"{APP_NAME} Setup", bg=HEADER_BG, fg=HEADER_FG, font=("Segoe UI", 14, "bold")
     ).pack(side="left", padx=20)
 
+    # nav is packed (side="bottom") before container so it always claims its space against the
+    # bottom edge first -- if it were packed after an expand=True container instead, a page tall
+    # enough to make container's own requested height exceed what's left over (the Advanced
+    # options page does, at ~470px) would squeeze nav down to near-zero height, hiding the
+    # Back/Next/Cancel buttons entirely with no error or indication anything was wrong.
+    nav = tk.Frame(root)
+    nav.pack(side="bottom", fill="x", padx=16, pady=12)
+
     container = tk.Frame(root, bg=PAGE_BG)
     container.pack(fill="both", expand=True)
     container.columnconfigure(0, weight=1)
     container.rowconfigure(0, weight=1)
-
-    nav = tk.Frame(root)
-    nav.pack(fill="x", padx=16, pady=12)
 
     pages = {}
 
