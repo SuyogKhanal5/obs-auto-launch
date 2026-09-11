@@ -287,6 +287,19 @@ Records selected OBS inputs (mic, desktop audio, isolated game audio, Discord, e
 
 **Quick setup (recommended):** in the settings editor's OBS tab → **Multi-Track Audio** → **Quick Setup...**, pick your desktop audio device and microphone from dropdowns (populated live from OBS), tick whichever common apps you use — Discord/Slack/Zoom, Spotify/Apple Music, Chrome/Firefox/Edge — and click **Apply**. It creates an Application Audio Capture source in OBS for any app you picked that doesn't already have one (reusing an existing one by name instead of duplicating it), fills in the track list below with the same layout below, and turns the feature on — no hand-typing input names or track numbers. Game audio is included automatically on track 3 if [game audio isolation](#optional-isolate-game-audio) is already enabled above; anything not in the common-apps list can still be added afterward with **+ Add Track Mapping**. While you're on that tab, also set **Recording format** to `mkv` — see below for why.
 
+**Recommended track layout** (this is exactly what Quick Setup builds for you):
+
+| Track | Contains |
+|---|---|
+| 1 | Desktop audio **+** microphone, combined |
+| 2 | Microphone alone |
+| 3 | Game audio (isolated) |
+| 4 | Discord / other voice chat |
+| 5 | Spotify / Apple Music |
+| 6 | Browser |
+
+The reasoning behind track 1: most media players (VLC included) default to playing a file's *first* audio track and never prompt you to pick one. Putting the full desktop+mic mix there means a quick double-click preview of a clip sounds complete and normal, exactly like a regular recording — while tracks 2-6 stay available as isolated stems for when you actually sit down to edit and want to mute/replace/rebalance one source (drop the music track, duck voice chat, re-level the mic) without re-recording anything.
+
 **If an app's isolation randomly stops working** (e.g. Discord audio bleeds into other tracks again, or its track goes silent, after having worked before): this is an OBS quirk, not something you misconfigured. A "capture this app's audio, whatever window it has" source in OBS is stored internally as an exe-only match, but OBS can silently rewrite that into a specific window's exact title the moment its Properties dialog is opened in OBS itself (even without changing anything) — and that stored title then goes stale as soon as the app's window title changes next (Discord's includes the current server/channel name, so this can happen constantly). Every app added via **Quick Setup** is automatically re-pointed back to its exe-only match at the start of every recording, so this self-heals on its own within one recording start; you never need to fix it by hand in OBS. This self-heal only covers apps added through Quick Setup, since that's the only place the app's exe name is known — an app added manually via **+ Add Track Mapping** won't get it unless you also add a matching entry to `obs.multi_track_audio.app_captures` yourself (see below).
 
 Manual setup:
@@ -328,6 +341,8 @@ What this changes, all scoped to the dedicated profile only:
 
 You can optionally enable OBS's file-splitting so a long session isn't stuck in one giant file. Once set up, a split can be triggered while in-game to split off a new file at any time — the tray icon (and overlay, if enabled) will flash green for a few seconds each time a split happens.
 
+**About OBS's "Automatically split file" checkbox:** despite the name, this is OBS's master switch for split support generally — even a purely manual split (OBS's own hotkey, this app's tray item, or a custom keybind) fails with `OBSSDKRequestError: ... code 702` unless it's ticked in OBS's own Settings → Output (Advanced mode) → Recording. The tray item and custom keybinds below tick it for you automatically the moment they're used, so nothing to set up by hand for those. **OBS's own hotkey is the one exception**: this app has no way to intercept that path, so if you only ever use OBS's native Split Recording File hotkey (never the tray item or a custom keybind), you'll still need to tick this checkbox yourself once — the time/size fields next to it can stay at whatever OBS defaults to, they're irrelevant unless you also want [automatic splitting](#optional-split-recording-files) itself.
+
 - **Manual, via OBS's own hotkey**: OBS Settings → Hotkeys → set a **Split Recording File** hotkey. Files from a manual split are renamed with a `Split N` tag (e.g. `Game - Split 1 - filename.mp4`), and if any manual split happened during the session, the final segment gets a `Split N` tag too.
 - **Manual, via this app's tray menu**: set `obs.manual_split.enabled` to `true` (**Edit Settings... → OBS tab → Manual Split**) to add a **Split Recording File** tray item, so you don't need to bind or remember an OBS hotkey at all. `obs.manual_split.buffer_seconds` (default `0`) delays the actual split by that many seconds after clicking — the wait happens in this app, not in OBS, so it's independent of any hotkey. Files from this kind of split get the same `Split N` tag treatment as a hotkey-triggered manual split.
 - **Manual, via a custom keybind**: add a **Split Recording File** entry in [Custom Keybinds](#optional-custom-keybinds) for a system-wide key combo that splits immediately (also honoring `obs.manual_split.buffer_seconds`), without opening the tray menu or touching OBS's Hotkeys settings at all.
@@ -337,7 +352,7 @@ OBS's WebSocket API doesn't report *why* a file split happened, so the script ca
 
 ## Optional: custom keybinds
 
-**Edit Settings... → Custom Keybinds** lets you set your own system-wide key combos (e.g. `Ctrl+Alt+S`) that call an OBS action directly over the WebSocket the instant they're pressed — Split Recording File, Save/Start/Stop/Toggle Replay Buffer, Start/Stop/Toggle Recording, Pause/Resume/Toggle Recording Pause, or Toggle Mute for a named input. Each row has an on/off checkbox, an action dropdown, Ctrl/Alt/Shift/Win modifier checkboxes, a key (0-9, A-Z, or F1-F12), and a Param field (only used by Toggle Mute, where it's the exact OBS input name to mute/unmute).
+**Edit Settings... → Custom Keybinds** lets you set your own system-wide key combos (e.g. `Ctrl+Alt+S`) that call an OBS action directly over the WebSocket the instant they're pressed — Split Recording File, Save/Start/Stop/Toggle Replay Buffer, Start/Stop/Toggle Recording, or Pause/Resume/Toggle Recording Pause. Each row has an on/off checkbox, an action dropdown, Ctrl/Alt/Shift/Win modifier checkboxes, and a key (0-9, A-Z, or F1-F12).
 
 This is *not* OBS hotkey rebinding, and doesn't touch OBS's own Hotkeys settings at all: obs-websocket (the protocol this app talks to OBS with) has no API to read or change what physical key OBS itself has a hotkey bound to. Instead, this app registers its own keybinds directly with Windows and calls the matching WebSocket request when one fires — completely independent of, and in addition to, whatever's set in OBS's own **Settings → Hotkeys** dialog. That means:
 
@@ -345,8 +360,9 @@ This is *not* OBS hotkey rebinding, and doesn't touch OBS's own Hotkeys settings
 - They only fire while this app is running, and only actually do anything while OBS is running and connected (a keybind pressed with OBS closed just logs a warning).
 - A key combo already claimed by another running app (or by OBS itself, or Windows) may fail to register — check `autostart_script.log` at startup for "Could not register custom keybind..." if one doesn't seem to work, and try a different combo.
 - Changes here take effect on the next app restart (**Save and Restart**, or **Restart App** from the tray), same as other settings.
+- **Split Recording File** automatically ticks OBS's own **Automatically split file** option in Settings → Output the moment it's used, if it isn't already on — see [Optional: split recording files](#optional-split-recording-files) for why OBS requires that even for a manual split.
 
-`obs.custom_keybinds` in `config.json` is a list of `{"enabled": true, "action": "split_record_file", "modifiers": ["ctrl", "alt"], "key": "S", "param": ""}` entries if you'd rather edit it by hand; valid `action` values are `split_record_file`, `save_replay_buffer`, `start_replay_buffer`, `stop_replay_buffer`, `toggle_replay_buffer`, `start_record`, `stop_record`, `toggle_record`, `pause_record`, `resume_record`, `toggle_record_pause`, and `toggle_input_mute` (needs `param` set to an exact OBS input name).
+`obs.custom_keybinds` in `config.json` is a list of `{"enabled": true, "action": "split_record_file", "modifiers": ["ctrl", "alt"], "key": "S"}` entries if you'd rather edit it by hand; valid `action` values are `split_record_file`, `save_replay_buffer`, `start_replay_buffer`, `stop_replay_buffer`, `toggle_replay_buffer`, `start_record`, `stop_record`, `toggle_record`, `pause_record`, `resume_record`, and `toggle_record_pause`.
 
 ## Optional: more launchers
 
@@ -382,6 +398,8 @@ Setting `obs.replay_buffer.enabled` to `true` starts OBS's replay buffer wheneve
 ## Optional: post-record transcode
 
 Setting `post_record_transcode.enabled` to `true` runs each finished recording through `ffmpeg` in the background right after it's renamed. `post_record_transcode.args` are passed to `ffmpeg` between the input and output file — customize these for whatever codec/quality/size tradeoff you want (the default re-encodes to H.264/AAC at a moderate quality, mainly to shrink OBS's typically larger native output, and includes `-map 0` so every audio track survives the re-encode rather than just the first one). The output filename gets `post_record_transcode.suffix` appended; set `post_record_transcode.delete_original` to `true` to remove the original once the transcode succeeds. By default the output keeps the original file's extension — set `post_record_transcode.output_extension` (e.g. `.mp4`) to convert it to a different container.
+
+**No ffmpeg installed yet?** **Edit Settings... → Post-Processing** shows an **Install ffmpeg via winget** button and a manual download link instead of the usual options, since there's nothing useful to configure until ffmpeg actually exists somewhere on the PC. Installing it (either way) switches the panel over to the full options automatically, no need to reopen Settings. Any value already saved in `config.json` from before ffmpeg went missing (or before it's installed yet) is preserved either way, even while its controls are hidden.
 
 **Finding ffmpeg:** this feature needs `ffmpeg` actually installed somewhere on the PC — most users don't have it by default, which is why the [installer](#quick-install-recommended) already tries to install it for you automatically via `winget`. If you skipped that or it couldn't find `winget`, leave `post_record_transcode.ffmpeg_path` as `"ffmpeg"` (the default) and the app will look for it on your `PATH` automatically; if that fails, **Edit Settings... → Post-Processing → Auto-detect ffmpeg** searches the install locations of common Windows package managers (winget, Chocolatey, Scoop) and a few common manual-install folders, and fills in the exact path if it finds one. If nothing's found anywhere, install ffmpeg first (e.g. `winget install ffmpeg`, or download from ffmpeg.org), then auto-detect again, or use **Browse...** to point the field at `ffmpeg.exe` by hand. The same auto-detect fallback also runs automatically at transcode time if the configured path stops resolving (e.g. ffmpeg got reinstalled elsewhere).
 

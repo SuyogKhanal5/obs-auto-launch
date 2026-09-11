@@ -176,8 +176,5 @@ class FakeObsClient:
     def toggle_record_pause(self):
         self.calls.append(("toggle_record_pause",))
 
-    def toggle_input_mute(self, name):
-        self.calls.append(("toggle_input_mute", name))
-
     def disconnect(self):
         self.calls.append(("disconnect",))
