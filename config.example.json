@@ -85,6 +85,12 @@
         "suffix": "_compressed",
         "delete_original": false
     },
+    "clip_editor": {
+        "output_folder": "",
+        "delete_original_after_trim": false,
+        "default_output_format": "Same as source",
+        "vlc_path": ""
+    },
     "obs": {
         "process_name": "obs64.exe",
         "path": "C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe",

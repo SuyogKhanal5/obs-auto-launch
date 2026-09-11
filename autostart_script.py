@@ -1591,6 +1591,138 @@ def winget_install_ffmpeg(timeout=600):
     return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
 
 
+VLC_DOWNLOAD_URL = "https://www.videolan.org/vlc/"
+VLC_WINGET_ID = "VideoLAN.VLC"
+
+
+def find_vlc():
+    """Best-effort search for a VLC install on this PC, mirroring find_ffmpeg()'s approach but
+    checking for libvlc.dll (what python-vlc actually loads) via the registry key VLC itself
+    writes on install, rather than a bare exe on PATH. Deliberately does NOT import the `vlc`
+    module -- see import_vlc_module()'s docstring for why that has to stay separate. Returns the
+    install directory, or None."""
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(hive, r"Software\VideoLAN\VLC") as key:
+                install_dir = winreg.QueryValueEx(key, "InstallDir")[0]
+        except OSError:
+            continue
+        if install_dir and os.path.isfile(os.path.join(install_dir, "libvlc.dll")):
+            return install_dir
+
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_var)
+        if not base:
+            continue
+        candidate = os.path.join(base, "VideoLAN", "VLC")
+        if os.path.isfile(os.path.join(candidate, "libvlc.dll")):
+            return candidate
+
+    vlc_exe = shutil.which("vlc")
+    if vlc_exe:
+        candidate = os.path.dirname(vlc_exe)
+        if os.path.isfile(os.path.join(candidate, "libvlc.dll")):
+            return candidate
+
+    return None
+
+
+def resolve_vlc_path(configured_path):
+    """Resolves clip_editor.vlc_path to an actual VLC install directory: an explicit configured
+    directory that still contains libvlc.dll wins as-is (mirrors resolve_ffmpeg_path's
+    precedence), otherwise falls back to find_vlc()'s auto-detection."""
+    if configured_path and os.path.isfile(os.path.join(configured_path, "libvlc.dll")):
+        return configured_path
+    return find_vlc()
+
+
+def winget_install_vlc(timeout=600):
+    """Best-effort silent VLC install via winget, mirroring winget_install_ffmpeg(). Returns
+    (True, None) on success, (False, reason) otherwise; never raises."""
+    try:
+        result = subprocess.run(
+            [
+                "winget", "install", "--id", VLC_WINGET_ID, "-e", "--silent",
+                "--accept-source-agreements", "--accept-package-agreements",
+            ],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, None
+    return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
+
+
+def import_vlc_module():
+    """Lazily imports python-vlc -- only ever call this once find_vlc() has already confirmed an
+    install exists, and never at module load time. python-vlc's own DLL discovery (vlc.py's
+    module-level find_lib(), which runs the instant `import vlc` executes) raises a bare,
+    uncaught OSError if libvlc can't be found at all, with no fallback -- so an unconditional
+    `import vlc` at the top of this file would crash this entire app on startup for every user
+    who doesn't have VLC installed, even though the vast majority of this app's features have
+    nothing to do with it. Returns the vlc module, or None if it couldn't be loaded for any
+    reason (VLC uninstalled between find_vlc() and this call, a corrupt install, etc.)."""
+    try:
+        import vlc
+        return vlc
+    except Exception as exc:
+        logging.warning("Could not load VLC (python-vlc/libvlc): %s", exc)
+        return None
+
+
+# libvlc's own default logging writes raw, unformatted text straight to the process's real
+# stderr -- including a one-time "stale plugins cache" rebuild notice some Windows installs print
+# after VLC updates itself, one line per plugin. That specific burst happens synchronously inside
+# vlc.Instance() construction, before there's an instance to attach a log callback to, so no
+# instance-level API can redirect or suppress it individually -- it's harmless and self-resolving
+# (the cache stays fresh after that first run), and --quiet below keeps it off a console this app
+# may not even have (--noconsole builds) without also silencing the log_set() callback: --quiet
+# only mutes libvlc's own default output sink, it doesn't lower what still reaches log_set().
+_VLC_LOG_LEVEL_MAP = {}
+
+
+def create_vlc_instance_with_logging(vlc_module, args=None):
+    """Creates a vlc.Instance() and routes every log message it emits from that point on (real
+    playback/codec errors in particular) into this app's own logging via libvlc's log_set()
+    callback, instead of discarding them or leaking raw text to a console that may not exist."""
+    args = list(args or [])
+    if "--quiet" not in args:
+        args.append("--quiet")
+    instance = vlc_module.Instance(*args)
+
+    if not _VLC_LOG_LEVEL_MAP:
+        _VLC_LOG_LEVEL_MAP.update({
+            vlc_module.LogLevel.DEBUG: logging.DEBUG,
+            vlc_module.LogLevel.NOTICE: logging.INFO,
+            vlc_module.LogLevel.WARNING: logging.WARNING,
+            vlc_module.LogLevel.ERROR: logging.ERROR,
+        })
+
+    try:
+        msvcrt = ctypes.CDLL("msvcrt")
+        msvcrt.vsnprintf.restype = ctypes.c_int
+        msvcrt.vsnprintf.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_void_p]
+
+        @vlc_module.CallbackDecorators.LogCb
+        def on_vlc_log(_data, level, _ctx, fmt, log_args):
+            buf = ctypes.create_string_buffer(2048)
+            n = msvcrt.vsnprintf(buf, len(buf), fmt, log_args)
+            text = buf.raw[:n].decode("utf-8", errors="replace") if n and n > 0 else "<unreadable log message>"
+            logging.log(_VLC_LOG_LEVEL_MAP.get(level, logging.DEBUG), "libvlc: %s", text)
+
+        instance.log_set(on_vlc_log, None)
+        # ctypes callbacks are only kept alive by Python references -- without holding this one
+        # on the instance itself, it can be garbage-collected while libvlc still expects to call
+        # it, which segfaults the process rather than raising a catchable Python exception.
+        instance._log_callback_ref = on_vlc_log
+    except Exception as exc:
+        logging.warning("Could not attach VLC log capture: %s", exc)
+
+    return instance
+
+
 def transcode_recording(input_path, transcode_config, icon=None, notifications_config=None):
     configured_ffmpeg_path = transcode_config.get("ffmpeg_path", "ffmpeg")
     args = transcode_config.get("args", ["-map", "0", "-c:v", "libx264", "-crf", "23", "-c:a", "aac"])
@@ -1649,6 +1781,153 @@ def transcode_recording(input_path, transcode_config, icon=None, notifications_c
             os.remove(input_path)
         except OSError as exc:
             logging.warning("Could not delete original after transcode: %s", exc)
+
+
+def parse_timestamp(text):
+    """Parses a "HH:MM:SS.mmm" / "MM:SS.mmm" / "SS.mmm" timestamp (colon-separated, most-
+    significant component first, any number of fractional digits) into a float number of
+    seconds. Raises ValueError with a message fit to show directly in the editor's status label
+    on anything empty, unparseable, negative, or with an out-of-range minutes/seconds field."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Timestamp is empty.")
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise ValueError(f"Invalid timestamp '{text}'.")
+    try:
+        values = [float(p) for p in parts]
+    except ValueError:
+        raise ValueError(f"Invalid timestamp '{text}'.")
+    if any(v < 0 for v in values):
+        raise ValueError(f"Timestamp '{text}' can't be negative.")
+    # A bare number (no colons) is a plain seconds value with no upper bound -- "90" means 90
+    # seconds, not an out-of-range SS field. The <60 check only makes sense once there's a more
+    # significant component (minutes and/or hours) actually written alongside it.
+    if len(values) == 1:
+        return values[0]
+    while len(values) < 3:
+        values.insert(0, 0.0)
+    hours, minutes, seconds = values
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError(f"Invalid timestamp '{text}': minutes and seconds must be under 60.")
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def format_timestamp(total_seconds):
+    """Formats a float number of seconds as "HH:MM:SS.mmm" -- the inverse of parse_timestamp,
+    and also what gets passed to ffmpeg's -ss/-t flags in build_trim_command."""
+    total_seconds = max(total_seconds, 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
+
+
+def build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False):
+    """Builds the ffmpeg argv to cut [start_seconds, end_seconds) out of input_path. Always uses
+    -t (duration) rather than -to (absolute end time) even though both express the same cut --
+    -to's meaning shifts depending on whether -ss is an input or output option, a well-known
+    ffmpeg gotcha; -t means the same thing either way, so it sidesteps that ambiguity entirely.
+
+    Fast mode (the default): -ss before -i uses the demuxer's own fast seek, paired with -c copy
+    for a lossless, near-instant stream-copy trim -- but the actual cut snaps to the nearest
+    keyframe at or before start_seconds, which can be off by a couple of seconds depending on the
+    source's keyframe interval.
+
+    Precise mode: -ss after -i decodes from the start of the file up to the cut point instead
+    (slower), paired with a re-encode, since a non-keyframe-aligned start can't be stream-copied
+    at all -- this is what actually buys frame accuracy, not just a different flag position."""
+    start_str = format_timestamp(start_seconds)
+    duration_str = format_timestamp(end_seconds - start_seconds)
+    if precise:
+        return [
+            ffmpeg_path, "-y", "-i", input_path, "-ss", start_str, "-t", duration_str,
+            "-map", "0", "-c:v", "libx264", "-crf", "18", "-c:a", "aac", output_path,
+        ]
+    return [
+        ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str,
+        "-map", "0", "-c", "copy", output_path,
+    ]
+
+
+def compute_trim_output_path(input_path, output_folder=None, suffix="_trimmed", output_ext=None):
+    """Computes where a trimmed clip should be written: inside output_folder if given (created
+    if it doesn't exist yet, mirroring apply_output_folder), otherwise next to the source file.
+    Never overwrites an existing file -- appends " (2)", " (3)", etc. until a free name is found,
+    the same convention Windows Explorer itself uses for a colliding copy.
+
+    output_ext, if given (e.g. ".mkv"), overrides the source file's extension -- this is how the
+    editor's output-format picker changes the trimmed clip's container; ffmpeg itself picks the
+    muxer from the output path's extension, so nothing else needs to change to support it."""
+    directory = output_folder or os.path.dirname(input_path)
+    if output_folder:
+        os.makedirs(output_folder, exist_ok=True)
+    base, ext = os.path.splitext(os.path.basename(input_path))
+    if output_ext:
+        ext = output_ext
+
+    candidate = os.path.join(directory, f"{base}{suffix}{ext}")
+    if not os.path.exists(candidate):
+        return candidate
+    n = 2
+    while True:
+        candidate = os.path.join(directory, f"{base}{suffix} ({n}){ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
+def trim_clip(
+    input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
+    delete_original=False, icon=None, notifications_config=None,
+):
+    """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
+    way transcode_recording's callers do. Verifies the output file actually exists and has a
+    nonzero size before reporting success or deleting the source; never deletes on a failed or
+    suspicious-looking trim, same rule transcode_recording already follows."""
+    basename = os.path.basename(input_path)
+    if end_seconds <= start_seconds:
+        logging.error("Could not trim %s: end time must be after the start time.", basename)
+        return False
+
+    cmd = build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise)
+    logging.info("Trimming %s: %s", basename, " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except OSError as exc:
+        logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
+        notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
+        return False
+
+    output_ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+    if result.returncode != 0 or not output_ok:
+        logging.error(
+            "ffmpeg trim failed for %s (exit code %s).\nCommand: %s\nstderr:\n%s",
+            input_path, result.returncode, " ".join(cmd), result.stderr[-4000:],
+        )
+        notify(
+            icon, notifications_config, "Trim failed",
+            f"{basename} was kept, but the trim failed -- see the log for details.",
+        )
+        if os.path.isfile(output_path) and not output_ok:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return False
+
+    logging.info("Trimmed clip saved to %s", output_path)
+    notify(icon, notifications_config, "Clip trimmed", os.path.basename(output_path))
+
+    if delete_original:
+        try:
+            os.remove(input_path)
+            logging.info("Deleted original recording after trim: %s", basename)
+        except OSError as exc:
+            logging.warning("Could not delete original after trim: %s", exc)
+
+    return True
 
 
 def rename_with_game_prefix(output_path, game_display_name, split_part=None, silent=False, use_subfolder=False):
@@ -2922,7 +3201,7 @@ def build_launcher_section(parent, row, title, launcher_config, include_install_
 EDITOR_STUCK_TIMEOUT_SECONDS = 300
 
 
-def open_config_editor_window(editor_state, restart_callback, overlay_state):
+def open_config_editor_window(editor_state, restart_callback, overlay_state, icon):
     if editor_state.get("open"):
         if time.time() - editor_state.get("opened_at", 0) < EDITOR_STUCK_TIMEOUT_SECONDS:
             logging.info("Settings editor is already open.")
@@ -2942,6 +3221,11 @@ def open_config_editor_window(editor_state, restart_callback, overlay_state):
 
     def on_close():
         editor_state["open"] = False
+        # pystray only rebuilds the native tray menu right after a menu item is clicked (see the
+        # matching comment in the watcher loop) -- without this, "Edit Settings..." stays greyed
+        # out until some unrelated menu click happens to refresh it, even though the editor is
+        # long closed.
+        icon.update_menu()
 
     def build():
         try:
@@ -3452,6 +3736,130 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_checkbox(post_tab, row, "Show Windows toast notifications for key events", notifications_enabled_var)
     row += 1
 
+    # --- Clip Editor ---
+    clip_editor_tab = make_scrollable_tab(notebook, "Clip Editor")
+    clip_editor_tab.columnconfigure(1, weight=1)
+    clip_editor_config = config.get("clip_editor", {})
+    row = 0
+    add_section_label(clip_editor_tab, row, "Trimmed Clip Output")
+    row += 1
+    clip_output_folder_var = tk.StringVar(value=clip_editor_config.get("output_folder", "") or "")
+    add_labeled_entry(clip_editor_tab, row, "Output folder (optional)", clip_output_folder_var)
+    add_browse_button(clip_editor_tab, row, clip_output_folder_var, mode="dir")
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text="    Leave blank to save trimmed clips in the same folder as the source recording.",
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    clip_delete_original_var = tk.BooleanVar(value=clip_editor_config.get("delete_original_after_trim", False))
+    add_checkbox(
+        clip_editor_tab, row, "Delete the original recording after a successful trim",
+        clip_delete_original_var,
+    )
+    row += 1
+    configured_default_format = clip_editor_config.get("default_output_format", CLIP_EDITOR_OUTPUT_FORMATS[0])
+    if configured_default_format not in CLIP_EDITOR_OUTPUT_FORMATS:
+        configured_default_format = CLIP_EDITOR_OUTPUT_FORMATS[0]
+    clip_default_format_var = tk.StringVar(value=configured_default_format)
+    tk.Label(clip_editor_tab, text="Default export format", anchor="w").grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        clip_editor_tab, textvariable=clip_default_format_var, values=CLIP_EDITOR_OUTPUT_FORMATS,
+        state="readonly", width=16,
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Trims default to this container -- e.g. record in MKV but always want trimmed "
+            "clips as MP4 without transcoding the whole recording first. The editor's own "
+            "dropdown can still override this per trim."
+        ),
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    add_section_label(clip_editor_tab, row, "Video Preview (VLC)")
+    row += 1
+
+    # Same found/missing toggle-panel pattern as Post-Processing's ffmpeg section above: VLC
+    # detection only gates the VLC-specific controls, not the whole tab, since output folder and
+    # delete-original are meaningful to configure even before VLC is installed.
+    vlc_panel_row = row
+    row += 1
+    vlc_found_frame = tk.Frame(clip_editor_tab)
+    vlc_found_frame.grid(row=vlc_panel_row, column=0, columnspan=3, sticky="we")
+    vlc_missing_frame = tk.Frame(clip_editor_tab)
+    vlc_missing_frame.grid(row=vlc_panel_row, column=0, columnspan=3, sticky="we")
+
+    tk.Label(
+        vlc_found_frame,
+        text="VLC install found. Override its location only if you have more than one installed:",
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    clip_vlc_path_var = tk.StringVar(value=clip_editor_config.get("vlc_path", "") or "")
+    add_labeled_entry(vlc_found_frame, 1, "VLC install folder (optional)", clip_vlc_path_var)
+    add_browse_button(vlc_found_frame, 1, clip_vlc_path_var, mode="dir")
+
+    tk.Label(
+        vlc_missing_frame,
+        text=(
+            "VLC isn't installed, so the clip editor's video preview won't be available yet. "
+            "Install it below -- this panel switches over automatically once it's found, no need "
+            "to reopen Settings."
+        ),
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
+
+    def reveal_vlc_options_if_found():
+        if resolve_vlc_path(clip_vlc_path_var.get()):
+            vlc_missing_frame.grid_remove()
+            vlc_found_frame.grid()
+            return True
+        return False
+
+    def install_vlc_via_winget():
+        winget_install_vlc_button.config(state="disabled", text="Installing VLC...")
+
+        def worker():
+            result = winget_install_vlc()
+
+            def finish():
+                success, reason = result
+                if not (success and reveal_vlc_options_if_found()):
+                    winget_install_vlc_button.config(state="normal", text="Install VLC via winget")
+                    messagebox.showwarning(
+                        "Install didn't finish",
+                        f"Couldn't install VLC automatically ({reason or 'still not found after install'}). "
+                        "Try again, or use the manual download link instead.",
+                        parent=clip_editor_tab,
+                    )
+
+            clip_editor_tab.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    if has_winget():
+        winget_install_vlc_button = tk.Button(
+            vlc_missing_frame, text="Install VLC via winget", command=install_vlc_via_winget,
+        )
+        winget_install_vlc_button.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 4))
+
+    vlc_download_link = tk.Label(
+        vlc_missing_frame, text="Or download it manually from videolan.org ↗", fg="#2563eb",
+        font=("Segoe UI", 9, "underline"), cursor="hand2",
+    )
+    vlc_download_link.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
+    vlc_download_link.bind("<Button-1>", lambda _event: webbrowser.open(VLC_DOWNLOAD_URL))
+
+    if resolve_vlc_path(clip_vlc_path_var.get()):
+        vlc_missing_frame.grid_remove()
+    else:
+        vlc_found_frame.grid_remove()
+
     # --- Save / Cancel ---
     status_label = tk.Label(root, text="", fg="#b00020", anchor="w")
     status_label.pack(fill="x", padx=10)
@@ -3674,6 +4082,20 @@ def _run_config_editor(master_root, restart_callback, on_close):
         notifications = new_config.setdefault("notifications", {})
         notifications["enabled"] = notifications_enabled_var.get()
 
+        clip_editor = new_config.setdefault("clip_editor", {})
+        clip_output_folder_value = clip_output_folder_var.get().strip()
+        if clip_output_folder_value:
+            clip_editor["output_folder"] = clip_output_folder_value
+        else:
+            clip_editor.pop("output_folder", None)
+        clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
+        clip_editor["default_output_format"] = clip_default_format_var.get()
+        clip_vlc_path_value = clip_vlc_path_var.get().strip()
+        if clip_vlc_path_value:
+            clip_editor["vlc_path"] = clip_vlc_path_value
+        else:
+            clip_editor.pop("vlc_path", None)
+
         return new_config, errors
 
     def do_save(and_restart):
@@ -3711,6 +4133,492 @@ def _run_config_editor(master_root, restart_callback, on_close):
     tk.Button(button_bar, text="Save and Restart", command=lambda: do_save(True)).pack(side="right")
 
 
+CLIP_EDITOR_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".flv", ".ts", ".webm", ".avi"}
+CLIP_EDITOR_MAX_RECENT_RECORDINGS = 30
+# First entry means "keep the source file's own extension" -- do_trim() checks for it by identity
+# rather than treating it as a real container, so it must stay first.
+CLIP_EDITOR_OUTPUT_FORMATS = ["Same as source", ".mp4", ".mkv", ".mov", ".avi", ".webm"]
+
+
+def list_recent_recordings(folder, limit=CLIP_EDITOR_MAX_RECENT_RECORDINGS):
+    """Lists up to `limit` video files under folder, newest first -- recursive, since
+    organize_into_game_subfolders nests recordings one level deeper per game."""
+    if not folder or not os.path.isdir(folder):
+        return []
+    found = []
+    for root_dir, _dirs, files in os.walk(folder):
+        for name in files:
+            if os.path.splitext(name)[1].lower() not in CLIP_EDITOR_VIDEO_EXTENSIONS:
+                continue
+            path = os.path.join(root_dir, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            found.append((path, mtime))
+    found.sort(key=lambda item: item[1], reverse=True)
+    return [path for path, _mtime in found[:limit]]
+
+
+def validate_trim_range(start_seconds, end_seconds, duration_seconds=None):
+    """Returns None if [start_seconds, end_seconds) is a sane trim range, otherwise an error
+    message fit to show directly in the editor's status label. duration_seconds is optional
+    (VLC doesn't always know a clip's length immediately after loading it) -- skipped when not
+    yet available rather than blocking the user on a check that can't be performed yet."""
+    if start_seconds < 0:
+        return "Start time can't be negative."
+    if end_seconds <= start_seconds:
+        return "End time must be after the start time."
+    if duration_seconds and start_seconds > duration_seconds:
+        return "Start time is past the end of the clip."
+    if duration_seconds and end_seconds > duration_seconds + 0.5:  # small slack for UI rounding
+        return "End time is past the end of the clip."
+    return None
+
+
+def is_file_being_recorded(path, recording_state):
+    """True if `path` is the exact file OBS is currently writing to -- the clip editor refuses
+    to open this one, rather than letting someone try to trim a file that's still growing."""
+    active_path = recording_state.get("current_path")
+    if not active_path:
+        return False
+    return os.path.normpath(active_path) == os.path.normpath(path)
+
+
+def open_clip_editor_window(editor_state, config, recording_state, overlay_state, icon):
+    if editor_state.get("open"):
+        if time.time() - editor_state.get("opened_at", 0) < EDITOR_STUCK_TIMEOUT_SECONDS:
+            logging.info("Clip editor is already open.")
+            return
+        logging.warning(
+            "Clip editor has appeared open for over %d seconds without closing; assuming it's "
+            "stuck and allowing a new attempt.", EDITOR_STUCK_TIMEOUT_SECONDS,
+        )
+
+    overlay_root = overlay_state.get("root")
+    if not overlay_root:
+        logging.warning("Overlay isn't ready yet; can't open the clip editor. Try again in a moment.")
+        return
+
+    editor_state["open"] = True
+    editor_state["opened_at"] = time.time()
+    logging.info("Opening the clip editor.")
+
+    def on_close():
+        editor_state["open"] = False
+        # pystray only rebuilds the native tray menu right after a menu item is clicked (see the
+        # matching comment in the watcher loop) -- without this, "Edit Clips..." stays greyed out
+        # until some unrelated menu click happens to refresh it, even though the editor is long
+        # closed.
+        icon.update_menu()
+
+    def build():
+        try:
+            _run_clip_editor(overlay_root, config, recording_state, on_close, icon)
+        except Exception:
+            logging.exception("Clip editor crashed.")
+            on_close()
+
+    # Same reasoning as open_config_editor_window: built as a Toplevel of the overlay's already-
+    # running interpreter, scheduled via .after() rather than a second independent tk.Tk() on its
+    # own thread, which PyInstaller's bundled Tcl/Tk doesn't reliably support.
+    overlay_root.after(0, build)
+
+
+def _open_vlc_missing_window(master_root, on_close):
+    """Shown instead of the real editor when VLC can't be found -- unlike the Settings tab's
+    equivalent panel, there's no usable editor at all without it (no preview, no way to pick a
+    start/end by watching the video), so this is the whole window rather than one section of it."""
+    root = tk.Toplevel(master_root)
+    root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
+    root.title("OBS Auto Recorder - Clip Editor")
+    root.geometry("460x220")
+
+    frame = tk.Frame(root, padx=16, pady=16)
+    frame.pack(fill="both", expand=True)
+    tk.Label(
+        frame,
+        text=(
+            "VLC isn't installed, so the clip editor's video preview isn't available. Install it "
+            "below, then try Edit Clips... again."
+        ),
+        anchor="w", justify="left", wraplength=420,
+    ).pack(fill="x", pady=(0, 12))
+
+    status_label = tk.Label(frame, text="", fg="#b00020", anchor="w", justify="left", wraplength=420)
+    status_label.pack(fill="x", pady=(0, 8))
+
+    def install_via_winget():
+        install_button.config(state="disabled", text="Installing VLC...")
+        logging.info("Clip editor: installing VLC via winget...")
+
+        def worker():
+            result = winget_install_vlc()
+
+            def finish():
+                success, reason = result
+                if success and find_vlc():
+                    logging.info("Clip editor: VLC installed successfully via winget.")
+                    status_label.config(fg="#15803d", text="VLC installed -- close this window and try Edit Clips... again.")
+                    install_button.pack_forget()
+                else:
+                    logging.warning(
+                        "Clip editor: VLC install via winget did not finish (%s).",
+                        reason or "VLC still not found after install",
+                    )
+                    install_button.config(state="normal", text="Install VLC via winget")
+                    status_label.config(text=f"Install didn't finish ({reason or 'VLC still not found after install'}).")
+
+            root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    if has_winget():
+        install_button = tk.Button(frame, text="Install VLC via winget", command=install_via_winget)
+        install_button.pack(anchor="w", pady=(0, 8))
+
+    download_link = tk.Label(
+        frame, text="Or download it manually from videolan.org ↗", fg="#2563eb",
+        font=("Segoe UI", 9, "underline"), cursor="hand2",
+    )
+    download_link.pack(anchor="w")
+    download_link.bind("<Button-1>", lambda _event: webbrowser.open(VLC_DOWNLOAD_URL))
+
+    tk.Button(root, text="Close", command=root.destroy).pack(anchor="e", padx=16, pady=16)
+
+
+def _run_clip_editor(master_root, config, recording_state, on_close, icon):
+    clip_editor_config = config.get("clip_editor", {})
+    notifications_config = config.get("notifications", {})
+
+    vlc_dir = resolve_vlc_path(clip_editor_config.get("vlc_path", ""))
+    vlc_module = import_vlc_module() if vlc_dir else None
+    if not vlc_module:
+        logging.warning("Clip editor: VLC not found; showing the install-VLC prompt instead of the real editor.")
+        _open_vlc_missing_window(master_root, on_close)
+        return
+
+    root = tk.Toplevel(master_root)
+    root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
+    root.title("OBS Auto Recorder - Clip Editor")
+    root.geometry("820x600")
+    root.minsize(600, 420)
+    root.lift()
+    root.focus_force()
+    logging.info("Clip editor opened.")
+
+    instance = create_vlc_instance_with_logging(vlc_module)
+    player = instance.media_player_new()
+
+    def cleanup():
+        try:
+            player.stop()
+            instance.release()
+        except Exception:
+            pass
+
+    def close_editor():
+        # Stop playback (and release the VLC instance) BEFORE the window's video-output HWND
+        # actually gets torn down -- relying on <Destroy> alone lets VLC keep trying to render
+        # into an HWND Windows has already destroyed, which spams a cascade of native
+        # SwapChain/CreateWindow errors instead of shutting down cleanly (confirmed by deliberately
+        # closing the editor while a clip was still playing and watching libvlc's own log fill
+        # with "Could not create the SwapChain" / "video output creation failed" messages until
+        # cleanup() ran first here).
+        logging.info("Clip editor closed.")
+        cleanup()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_editor)
+    root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
+
+    # --- Open file row ---
+    open_row = tk.Frame(root)
+    open_row.pack(fill="x", padx=10, pady=(10, 4))
+    tk.Button(open_row, text="Browse for a recording...", command=lambda: browse_for_file()).pack(side="left")
+
+    recent_recordings = list_recent_recordings(config.get("obs", {}).get("output_folder"))
+    recent_var = tk.StringVar()
+    if recent_recordings:
+        recent_combo = ttk.Combobox(
+            open_row, textvariable=recent_var,
+            values=[os.path.basename(p) for p in recent_recordings],
+            state="readonly", width=40,
+        )
+        recent_combo.pack(side="left", padx=(8, 0))
+
+        def on_recent_selected(_event):
+            index = recent_combo.current()
+            if 0 <= index < len(recent_recordings):
+                load_file(recent_recordings[index])
+
+        recent_combo.bind("<<ComboboxSelected>>", on_recent_selected)
+
+    # --- Video preview ---
+    video_frame = tk.Frame(root, bg="black")
+    video_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+    root.update_idletasks()
+    player.set_hwnd(video_frame.winfo_id())
+
+    # --- Timeline (click/drag anywhere to seek; start/end markers drawn in their own colors so
+    # they're never confused with the playback seeker) ---
+    TIMELINE_HEIGHT = 40
+    SEEKER_COLOR = "#f5a623"
+    START_MARKER_COLOR = "#22c55e"
+    END_MARKER_COLOR = "#ef4444"
+
+    time_label = tk.Label(root, text="00:00:00.000 / 00:00:00.000", anchor="e")
+    time_label.pack(fill="x", padx=10, pady=(0, 2))
+
+    timeline_canvas = tk.Canvas(root, height=TIMELINE_HEIGHT, bg="#2b2b2b", highlightthickness=0)
+    timeline_canvas.pack(fill="x", padx=10, pady=(0, 4))
+
+    def canvas_x_to_seconds(x):
+        width = timeline_canvas.winfo_width()
+        duration = state["duration"]
+        if width <= 0 or not duration:
+            return 0.0
+        return min(max(x / width, 0.0), 1.0) * duration
+
+    def seconds_to_canvas_x(seconds):
+        width = timeline_canvas.winfo_width()
+        duration = state["duration"]
+        if width <= 0 or not duration:
+            return 0
+        return min(max(seconds / duration, 0.0), 1.0) * width
+
+    def draw_timeline():
+        timeline_canvas.delete("all")
+        width = timeline_canvas.winfo_width()
+        if width <= 1 or not state["duration"]:
+            return
+        mid = TIMELINE_HEIGHT // 2
+        timeline_canvas.create_rectangle(0, mid - 3, width, mid + 3, fill="#555555", outline="")
+        try:
+            x = seconds_to_canvas_x(parse_timestamp(start_var.get()))
+            timeline_canvas.create_line(x, 0, x, TIMELINE_HEIGHT, fill=START_MARKER_COLOR, width=3)
+        except ValueError:
+            pass
+        try:
+            x = seconds_to_canvas_x(parse_timestamp(end_var.get()))
+            timeline_canvas.create_line(x, 0, x, TIMELINE_HEIGHT, fill=END_MARKER_COLOR, width=3)
+        except ValueError:
+            pass
+        x = seconds_to_canvas_x(player.get_time() / 1000)
+        timeline_canvas.create_line(x, 0, x, TIMELINE_HEIGHT, fill=SEEKER_COLOR, width=2)
+
+    def seek_to_canvas_x(x):
+        if not state["path"] or not state["duration"]:
+            return
+        player.set_time(int(canvas_x_to_seconds(x) * 1000))
+        draw_timeline()
+
+    timeline_canvas.bind("<Button-1>", lambda event: seek_to_canvas_x(event.x))
+    timeline_canvas.bind("<B1-Motion>", lambda event: seek_to_canvas_x(event.x))
+    timeline_canvas.bind("<Configure>", lambda event: draw_timeline())
+
+    # --- Transport controls (below the timeline: rewind/forward flank play-pause, all centered) ---
+    transport_row = tk.Frame(root)
+    transport_row.pack(fill="x", padx=10, pady=4)
+    transport_buttons = tk.Frame(transport_row)
+    transport_buttons.pack()  # no side/fill -- pack centers a parcel-filling child by default
+    tk.Button(transport_buttons, text="⏪ Rewind 5s", command=lambda: seek_relative(-5)).pack(side="left")
+    play_pause_button = tk.Button(transport_buttons, text="Play/Pause", command=lambda: toggle_play_pause())
+    play_pause_button.pack(side="left", padx=6)
+    tk.Button(transport_buttons, text="Forward 5s ⏩", command=lambda: seek_relative(5)).pack(side="left")
+
+    # --- Start/End controls ---
+    range_row = tk.Frame(root)
+    range_row.pack(fill="x", padx=10, pady=4)
+    start_var = tk.StringVar(value="00:00:00.000")
+    end_var = tk.StringVar(value="00:00:00.000")
+    tk.Button(range_row, text="Set Start", command=lambda: set_start()).pack(side="left")
+    tk.Entry(range_row, textvariable=start_var, width=14).pack(side="left", padx=(4, 16))
+    tk.Button(range_row, text="Set End", command=lambda: set_end()).pack(side="left")
+    tk.Entry(range_row, textvariable=end_var, width=14).pack(side="left", padx=(4, 16))
+    precise_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(range_row, text="Precise (slower, frame-accurate)", variable=precise_var).pack(side="left")
+
+    start_var.trace_add("write", lambda *_args: draw_timeline())
+    end_var.trace_add("write", lambda *_args: draw_timeline())
+
+    # --- Output format ---
+    default_format = clip_editor_config.get("default_output_format", CLIP_EDITOR_OUTPUT_FORMATS[0])
+    if default_format not in CLIP_EDITOR_OUTPUT_FORMATS:
+        default_format = CLIP_EDITOR_OUTPUT_FORMATS[0]
+    format_row = tk.Frame(root)
+    format_row.pack(fill="x", padx=10, pady=(0, 4))
+    tk.Label(format_row, text="Output format:").pack(side="left")
+    format_var = tk.StringVar(value=default_format)
+    ttk.Combobox(
+        format_row, textvariable=format_var, values=CLIP_EDITOR_OUTPUT_FORMATS, state="readonly", width=16,
+    ).pack(side="left", padx=(6, 0))
+
+    # --- Status + trim ---
+    status_label = tk.Label(root, text="", fg="#b00020", anchor="w", justify="left", wraplength=780)
+    status_label.pack(fill="x", padx=10, pady=(4, 0))
+
+    progress = ttk.Progressbar(root, mode="indeterminate")
+
+    bottom_row = tk.Frame(root)
+    bottom_row.pack(fill="x", padx=10, pady=10, side="bottom")
+    tk.Button(bottom_row, text="Close", command=close_editor).pack(side="right")
+    trim_button = tk.Button(bottom_row, text="Trim Clip", command=lambda: do_trim())
+    trim_button.pack(side="right", padx=(0, 8))
+
+    state = {"path": None, "duration": 0.0}
+
+    def browse_for_file():
+        path = filedialog.askopenfilename(
+            title="Open a recording", filetypes=[("Video files", "*.mp4 *.mkv *.mov *.flv *.ts *.webm *.avi"), ("All files", "*.*")],
+        )
+        if path:
+            load_file(path)
+
+    def load_file(path):
+        if is_file_being_recorded(path, recording_state):
+            logging.warning("Clip editor: refused to open %s -- it's still being recorded.", os.path.basename(path))
+            status_label.config(text="That recording is still in progress -- wait for it to finish before trimming it.")
+            return
+        player.stop()
+        media = instance.media_new(path)
+        player.set_media(media)
+        player.play()
+
+        # Pausing immediately after play() races VLC's own async open/buffer state -- called
+        # this early, pause() is liable to be silently dropped, leaving the clip playing all the
+        # way through instead of stopping on its first frame like a freshly-opened file should.
+        # Poll (on the Tk thread, not a VLC event callback, so there's nothing here that needs to
+        # worry about calling back into Tkinter from a non-Tk thread) until playback has actually
+        # started, then pause; gives up after ~5s so a genuinely broken file doesn't poll forever.
+        def pause_once_playing(attempts=0):
+            if not root.winfo_exists():
+                return
+            if player.get_state() == vlc_module.State.Playing:
+                player.pause()
+            elif attempts < 50:
+                root.after(100, lambda: pause_once_playing(attempts + 1))
+
+        root.after(50, pause_once_playing)
+
+        state["path"] = path
+        state["duration"] = 0.0
+        start_var.set(format_timestamp(0))
+        end_var.set(format_timestamp(0))
+        status_label.config(text="")
+        root.title(f"OBS Auto Recorder - Clip Editor - {os.path.basename(path)}")
+        logging.info("Clip editor: opened %s", os.path.basename(path))
+
+    def toggle_play_pause():
+        if not state["path"]:
+            return
+        if player.is_playing():
+            player.pause()
+        else:
+            player.play()
+
+    def seek_relative(seconds):
+        if not state["path"]:
+            return
+        new_time = player.get_time() + seconds * 1000
+        length = player.get_length()
+        if length > 0:
+            new_time = min(new_time, length)
+        player.set_time(max(0, new_time))
+        draw_timeline()
+
+    def set_start():
+        if state["path"]:
+            start_var.set(format_timestamp(player.get_time() / 1000))
+
+    def set_end():
+        if state["path"]:
+            end_var.set(format_timestamp(player.get_time() / 1000))
+
+    def do_trim():
+        if not state["path"]:
+            logging.warning("Clip editor: Trim Clip clicked with no recording open.")
+            status_label.config(text="Open a recording first.")
+            return
+        try:
+            start_seconds = parse_timestamp(start_var.get())
+            end_seconds = parse_timestamp(end_var.get())
+        except ValueError as exc:
+            logging.warning("Clip editor: could not start trim -- %s", exc)
+            status_label.config(text=str(exc))
+            return
+        error = validate_trim_range(start_seconds, end_seconds, state["duration"] or None)
+        if error:
+            logging.warning("Clip editor: could not start trim -- %s", error)
+            status_label.config(text=error)
+            return
+
+        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+        if not ffmpeg_path:
+            logging.error("Clip editor: could not start trim -- ffmpeg not found.")
+            status_label.config(
+                text="ffmpeg isn't installed -- install it from Settings > Post-Processing, then try again."
+            )
+            return
+
+        format_choice = format_var.get()
+        output_ext = None if format_choice == CLIP_EDITOR_OUTPUT_FORMATS[0] else format_choice
+        output_path = compute_trim_output_path(
+            state["path"], clip_editor_config.get("output_folder") or None, output_ext=output_ext
+        )
+        delete_original = clip_editor_config.get("delete_original_after_trim", False)
+        precise = precise_var.get()
+        source_path = state["path"]
+
+        status_label.config(fg="#555555", text=f"Trimming to {os.path.basename(output_path)}...")
+        trim_button.config(state="disabled")
+        progress.pack(fill="x", padx=10, pady=(0, 6), before=bottom_row)
+        progress.start(12)
+
+        def worker():
+            success = trim_clip(
+                source_path, start_seconds, end_seconds, output_path, ffmpeg_path=ffmpeg_path,
+                precise=precise, delete_original=delete_original, icon=icon,
+                notifications_config=notifications_config,
+            )
+
+            def finish():
+                if not root.winfo_exists():
+                    # Editor was closed while this trim was still running -- trim_clip() already
+                    # logged the result and fired a toast notification above, so the user still
+                    # finds out; there's just no window left to update here. Nothing else to do.
+                    return
+                progress.stop()
+                progress.pack_forget()
+                trim_button.config(state="normal")
+                if success:
+                    status_label.config(fg="#15803d", text=f"Saved to {output_path}")
+                else:
+                    status_label.config(fg="#b00020", text="Trim failed -- see the log for details.")
+
+            try:
+                root.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def poll():
+        if not root.winfo_exists():
+            return
+        if state["path"]:
+            length = player.get_length()
+            if length > 0:
+                state["duration"] = length / 1000
+            draw_timeline()
+            time_label.config(
+                text=f"{format_timestamp(player.get_time() / 1000)} / {format_timestamp(state['duration'])}"
+            )
+        root.after(200, poll)
+
+    root.after(200, poll)
+
+
 def main():
     config = load_config()
 
@@ -3740,6 +4648,7 @@ def main():
     reset_recording_state(recording_state)
     runtime_state = {"obs_client": None}
     editor_state = {"open": False}
+    clip_editor_state = {"open": False}
 
     def on_quit(icon, menu_item):
         logging.info("Quit requested from tray icon.")
@@ -3768,7 +4677,10 @@ def main():
         stop_event.set()
 
     def on_edit_settings(icon, menu_item):
-        open_config_editor_window(editor_state, do_restart, overlay_state)
+        open_config_editor_window(editor_state, do_restart, overlay_state, icon)
+
+    def on_edit_clips(icon, menu_item):
+        open_clip_editor_window(clip_editor_state, config, recording_state, overlay_state, icon)
 
     def on_open_recordings_folder(icon, menu_item):
         client = runtime_state.get("obs_client")
@@ -3883,6 +4795,9 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Open Recordings Folder", on_open_recordings_folder),
         pystray.MenuItem("Open Log File", on_open_log_file),
+        pystray.MenuItem(
+            "Edit Clips...", on_edit_clips, enabled=lambda item: not clip_editor_state["open"]
+        ),
         pystray.MenuItem(
             "Edit Settings...", on_edit_settings, enabled=lambda item: not editor_state["open"]
         ),
