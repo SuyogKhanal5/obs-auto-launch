@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import installer
@@ -80,6 +81,64 @@ class BuildConfigTests(unittest.TestCase):
     def test_password_is_written_into_websocket_settings(self):
         config = installer.build_config(self.template, None, "generated-pw", base_options())
         self.assertEqual(config["obs"]["websocket"]["password"], "generated-pw")
+
+
+class EnsureFfmpegTests(unittest.TestCase):
+    """ensure_ffmpeg must never block or fail setup regardless of what's on the machine -- these
+    pin its four possible outcomes against mocked presence/winget checks."""
+
+    def test_already_present_skips_install_entirely(self):
+        with patch.object(installer, "is_ffmpeg_installed", return_value=True):
+            with patch.object(installer, "winget_install") as mock_install:
+                status = installer.ensure_ffmpeg(lambda _msg: None)
+        self.assertEqual(status, "already_present")
+        mock_install.assert_not_called()
+
+    def test_no_winget_reports_no_winget_without_attempting_install(self):
+        with patch.object(installer, "is_ffmpeg_installed", return_value=False):
+            with patch.object(installer, "has_winget", return_value=False):
+                with patch.object(installer, "winget_install") as mock_install:
+                    status = installer.ensure_ffmpeg(lambda _msg: None)
+        self.assertEqual(status, "no_winget")
+        mock_install.assert_not_called()
+
+    def test_successful_winget_install_reports_installed(self):
+        with patch.object(installer, "is_ffmpeg_installed", return_value=False):
+            with patch.object(installer, "has_winget", return_value=True):
+                with patch.object(installer, "winget_install", return_value=(True, None)):
+                    status = installer.ensure_ffmpeg(lambda _msg: None)
+        self.assertEqual(status, "installed")
+
+    def test_failed_winget_install_reports_winget_failed_not_raise(self):
+        with patch.object(installer, "is_ffmpeg_installed", return_value=False):
+            with patch.object(installer, "has_winget", return_value=True):
+                with patch.object(installer, "winget_install", return_value=(False, "network error")):
+                    status = installer.ensure_ffmpeg(lambda _msg: None)  # must not raise
+        self.assertEqual(status, "winget_failed")
+
+
+class WingetInstallTests(unittest.TestCase):
+    def test_success_exit_code_reports_success(self):
+        with patch.object(installer.subprocess, "run") as mock_run:
+            mock_run.return_value = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            success, reason = installer.winget_install("Some.Package")
+        self.assertTrue(success)
+        self.assertIsNone(reason)
+
+    def test_nonzero_exit_code_reports_failure_with_reason(self):
+        with patch.object(installer.subprocess, "run") as mock_run:
+            mock_run.return_value = type(
+                "Result", (), {"returncode": 1, "stdout": "", "stderr": "no package found"}
+            )()
+            success, reason = installer.winget_install("Some.Package")
+        self.assertFalse(success)
+        self.assertIn("no package found", reason)
+
+    def test_missing_winget_binary_reports_failure_not_raise(self):
+        with patch.object(installer.subprocess, "run", side_effect=OSError("not found")):
+            success, reason = installer.winget_install("Some.Package")  # must not raise
+        self.assertFalse(success)
+        self.assertIsNotNone(reason)
 
 
 if __name__ == "__main__":

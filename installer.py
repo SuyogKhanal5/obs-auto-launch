@@ -11,6 +11,7 @@ Kept intentionally separate from autostart_script.py: it only needs a
 handful of stdlib modules plus psutil, not the full app's dependency set.
 """
 
+import glob
 import json
 import os
 import secrets
@@ -35,6 +36,69 @@ DEFAULT_OBS_PATHS = [
     r"C:\Program Files (x86)\obs-studio\bin\64bit\obs64.exe",
 ]
 OBS_DOWNLOAD_URL = "https://obsproject.com/download"
+OBS_WINGET_ID = "OBSProject.OBSStudio"
+FFMPEG_WINGET_ID = "Gyan.FFmpeg"
+FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
+
+
+def has_winget():
+    return shutil.which("winget") is not None
+
+
+def is_ffmpeg_installed():
+    """Minimal presence check mirroring autostart_script.py's find_ffmpeg(), duplicated rather
+    than imported since this installer deliberately stays independent of the main app's
+    dependency set (see the module docstring)."""
+    if shutil.which("ffmpeg"):
+        return True
+    candidates = [
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+        os.path.expandvars(r"%USERPROFILE%\scoop\shims\ffmpeg.exe"),
+    ]
+    try:
+        candidates += glob.glob(
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\*FFmpeg*\**\ffmpeg.exe"),
+            recursive=True,
+        )
+    except OSError:
+        pass
+    return any(path and os.path.isfile(path) for path in candidates)
+
+
+def winget_install(package_id, timeout=600):
+    """Best-effort winget install. Returns (True, None) on success, (False, reason) otherwise --
+    never raises, so a failed/missing winget never blocks the rest of setup."""
+    try:
+        result = subprocess.run(
+            [
+                "winget", "install", "--id", package_id, "-e", "--silent",
+                "--accept-source-agreements", "--accept-package-agreements",
+            ],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, None
+    return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
+
+
+def ensure_ffmpeg(on_progress):
+    """Best-effort, non-blocking: ffmpeg powers the app's optional MKV-to-MP4 post-record
+    conversion, but most people don't have it and don't know where to get it, so this installs
+    it automatically via winget when available instead of leaving it as a manual step. Returns
+    one of "already_present", "installed", "winget_failed", "no_winget" -- callers decide what
+    (if anything) to tell the user based on that, this never raises or fails setup itself."""
+    if is_ffmpeg_installed():
+        return "already_present"
+    if not has_winget():
+        return "no_winget"
+    on_progress("Installing ffmpeg (for optional MKV to MP4 conversion)...")
+    success, _reason = winget_install(FFMPEG_WINGET_ID)
+    return "installed" if success else "winget_failed"
 
 
 def resource_path(name):
@@ -222,6 +286,9 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
         on_progress("Configuring OBS's WebSocket server...")
         obs_ws_configured, obs_ws_reason = try_configure_obs_websocket(password)
 
+    on_progress("Checking for ffmpeg...")
+    ffmpeg_status = ensure_ffmpeg(on_progress)
+
     exe_path = os.path.join(install_dir, EXE_NAME)
 
     if options.get("desktop_shortcut"):
@@ -240,6 +307,7 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
         "password": password,
         "obs_ws_configured": obs_ws_configured,
         "obs_ws_reason": obs_ws_reason,
+        "ffmpeg_status": ffmpeg_status,
     }
 
 
@@ -415,9 +483,42 @@ def main():
             obs_var.set(chosen)
             refresh_obs_status()
 
+    def on_easy_install_obs():
+        easy_install_btn.config(state="disabled")
+        obs_status.config(text="Installing OBS Studio via winget... this can take a few minutes.", fg="#555555")
+        download_link.pack_forget()
+
+        def worker():
+            return winget_install(OBS_WINGET_ID, timeout=900)
+
+        def done(result, error):
+            easy_install_btn.config(state="normal")
+            success, reason = result if error is None else (False, str(error))
+            if success:
+                found = find_obs_exe()
+                if found:
+                    obs_var.set(found)
+                refresh_obs_status()
+            else:
+                obs_status.config(
+                    text=(
+                        f"Automatic install didn't finish ({reason}). Try Browse if it's already "
+                        "installed, or use the download link below."
+                    ),
+                    fg="#b91c1c",
+                )
+                download_link.pack(side="left", padx=(16, 0))
+
+        run_async(worker, done)
+
     obs_buttons_row = tk.Frame(obs_page, bg=PAGE_BG)
     obs_buttons_row.pack(anchor="w", pady=(0, 8))
     tk.Button(obs_buttons_row, text="Browse for obs64.exe...", command=browse_obs).pack(side="left")
+    # "Easy Install" only makes sense (and only appears) when winget is actually available to run
+    # it -- otherwise the existing manual download link below is the only path, same as before.
+    if has_winget():
+        easy_install_btn = tk.Button(obs_buttons_row, text="Easy Install", command=on_easy_install_obs)
+        easy_install_btn.pack(side="left", padx=(8, 0))
     download_link = tk.Label(
         obs_buttons_row, text="Don't have OBS? Download it here ↗", bg=PAGE_BG, fg="#2563eb",
         font=("Segoe UI", 10, "underline"), cursor="hand2",
@@ -724,6 +825,18 @@ def main():
                 "One manual step is still needed: open OBS \u2192 Tools \u2192 WebSocket Server "
                 f"Settings, turn it on, and set the password to:\n\n{result['password']}\n\n"
                 "(Or copy whatever password OBS already shows there into this app's Settings instead.)"
+            )
+        ffmpeg_status = result.get("ffmpeg_status")
+        if ffmpeg_status == "installed":
+            lines.append(
+                "\nffmpeg was also installed automatically, so you're ready to convert MKV "
+                "recordings to MP4 later from Settings → Post-Processing, if you ever want to."
+            )
+        elif ffmpeg_status in ("no_winget", "winget_failed"):
+            lines.append(
+                "\nffmpeg wasn't found and couldn't be installed automatically -- it's only needed "
+                f"if you want to convert MKV recordings to MP4 later. Install it from {FFMPEG_DOWNLOAD_URL} "
+                "and this app will find it on its own, or point Settings → Post-Processing at it directly."
             )
         finish_body.config(text="\n".join(lines))
         launch_check.pack(anchor="w", pady=(8, 0))

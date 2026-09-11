@@ -75,7 +75,8 @@
     "post_record_transcode": {
         "enabled": false,
         "ffmpeg_path": "ffmpeg",
-        "args": ["-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k"],
+        "args": ["-map", "0", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k"],
+        "output_extension": "",
         "suffix": "_compressed",
         "delete_original": false
     },
@@ -97,6 +98,11 @@
             "megabytes": 4096,
             "tolerance_megabytes": 50
         },
+        "manual_split": {
+            "enabled": false,
+            "buffer_seconds": 0
+        },
+        "custom_keybinds": [],
         "recovery": {
             "memory_limit_gb": 5,
             "cooldown_seconds": 30
@@ -112,7 +118,8 @@
                 {"input_name": "Mic/Aux", "track": 1},
                 {"input_name": "Desktop Audio", "track": 2},
                 {"input_name": "Game Audio", "track": 3}
-            ]
+            ],
+            "app_captures": []
         },
         "replay_buffer": {
             "enabled": false
