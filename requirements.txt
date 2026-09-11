@@ -2,3 +2,4 @@ psutil
 obsws-python
 pystray
 pillow
+python-vlc

@@ -1502,6 +1502,129 @@ def winget_install_ffmpeg(timeout=600):
     return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
 
 
+VLC_DOWNLOAD_URL = "https://www.videolan.org/vlc/"
+VLC_WINGET_ID = "VideoLAN.VLC"
+
+
+def find_vlc():
+    """Best-effort search for a VLC install on this PC, mirroring find_ffmpeg()'s approach but
+    checking for libvlc.dll (what python-vlc actually loads) via the registry key VLC itself
+    writes on install, rather than a bare exe on PATH. Deliberately does NOT import the `vlc`
+    module -- see import_vlc_module()'s docstring for why that has to stay separate. Returns the
+    install directory, or None."""
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(hive, r"Software\VideoLAN\VLC") as key:
+                install_dir = winreg.QueryValueEx(key, "InstallDir")[0]
+        except OSError:
+            continue
+        if install_dir and os.path.isfile(os.path.join(install_dir, "libvlc.dll")):
+            return install_dir
+
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_var)
+        if not base:
+            continue
+        candidate = os.path.join(base, "VideoLAN", "VLC")
+        if os.path.isfile(os.path.join(candidate, "libvlc.dll")):
+            return candidate
+
+    vlc_exe = shutil.which("vlc")
+    if vlc_exe:
+        candidate = os.path.dirname(vlc_exe)
+        if os.path.isfile(os.path.join(candidate, "libvlc.dll")):
+            return candidate
+
+    return None
+
+
+def winget_install_vlc(timeout=600):
+    """Best-effort silent VLC install via winget, mirroring winget_install_ffmpeg(). Returns
+    (True, None) on success, (False, reason) otherwise; never raises."""
+    try:
+        result = subprocess.run(
+            [
+                "winget", "install", "--id", VLC_WINGET_ID, "-e", "--silent",
+                "--accept-source-agreements", "--accept-package-agreements",
+            ],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, None
+    return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
+
+
+def import_vlc_module():
+    """Lazily imports python-vlc -- only ever call this once find_vlc() has already confirmed an
+    install exists, and never at module load time. python-vlc's own DLL discovery (vlc.py's
+    module-level find_lib(), which runs the instant `import vlc` executes) raises a bare,
+    uncaught OSError if libvlc can't be found at all, with no fallback -- so an unconditional
+    `import vlc` at the top of this file would crash this entire app on startup for every user
+    who doesn't have VLC installed, even though the vast majority of this app's features have
+    nothing to do with it. Returns the vlc module, or None if it couldn't be loaded for any
+    reason (VLC uninstalled between find_vlc() and this call, a corrupt install, etc.)."""
+    try:
+        import vlc
+        return vlc
+    except Exception as exc:
+        logging.warning("Could not load VLC (python-vlc/libvlc): %s", exc)
+        return None
+
+
+# libvlc's own default logging writes raw, unformatted text straight to the process's real
+# stderr -- including a one-time "stale plugins cache" rebuild notice some Windows installs print
+# after VLC updates itself, one line per plugin. That specific burst happens synchronously inside
+# vlc.Instance() construction, before there's an instance to attach a log callback to, so no
+# instance-level API can redirect or suppress it individually -- it's harmless and self-resolving
+# (the cache stays fresh after that first run), and --quiet below keeps it off a console this app
+# may not even have (--noconsole builds) without also silencing the log_set() callback: --quiet
+# only mutes libvlc's own default output sink, it doesn't lower what still reaches log_set().
+_VLC_LOG_LEVEL_MAP = {}
+
+
+def create_vlc_instance_with_logging(vlc_module, args=None):
+    """Creates a vlc.Instance() and routes every log message it emits from that point on (real
+    playback/codec errors in particular) into this app's own logging via libvlc's log_set()
+    callback, instead of discarding them or leaking raw text to a console that may not exist."""
+    args = list(args or [])
+    if "--quiet" not in args:
+        args.append("--quiet")
+    instance = vlc_module.Instance(*args)
+
+    if not _VLC_LOG_LEVEL_MAP:
+        _VLC_LOG_LEVEL_MAP.update({
+            vlc_module.LogLevel.DEBUG: logging.DEBUG,
+            vlc_module.LogLevel.NOTICE: logging.INFO,
+            vlc_module.LogLevel.WARNING: logging.WARNING,
+            vlc_module.LogLevel.ERROR: logging.ERROR,
+        })
+
+    try:
+        msvcrt = ctypes.CDLL("msvcrt")
+        msvcrt.vsnprintf.restype = ctypes.c_int
+        msvcrt.vsnprintf.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_void_p]
+
+        @vlc_module.CallbackDecorators.LogCb
+        def on_vlc_log(_data, level, _ctx, fmt, log_args):
+            buf = ctypes.create_string_buffer(2048)
+            n = msvcrt.vsnprintf(buf, len(buf), fmt, log_args)
+            text = buf.raw[:n].decode("utf-8", errors="replace") if n and n > 0 else "<unreadable log message>"
+            logging.log(_VLC_LOG_LEVEL_MAP.get(level, logging.DEBUG), "libvlc: %s", text)
+
+        instance.log_set(on_vlc_log, None)
+        # ctypes callbacks are only kept alive by Python references -- without holding this one
+        # on the instance itself, it can be garbage-collected while libvlc still expects to call
+        # it, which segfaults the process rather than raising a catchable Python exception.
+        instance._log_callback_ref = on_vlc_log
+    except Exception as exc:
+        logging.warning("Could not attach VLC log capture: %s", exc)
+
+    return instance
+
+
 def transcode_recording(input_path, transcode_config, icon=None, notifications_config=None):
     configured_ffmpeg_path = transcode_config.get("ffmpeg_path", "ffmpeg")
     args = transcode_config.get("args", ["-map", "0", "-c:v", "libx264", "-crf", "23", "-c:a", "aac"])
