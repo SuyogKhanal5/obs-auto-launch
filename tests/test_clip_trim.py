@@ -228,6 +228,24 @@ class TrimClipTests(unittest.TestCase):
             self.assertFalse(result)
 
 
+class IsFileBeingRecordedTests(unittest.TestCase):
+    def test_true_for_the_exact_active_recording(self):
+        recording_state = {"current_path": r"C:\Recordings\Game - clip.mkv"}
+        self.assertTrue(a.is_file_being_recorded(r"C:\Recordings\Game - clip.mkv", recording_state))
+
+    def test_true_regardless_of_path_normalization(self):
+        recording_state = {"current_path": r"C:\Recordings\Game - clip.mkv"}
+        self.assertTrue(a.is_file_being_recorded(r"C:\Recordings\.\Game - clip.mkv", recording_state))
+
+    def test_false_for_a_different_file(self):
+        recording_state = {"current_path": r"C:\Recordings\Game - clip.mkv"}
+        self.assertFalse(a.is_file_being_recorded(r"C:\Recordings\Other - clip.mkv", recording_state))
+
+    def test_false_when_nothing_is_recording(self):
+        self.assertFalse(a.is_file_being_recorded(r"C:\Recordings\Game - clip.mkv", {}))
+        self.assertFalse(a.is_file_being_recorded(r"C:\Recordings\Game - clip.mkv", {"current_path": None}))
+
+
 class ValidateTrimRangeTests(unittest.TestCase):
     def test_valid_range_returns_none(self):
         self.assertIsNone(a.validate_trim_range(5, 10, 20))

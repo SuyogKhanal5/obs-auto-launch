@@ -4018,6 +4018,15 @@ def validate_trim_range(start_seconds, end_seconds, duration_seconds=None):
     return None
 
 
+def is_file_being_recorded(path, recording_state):
+    """True if `path` is the exact file OBS is currently writing to -- the clip editor refuses
+    to open this one, rather than letting someone try to trim a file that's still growing."""
+    active_path = recording_state.get("current_path")
+    if not active_path:
+        return False
+    return os.path.normpath(active_path) == os.path.normpath(path)
+
+
 def open_clip_editor_window(editor_state, config, recording_state, overlay_state, icon):
     if editor_state.get("open"):
         if time.time() - editor_state.get("opened_at", 0) < EDITOR_STUCK_TIMEOUT_SECONDS:
@@ -4129,14 +4138,26 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     instance = create_vlc_instance_with_logging(vlc_module)
     player = instance.media_player_new()
 
-    def cleanup(_event=None):
+    def cleanup():
         try:
             player.stop()
             instance.release()
         except Exception:
             pass
 
-    root.bind("<Destroy>", lambda event: (cleanup(), on_close()) if event.widget is root else None)
+    def close_editor():
+        # Stop playback (and release the VLC instance) BEFORE the window's video-output HWND
+        # actually gets torn down -- relying on <Destroy> alone lets VLC keep trying to render
+        # into an HWND Windows has already destroyed, which spams a cascade of native
+        # SwapChain/CreateWindow errors instead of shutting down cleanly (confirmed by deliberately
+        # closing the editor while a clip was still playing and watching libvlc's own log fill
+        # with "Could not create the SwapChain" / "video output creation failed" messages until
+        # cleanup() ran first here).
+        cleanup()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_editor)
+    root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
 
     # --- Open file row ---
     open_row = tk.Frame(root)
@@ -4201,7 +4222,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
     bottom_row = tk.Frame(root)
     bottom_row.pack(fill="x", padx=10, pady=10, side="bottom")
-    tk.Button(bottom_row, text="Close", command=root.destroy).pack(side="right")
+    tk.Button(bottom_row, text="Close", command=close_editor).pack(side="right")
     trim_button = tk.Button(bottom_row, text="Trim Clip", command=lambda: do_trim())
     trim_button.pack(side="right", padx=(0, 8))
 
@@ -4215,8 +4236,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             load_file(path)
 
     def load_file(path):
-        active_path = recording_state.get("current_path")
-        if active_path and os.path.normpath(active_path) == os.path.normpath(path):
+        if is_file_being_recorded(path, recording_state):
             status_label.config(text="That recording is still in progress -- wait for it to finish before trimming it.")
             return
         player.stop()
@@ -4231,6 +4251,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         # worry about calling back into Tkinter from a non-Tk thread) until playback has actually
         # started, then pause; gives up after ~5s so a genuinely broken file doesn't poll forever.
         def pause_once_playing(attempts=0):
+            if not root.winfo_exists():
+                return
             if player.get_state() == vlc_module.State.Playing:
                 player.pause()
             elif attempts < 50:
@@ -4318,6 +4340,11 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             )
 
             def finish():
+                if not root.winfo_exists():
+                    # Editor was closed while this trim was still running -- trim_clip() already
+                    # logged the result and fired a toast notification above, so the user still
+                    # finds out; there's just no window left to update here. Nothing else to do.
+                    return
                 progress.stop()
                 progress.pack_forget()
                 trim_button.config(state="normal")
@@ -4326,7 +4353,10 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 else:
                     status_label.config(fg="#b00020", text="Trim failed -- see the log for details.")
 
-            root.after(0, finish)
+            try:
+                root.after(0, finish)
+            except tk.TclError:
+                pass
 
         threading.Thread(target=worker, daemon=True).start()
 
