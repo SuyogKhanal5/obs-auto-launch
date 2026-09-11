@@ -1849,15 +1849,21 @@ def build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, outp
     ]
 
 
-def compute_trim_output_path(input_path, output_folder=None, suffix="_trimmed"):
+def compute_trim_output_path(input_path, output_folder=None, suffix="_trimmed", output_ext=None):
     """Computes where a trimmed clip should be written: inside output_folder if given (created
     if it doesn't exist yet, mirroring apply_output_folder), otherwise next to the source file.
     Never overwrites an existing file -- appends " (2)", " (3)", etc. until a free name is found,
-    the same convention Windows Explorer itself uses for a colliding copy."""
+    the same convention Windows Explorer itself uses for a colliding copy.
+
+    output_ext, if given (e.g. ".mkv"), overrides the source file's extension -- this is how the
+    editor's output-format picker changes the trimmed clip's container; ffmpeg itself picks the
+    muxer from the output path's extension, so nothing else needs to change to support it."""
     directory = output_folder or os.path.dirname(input_path)
     if output_folder:
         os.makedirs(output_folder, exist_ok=True)
     base, ext = os.path.splitext(os.path.basename(input_path))
+    if output_ext:
+        ext = output_ext
 
     candidate = os.path.join(directory, f"{base}{suffix}{ext}")
     if not os.path.exists(candidate):
@@ -3195,7 +3201,7 @@ def build_launcher_section(parent, row, title, launcher_config, include_install_
 EDITOR_STUCK_TIMEOUT_SECONDS = 300
 
 
-def open_config_editor_window(editor_state, restart_callback, overlay_state):
+def open_config_editor_window(editor_state, restart_callback, overlay_state, icon):
     if editor_state.get("open"):
         if time.time() - editor_state.get("opened_at", 0) < EDITOR_STUCK_TIMEOUT_SECONDS:
             logging.info("Settings editor is already open.")
@@ -3215,6 +3221,11 @@ def open_config_editor_window(editor_state, restart_callback, overlay_state):
 
     def on_close():
         editor_state["open"] = False
+        # pystray only rebuilds the native tray menu right after a menu item is clicked (see the
+        # matching comment in the watcher loop) -- without this, "Edit Settings..." stays greyed
+        # out until some unrelated menu click happens to refresh it, even though the editor is
+        # long closed.
+        icon.update_menu()
 
     def build():
         try:
@@ -3748,6 +3759,28 @@ def _run_config_editor(master_root, restart_callback, on_close):
         clip_delete_original_var,
     )
     row += 1
+    configured_default_format = clip_editor_config.get("default_output_format", CLIP_EDITOR_OUTPUT_FORMATS[0])
+    if configured_default_format not in CLIP_EDITOR_OUTPUT_FORMATS:
+        configured_default_format = CLIP_EDITOR_OUTPUT_FORMATS[0]
+    clip_default_format_var = tk.StringVar(value=configured_default_format)
+    tk.Label(clip_editor_tab, text="Default export format", anchor="w").grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        clip_editor_tab, textvariable=clip_default_format_var, values=CLIP_EDITOR_OUTPUT_FORMATS,
+        state="readonly", width=16,
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Trims default to this container -- e.g. record in MKV but always want trimmed "
+            "clips as MP4 without transcoding the whole recording first. The editor's own "
+            "dropdown can still override this per trim."
+        ),
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
 
     add_section_label(clip_editor_tab, row, "Video Preview (VLC)")
     row += 1
@@ -4056,6 +4089,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
         else:
             clip_editor.pop("output_folder", None)
         clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
+        clip_editor["default_output_format"] = clip_default_format_var.get()
         clip_vlc_path_value = clip_vlc_path_var.get().strip()
         if clip_vlc_path_value:
             clip_editor["vlc_path"] = clip_vlc_path_value
@@ -4101,6 +4135,9 @@ def _run_config_editor(master_root, restart_callback, on_close):
 
 CLIP_EDITOR_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".flv", ".ts", ".webm", ".avi"}
 CLIP_EDITOR_MAX_RECENT_RECORDINGS = 30
+# First entry means "keep the source file's own extension" -- do_trim() checks for it by identity
+# rather than treating it as a real container, so it must stay first.
+CLIP_EDITOR_OUTPUT_FORMATS = ["Same as source", ".mp4", ".mkv", ".mov", ".avi", ".webm"]
 
 
 def list_recent_recordings(folder, limit=CLIP_EDITOR_MAX_RECENT_RECORDINGS):
@@ -4169,6 +4206,11 @@ def open_clip_editor_window(editor_state, config, recording_state, overlay_state
 
     def on_close():
         editor_state["open"] = False
+        # pystray only rebuilds the native tray menu right after a menu item is clicked (see the
+        # matching comment in the watcher loop) -- without this, "Edit Clips..." stays greyed out
+        # until some unrelated menu click happens to refresh it, even though the editor is long
+        # closed.
+        icon.update_menu()
 
     def build():
         try:
@@ -4318,20 +4360,72 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     root.update_idletasks()
     player.set_hwnd(video_frame.winfo_id())
 
-    # --- Transport controls ---
+    # --- Timeline (click/drag anywhere to seek; start/end markers drawn in their own colors so
+    # they're never confused with the playback seeker) ---
+    TIMELINE_HEIGHT = 40
+    SEEKER_COLOR = "#f5a623"
+    START_MARKER_COLOR = "#22c55e"
+    END_MARKER_COLOR = "#ef4444"
+
+    time_label = tk.Label(root, text="00:00:00.000 / 00:00:00.000", anchor="e")
+    time_label.pack(fill="x", padx=10, pady=(0, 2))
+
+    timeline_canvas = tk.Canvas(root, height=TIMELINE_HEIGHT, bg="#2b2b2b", highlightthickness=0)
+    timeline_canvas.pack(fill="x", padx=10, pady=(0, 4))
+
+    def canvas_x_to_seconds(x):
+        width = timeline_canvas.winfo_width()
+        duration = state["duration"]
+        if width <= 0 or not duration:
+            return 0.0
+        return min(max(x / width, 0.0), 1.0) * duration
+
+    def seconds_to_canvas_x(seconds):
+        width = timeline_canvas.winfo_width()
+        duration = state["duration"]
+        if width <= 0 or not duration:
+            return 0
+        return min(max(seconds / duration, 0.0), 1.0) * width
+
+    def draw_timeline():
+        timeline_canvas.delete("all")
+        width = timeline_canvas.winfo_width()
+        if width <= 1 or not state["duration"]:
+            return
+        mid = TIMELINE_HEIGHT // 2
+        timeline_canvas.create_rectangle(0, mid - 3, width, mid + 3, fill="#555555", outline="")
+        try:
+            x = seconds_to_canvas_x(parse_timestamp(start_var.get()))
+            timeline_canvas.create_line(x, 0, x, TIMELINE_HEIGHT, fill=START_MARKER_COLOR, width=3)
+        except ValueError:
+            pass
+        try:
+            x = seconds_to_canvas_x(parse_timestamp(end_var.get()))
+            timeline_canvas.create_line(x, 0, x, TIMELINE_HEIGHT, fill=END_MARKER_COLOR, width=3)
+        except ValueError:
+            pass
+        x = seconds_to_canvas_x(player.get_time() / 1000)
+        timeline_canvas.create_line(x, 0, x, TIMELINE_HEIGHT, fill=SEEKER_COLOR, width=2)
+
+    def seek_to_canvas_x(x):
+        if not state["path"] or not state["duration"]:
+            return
+        player.set_time(int(canvas_x_to_seconds(x) * 1000))
+        draw_timeline()
+
+    timeline_canvas.bind("<Button-1>", lambda event: seek_to_canvas_x(event.x))
+    timeline_canvas.bind("<B1-Motion>", lambda event: seek_to_canvas_x(event.x))
+    timeline_canvas.bind("<Configure>", lambda event: draw_timeline())
+
+    # --- Transport controls (below the timeline: rewind/forward flank play-pause, all centered) ---
     transport_row = tk.Frame(root)
     transport_row.pack(fill="x", padx=10, pady=4)
-    play_pause_button = tk.Button(transport_row, text="Play/Pause", command=lambda: toggle_play_pause())
-    play_pause_button.pack(side="left")
-    tk.Button(transport_row, text="Rewind 5s", command=lambda: rewind(5)).pack(side="left", padx=(6, 0))
-
-    seek_var = tk.DoubleVar(value=0)
-    seeking = {"active": False}
-    seek_scale = ttk.Scale(transport_row, from_=0, to=1000, orient="horizontal", variable=seek_var)
-    seek_scale.pack(side="left", fill="x", expand=True, padx=8)
-
-    time_label = tk.Label(transport_row, text="00:00:00.000 / 00:00:00.000", width=24, anchor="e")
-    time_label.pack(side="left")
+    transport_buttons = tk.Frame(transport_row)
+    transport_buttons.pack()  # no side/fill -- pack centers a parcel-filling child by default
+    tk.Button(transport_buttons, text="⏪ Rewind 5s", command=lambda: seek_relative(-5)).pack(side="left")
+    play_pause_button = tk.Button(transport_buttons, text="Play/Pause", command=lambda: toggle_play_pause())
+    play_pause_button.pack(side="left", padx=6)
+    tk.Button(transport_buttons, text="Forward 5s ⏩", command=lambda: seek_relative(5)).pack(side="left")
 
     # --- Start/End controls ---
     range_row = tk.Frame(root)
@@ -4344,6 +4438,21 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     tk.Entry(range_row, textvariable=end_var, width=14).pack(side="left", padx=(4, 16))
     precise_var = tk.BooleanVar(value=False)
     tk.Checkbutton(range_row, text="Precise (slower, frame-accurate)", variable=precise_var).pack(side="left")
+
+    start_var.trace_add("write", lambda *_args: draw_timeline())
+    end_var.trace_add("write", lambda *_args: draw_timeline())
+
+    # --- Output format ---
+    default_format = clip_editor_config.get("default_output_format", CLIP_EDITOR_OUTPUT_FORMATS[0])
+    if default_format not in CLIP_EDITOR_OUTPUT_FORMATS:
+        default_format = CLIP_EDITOR_OUTPUT_FORMATS[0]
+    format_row = tk.Frame(root)
+    format_row.pack(fill="x", padx=10, pady=(0, 4))
+    tk.Label(format_row, text="Output format:").pack(side="left")
+    format_var = tk.StringVar(value=default_format)
+    ttk.Combobox(
+        format_row, textvariable=format_var, values=CLIP_EDITOR_OUTPUT_FORMATS, state="readonly", width=16,
+    ).pack(side="left", padx=(6, 0))
 
     # --- Status + trim ---
     status_label = tk.Label(root, text="", fg="#b00020", anchor="w", justify="left", wraplength=780)
@@ -4408,22 +4517,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         else:
             player.play()
 
-    def rewind(seconds):
+    def seek_relative(seconds):
         if not state["path"]:
             return
-        player.set_time(max(0, player.get_time() - seconds * 1000))
-
-    def on_seek_press(_event):
-        seeking["active"] = True
-
-    def on_seek_release(_event):
+        new_time = player.get_time() + seconds * 1000
         length = player.get_length()
         if length > 0:
-            player.set_time(int(seek_var.get() / 1000 * length))
-        seeking["active"] = False
-
-    seek_scale.bind("<Button-1>", on_seek_press)
-    seek_scale.bind("<ButtonRelease-1>", on_seek_release)
+            new_time = min(new_time, length)
+        player.set_time(max(0, new_time))
+        draw_timeline()
 
     def set_start():
         if state["path"]:
@@ -4459,7 +4561,11 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             )
             return
 
-        output_path = compute_trim_output_path(state["path"], clip_editor_config.get("output_folder") or None)
+        format_choice = format_var.get()
+        output_ext = None if format_choice == CLIP_EDITOR_OUTPUT_FORMATS[0] else format_choice
+        output_path = compute_trim_output_path(
+            state["path"], clip_editor_config.get("output_folder") or None, output_ext=output_ext
+        )
         delete_original = clip_editor_config.get("delete_original_after_trim", False)
         precise = precise_var.get()
         source_path = state["path"]
@@ -4504,8 +4610,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             length = player.get_length()
             if length > 0:
                 state["duration"] = length / 1000
-                if not seeking["active"]:
-                    seek_var.set(player.get_time() / length * 1000)
+            draw_timeline()
             time_label.config(
                 text=f"{format_timestamp(player.get_time() / 1000)} / {format_timestamp(state['duration'])}"
             )
@@ -4572,7 +4677,7 @@ def main():
         stop_event.set()
 
     def on_edit_settings(icon, menu_item):
-        open_config_editor_window(editor_state, do_restart, overlay_state)
+        open_config_editor_window(editor_state, do_restart, overlay_state, icon)
 
     def on_edit_clips(icon, menu_item):
         open_clip_editor_window(clip_editor_state, config, recording_state, overlay_state, icon)

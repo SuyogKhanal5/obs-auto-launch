@@ -88,6 +88,7 @@
     "clip_editor": {
         "output_folder": "",
         "delete_original_after_trim": false,
+        "default_output_format": "Same as source",
         "vlc_path": ""
     },
     "obs": {
