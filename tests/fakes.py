@@ -142,5 +142,42 @@ class FakeObsClient:
         self.calls.append(("create_input", sceneName, inputName, inputKind, inputSettings))
         return SimpleNamespace(scene_item_id=len(self.inputs))
 
+    # --- replay buffer / split / recording control (custom keybind actions) ---
+    def save_replay_buffer(self):
+        self.calls.append(("save_replay_buffer",))
+
+    def start_replay_buffer(self):
+        self.calls.append(("start_replay_buffer",))
+
+    def stop_replay_buffer(self):
+        self.calls.append(("stop_replay_buffer",))
+
+    def toggle_replay_buffer(self):
+        self.calls.append(("toggle_replay_buffer",))
+
+    def split_record_file(self):
+        self.calls.append(("split_record_file",))
+
+    def start_record(self):
+        self.calls.append(("start_record",))
+
+    def stop_record(self):
+        self.calls.append(("stop_record",))
+
+    def toggle_record(self):
+        self.calls.append(("toggle_record",))
+
+    def pause_record(self):
+        self.calls.append(("pause_record",))
+
+    def resume_record(self):
+        self.calls.append(("resume_record",))
+
+    def toggle_record_pause(self):
+        self.calls.append(("toggle_record_pause",))
+
+    def toggle_input_mute(self, name):
+        self.calls.append(("toggle_input_mute", name))
+
     def disconnect(self):
         self.calls.append(("disconnect",))

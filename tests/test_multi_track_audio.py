@@ -157,5 +157,48 @@ class EnsureDedicatedProfileTests(unittest.TestCase):
         self.assertEqual(client.calls, [])
 
 
+class SyncMultiTrackAudioAppCapturesTests(unittest.TestCase):
+    """obs.game_audio_capture's input gets re-pointed at its target on every recording start,
+    which self-heals it if OBS ever silently rewrites its exe-only window match into a specific
+    (and eventually stale) window title. Quick-Setup-created app captures (Discord, Spotify, ...)
+    used to only get that treatment once, at creation -- meaning the exact same OBS-side drift
+    would leave them silently broken until someone noticed and fixed it by hand. This checks
+    sync_multi_track_audio now re-asserts every configured app_captures entry on every call."""
+
+    def test_repoints_existing_app_capture_every_time(self):
+        client = FakeObsClient(
+            profile_name="OBS Auto Recorder",
+            inputs={
+                "Discord": {
+                    "kind": "wasapi_process_output_capture",
+                    "tracks": {str(i): False for i in range(1, 7)},
+                    "settings": {"window": "#some-stale-channel-name:Chrome_WidgetWin_1:Discord.exe", "priority": 2},
+                },
+            },
+        )
+        multi_track_config = {
+            "enabled": True,
+            "tracks": [{"input_name": "Discord", "track": 4}],
+            "app_captures": [{"input_name": "Discord", "process_name": "Discord.exe"}],
+        }
+        a.sync_multi_track_audio(client, multi_track_config)
+        self.assertEqual(client.inputs["Discord"]["settings"]["window"], "::Discord.exe")
+
+    def test_missing_app_capture_input_is_created_not_skipped(self):
+        client = FakeObsClient(profile_name="OBS Auto Recorder")
+        multi_track_config = {
+            "enabled": True,
+            "tracks": [{"input_name": "Spotify", "track": 5}],
+            "app_captures": [{"input_name": "Spotify", "process_name": "Spotify.exe"}],
+        }
+        a.sync_multi_track_audio(client, multi_track_config)
+        self.assertEqual(client.inputs["Spotify"]["settings"]["window"], "::Spotify.exe")
+
+    def test_no_app_captures_configured_does_not_raise(self):
+        client = FakeObsClient(profile_name="OBS Auto Recorder")
+        multi_track_config = {"enabled": True, "tracks": [{"input_name": "Desktop Audio", "track": 1}]}
+        a.sync_multi_track_audio(client, multi_track_config)  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

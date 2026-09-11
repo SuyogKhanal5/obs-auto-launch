@@ -35,33 +35,39 @@ class ComputeQuickSetupTracksTests(unittest.TestCase):
         self.spotify = next(app for app in a.COMMON_AUDIO_APPS if app["name"] == "Spotify")
 
     def test_desktop_and_mic_route_to_tracks_one_and_two(self):
-        tracks, created = a.compute_quick_setup_tracks(self.client, "Desktop Audio", "Scarlet", None, [])
+        tracks, created, app_captures = a.compute_quick_setup_tracks(self.client, "Desktop Audio", "Scarlet", None, [])
         self.assertIn({"input_name": "Desktop Audio", "track": 1}, tracks)
         self.assertIn({"input_name": "Scarlet", "track": 1}, tracks)
         self.assertIn({"input_name": "Scarlet", "track": 2}, tracks)
         self.assertEqual(created, [])
+        self.assertEqual(app_captures, {})
 
     def test_none_desktop_and_mic_are_skipped(self):
-        tracks, created = a.compute_quick_setup_tracks(self.client, None, None, None, [])
+        tracks, created, app_captures = a.compute_quick_setup_tracks(self.client, None, None, None, [])
         self.assertEqual(tracks, [])
         self.assertEqual(created, [])
+        self.assertEqual(app_captures, {})
 
     def test_game_audio_routes_to_track_three(self):
-        tracks, _ = a.compute_quick_setup_tracks(self.client, None, None, "Game Audio", [])
+        tracks, _, _ = a.compute_quick_setup_tracks(self.client, None, None, "Game Audio", [])
         self.assertEqual(tracks, [{"input_name": "Game Audio", "track": 3}])
 
     def test_existing_app_input_is_reused_not_recreated(self):
-        tracks, created = a.compute_quick_setup_tracks(self.client, None, None, None, [self.discord])
+        tracks, created, app_captures = a.compute_quick_setup_tracks(self.client, None, None, None, [self.discord])
         self.assertEqual(created, [])
         self.assertEqual(tracks, [{"input_name": "Discord", "track": 4}])
         self.assertNotIn(("create_input", "Screen", "Discord", "wasapi_process_output_capture", {"window": "::Discord.exe", "priority": 2}), self.client.calls)
+        # Reported even though it already existed -- the caller re-points existing app captures
+        # every recording start to self-heal drift, not just newly-created ones.
+        self.assertEqual(app_captures, {"Discord": "Discord.exe"})
 
     def test_missing_app_input_is_created_and_routed(self):
-        tracks, created = a.compute_quick_setup_tracks(self.client, None, None, None, [self.spotify])
+        tracks, created, app_captures = a.compute_quick_setup_tracks(self.client, None, None, None, [self.spotify])
         self.assertEqual(created, ["Spotify"])
         self.assertEqual(tracks, [{"input_name": "Spotify", "track": 5}])
         self.assertIn("Spotify", self.client.inputs)
         self.assertEqual(self.client.inputs["Spotify"]["kind"], "wasapi_process_output_capture")
+        self.assertEqual(app_captures, {"Spotify": "Spotify.exe"})
 
     def test_created_input_targets_the_apps_exe_by_window_setting(self):
         a.compute_quick_setup_tracks(self.client, None, None, None, [self.spotify])
@@ -74,7 +80,7 @@ class ComputeQuickSetupTracksTests(unittest.TestCase):
 
     def test_full_scheme_matches_the_six_track_layout(self):
         chrome = next(app for app in a.COMMON_AUDIO_APPS if app["name"] == "Chrome")
-        tracks, created = a.compute_quick_setup_tracks(
+        tracks, created, app_captures = a.compute_quick_setup_tracks(
             self.client, "Desktop Audio", "Scarlet", "Game Audio", [self.discord, self.spotify, chrome]
         )
         by_track = {}
@@ -87,6 +93,9 @@ class ComputeQuickSetupTracksTests(unittest.TestCase):
         self.assertEqual(by_track[5], {"Spotify"})
         self.assertEqual(by_track[6], {"Chrome"})
         self.assertEqual(set(created), {"Spotify", "Chrome"})  # Discord already existed
+        self.assertEqual(
+            app_captures, {"Discord": "Discord.exe", "Spotify": "Spotify.exe", "Chrome": "chrome.exe"}
+        )
 
 
 if __name__ == "__main__":

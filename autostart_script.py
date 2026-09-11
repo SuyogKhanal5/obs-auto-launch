@@ -1,4 +1,5 @@
 import ctypes
+import glob
 import json
 import logging
 import os
@@ -575,9 +576,11 @@ def reset_segment_audio_tracking(recording_state):
     recording_state["silent_warning_sent"] = False
 
 
-def maybe_transcode(path, transcode_config):
+def maybe_transcode(path, transcode_config, icon=None, notifications_config=None):
     if transcode_config.get("enabled") and path:
-        threading.Thread(target=transcode_recording, args=(path, transcode_config), daemon=True).start()
+        threading.Thread(
+            target=transcode_recording, args=(path, transcode_config, icon, notifications_config), daemon=True
+        ).start()
 
 
 def is_event_client_connected(event_client):
@@ -858,6 +861,13 @@ def apply_output_folder(client, output_folder):
 # dropdown) so a value outside this list can still be typed in and used as-is.
 RECORDING_FORMAT_OPTIONS = ["mp4", "mkv", "mov", "hybrid_mp4", "fragmented_mp4", "fragmented_mov", "flv", "ts", "hls"]
 
+# ffmpeg output container extensions offered in the post-record transcode field. A free-text
+# entry here is easy to typo (a missing leading dot, an unsupported extension for the chosen
+# args) in a way that only surfaces as a cryptic ffmpeg failure after a recording finishes, so
+# this is a dropdown instead -- still editable, in case someone genuinely needs a container not
+# listed here. Blank means "keep the original recording's extension".
+TRANSCODE_OUTPUT_EXTENSION_OPTIONS = ["", ".mp4", ".mkv", ".mov", ".ts", ".flv", ".webm", ".avi"]
+
 
 def apply_recording_format(client, recording_format):
     """Best-effort override of OBS's recording container format for whichever profile is
@@ -1120,6 +1130,20 @@ def sync_multi_track_audio(client, multi_track_config):
             return
         if not sync_multi_track_output_settings(client, entries, profile_name):
             return
+        # Re-point every app-audio-capture input at its exe before routing runs below -- both
+        # because a missing input needs to exist first to be routed at all (this call creates it
+        # if needed, same fallback obs.game_audio_capture already relies on), and because OBS can
+        # silently rewrite a wasapi_process_output_capture's exe-only match into a specific window
+        # title behind this app's back (e.g. its Properties dialog was ever opened in OBS itself),
+        # which then goes stale the moment the app's window title changes (Discord's includes the
+        # current server/channel name) -- exactly what "isolation randomly stops working" turns
+        # out to be. This re-point isn't a one-time fix, it runs on every recording start, same as
+        # obs.game_audio_capture already gets.
+        for app_capture in multi_track_config.get("app_captures", []):
+            input_name = app_capture.get("input_name")
+            process_name = app_capture.get("process_name")
+            if input_name and process_name:
+                set_game_audio_capture_target(client, input_name, process_name)
         apply_multi_track_routing(client, entries)
     except Exception:
         logging.exception("Unexpected error while syncing multi-track audio settings.")
@@ -1165,6 +1189,174 @@ def save_replay_buffer(client):
         logging.error("Could not save replay buffer: %s", exc)
 
 
+def trigger_buffered_split(client, buffer_seconds):
+    # The buffer runs on our side, not OBS's: obs-websocket's SplitRecordFile request fires the
+    # split immediately and independently of whatever physical hotkey OBS itself has bound for it,
+    # so a delay here just means "wait, then call split", not "delay OBS's own hotkey".
+    if buffer_seconds > 0:
+        logging.info("Splitting recording in %s second(s)...", buffer_seconds)
+        time.sleep(buffer_seconds)
+    try:
+        client.split_record_file()
+        logging.info("Recording file split.")
+    except Exception as exc:
+        logging.error("Could not split recording file: %s", exc)
+
+
+# obs-websocket has no API to read or set what physical key OBS itself has a hotkey bound to (see
+# find_ffmpeg/resolve_ffmpeg_path above for the analogous ffmpeg-discovery story -- this one's
+# just a hard protocol limitation instead). Rather than only listing/triggering OBS's existing
+# hotkeys, this app registers its own system-wide keybinds directly with Windows and calls the
+# matching WebSocket action when pressed -- fully independent of whatever OBS has (or hasn't)
+# bound, and works even if OBS's own Hotkeys page has never been touched.
+CUSTOM_KEYBIND_ACTIONS = {
+    "split_record_file": "Split Recording File",
+    "save_replay_buffer": "Save Replay Buffer",
+    "start_replay_buffer": "Start Replay Buffer",
+    "stop_replay_buffer": "Stop Replay Buffer",
+    "toggle_replay_buffer": "Toggle Replay Buffer",
+    "start_record": "Start Recording",
+    "stop_record": "Stop Recording",
+    "toggle_record": "Toggle Recording",
+    "pause_record": "Pause Recording",
+    "resume_record": "Resume Recording",
+    "toggle_record_pause": "Toggle Recording Pause",
+    "toggle_input_mute": "Toggle Mute (needs input name)",
+}
+CUSTOM_KEYBIND_ACTIONS_BY_LABEL = {label: action for action, label in CUSTOM_KEYBIND_ACTIONS.items()}
+CUSTOM_KEYBIND_KEY_OPTIONS = (
+    [str(d) for d in range(10)] + [chr(c) for c in range(65, 91)] + [f"F{n}" for n in range(1, 13)]
+)
+
+# Win32 RegisterHotKey modifier flags and the WM_HOTKEY message id -- MOD_NOREPEAT (added to
+# every registration below) keeps a held-down key from re-firing the action on every auto-repeat
+# tick, which would otherwise queue up a burst of duplicate split/mute/etc. calls.
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+WM_HOTKEY = 0x0312
+_CUSTOM_KEYBIND_MODIFIER_FLAGS = {"ctrl": MOD_CONTROL, "alt": MOD_ALT, "shift": MOD_SHIFT, "win": MOD_WIN}
+
+
+def vk_code_for_key(key):
+    """Maps a CUSTOM_KEYBIND_KEY_OPTIONS entry to its Win32 virtual-key code. Letters and digits
+    share their ASCII codes with Windows' VK_0-VK_9/VK_A-VK_Z, so those need no lookup table."""
+    key = (key or "").strip().upper()
+    if len(key) == 1 and (key.isalpha() or key.isdigit()):
+        return ord(key)
+    match = re.fullmatch(r"F(\d{1,2})", key)
+    if match and 1 <= int(match.group(1)) <= 12:
+        return 0x6F + int(match.group(1))  # VK_F1 is 0x70
+    return None
+
+
+def mod_flags_for(modifiers):
+    flags = 0
+    for m in modifiers or []:
+        flags |= _CUSTOM_KEYBIND_MODIFIER_FLAGS.get(m, 0)
+    return flags
+
+
+def describe_keybind(binding):
+    parts = [m.capitalize() for m in binding.get("modifiers", [])]
+    parts.append(binding.get("key", "?"))
+    return "+".join(parts)
+
+
+def perform_keybind_action(client, action, param="", manual_split_buffer_seconds=0):
+    try:
+        if action == "split_record_file":
+            trigger_buffered_split(client, manual_split_buffer_seconds)
+        elif action == "save_replay_buffer":
+            client.save_replay_buffer()
+        elif action == "start_replay_buffer":
+            client.start_replay_buffer()
+        elif action == "stop_replay_buffer":
+            client.stop_replay_buffer()
+        elif action == "toggle_replay_buffer":
+            client.toggle_replay_buffer()
+        elif action == "start_record":
+            client.start_record()
+        elif action == "stop_record":
+            client.stop_record()
+        elif action == "toggle_record":
+            client.toggle_record()
+        elif action == "pause_record":
+            client.pause_record()
+        elif action == "resume_record":
+            client.resume_record()
+        elif action == "toggle_record_pause":
+            client.toggle_record_pause()
+        elif action == "toggle_input_mute":
+            if not param:
+                logging.warning("Toggle Mute keybind has no input name configured; ignoring.")
+                return
+            client.toggle_input_mute(param)
+        else:
+            logging.warning("Unknown custom keybind action: %s", action)
+            return
+        logging.info("Custom keybind action performed: %s%s", action, f" ({param})" if param else "")
+    except Exception as exc:
+        logging.error("Custom keybind action '%s' failed: %s", action, exc)
+
+
+def fire_custom_keybind(binding, get_client, get_manual_split_buffer_seconds):
+    client = get_client()
+    if not client:
+        logging.warning("Custom keybind %s pressed but OBS is not connected.", describe_keybind(binding))
+        return
+    perform_keybind_action(client, binding.get("action"), binding.get("param", ""), get_manual_split_buffer_seconds())
+
+
+def run_custom_keybind_listener(bindings, get_client, get_manual_split_buffer_seconds):
+    """Runs for its whole lifetime on one dedicated daemon thread: RegisterHotKey (and the
+    WM_HOTKEY messages it produces) has thread affinity, so every binding must be registered from
+    -- and received on -- the same thread. Passing hwnd=None posts WM_HOTKEY straight to this
+    thread's message queue instead of routing through a window, so no hidden window is needed."""
+    user32 = ctypes.windll.user32
+    registered = []
+    for index, binding in enumerate(bindings):
+        if not binding.get("enabled", True):
+            continue
+        vk = vk_code_for_key(binding.get("key", ""))
+        if vk is None:
+            logging.warning("Custom keybind has an invalid key %r; skipping.", binding.get("key"))
+            continue
+        mods = mod_flags_for(binding.get("modifiers")) | MOD_NOREPEAT
+        hotkey_id = index + 1
+        if user32.RegisterHotKey(None, hotkey_id, mods, vk):
+            registered.append((hotkey_id, binding))
+            logging.info("Registered custom keybind %s -> %s", describe_keybind(binding), binding.get("action"))
+        else:
+            logging.warning(
+                "Could not register custom keybind %s (it may already be in use by another app).",
+                describe_keybind(binding),
+            )
+
+    if not registered:
+        return
+
+    by_id = dict(registered)
+    msg = wintypes.MSG()
+    try:
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == WM_HOTKEY:
+                binding = by_id.get(msg.wParam)
+                if binding:
+                    threading.Thread(
+                        target=fire_custom_keybind,
+                        args=(binding, get_client, get_manual_split_buffer_seconds),
+                        daemon=True,
+                    ).start()
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+    finally:
+        for hotkey_id, _ in registered:
+            user32.UnregisterHotKey(None, hotkey_id)
+
+
 def notify(icon, notifications_config, title, message):
     if not (notifications_config or {}).get("enabled"):
         return
@@ -1185,25 +1377,112 @@ def delete_recording_files(paths):
             logging.error("Failed to delete short recording %s: %s", path, exc)
 
 
-def transcode_recording(input_path, transcode_config):
-    ffmpeg_path = transcode_config.get("ffmpeg_path", "ffmpeg")
-    args = transcode_config.get("args", ["-c:v", "libx264", "-crf", "23", "-c:a", "aac"])
+# A remux-only preset: -map 0 keeps every stream (video + every audio track) instead of
+# ffmpeg's default of picking just one "best" stream per type, and -c copy repackages them into
+# the new container without re-encoding at all -- lossless and fast, so this is the actual
+# "preserve every audio track exactly" option for converting a multi-track recording between
+# containers (e.g. the MKV this app recommends for multi-track audio, into a more universally
+# compatible MP4). The default re-encode preset below now also includes -map 0 so plain
+# compression doesn't silently drop extra tracks either, just without the lossless guarantee.
+MKV_TO_MP4_PRESERVE_TRACKS_ARGS = ["-map", "0", "-c", "copy"]
+MKV_TO_MP4_PRESERVE_TRACKS_EXTENSION = ".mp4"
+
+
+def find_ffmpeg():
+    """Best-effort search for an ffmpeg install already on this PC, so most users never have to
+    know or set an ffmpeg path themselves. Checks PATH first, then the install locations of the
+    package managers people actually use to get ffmpeg on Windows (winget, Chocolatey, Scoop)
+    plus a couple of common manual-install folders. Returns None if nothing turns up anywhere --
+    the feature is still opt-in and requires an actual ffmpeg somewhere on the machine."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    candidates = [
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+        os.path.expandvars(r"%USERPROFILE%\scoop\shims\ffmpeg.exe"),
+    ]
+    try:
+        candidates += glob.glob(
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\*FFmpeg*\**\ffmpeg.exe"),
+            recursive=True,
+        )
+    except OSError:
+        pass
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def resolve_ffmpeg_path(configured_path):
+    """Resolves the ffmpeg_path from config.json to an actual runnable path: an explicit path
+    that still exists wins as-is, otherwise falls back to a PATH lookup of whatever string was
+    configured (so plain "ffmpeg" keeps working the normal way), and only falls back to
+    find_ffmpeg()'s broader search if that specific configured value can't be resolved -- e.g.
+    the default "ffmpeg" isn't on PATH, or a previously-set explicit path no longer exists."""
+    configured_path = configured_path or "ffmpeg"
+    if os.path.isabs(configured_path) and os.path.isfile(configured_path):
+        return configured_path
+    found = shutil.which(configured_path)
+    if found:
+        return found
+    return find_ffmpeg()
+
+
+def transcode_recording(input_path, transcode_config, icon=None, notifications_config=None):
+    configured_ffmpeg_path = transcode_config.get("ffmpeg_path", "ffmpeg")
+    args = transcode_config.get("args", ["-map", "0", "-c:v", "libx264", "-crf", "23", "-c:a", "aac"])
     suffix = transcode_config.get("suffix", "_compressed")
     delete_original = transcode_config.get("delete_original", False)
+    output_extension = transcode_config.get("output_extension") or None
 
     directory = os.path.dirname(input_path)
     base, ext = os.path.splitext(os.path.basename(input_path))
-    output_path = os.path.join(directory, f"{base}{suffix}{ext}")
+    output_path = os.path.join(directory, f"{base}{suffix}{output_extension or ext}")
+
+    ffmpeg_path = resolve_ffmpeg_path(configured_ffmpeg_path)
+    if not ffmpeg_path:
+        logging.error(
+            "ffmpeg not found (checked '%s', PATH, and common install locations); skipping "
+            "post-record transcode for %s. The original recording is untouched -- install ffmpeg "
+            "(e.g. `winget install ffmpeg`) or set post_record_transcode.ffmpeg_path to its exact "
+            "location, then use Settings > Post-Processing > Auto-detect ffmpeg.",
+            configured_ffmpeg_path, os.path.basename(input_path),
+        )
+        notify(
+            icon, notifications_config, "ffmpeg not found",
+            f"{os.path.basename(input_path)} was kept, but not transcoded: ffmpeg isn't installed or configured.",
+        )
+        return
 
     cmd = [ffmpeg_path, "-y", "-i", input_path] + list(args) + [output_path]
-    logging.info("Transcoding %s with ffmpeg...", os.path.basename(input_path))
+    logging.info("Transcoding %s with ffmpeg: %s", os.path.basename(input_path), " ".join(cmd))
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-    except FileNotFoundError:
-        logging.error("ffmpeg not found at '%s'; skipping post-record transcode.", ffmpeg_path)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except OSError as exc:
+        logging.error(
+            "Could not run ffmpeg at '%s' for %s: %s. The original recording is untouched.",
+            ffmpeg_path, os.path.basename(input_path), exc,
+        )
+        notify(
+            icon, notifications_config, "ffmpeg failed to run",
+            f"{os.path.basename(input_path)} was kept, but not transcoded: {exc}",
+        )
         return
     if result.returncode != 0:
-        logging.error("ffmpeg transcode failed for %s: %s", input_path, result.stderr[-2000:])
+        logging.error(
+            "ffmpeg transcode failed for %s (exit code %s).\nCommand: %s\nstderr:\n%s",
+            input_path, result.returncode, " ".join(cmd), result.stderr[-4000:],
+        )
+        notify(
+            icon, notifications_config, "Transcode failed",
+            f"{os.path.basename(input_path)} was kept, but ffmpeg failed to transcode it -- see the log for details.",
+        )
         return
     logging.info("Transcoded to %s", os.path.basename(output_path))
     if delete_original:
@@ -1304,7 +1583,7 @@ def stop_recording(client, icon, game_display_name=None, recording_state=None, c
     if recording_state is not None and new_path:
         recording_state.setdefault("segment_files", []).append(new_path)
 
-    maybe_transcode(new_path, config.get("post_record_transcode", {}))
+    maybe_transcode(new_path, config.get("post_record_transcode", {}), icon, notifications_config)
     return True
 
 
@@ -2097,6 +2376,88 @@ def open_obs_input_picker(parent, get_ws_config, on_pick):
     listbox.bind("<Double-Button-1>", lambda e: select())
 
 
+def build_custom_keybinds_editor(parent, initial_rows):
+    """Row editor for obs.custom_keybinds -- see the CUSTOM_KEYBIND_ACTIONS comment above for why
+    this app registers its own system-wide keybinds instead of trying to rebind OBS's."""
+    tk.Label(
+        parent,
+        text=(
+            "System-wide keybinds captured by this app itself (not OBS) that call the matching "
+            "OBS WebSocket action directly the moment they're pressed -- they work without ever "
+            "touching OBS's own Hotkeys settings, but only while OBS is running and connected, and "
+            "only while this app is running. \"Split Recording File\" uses the buffer configured "
+            "above under Manual Split. A key already claimed by another running app may fail to "
+            "register; check the log if a keybind doesn't seem to fire."
+        ),
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).pack(fill="x", padx=10, pady=(10, 6))
+
+    header = tk.Frame(parent)
+    header.pack(fill="x", padx=10)
+    for text, w in (
+        ("On", 3), ("Action", 24), ("Ctrl", 4), ("Alt", 4), ("Shift", 5), ("Win", 4), ("Key", 4), ("Param", 14),
+    ):
+        tk.Label(header, text=text, width=w, anchor="w").pack(side="left", padx=2)
+
+    container = tk.Frame(parent)
+    container.pack(fill="x", padx=10)
+    rows = []
+
+    def add_row(enabled=True, action="split_record_file", modifiers=None, key="S", param=""):
+        modifiers = modifiers if modifiers is not None else ["ctrl", "alt"]
+        row_frame = tk.Frame(container)
+        row_frame.pack(fill="x", pady=2)
+
+        enabled_var = tk.BooleanVar(value=enabled)
+        tk.Checkbutton(row_frame, variable=enabled_var, width=2).pack(side="left", padx=2)
+
+        action_label_var = tk.StringVar(value=CUSTOM_KEYBIND_ACTIONS.get(action, action))
+        ttk.Combobox(
+            row_frame, textvariable=action_label_var, values=list(CUSTOM_KEYBIND_ACTIONS.values()),
+            state="readonly", width=24,
+        ).pack(side="left", padx=2)
+
+        ctrl_var = tk.BooleanVar(value="ctrl" in modifiers)
+        alt_var = tk.BooleanVar(value="alt" in modifiers)
+        shift_var = tk.BooleanVar(value="shift" in modifiers)
+        win_var = tk.BooleanVar(value="win" in modifiers)
+        tk.Checkbutton(row_frame, variable=ctrl_var, width=3).pack(side="left", padx=2)
+        tk.Checkbutton(row_frame, variable=alt_var, width=3).pack(side="left", padx=2)
+        tk.Checkbutton(row_frame, variable=shift_var, width=4).pack(side="left", padx=2)
+        tk.Checkbutton(row_frame, variable=win_var, width=3).pack(side="left", padx=2)
+
+        key_var = tk.StringVar(value=(key or "S").upper())
+        ttk.Combobox(
+            row_frame, textvariable=key_var, values=CUSTOM_KEYBIND_KEY_OPTIONS, state="readonly", width=4,
+        ).pack(side="left", padx=2)
+
+        param_var = tk.StringVar(value=param)
+        tk.Entry(row_frame, textvariable=param_var, width=14).pack(side="left", padx=2)
+
+        entry = {
+            "enabled": enabled_var, "action_label": action_label_var,
+            "ctrl": ctrl_var, "alt": alt_var, "shift": shift_var, "win": win_var,
+            "key": key_var, "param": param_var,
+        }
+
+        def remove():
+            row_frame.destroy()
+            rows.remove(entry)
+
+        tk.Button(row_frame, text="Remove", command=remove).pack(side="left", padx=4)
+        entry["frame"] = row_frame
+        rows.append(entry)
+
+    for kb in initial_rows:
+        add_row(
+            kb.get("enabled", True), kb.get("action", "split_record_file"),
+            kb.get("modifiers", []), kb.get("key", "S"), kb.get("param", ""),
+        )
+
+    tk.Button(parent, text="+ Add Keybind", command=lambda: add_row()).pack(anchor="w", padx=10, pady=(4, 10))
+    return rows, add_row
+
+
 # Curated common apps for the multi-track quick-setup wizard, grouped into the same category
 # scheme the app's own author ended up hand-building: voice chat on one track, music on another,
 # browsers on a third. Not exhaustive -- anything not listed can still be added by hand via
@@ -2128,9 +2489,18 @@ def compute_quick_setup_tracks(client, desktop_name, mic_name, game_audio_name, 
     desktop_name/mic_name/game_audio_name are input names to route to tracks 1(+2)/3, or None
     to skip that track. selected_apps is a list of COMMON_AUDIO_APPS-shaped dicts to route to
     their category's track, creating each one's source first if it isn't already present.
+
+    Also returns app_captures: {input_name: process_name} for every selected app, whether newly
+    created here or already existing. OBS can silently rewrite a wasapi_process_output_capture
+    input's exe-only "::process_name" window match into a specific, eventually-stale window
+    title (e.g. if its Properties dialog is ever opened in OBS itself) -- the caller is expected
+    to persist this mapping and re-apply it via set_game_audio_capture_target on every recording
+    start (the same self-healing re-point obs.game_audio_capture already gets), so an app's
+    isolation can't silently stay broken after drifting once.
     """
     tracks = []
     created = []
+    app_captures = {}
     current_inputs = {i["inputName"] for i in client.get_input_list().inputs}
     scene = client.get_current_program_scene().current_program_scene_name
 
@@ -2151,8 +2521,9 @@ def compute_quick_setup_tracks(client, desktop_name, mic_name, game_audio_name, 
             )
             created.append(name)
         tracks.append({"input_name": name, "track": QUICK_SETUP_CATEGORY_TRACKS[app["category"]]})
+        app_captures[name] = app["process_name"]
 
-    return tracks, created
+    return tracks, created, app_captures
 
 
 def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_apply):
@@ -2262,7 +2633,7 @@ def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_ap
 
         selected_apps = [app for var, app in app_vars.values() if var.get()]
         try:
-            tracks, created = compute_quick_setup_tracks(
+            tracks, created, app_captures = compute_quick_setup_tracks(
                 apply_client,
                 desktop_var.get() if desktop_var.get() != "(none)" else None,
                 mic_var.get() if mic_var.get() != "(none)" else None,
@@ -2275,7 +2646,7 @@ def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_ap
             return
         apply_client.disconnect()
 
-        on_apply(tracks)
+        on_apply(tracks, app_captures)
         dialog.destroy()
         summary = f"Applied {len(tracks)} track mapping(s)."
         if created:
@@ -2551,6 +2922,25 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_labeled_entry(obs_tab, row, "Tolerance megabytes", auto_split_tolerance_megabytes_var)
     row += 1
 
+    manual_split_config = obs_config.get("manual_split", {})
+    add_section_label(obs_tab, row, "Manual Split (tray menu)")
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    Adds a \"Split Recording File\" item to the tray menu that splits the current "
+            "recording on demand, after an optional delay -- separate from OBS's own split hotkey."
+        ),
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    manual_split_enabled_var = tk.BooleanVar(value=manual_split_config.get("enabled", False))
+    add_checkbox(obs_tab, row, "Show \"Split Recording File\" in the tray menu", manual_split_enabled_var)
+    row += 1
+    manual_split_buffer_var = tk.StringVar(value=str(manual_split_config.get("buffer_seconds", 0)))
+    add_labeled_entry(obs_tab, row, "Buffer seconds before splitting", manual_split_buffer_var)
+    row += 1
+
     recovery_config = obs_config.get("recovery", {})
     add_section_label(obs_tab, row, "OBS Health Recovery")
     row += 1
@@ -2574,6 +2964,15 @@ def _run_config_editor(master_root, restart_callback, on_close):
     row += 1
 
     multi_track_config = obs_config.get("multi_track_audio", {})
+    # Keyed by input name so re-running Quick Setup (or hand-editing tracks afterward) never
+    # loses a previously-recorded app -> process mapping; collect_config() below reads this back
+    # out into multi_track_audio.app_captures for sync_multi_track_audio to re-point every
+    # recording start, self-healing the Discord/Spotify/etc. drift described where it's used.
+    app_captures_state = {
+        ac["input_name"]: ac["process_name"]
+        for ac in multi_track_config.get("app_captures", [])
+        if ac.get("input_name") and ac.get("process_name")
+    }
     add_section_label(obs_tab, row, "Multi-Track Audio (Advanced)")
     row += 1
     tk.Label(
@@ -2604,11 +3003,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
         return {"host": ws_host_var.get().strip() or "localhost", "port": port, "password": ws_password_var.get()}
 
     def open_quick_setup():
-        def on_quick_setup_apply(tracks):
+        def on_quick_setup_apply(tracks, app_captures):
             multi_track_clear_rows()
             for t in tracks:
                 multi_track_add_row(t["input_name"], t["track"])
             multi_track_enabled_var.set(True)
+            app_captures_state.update(app_captures)
 
         open_multi_track_quick_setup(
             obs_tab, get_current_ws_config,
@@ -2620,6 +3020,10 @@ def _run_config_editor(master_root, restart_callback, on_close):
         row=row, column=0, sticky="w", padx=10, pady=(0, 6)
     )
     row += 1
+
+    # --- Custom Keybinds ---
+    keybinds_tab = make_scrollable_tab(notebook, "Custom Keybinds")
+    custom_keybind_rows, _ = build_custom_keybinds_editor(keybinds_tab, obs_config.get("custom_keybinds", []))
 
     multi_track_list_frame = tk.Frame(obs_tab)
     multi_track_list_frame.grid(row=row, column=0, columnspan=3, sticky="we")
@@ -2692,10 +3096,63 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_labeled_entry(post_tab, row, "ffmpeg path", transcode_ffmpeg_path_var)
     add_browse_button(post_tab, row, transcode_ffmpeg_path_var)
     row += 1
+
+    def detect_ffmpeg():
+        found = find_ffmpeg()
+        if found:
+            transcode_ffmpeg_path_var.set(found)
+            messagebox.showinfo("ffmpeg found", f"Found ffmpeg at:\n{found}", parent=post_tab)
+        else:
+            messagebox.showwarning(
+                "ffmpeg not found",
+                "Couldn't find ffmpeg on this PC (checked PATH and common install locations like "
+                "winget/Chocolatey/Scoop). Install it -- e.g. run `winget install ffmpeg` in a "
+                "terminal, or download it from ffmpeg.org -- then try again, or use Browse... to "
+                "point this field at ffmpeg.exe manually.",
+                parent=post_tab,
+            )
+
+    tk.Button(post_tab, text="Auto-detect ffmpeg", command=detect_ffmpeg).grid(
+        row=row, column=0, sticky="w", padx=10, pady=(0, 6)
+    )
+    row += 1
     transcode_args_var = tk.StringVar(
-        value=" ".join(transcode_config.get("args", ["-c:v", "libx264", "-crf", "23", "-c:a", "aac"]))
+        value=" ".join(transcode_config.get("args", ["-map", "0", "-c:v", "libx264", "-crf", "23", "-c:a", "aac"]))
     )
     add_labeled_entry(post_tab, row, "ffmpeg args (space-separated)", transcode_args_var, width=44)
+    row += 1
+    transcode_output_extension_var = tk.StringVar(value=transcode_config.get("output_extension", "") or "")
+    tk.Label(post_tab, text="Output extension (optional)", anchor="w").grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        post_tab, textvariable=transcode_output_extension_var, values=TRANSCODE_OUTPUT_EXTENSION_OPTIONS, width=16,
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        post_tab,
+        text="    Leave blank to keep the original recording's extension.",
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    def use_mkv_to_mp4_preset():
+        transcode_args_var.set(" ".join(MKV_TO_MP4_PRESERVE_TRACKS_ARGS))
+        transcode_output_extension_var.set(MKV_TO_MP4_PRESERVE_TRACKS_EXTENSION)
+
+    tk.Button(
+        post_tab, text="Use MKV → MP4 preset (preserve every audio track)", command=use_mkv_to_mp4_preset,
+    ).grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    tk.Label(
+        post_tab,
+        text=(
+            "    A pure remux (-map 0 -c copy): every audio track carried over byte-for-byte, no "
+            "re-encoding, no quality loss -- just repackaged into MP4. Overwrites the ffmpeg args "
+            "and output extension above; leave the suffix/delete-original settings as you like."
+        ),
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
     transcode_suffix_var = tk.StringVar(value=transcode_config.get("suffix", "_compressed"))
     add_labeled_entry(post_tab, row, "Output filename suffix", transcode_suffix_var)
@@ -2813,6 +3270,31 @@ def _run_config_editor(master_root, restart_callback, on_close):
             auto_split_tolerance_megabytes_var, "Split tolerance megabytes", auto_split.get("tolerance_megabytes", 50)
         )
 
+        manual_split = obs.setdefault("manual_split", {})
+        manual_split["enabled"] = manual_split_enabled_var.get()
+        manual_split["buffer_seconds"] = read_int(
+            manual_split_buffer_var, "Manual split buffer seconds", manual_split.get("buffer_seconds", 0)
+        )
+
+        custom_keybinds = []
+        for row_vars in custom_keybind_rows:
+            modifiers = [
+                name for name, var in (
+                    ("ctrl", row_vars["ctrl"]), ("alt", row_vars["alt"]),
+                    ("shift", row_vars["shift"]), ("win", row_vars["win"]),
+                )
+                if var.get()
+            ]
+            action = CUSTOM_KEYBIND_ACTIONS_BY_LABEL.get(row_vars["action_label"].get(), "split_record_file")
+            custom_keybinds.append({
+                "enabled": row_vars["enabled"].get(),
+                "action": action,
+                "modifiers": modifiers,
+                "key": row_vars["key"].get(),
+                "param": row_vars["param"].get().strip(),
+            })
+        obs["custom_keybinds"] = custom_keybinds
+
         recovery = obs.setdefault("recovery", {})
         recovery["memory_limit_gb"] = read_float(
             memory_limit_var, "Memory limit", recovery.get("memory_limit_gb", DEFAULT_OBS_MEMORY_LIMIT_GB)
@@ -2843,6 +3325,10 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 continue
             multi_track_tracks.append({"input_name": name, "track": track_num})
         multi_track_audio["tracks"] = multi_track_tracks
+        multi_track_audio["app_captures"] = [
+            {"input_name": name, "process_name": process_name}
+            for name, process_name in app_captures_state.items()
+        ]
 
         replay_buffer = obs.setdefault("replay_buffer", {})
         replay_buffer["enabled"] = replay_buffer_enabled_var.get()
@@ -2880,6 +3366,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
         transcode["enabled"] = transcode_enabled_var.get()
         transcode["ffmpeg_path"] = transcode_ffmpeg_path_var.get().strip() or "ffmpeg"
         transcode["args"] = transcode_args_var.get().split()
+        output_extension_value = transcode_output_extension_var.get().strip()
+        if output_extension_value:
+            transcode["output_extension"] = output_extension_value
+        else:
+            transcode.pop("output_extension", None)
         transcode["suffix"] = transcode_suffix_var.get()
         transcode["delete_original"] = transcode_delete_original_var.get()
 
@@ -3020,6 +3511,14 @@ def main():
             return
         threading.Thread(target=save_replay_buffer, args=(client,), daemon=True).start()
 
+    def on_buffered_split(icon, menu_item):
+        client = runtime_state.get("obs_client")
+        if not client:
+            logging.warning("Split Recording requested but OBS is not connected.")
+            return
+        buffer_seconds = config.get("obs", {}).get("manual_split", {}).get("buffer_seconds", 0)
+        threading.Thread(target=trigger_buffered_split, args=(client, buffer_seconds), daemon=True).start()
+
     def select_monitor(index):
         def action(icon, menu_item):
             overlay_state["monitor_index"] = index
@@ -3083,6 +3582,8 @@ def main():
     ]
     if config.get("obs", {}).get("replay_buffer", {}).get("enabled"):
         menu_items.append(pystray.MenuItem("Save Replay Buffer", on_save_replay))
+    if config.get("obs", {}).get("manual_split", {}).get("enabled"):
+        menu_items.append(pystray.MenuItem("Split Recording File", on_buffered_split))
     menu_items += [
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(obs_toggle_text, on_obs_toggle),
@@ -3106,11 +3607,22 @@ def main():
     overlay_thread = threading.Thread(
         target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event), daemon=True
     )
+    custom_keybinds = config.get("obs", {}).get("custom_keybinds", [])
+    manual_split_buffer_seconds = config.get("obs", {}).get("manual_split", {}).get("buffer_seconds", 0)
+    keybind_thread = None
+    if any(kb.get("enabled", True) for kb in custom_keybinds):
+        keybind_thread = threading.Thread(
+            target=run_custom_keybind_listener,
+            args=(custom_keybinds, lambda: runtime_state.get("obs_client"), lambda: manual_split_buffer_seconds),
+            daemon=True,
+        )
 
     def setup(icon):
         icon.visible = True
         watcher_thread.start()
         overlay_thread.start()
+        if keybind_thread:
+            keybind_thread.start()
 
     icon.run(setup=setup)
 
