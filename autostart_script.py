@@ -4044,6 +4044,7 @@ def open_clip_editor_window(editor_state, config, recording_state, overlay_state
 
     editor_state["open"] = True
     editor_state["opened_at"] = time.time()
+    logging.info("Opening the clip editor.")
 
     def on_close():
         editor_state["open"] = False
@@ -4086,6 +4087,7 @@ def _open_vlc_missing_window(master_root, on_close):
 
     def install_via_winget():
         install_button.config(state="disabled", text="Installing VLC...")
+        logging.info("Clip editor: installing VLC via winget...")
 
         def worker():
             result = winget_install_vlc()
@@ -4093,9 +4095,14 @@ def _open_vlc_missing_window(master_root, on_close):
             def finish():
                 success, reason = result
                 if success and find_vlc():
+                    logging.info("Clip editor: VLC installed successfully via winget.")
                     status_label.config(fg="#15803d", text="VLC installed -- close this window and try Edit Clips... again.")
                     install_button.pack_forget()
                 else:
+                    logging.warning(
+                        "Clip editor: VLC install via winget did not finish (%s).",
+                        reason or "VLC still not found after install",
+                    )
                     install_button.config(state="normal", text="Install VLC via winget")
                     status_label.config(text=f"Install didn't finish ({reason or 'VLC still not found after install'}).")
 
@@ -4124,6 +4131,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     vlc_dir = resolve_vlc_path(clip_editor_config.get("vlc_path", ""))
     vlc_module = import_vlc_module() if vlc_dir else None
     if not vlc_module:
+        logging.warning("Clip editor: VLC not found; showing the install-VLC prompt instead of the real editor.")
         _open_vlc_missing_window(master_root, on_close)
         return
 
@@ -4134,6 +4142,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     root.minsize(600, 420)
     root.lift()
     root.focus_force()
+    logging.info("Clip editor opened.")
 
     instance = create_vlc_instance_with_logging(vlc_module)
     player = instance.media_player_new()
@@ -4153,6 +4162,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         # closing the editor while a clip was still playing and watching libvlc's own log fill
         # with "Could not create the SwapChain" / "video output creation failed" messages until
         # cleanup() ran first here).
+        logging.info("Clip editor closed.")
         cleanup()
         root.destroy()
 
@@ -4237,6 +4247,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
     def load_file(path):
         if is_file_being_recorded(path, recording_state):
+            logging.warning("Clip editor: refused to open %s -- it's still being recorded.", os.path.basename(path))
             status_label.config(text="That recording is still in progress -- wait for it to finish before trimming it.")
             return
         player.stop()
@@ -4266,6 +4277,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         end_var.set(format_timestamp(0))
         status_label.config(text="")
         root.title(f"OBS Auto Recorder - Clip Editor - {os.path.basename(path)}")
+        logging.info("Clip editor: opened %s", os.path.basename(path))
 
     def toggle_play_pause():
         if not state["path"]:
@@ -4302,21 +4314,25 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
     def do_trim():
         if not state["path"]:
+            logging.warning("Clip editor: Trim Clip clicked with no recording open.")
             status_label.config(text="Open a recording first.")
             return
         try:
             start_seconds = parse_timestamp(start_var.get())
             end_seconds = parse_timestamp(end_var.get())
         except ValueError as exc:
+            logging.warning("Clip editor: could not start trim -- %s", exc)
             status_label.config(text=str(exc))
             return
         error = validate_trim_range(start_seconds, end_seconds, state["duration"] or None)
         if error:
+            logging.warning("Clip editor: could not start trim -- %s", error)
             status_label.config(text=error)
             return
 
         ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
         if not ffmpeg_path:
+            logging.error("Clip editor: could not start trim -- ffmpeg not found.")
             status_label.config(
                 text="ffmpeg isn't installed -- install it from Settings > Post-Processing, then try again."
             )
