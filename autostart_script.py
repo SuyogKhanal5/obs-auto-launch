@@ -108,6 +108,18 @@ def get_monitor_rects():
     return monitors
 
 
+def default_overlay_monitor_index(monitors):
+    """Picks a sensible monitor to auto-select when the overlay needs to turn itself on (e.g.
+    enabling the audio mixer levels toggle while no monitor was chosen yet) -- Windows doesn't
+    report which monitor is "primary" through EnumDisplayMonitors, but the primary monitor's
+    origin is always (0, 0), so that's the most reliable stand-in. Falls back to the first
+    monitor (index 0) if none sits exactly at the origin, or None if there are no monitors at all."""
+    for i, m in enumerate(monitors):
+        if m["left"] == 0 and m["top"] == 0:
+            return i
+    return 0 if monitors else None
+
+
 def get_running_processes():
     processes = []
     for proc in psutil.process_iter(["name", "exe"]):
@@ -3685,6 +3697,16 @@ def main():
     def toggle_audio_levels(icon, menu_item):
         audio_state["enabled"] = not audio_state["enabled"]
         logging.info("Audio mixer levels overlay %s", "enabled" if audio_state["enabled"] else "disabled")
+        # The levels only ever show up inside the floating overlay -- turning this on while the
+        # overlay itself is still "Off" would otherwise have no visible effect at all, so pick a
+        # monitor for it automatically instead of leaving the user to find "Overlay Monitor"
+        # separately. Never overrides a monitor already chosen, and never turns the overlay back
+        # off when levels are disabled (the user may still want the plain status overlay).
+        if audio_state["enabled"] and overlay_state["monitor_index"] is None:
+            index = default_overlay_monitor_index(monitors)
+            if index is not None:
+                overlay_state["monitor_index"] = index
+                logging.info("Overlay monitor set to: %s", monitors[index]["label"])
 
     def audio_levels_checked(menu_item):
         return audio_state["enabled"]

@@ -164,5 +164,21 @@ class CleanupOrphanedPyinstallerTempDirsTests(unittest.TestCase):
             a.cleanup_orphaned_pyinstaller_temp_dirs()  # must not raise
 
 
+class DefaultOverlayMonitorIndexTests(unittest.TestCase):
+    def test_picks_monitor_at_origin(self):
+        monitors = [
+            {"left": -1920, "top": 0, "right": 0, "bottom": 1080},
+            {"left": 0, "top": 0, "right": 1920, "bottom": 1080},
+        ]
+        self.assertEqual(a.default_overlay_monitor_index(monitors), 1)
+
+    def test_falls_back_to_first_monitor_when_none_at_origin(self):
+        monitors = [{"left": 100, "top": 50, "right": 1920, "bottom": 1080}]
+        self.assertEqual(a.default_overlay_monitor_index(monitors), 0)
+
+    def test_no_monitors_returns_none(self):
+        self.assertIsNone(a.default_overlay_monitor_index([]))
+
+
 if __name__ == "__main__":
     unittest.main()
