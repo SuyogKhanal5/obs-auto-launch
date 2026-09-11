@@ -1538,6 +1538,15 @@ def find_vlc():
     return None
 
 
+def resolve_vlc_path(configured_path):
+    """Resolves clip_editor.vlc_path to an actual VLC install directory: an explicit configured
+    directory that still contains libvlc.dll wins as-is (mirrors resolve_ffmpeg_path's
+    precedence), otherwise falls back to find_vlc()'s auto-detection."""
+    if configured_path and os.path.isfile(os.path.join(configured_path, "libvlc.dll")):
+        return configured_path
+    return find_vlc()
+
+
 def winget_install_vlc(timeout=600):
     """Best-effort silent VLC install via winget, mirroring winget_install_ffmpeg(). Returns
     (True, None) on success, (False, reason) otherwise; never raises."""
@@ -3467,6 +3476,108 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_checkbox(post_tab, row, "Show Windows toast notifications for key events", notifications_enabled_var)
     row += 1
 
+    # --- Clip Editor ---
+    clip_editor_tab = make_scrollable_tab(notebook, "Clip Editor")
+    clip_editor_tab.columnconfigure(1, weight=1)
+    clip_editor_config = config.get("clip_editor", {})
+    row = 0
+    add_section_label(clip_editor_tab, row, "Trimmed Clip Output")
+    row += 1
+    clip_output_folder_var = tk.StringVar(value=clip_editor_config.get("output_folder", "") or "")
+    add_labeled_entry(clip_editor_tab, row, "Output folder (optional)", clip_output_folder_var)
+    add_browse_button(clip_editor_tab, row, clip_output_folder_var, mode="dir")
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text="    Leave blank to save trimmed clips in the same folder as the source recording.",
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    clip_delete_original_var = tk.BooleanVar(value=clip_editor_config.get("delete_original_after_trim", False))
+    add_checkbox(
+        clip_editor_tab, row, "Delete the original recording after a successful trim",
+        clip_delete_original_var,
+    )
+    row += 1
+
+    add_section_label(clip_editor_tab, row, "Video Preview (VLC)")
+    row += 1
+
+    # Same found/missing toggle-panel pattern as Post-Processing's ffmpeg section above: VLC
+    # detection only gates the VLC-specific controls, not the whole tab, since output folder and
+    # delete-original are meaningful to configure even before VLC is installed.
+    vlc_panel_row = row
+    row += 1
+    vlc_found_frame = tk.Frame(clip_editor_tab)
+    vlc_found_frame.grid(row=vlc_panel_row, column=0, columnspan=3, sticky="we")
+    vlc_missing_frame = tk.Frame(clip_editor_tab)
+    vlc_missing_frame.grid(row=vlc_panel_row, column=0, columnspan=3, sticky="we")
+
+    tk.Label(
+        vlc_found_frame,
+        text="VLC install found. Override its location only if you have more than one installed:",
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    clip_vlc_path_var = tk.StringVar(value=clip_editor_config.get("vlc_path", "") or "")
+    add_labeled_entry(vlc_found_frame, 1, "VLC install folder (optional)", clip_vlc_path_var)
+    add_browse_button(vlc_found_frame, 1, clip_vlc_path_var, mode="dir")
+
+    tk.Label(
+        vlc_missing_frame,
+        text=(
+            "VLC isn't installed, so the clip editor's video preview won't be available yet. "
+            "Install it below -- this panel switches over automatically once it's found, no need "
+            "to reopen Settings."
+        ),
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
+
+    def reveal_vlc_options_if_found():
+        if resolve_vlc_path(clip_vlc_path_var.get()):
+            vlc_missing_frame.grid_remove()
+            vlc_found_frame.grid()
+            return True
+        return False
+
+    def install_vlc_via_winget():
+        winget_install_vlc_button.config(state="disabled", text="Installing VLC...")
+
+        def worker():
+            result = winget_install_vlc()
+
+            def finish():
+                success, reason = result
+                if not (success and reveal_vlc_options_if_found()):
+                    winget_install_vlc_button.config(state="normal", text="Install VLC via winget")
+                    messagebox.showwarning(
+                        "Install didn't finish",
+                        f"Couldn't install VLC automatically ({reason or 'still not found after install'}). "
+                        "Try again, or use the manual download link instead.",
+                        parent=clip_editor_tab,
+                    )
+
+            clip_editor_tab.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    if has_winget():
+        winget_install_vlc_button = tk.Button(
+            vlc_missing_frame, text="Install VLC via winget", command=install_vlc_via_winget,
+        )
+        winget_install_vlc_button.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 4))
+
+    vlc_download_link = tk.Label(
+        vlc_missing_frame, text="Or download it manually from videolan.org ↗", fg="#2563eb",
+        font=("Segoe UI", 9, "underline"), cursor="hand2",
+    )
+    vlc_download_link.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
+    vlc_download_link.bind("<Button-1>", lambda _event: webbrowser.open(VLC_DOWNLOAD_URL))
+
+    if resolve_vlc_path(clip_vlc_path_var.get()):
+        vlc_missing_frame.grid_remove()
+    else:
+        vlc_found_frame.grid_remove()
+
     # --- Save / Cancel ---
     status_label = tk.Label(root, text="", fg="#b00020", anchor="w")
     status_label.pack(fill="x", padx=10)
@@ -3675,6 +3786,19 @@ def _run_config_editor(master_root, restart_callback, on_close):
 
         notifications = new_config.setdefault("notifications", {})
         notifications["enabled"] = notifications_enabled_var.get()
+
+        clip_editor = new_config.setdefault("clip_editor", {})
+        clip_output_folder_value = clip_output_folder_var.get().strip()
+        if clip_output_folder_value:
+            clip_editor["output_folder"] = clip_output_folder_value
+        else:
+            clip_editor.pop("output_folder", None)
+        clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
+        clip_vlc_path_value = clip_vlc_path_var.get().strip()
+        if clip_vlc_path_value:
+            clip_editor["vlc_path"] = clip_vlc_path_value
+        else:
+            clip_editor.pop("vlc_path", None)
 
         return new_config, errors
 

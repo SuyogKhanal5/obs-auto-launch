@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -68,6 +69,29 @@ class FindVlcTests(unittest.TestCase):
                 with patch("os.path.isfile", return_value=False):
                     with patch("shutil.which", return_value=None):
                         self.assertIsNone(a.find_vlc())
+
+
+class ResolveVlcPathTests(unittest.TestCase):
+    def test_existing_configured_dir_is_used_as_is(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, "libvlc.dll"), "w").close()
+            with patch.object(a, "find_vlc") as mock_find_vlc:
+                self.assertEqual(a.resolve_vlc_path(tmp), tmp)
+            mock_find_vlc.assert_not_called()
+
+    def test_configured_dir_without_libvlc_falls_back_to_find_vlc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(a, "find_vlc", return_value=r"C:\Fallback\VLC") as mock_find_vlc:
+                self.assertEqual(a.resolve_vlc_path(tmp), r"C:\Fallback\VLC")
+            mock_find_vlc.assert_called_once()
+
+    def test_blank_configured_path_falls_back_to_find_vlc(self):
+        with patch.object(a, "find_vlc", return_value=r"C:\Auto\VLC"):
+            self.assertEqual(a.resolve_vlc_path(""), r"C:\Auto\VLC")
+
+    def test_returns_none_when_nothing_resolves(self):
+        with patch.object(a, "find_vlc", return_value=None):
+            self.assertIsNone(a.resolve_vlc_path(""))
 
 
 class WingetInstallVlcTests(unittest.TestCase):
