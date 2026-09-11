@@ -57,17 +57,6 @@ class PerformKeybindActionTests(unittest.TestCase):
         a.perform_keybind_action(client, "save_replay_buffer")
         self.assertIn(("save_replay_buffer",), client.calls)
 
-    def test_toggle_input_mute_passes_param(self):
-        client = FakeObsClient()
-        a.perform_keybind_action(client, "toggle_input_mute", param="Mic/Aux")
-        self.assertIn(("toggle_input_mute", "Mic/Aux"), client.calls)
-
-    def test_toggle_input_mute_without_param_is_a_noop(self):
-        client = FakeObsClient()
-        with self.assertLogs(level="WARNING"):
-            a.perform_keybind_action(client, "toggle_input_mute", param="")
-        self.assertEqual(client.calls, [])
-
     def test_unknown_action_is_logged_not_raised(self):
         client = FakeObsClient()
         with self.assertLogs(level="WARNING"):
@@ -89,7 +78,7 @@ class PerformKeybindActionTests(unittest.TestCase):
         # this catches a new action being added to the picker but never implemented.
         for action in a.CUSTOM_KEYBIND_ACTIONS:
             client = FakeObsClient()
-            a.perform_keybind_action(client, action, param="Mic/Aux")
+            a.perform_keybind_action(client, action)
             self.assertTrue(client.calls, f"action '{action}' did not call anything on the client")
 
 

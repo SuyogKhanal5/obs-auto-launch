@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 import winreg
 from ctypes import wintypes
 from tkinter import filedialog, messagebox, ttk
@@ -1189,6 +1190,27 @@ def save_replay_buffer(client):
         logging.error("Could not save replay buffer: %s", exc)
 
 
+OBS_SPLIT_NOT_ENABLED_CODE = 702
+
+
+def ensure_split_enabled(client):
+    """OBS's SplitRecordFile request -- used by both this app's own split triggers and OBS's own
+    hotkey -- silently fails with error 702 unless "Automatically split file" is ticked in OBS's
+    own Settings -> Output, a master switch despite the misleading name (it also gates a purely
+    manual split). Auto-enables just that one checkbox before every split attempt, so a
+    configured split trigger works out of the box instead of quietly doing nothing until someone
+    finds this setting by hand in OBS -- never touches the split type/interval fields next to it,
+    so it can't turn on unwanted automatic time/size-based splitting as a side effect."""
+    current = get_profile_parameter_value(client, "AdvOut", "RecSplitFile")
+    if str(current).strip().lower() == "true":
+        return
+    try:
+        client.set_profile_parameter("AdvOut", "RecSplitFile", "true")
+        logging.info("Enabled OBS's \"Automatically split file\" option (required for any split trigger to work).")
+    except Exception as exc:
+        logging.warning("Could not enable OBS's \"Automatically split file\" option: %s", exc)
+
+
 def trigger_buffered_split(client, buffer_seconds):
     # The buffer runs on our side, not OBS's: obs-websocket's SplitRecordFile request fires the
     # split immediately and independently of whatever physical hotkey OBS itself has bound for it,
@@ -1196,9 +1218,22 @@ def trigger_buffered_split(client, buffer_seconds):
     if buffer_seconds > 0:
         logging.info("Splitting recording in %s second(s)...", buffer_seconds)
         time.sleep(buffer_seconds)
+    ensure_split_enabled(client)
     try:
         client.split_record_file()
         logging.info("Recording file split.")
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code == OBS_SPLIT_NOT_ENABLED_CODE:
+            logging.error(
+                "Could not split recording file: OBS has file splitting turned off entirely. This "
+                "is a one-time fix in OBS itself, not this app -- go to OBS's Settings -> Output "
+                "(Advanced mode) -> Recording, and enable \"Automatically split file\". That master "
+                "switch has to be on for ANY split trigger to work (OBS's own hotkey, this app's "
+                "tray item, or a custom keybind), even if you never intend to use the actual "
+                "automatic time/size-based splitting -- just leave the time/size fields alone."
+            )
+        else:
+            logging.error("Could not split recording file: %s", exc)
     except Exception as exc:
         logging.error("Could not split recording file: %s", exc)
 
@@ -1221,7 +1256,6 @@ CUSTOM_KEYBIND_ACTIONS = {
     "pause_record": "Pause Recording",
     "resume_record": "Resume Recording",
     "toggle_record_pause": "Toggle Recording Pause",
-    "toggle_input_mute": "Toggle Mute (needs input name)",
 }
 CUSTOM_KEYBIND_ACTIONS_BY_LABEL = {label: action for action, label in CUSTOM_KEYBIND_ACTIONS.items()}
 CUSTOM_KEYBIND_KEY_OPTIONS = (
@@ -1265,7 +1299,7 @@ def describe_keybind(binding):
     return "+".join(parts)
 
 
-def perform_keybind_action(client, action, param="", manual_split_buffer_seconds=0):
+def perform_keybind_action(client, action, manual_split_buffer_seconds=0):
     try:
         if action == "split_record_file":
             trigger_buffered_split(client, manual_split_buffer_seconds)
@@ -1289,15 +1323,10 @@ def perform_keybind_action(client, action, param="", manual_split_buffer_seconds
             client.resume_record()
         elif action == "toggle_record_pause":
             client.toggle_record_pause()
-        elif action == "toggle_input_mute":
-            if not param:
-                logging.warning("Toggle Mute keybind has no input name configured; ignoring.")
-                return
-            client.toggle_input_mute(param)
         else:
             logging.warning("Unknown custom keybind action: %s", action)
             return
-        logging.info("Custom keybind action performed: %s%s", action, f" ({param})" if param else "")
+        logging.info("Custom keybind action performed: %s", action)
     except Exception as exc:
         logging.error("Custom keybind action '%s' failed: %s", action, exc)
 
@@ -1307,7 +1336,7 @@ def fire_custom_keybind(binding, get_client, get_manual_split_buffer_seconds):
     if not client:
         logging.warning("Custom keybind %s pressed but OBS is not connected.", describe_keybind(binding))
         return
-    perform_keybind_action(client, binding.get("action"), binding.get("param", ""), get_manual_split_buffer_seconds())
+    perform_keybind_action(client, binding.get("action"), get_manual_split_buffer_seconds())
 
 
 def run_custom_keybind_listener(bindings, get_client, get_manual_split_buffer_seconds):
@@ -1430,6 +1459,35 @@ def resolve_ffmpeg_path(configured_path):
     if found:
         return found
     return find_ffmpeg()
+
+
+FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
+FFMPEG_WINGET_ID = "Gyan.FFmpeg"
+
+
+def has_winget():
+    return shutil.which("winget") is not None
+
+
+def winget_install_ffmpeg(timeout=600):
+    """Best-effort silent ffmpeg install via winget, mirroring installer.py's winget_install()
+    (duplicated rather than imported -- this module and installer.py are intentionally
+    independent, and installer.py isn't bundled into this app's own build). Returns (True, None)
+    on success, (False, reason) otherwise; never raises."""
+    try:
+        result = subprocess.run(
+            [
+                "winget", "install", "--id", FFMPEG_WINGET_ID, "-e", "--silent",
+                "--accept-source-agreements", "--accept-package-agreements",
+            ],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, None
+    return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
 
 
 def transcode_recording(input_path, transcode_config, icon=None, notifications_config=None):
@@ -2392,66 +2450,82 @@ def build_custom_keybinds_editor(parent, initial_rows):
         anchor="w", justify="left", wraplength=520, fg="#555555",
     ).pack(fill="x", padx=10, pady=(10, 6))
 
-    header = tk.Frame(parent)
-    header.pack(fill="x", padx=10)
-    for text, w in (
-        ("On", 3), ("Action", 24), ("Ctrl", 4), ("Alt", 4), ("Shift", 5), ("Win", 4), ("Key", 4), ("Param", 14),
-    ):
-        tk.Label(header, text=text, width=w, anchor="w").pack(side="left", padx=2)
+    # A grid table (not pack) so header labels and row widgets share real column boundaries --
+    # packing a Label(width=N) next to a Checkbutton(width=N) or Combobox(width=N) doesn't
+    # actually line them up, since a Checkbutton's width includes its indicator box on top of the
+    # same character-width unit, so identical widths still render as different pixel widths.
+    table = tk.Frame(parent)
+    table.pack(fill="x", padx=10)
+    for col, text in enumerate(["On", "Action", "Ctrl", "Alt", "Shift", "Win", "Key", ""]):
+        tk.Label(table, text=text, anchor="w", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=col, sticky="w", padx=4, pady=(0, 4)
+        )
 
-    container = tk.Frame(parent)
-    container.pack(fill="x", padx=10)
     rows = []
 
-    def add_row(enabled=True, action="split_record_file", modifiers=None, key="S", param=""):
+    def renumber():
+        for i, entry in enumerate(rows, start=1):
+            for widget in entry["widgets"]:
+                widget.grid(row=i)
+
+    def add_row(enabled=True, action="split_record_file", modifiers=None, key="S"):
         modifiers = modifiers if modifiers is not None else ["ctrl", "alt"]
-        row_frame = tk.Frame(container)
-        row_frame.pack(fill="x", pady=2)
+        r = len(rows) + 1
 
         enabled_var = tk.BooleanVar(value=enabled)
-        tk.Checkbutton(row_frame, variable=enabled_var, width=2).pack(side="left", padx=2)
+        enabled_cb = tk.Checkbutton(table, variable=enabled_var)
+        enabled_cb.grid(row=r, column=0, padx=4, pady=1)
 
         action_label_var = tk.StringVar(value=CUSTOM_KEYBIND_ACTIONS.get(action, action))
-        ttk.Combobox(
-            row_frame, textvariable=action_label_var, values=list(CUSTOM_KEYBIND_ACTIONS.values()),
+        action_combo = ttk.Combobox(
+            table, textvariable=action_label_var, values=list(CUSTOM_KEYBIND_ACTIONS.values()),
             state="readonly", width=24,
-        ).pack(side="left", padx=2)
+        )
+        action_combo.grid(row=r, column=1, sticky="w", padx=4, pady=1)
 
         ctrl_var = tk.BooleanVar(value="ctrl" in modifiers)
         alt_var = tk.BooleanVar(value="alt" in modifiers)
         shift_var = tk.BooleanVar(value="shift" in modifiers)
         win_var = tk.BooleanVar(value="win" in modifiers)
-        tk.Checkbutton(row_frame, variable=ctrl_var, width=3).pack(side="left", padx=2)
-        tk.Checkbutton(row_frame, variable=alt_var, width=3).pack(side="left", padx=2)
-        tk.Checkbutton(row_frame, variable=shift_var, width=4).pack(side="left", padx=2)
-        tk.Checkbutton(row_frame, variable=win_var, width=3).pack(side="left", padx=2)
+        ctrl_cb = tk.Checkbutton(table, variable=ctrl_var)
+        ctrl_cb.grid(row=r, column=2, padx=4, pady=1)
+        alt_cb = tk.Checkbutton(table, variable=alt_var)
+        alt_cb.grid(row=r, column=3, padx=4, pady=1)
+        shift_cb = tk.Checkbutton(table, variable=shift_var)
+        shift_cb.grid(row=r, column=4, padx=4, pady=1)
+        win_cb = tk.Checkbutton(table, variable=win_var)
+        win_cb.grid(row=r, column=5, padx=4, pady=1)
 
         key_var = tk.StringVar(value=(key or "S").upper())
-        ttk.Combobox(
-            row_frame, textvariable=key_var, values=CUSTOM_KEYBIND_KEY_OPTIONS, state="readonly", width=4,
-        ).pack(side="left", padx=2)
+        key_combo = ttk.Combobox(
+            table, textvariable=key_var, values=CUSTOM_KEYBIND_KEY_OPTIONS, state="readonly", width=4,
+        )
+        key_combo.grid(row=r, column=6, padx=4, pady=1)
 
-        param_var = tk.StringVar(value=param)
-        tk.Entry(row_frame, textvariable=param_var, width=14).pack(side="left", padx=2)
+        widgets = [enabled_cb, action_combo, ctrl_cb, alt_cb, shift_cb, win_cb, key_combo]
 
         entry = {
             "enabled": enabled_var, "action_label": action_label_var,
             "ctrl": ctrl_var, "alt": alt_var, "shift": shift_var, "win": win_var,
-            "key": key_var, "param": param_var,
+            "key": key_var, "widgets": widgets,
         }
 
         def remove():
-            row_frame.destroy()
+            for widget in widgets:
+                widget.destroy()
+            remove_btn.destroy()
             rows.remove(entry)
+            renumber()
 
-        tk.Button(row_frame, text="Remove", command=remove).pack(side="left", padx=4)
-        entry["frame"] = row_frame
+        remove_btn = tk.Button(table, text="Remove", command=remove)
+        remove_btn.grid(row=r, column=7, padx=4, pady=1)
+        widgets.append(remove_btn)
         rows.append(entry)
 
     for kb in initial_rows:
         add_row(
             kb.get("enabled", True), kb.get("action", "split_record_file"),
-            kb.get("modifiers", []), kb.get("key", "S"), kb.get("param", ""),
+            kb.get("modifiers", []), kb.get("key", "S"),
         )
 
     tk.Button(parent, text="+ Add Keybind", command=lambda: add_row()).pack(anchor="w", padx=10, pady=(4, 10))
@@ -3087,15 +3161,32 @@ def _run_config_editor(master_root, restart_callback, on_close):
     post_tab.columnconfigure(1, weight=1)
     transcode_config = config.get("post_record_transcode", {})
     row = 0
-    add_section_label(post_tab, row, "Post-Record Transcode (ffmpeg)")
+
+    # The actual controls and the "go install ffmpeg" prompt occupy the same post_tab row and
+    # toggle which one's visible, rather than sitting side by side -- there's nothing useful to
+    # configure here until ffmpeg actually exists somewhere on the PC, and showing a page full of
+    # ffmpeg-flag jargon for a feature that can't currently run is more confusing than helpful for
+    # most users. The Tk variables below are still created either way (from whatever was already
+    # in config.json) so a value set before ffmpeg went missing -- or before it's installed yet --
+    # is preserved on Save even while its controls are hidden.
+    transcode_panel_row = row
     row += 1
+    transcode_options_frame = tk.Frame(post_tab)
+    transcode_options_frame.grid(row=transcode_panel_row, column=0, columnspan=3, sticky="we")
+    transcode_options_frame.columnconfigure(1, weight=1)
+    ffmpeg_missing_frame = tk.Frame(post_tab)
+    ffmpeg_missing_frame.grid(row=transcode_panel_row, column=0, columnspan=3, sticky="we")
+
+    opt_row = 0
+    add_section_label(transcode_options_frame, opt_row, "Post-Record Transcode (ffmpeg)")
+    opt_row += 1
     transcode_enabled_var = tk.BooleanVar(value=transcode_config.get("enabled", False))
-    add_checkbox(post_tab, row, "Run finished recordings through ffmpeg", transcode_enabled_var)
-    row += 1
+    add_checkbox(transcode_options_frame, opt_row, "Run finished recordings through ffmpeg", transcode_enabled_var)
+    opt_row += 1
     transcode_ffmpeg_path_var = tk.StringVar(value=transcode_config.get("ffmpeg_path", "ffmpeg"))
-    add_labeled_entry(post_tab, row, "ffmpeg path", transcode_ffmpeg_path_var)
-    add_browse_button(post_tab, row, transcode_ffmpeg_path_var)
-    row += 1
+    add_labeled_entry(transcode_options_frame, opt_row, "ffmpeg path", transcode_ffmpeg_path_var)
+    add_browse_button(transcode_options_frame, opt_row, transcode_ffmpeg_path_var)
+    opt_row += 1
 
     def detect_ffmpeg():
         found = find_ffmpeg()
@@ -3112,54 +3203,116 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 parent=post_tab,
             )
 
-    tk.Button(post_tab, text="Auto-detect ffmpeg", command=detect_ffmpeg).grid(
-        row=row, column=0, sticky="w", padx=10, pady=(0, 6)
+    tk.Button(transcode_options_frame, text="Auto-detect ffmpeg", command=detect_ffmpeg).grid(
+        row=opt_row, column=0, sticky="w", padx=10, pady=(0, 6)
     )
-    row += 1
+    opt_row += 1
     transcode_args_var = tk.StringVar(
         value=" ".join(transcode_config.get("args", ["-map", "0", "-c:v", "libx264", "-crf", "23", "-c:a", "aac"]))
     )
-    add_labeled_entry(post_tab, row, "ffmpeg args (space-separated)", transcode_args_var, width=44)
-    row += 1
+    add_labeled_entry(transcode_options_frame, opt_row, "ffmpeg args (space-separated)", transcode_args_var, width=44)
+    opt_row += 1
     transcode_output_extension_var = tk.StringVar(value=transcode_config.get("output_extension", "") or "")
-    tk.Label(post_tab, text="Output extension (optional)", anchor="w").grid(
-        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    tk.Label(transcode_options_frame, text="Output extension (optional)", anchor="w").grid(
+        row=opt_row, column=0, sticky="w", padx=(10, 6), pady=4
     )
     ttk.Combobox(
-        post_tab, textvariable=transcode_output_extension_var, values=TRANSCODE_OUTPUT_EXTENSION_OPTIONS, width=16,
-    ).grid(row=row, column=1, sticky="w", pady=4)
-    row += 1
+        transcode_options_frame, textvariable=transcode_output_extension_var,
+        values=TRANSCODE_OUTPUT_EXTENSION_OPTIONS, width=16,
+    ).grid(row=opt_row, column=1, sticky="w", pady=4)
+    opt_row += 1
     tk.Label(
-        post_tab,
+        transcode_options_frame,
         text="    Leave blank to keep the original recording's extension.",
         anchor="w", justify="left", wraplength=520, fg="#555555",
-    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
-    row += 1
+    ).grid(row=opt_row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    opt_row += 1
 
     def use_mkv_to_mp4_preset():
         transcode_args_var.set(" ".join(MKV_TO_MP4_PRESERVE_TRACKS_ARGS))
         transcode_output_extension_var.set(MKV_TO_MP4_PRESERVE_TRACKS_EXTENSION)
 
     tk.Button(
-        post_tab, text="Use MKV → MP4 preset (preserve every audio track)", command=use_mkv_to_mp4_preset,
-    ).grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
-    row += 1
+        transcode_options_frame, text="Use MKV → MP4 preset (preserve every audio track)",
+        command=use_mkv_to_mp4_preset,
+    ).grid(row=opt_row, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
+    opt_row += 1
     tk.Label(
-        post_tab,
+        transcode_options_frame,
         text=(
             "    A pure remux (-map 0 -c copy): every audio track carried over byte-for-byte, no "
             "re-encoding, no quality loss -- just repackaged into MP4. Overwrites the ffmpeg args "
             "and output extension above; leave the suffix/delete-original settings as you like."
         ),
         anchor="w", justify="left", wraplength=520, fg="#555555",
-    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
-    row += 1
+    ).grid(row=opt_row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    opt_row += 1
     transcode_suffix_var = tk.StringVar(value=transcode_config.get("suffix", "_compressed"))
-    add_labeled_entry(post_tab, row, "Output filename suffix", transcode_suffix_var)
-    row += 1
+    add_labeled_entry(transcode_options_frame, opt_row, "Output filename suffix", transcode_suffix_var)
+    opt_row += 1
     transcode_delete_original_var = tk.BooleanVar(value=transcode_config.get("delete_original", False))
-    add_checkbox(post_tab, row, "Delete original after a successful transcode", transcode_delete_original_var)
-    row += 1
+    add_checkbox(
+        transcode_options_frame, opt_row, "Delete original after a successful transcode",
+        transcode_delete_original_var,
+    )
+    opt_row += 1
+
+    add_section_label(ffmpeg_missing_frame, 0, "Post-Record Transcode (ffmpeg)")
+    tk.Label(
+        ffmpeg_missing_frame,
+        text=(
+            "ffmpeg isn't installed, so post-record transcoding (e.g. converting MKV recordings to "
+            "MP4) isn't available yet. Install it below, then this panel switches to the full "
+            "options automatically -- no need to reopen Settings."
+        ),
+        anchor="w", justify="left", wraplength=520, fg="#555555",
+    ).grid(row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
+
+    def reveal_transcode_options_if_ffmpeg_found():
+        if resolve_ffmpeg_path(transcode_ffmpeg_path_var.get()):
+            ffmpeg_missing_frame.grid_remove()
+            transcode_options_frame.grid()
+            return True
+        return False
+
+    def install_ffmpeg_via_winget():
+        winget_install_button.config(state="disabled", text="Installing ffmpeg...")
+
+        def worker():
+            result = winget_install_ffmpeg()
+
+            def finish():
+                success, reason = result
+                if not (success and reveal_transcode_options_if_ffmpeg_found()):
+                    winget_install_button.config(state="normal", text="Install ffmpeg via winget")
+                    messagebox.showwarning(
+                        "Install didn't finish",
+                        f"Couldn't install ffmpeg automatically ({reason or 'still not found after install'}). "
+                        "Try again, or use the manual download link instead.",
+                        parent=post_tab,
+                    )
+
+            post_tab.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    if has_winget():
+        winget_install_button = tk.Button(
+            ffmpeg_missing_frame, text="Install ffmpeg via winget", command=install_ffmpeg_via_winget,
+        )
+        winget_install_button.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 4))
+
+    ffmpeg_download_link = tk.Label(
+        ffmpeg_missing_frame, text="Or download it manually from ffmpeg.org ↗", fg="#2563eb",
+        font=("Segoe UI", 9, "underline"), cursor="hand2",
+    )
+    ffmpeg_download_link.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
+    ffmpeg_download_link.bind("<Button-1>", lambda _event: webbrowser.open(FFMPEG_DOWNLOAD_URL))
+
+    if resolve_ffmpeg_path(transcode_ffmpeg_path_var.get()):
+        ffmpeg_missing_frame.grid_remove()
+    else:
+        transcode_options_frame.grid_remove()
 
     add_section_label(post_tab, row, "Notifications")
     row += 1
@@ -3291,7 +3444,6 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 "action": action,
                 "modifiers": modifiers,
                 "key": row_vars["key"].get(),
-                "param": row_vars["param"].get().strip(),
             })
         obs["custom_keybinds"] = custom_keybinds
 

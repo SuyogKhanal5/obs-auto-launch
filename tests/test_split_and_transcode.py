@@ -34,6 +34,63 @@ class TriggerBufferedSplitTests(unittest.TestCase):
         with self.assertLogs(level="ERROR"):
             a.trigger_buffered_split(client, 0)  # must not raise
 
+    def test_split_disabled_in_obs_gives_actionable_message(self):
+        # OBS rejects SplitRecordFile with code 702 if "Automatically split file" is off in its
+        # own Settings -> Output, even for a purely manual trigger -- this is the actual cause
+        # behind a configured split keybind/tray item silently doing nothing, so the log message
+        # for this specific case should point at the fix, not just print OBS's raw error text.
+        client = FakeObsClient()
+
+        def raise_split_disabled():
+            raise a.obsws.error.OBSSDKRequestError(
+                "SplitRecordFile", a.OBS_SPLIT_NOT_ENABLED_CODE,
+                "Verify that file splitting is enabled in the output settings.",
+            )
+
+        client.split_record_file = raise_split_disabled
+        with self.assertLogs(level="ERROR") as log_ctx:
+            a.trigger_buffered_split(client, 0)  # must not raise
+        self.assertTrue(any("Automatically split file" in message for message in log_ctx.output))
+
+    def test_enables_split_setting_before_attempting_to_split(self):
+        # A fresh profile has never touched AdvOut/RecSplitFile -- trigger_buffered_split should
+        # turn it on proactively so the split actually works the first time, instead of only
+        # explaining the fix after OBS rejects the request.
+        client = FakeObsClient()
+        a.trigger_buffered_split(client, 0)
+        self.assertEqual(a.get_profile_parameter_value(client, "AdvOut", "RecSplitFile"), "true")
+
+
+class EnsureSplitEnabledTests(unittest.TestCase):
+    def test_enables_when_not_already_set(self):
+        client = FakeObsClient()
+        a.ensure_split_enabled(client)
+        self.assertEqual(a.get_profile_parameter_value(client, "AdvOut", "RecSplitFile"), "true")
+
+    def test_already_enabled_is_not_reset(self):
+        client = FakeObsClient()
+        client.set_profile_parameter("AdvOut", "RecSplitFile", "true")
+        client.calls.clear()
+        a.ensure_split_enabled(client)
+        self.assertEqual(client.calls, [])
+
+    def test_case_insensitive_true_is_not_reset(self):
+        client = FakeObsClient()
+        client.set_profile_parameter("AdvOut", "RecSplitFile", "True")
+        client.calls.clear()
+        a.ensure_split_enabled(client)
+        self.assertEqual(client.calls, [])
+
+    def test_failure_to_set_is_logged_not_raised(self):
+        client = FakeObsClient()
+
+        def raise_error(category, name, value):
+            raise RuntimeError("boom")
+
+        client.set_profile_parameter = raise_error
+        with self.assertLogs(level="WARNING"):
+            a.ensure_split_enabled(client)  # must not raise
+
 
 class TranscodeRecordingTests(unittest.TestCase):
     def setUp(self):
@@ -127,6 +184,40 @@ class ResolveFfmpegPathTests(unittest.TestCase):
         with patch.object(a.shutil, "which", return_value=None):
             with patch.object(a, "find_ffmpeg", return_value=None):
                 self.assertIsNone(a.resolve_ffmpeg_path("ffmpeg"))
+
+
+class HasWingetTests(unittest.TestCase):
+    def test_true_when_winget_on_path(self):
+        with patch.object(a.shutil, "which", return_value=r"C:\Windows\winget.exe"):
+            self.assertTrue(a.has_winget())
+
+    def test_false_when_winget_not_on_path(self):
+        with patch.object(a.shutil, "which", return_value=None):
+            self.assertFalse(a.has_winget())
+
+
+class WingetInstallFfmpegTests(unittest.TestCase):
+    def test_success_exit_code_reports_success(self):
+        with patch.object(a.subprocess, "run") as mock_run:
+            mock_run.return_value = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            success, reason = a.winget_install_ffmpeg()
+        self.assertTrue(success)
+        self.assertIsNone(reason)
+
+    def test_nonzero_exit_code_reports_failure_with_reason(self):
+        with patch.object(a.subprocess, "run") as mock_run:
+            mock_run.return_value = type(
+                "Result", (), {"returncode": 1, "stdout": "", "stderr": "no package found"}
+            )()
+            success, reason = a.winget_install_ffmpeg()
+        self.assertFalse(success)
+        self.assertIn("no package found", reason)
+
+    def test_missing_winget_binary_reports_failure_not_raise(self):
+        with patch.object(a.subprocess, "run", side_effect=OSError("not found")):
+            success, reason = a.winget_install_ffmpeg()  # must not raise
+        self.assertFalse(success)
+        self.assertIsNotNone(reason)
 
 
 if __name__ == "__main__":
