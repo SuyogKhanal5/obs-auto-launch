@@ -228,5 +228,77 @@ class TrimClipTests(unittest.TestCase):
             self.assertFalse(result)
 
 
+class ValidateTrimRangeTests(unittest.TestCase):
+    def test_valid_range_returns_none(self):
+        self.assertIsNone(a.validate_trim_range(5, 10, 20))
+
+    def test_negative_start_is_rejected(self):
+        self.assertIsNotNone(a.validate_trim_range(-1, 10, 20))
+
+    def test_end_before_start_is_rejected(self):
+        self.assertIsNotNone(a.validate_trim_range(10, 5, 20))
+
+    def test_end_equal_to_start_is_rejected(self):
+        self.assertIsNotNone(a.validate_trim_range(5, 5, 20))
+
+    def test_start_past_duration_is_rejected(self):
+        self.assertIsNotNone(a.validate_trim_range(25, 30, 20))
+
+    def test_end_past_duration_is_rejected(self):
+        self.assertIsNotNone(a.validate_trim_range(5, 30, 20))
+
+    def test_small_overshoot_past_duration_is_tolerated(self):
+        # A little slack for UI/float rounding -- VLC's own reported duration and the user's
+        # typed/captured end time won't always agree to the millisecond.
+        self.assertIsNone(a.validate_trim_range(5, 20.3, 20))
+
+    def test_unknown_duration_skips_bounds_check(self):
+        # duration_seconds is None right after a file loads, before VLC reports its length --
+        # the range/ordering checks should still apply, but not the duration bound.
+        self.assertIsNone(a.validate_trim_range(5, 10000, None))
+        self.assertIsNotNone(a.validate_trim_range(10, 5, None))
+
+
+class ListRecentRecordingsTests(unittest.TestCase):
+    def test_empty_or_missing_folder_returns_empty_list(self):
+        self.assertEqual(a.list_recent_recordings(""), [])
+        self.assertEqual(a.list_recent_recordings(None), [])
+        self.assertEqual(a.list_recent_recordings(r"C:\does\not\exist"), [])
+
+    def test_lists_video_files_newest_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_path = os.path.join(tmp, "old.mp4")
+            new_path = os.path.join(tmp, "new.mkv")
+            open(old_path, "w").close()
+            os.utime(old_path, (1000, 1000))
+            open(new_path, "w").close()
+            os.utime(new_path, (2000, 2000))
+            self.assertEqual(a.list_recent_recordings(tmp), [new_path, old_path])
+
+    def test_ignores_non_video_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, "notes.txt"), "w").close()
+            video = os.path.join(tmp, "clip.mp4")
+            open(video, "w").close()
+            self.assertEqual(a.list_recent_recordings(tmp), [video])
+
+    def test_recurses_into_subfolders(self):
+        # organize_into_game_subfolders nests recordings one level deeper, per game.
+        with tempfile.TemporaryDirectory() as tmp:
+            subfolder = os.path.join(tmp, "SomeGame")
+            os.makedirs(subfolder)
+            nested = os.path.join(subfolder, "clip.mp4")
+            open(nested, "w").close()
+            self.assertEqual(a.list_recent_recordings(tmp), [nested])
+
+    def test_respects_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for i in range(5):
+                path = os.path.join(tmp, f"clip{i}.mp4")
+                open(path, "w").close()
+                os.utime(path, (1000 + i, 1000 + i))
+            self.assertEqual(len(a.list_recent_recordings(tmp, limit=3)), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

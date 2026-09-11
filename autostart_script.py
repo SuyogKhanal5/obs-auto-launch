@@ -3978,6 +3978,375 @@ def _run_config_editor(master_root, restart_callback, on_close):
     tk.Button(button_bar, text="Save and Restart", command=lambda: do_save(True)).pack(side="right")
 
 
+CLIP_EDITOR_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".flv", ".ts", ".webm", ".avi"}
+CLIP_EDITOR_MAX_RECENT_RECORDINGS = 30
+
+
+def list_recent_recordings(folder, limit=CLIP_EDITOR_MAX_RECENT_RECORDINGS):
+    """Lists up to `limit` video files under folder, newest first -- recursive, since
+    organize_into_game_subfolders nests recordings one level deeper per game."""
+    if not folder or not os.path.isdir(folder):
+        return []
+    found = []
+    for root_dir, _dirs, files in os.walk(folder):
+        for name in files:
+            if os.path.splitext(name)[1].lower() not in CLIP_EDITOR_VIDEO_EXTENSIONS:
+                continue
+            path = os.path.join(root_dir, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            found.append((path, mtime))
+    found.sort(key=lambda item: item[1], reverse=True)
+    return [path for path, _mtime in found[:limit]]
+
+
+def validate_trim_range(start_seconds, end_seconds, duration_seconds=None):
+    """Returns None if [start_seconds, end_seconds) is a sane trim range, otherwise an error
+    message fit to show directly in the editor's status label. duration_seconds is optional
+    (VLC doesn't always know a clip's length immediately after loading it) -- skipped when not
+    yet available rather than blocking the user on a check that can't be performed yet."""
+    if start_seconds < 0:
+        return "Start time can't be negative."
+    if end_seconds <= start_seconds:
+        return "End time must be after the start time."
+    if duration_seconds and start_seconds > duration_seconds:
+        return "Start time is past the end of the clip."
+    if duration_seconds and end_seconds > duration_seconds + 0.5:  # small slack for UI rounding
+        return "End time is past the end of the clip."
+    return None
+
+
+def open_clip_editor_window(editor_state, config, recording_state, overlay_state, icon):
+    if editor_state.get("open"):
+        if time.time() - editor_state.get("opened_at", 0) < EDITOR_STUCK_TIMEOUT_SECONDS:
+            logging.info("Clip editor is already open.")
+            return
+        logging.warning(
+            "Clip editor has appeared open for over %d seconds without closing; assuming it's "
+            "stuck and allowing a new attempt.", EDITOR_STUCK_TIMEOUT_SECONDS,
+        )
+
+    overlay_root = overlay_state.get("root")
+    if not overlay_root:
+        logging.warning("Overlay isn't ready yet; can't open the clip editor. Try again in a moment.")
+        return
+
+    editor_state["open"] = True
+    editor_state["opened_at"] = time.time()
+
+    def on_close():
+        editor_state["open"] = False
+
+    def build():
+        try:
+            _run_clip_editor(overlay_root, config, recording_state, on_close, icon)
+        except Exception:
+            logging.exception("Clip editor crashed.")
+            on_close()
+
+    # Same reasoning as open_config_editor_window: built as a Toplevel of the overlay's already-
+    # running interpreter, scheduled via .after() rather than a second independent tk.Tk() on its
+    # own thread, which PyInstaller's bundled Tcl/Tk doesn't reliably support.
+    overlay_root.after(0, build)
+
+
+def _open_vlc_missing_window(master_root, on_close):
+    """Shown instead of the real editor when VLC can't be found -- unlike the Settings tab's
+    equivalent panel, there's no usable editor at all without it (no preview, no way to pick a
+    start/end by watching the video), so this is the whole window rather than one section of it."""
+    root = tk.Toplevel(master_root)
+    root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
+    root.title("OBS Auto Recorder - Clip Editor")
+    root.geometry("460x220")
+
+    frame = tk.Frame(root, padx=16, pady=16)
+    frame.pack(fill="both", expand=True)
+    tk.Label(
+        frame,
+        text=(
+            "VLC isn't installed, so the clip editor's video preview isn't available. Install it "
+            "below, then try Edit Clips... again."
+        ),
+        anchor="w", justify="left", wraplength=420,
+    ).pack(fill="x", pady=(0, 12))
+
+    status_label = tk.Label(frame, text="", fg="#b00020", anchor="w", justify="left", wraplength=420)
+    status_label.pack(fill="x", pady=(0, 8))
+
+    def install_via_winget():
+        install_button.config(state="disabled", text="Installing VLC...")
+
+        def worker():
+            result = winget_install_vlc()
+
+            def finish():
+                success, reason = result
+                if success and find_vlc():
+                    status_label.config(fg="#15803d", text="VLC installed -- close this window and try Edit Clips... again.")
+                    install_button.pack_forget()
+                else:
+                    install_button.config(state="normal", text="Install VLC via winget")
+                    status_label.config(text=f"Install didn't finish ({reason or 'VLC still not found after install'}).")
+
+            root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    if has_winget():
+        install_button = tk.Button(frame, text="Install VLC via winget", command=install_via_winget)
+        install_button.pack(anchor="w", pady=(0, 8))
+
+    download_link = tk.Label(
+        frame, text="Or download it manually from videolan.org ↗", fg="#2563eb",
+        font=("Segoe UI", 9, "underline"), cursor="hand2",
+    )
+    download_link.pack(anchor="w")
+    download_link.bind("<Button-1>", lambda _event: webbrowser.open(VLC_DOWNLOAD_URL))
+
+    tk.Button(root, text="Close", command=root.destroy).pack(anchor="e", padx=16, pady=16)
+
+
+def _run_clip_editor(master_root, config, recording_state, on_close, icon):
+    clip_editor_config = config.get("clip_editor", {})
+    notifications_config = config.get("notifications", {})
+
+    vlc_dir = resolve_vlc_path(clip_editor_config.get("vlc_path", ""))
+    vlc_module = import_vlc_module() if vlc_dir else None
+    if not vlc_module:
+        _open_vlc_missing_window(master_root, on_close)
+        return
+
+    root = tk.Toplevel(master_root)
+    root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
+    root.title("OBS Auto Recorder - Clip Editor")
+    root.geometry("820x600")
+    root.minsize(600, 420)
+    root.lift()
+    root.focus_force()
+
+    instance = create_vlc_instance_with_logging(vlc_module)
+    player = instance.media_player_new()
+
+    def cleanup(_event=None):
+        try:
+            player.stop()
+            instance.release()
+        except Exception:
+            pass
+
+    root.bind("<Destroy>", lambda event: (cleanup(), on_close()) if event.widget is root else None)
+
+    # --- Open file row ---
+    open_row = tk.Frame(root)
+    open_row.pack(fill="x", padx=10, pady=(10, 4))
+    tk.Button(open_row, text="Browse for a recording...", command=lambda: browse_for_file()).pack(side="left")
+
+    recent_recordings = list_recent_recordings(config.get("obs", {}).get("output_folder"))
+    recent_var = tk.StringVar()
+    if recent_recordings:
+        recent_combo = ttk.Combobox(
+            open_row, textvariable=recent_var,
+            values=[os.path.basename(p) for p in recent_recordings],
+            state="readonly", width=40,
+        )
+        recent_combo.pack(side="left", padx=(8, 0))
+
+        def on_recent_selected(_event):
+            index = recent_combo.current()
+            if 0 <= index < len(recent_recordings):
+                load_file(recent_recordings[index])
+
+        recent_combo.bind("<<ComboboxSelected>>", on_recent_selected)
+
+    # --- Video preview ---
+    video_frame = tk.Frame(root, bg="black")
+    video_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+    root.update_idletasks()
+    player.set_hwnd(video_frame.winfo_id())
+
+    # --- Transport controls ---
+    transport_row = tk.Frame(root)
+    transport_row.pack(fill="x", padx=10, pady=4)
+    play_pause_button = tk.Button(transport_row, text="Play/Pause", command=lambda: toggle_play_pause())
+    play_pause_button.pack(side="left")
+    tk.Button(transport_row, text="Rewind 5s", command=lambda: rewind(5)).pack(side="left", padx=(6, 0))
+
+    seek_var = tk.DoubleVar(value=0)
+    seeking = {"active": False}
+    seek_scale = ttk.Scale(transport_row, from_=0, to=1000, orient="horizontal", variable=seek_var)
+    seek_scale.pack(side="left", fill="x", expand=True, padx=8)
+
+    time_label = tk.Label(transport_row, text="00:00:00.000 / 00:00:00.000", width=24, anchor="e")
+    time_label.pack(side="left")
+
+    # --- Start/End controls ---
+    range_row = tk.Frame(root)
+    range_row.pack(fill="x", padx=10, pady=4)
+    start_var = tk.StringVar(value="00:00:00.000")
+    end_var = tk.StringVar(value="00:00:00.000")
+    tk.Button(range_row, text="Set Start", command=lambda: set_start()).pack(side="left")
+    tk.Entry(range_row, textvariable=start_var, width=14).pack(side="left", padx=(4, 16))
+    tk.Button(range_row, text="Set End", command=lambda: set_end()).pack(side="left")
+    tk.Entry(range_row, textvariable=end_var, width=14).pack(side="left", padx=(4, 16))
+    precise_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(range_row, text="Precise (slower, frame-accurate)", variable=precise_var).pack(side="left")
+
+    # --- Status + trim ---
+    status_label = tk.Label(root, text="", fg="#b00020", anchor="w", justify="left", wraplength=780)
+    status_label.pack(fill="x", padx=10, pady=(4, 0))
+
+    progress = ttk.Progressbar(root, mode="indeterminate")
+
+    bottom_row = tk.Frame(root)
+    bottom_row.pack(fill="x", padx=10, pady=10, side="bottom")
+    tk.Button(bottom_row, text="Close", command=root.destroy).pack(side="right")
+    trim_button = tk.Button(bottom_row, text="Trim Clip", command=lambda: do_trim())
+    trim_button.pack(side="right", padx=(0, 8))
+
+    state = {"path": None, "duration": 0.0}
+
+    def browse_for_file():
+        path = filedialog.askopenfilename(
+            title="Open a recording", filetypes=[("Video files", "*.mp4 *.mkv *.mov *.flv *.ts *.webm *.avi"), ("All files", "*.*")],
+        )
+        if path:
+            load_file(path)
+
+    def load_file(path):
+        active_path = recording_state.get("current_path")
+        if active_path and os.path.normpath(active_path) == os.path.normpath(path):
+            status_label.config(text="That recording is still in progress -- wait for it to finish before trimming it.")
+            return
+        player.stop()
+        media = instance.media_new(path)
+        player.set_media(media)
+        player.play()
+
+        # Pausing immediately after play() races VLC's own async open/buffer state -- called
+        # this early, pause() is liable to be silently dropped, leaving the clip playing all the
+        # way through instead of stopping on its first frame like a freshly-opened file should.
+        # Poll (on the Tk thread, not a VLC event callback, so there's nothing here that needs to
+        # worry about calling back into Tkinter from a non-Tk thread) until playback has actually
+        # started, then pause; gives up after ~5s so a genuinely broken file doesn't poll forever.
+        def pause_once_playing(attempts=0):
+            if player.get_state() == vlc_module.State.Playing:
+                player.pause()
+            elif attempts < 50:
+                root.after(100, lambda: pause_once_playing(attempts + 1))
+
+        root.after(50, pause_once_playing)
+
+        state["path"] = path
+        state["duration"] = 0.0
+        start_var.set(format_timestamp(0))
+        end_var.set(format_timestamp(0))
+        status_label.config(text="")
+        root.title(f"OBS Auto Recorder - Clip Editor - {os.path.basename(path)}")
+
+    def toggle_play_pause():
+        if not state["path"]:
+            return
+        if player.is_playing():
+            player.pause()
+        else:
+            player.play()
+
+    def rewind(seconds):
+        if not state["path"]:
+            return
+        player.set_time(max(0, player.get_time() - seconds * 1000))
+
+    def on_seek_press(_event):
+        seeking["active"] = True
+
+    def on_seek_release(_event):
+        length = player.get_length()
+        if length > 0:
+            player.set_time(int(seek_var.get() / 1000 * length))
+        seeking["active"] = False
+
+    seek_scale.bind("<Button-1>", on_seek_press)
+    seek_scale.bind("<ButtonRelease-1>", on_seek_release)
+
+    def set_start():
+        if state["path"]:
+            start_var.set(format_timestamp(player.get_time() / 1000))
+
+    def set_end():
+        if state["path"]:
+            end_var.set(format_timestamp(player.get_time() / 1000))
+
+    def do_trim():
+        if not state["path"]:
+            status_label.config(text="Open a recording first.")
+            return
+        try:
+            start_seconds = parse_timestamp(start_var.get())
+            end_seconds = parse_timestamp(end_var.get())
+        except ValueError as exc:
+            status_label.config(text=str(exc))
+            return
+        error = validate_trim_range(start_seconds, end_seconds, state["duration"] or None)
+        if error:
+            status_label.config(text=error)
+            return
+
+        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+        if not ffmpeg_path:
+            status_label.config(
+                text="ffmpeg isn't installed -- install it from Settings > Post-Processing, then try again."
+            )
+            return
+
+        output_path = compute_trim_output_path(state["path"], clip_editor_config.get("output_folder") or None)
+        delete_original = clip_editor_config.get("delete_original_after_trim", False)
+        precise = precise_var.get()
+        source_path = state["path"]
+
+        status_label.config(fg="#555555", text=f"Trimming to {os.path.basename(output_path)}...")
+        trim_button.config(state="disabled")
+        progress.pack(fill="x", padx=10, pady=(0, 6), before=bottom_row)
+        progress.start(12)
+
+        def worker():
+            success = trim_clip(
+                source_path, start_seconds, end_seconds, output_path, ffmpeg_path=ffmpeg_path,
+                precise=precise, delete_original=delete_original, icon=icon,
+                notifications_config=notifications_config,
+            )
+
+            def finish():
+                progress.stop()
+                progress.pack_forget()
+                trim_button.config(state="normal")
+                if success:
+                    status_label.config(fg="#15803d", text=f"Saved to {output_path}")
+                else:
+                    status_label.config(fg="#b00020", text="Trim failed -- see the log for details.")
+
+            root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def poll():
+        if not root.winfo_exists():
+            return
+        if state["path"]:
+            length = player.get_length()
+            if length > 0:
+                state["duration"] = length / 1000
+                if not seeking["active"]:
+                    seek_var.set(player.get_time() / length * 1000)
+            time_label.config(
+                text=f"{format_timestamp(player.get_time() / 1000)} / {format_timestamp(state['duration'])}"
+            )
+        root.after(200, poll)
+
+    root.after(200, poll)
+
+
 def main():
     config = load_config()
 
@@ -4007,6 +4376,7 @@ def main():
     reset_recording_state(recording_state)
     runtime_state = {"obs_client": None}
     editor_state = {"open": False}
+    clip_editor_state = {"open": False}
 
     def on_quit(icon, menu_item):
         logging.info("Quit requested from tray icon.")
@@ -4036,6 +4406,9 @@ def main():
 
     def on_edit_settings(icon, menu_item):
         open_config_editor_window(editor_state, do_restart, overlay_state)
+
+    def on_edit_clips(icon, menu_item):
+        open_clip_editor_window(clip_editor_state, config, recording_state, overlay_state, icon)
 
     def on_open_recordings_folder(icon, menu_item):
         client = runtime_state.get("obs_client")
@@ -4150,6 +4523,9 @@ def main():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Open Recordings Folder", on_open_recordings_folder),
         pystray.MenuItem("Open Log File", on_open_log_file),
+        pystray.MenuItem(
+            "Edit Clips...", on_edit_clips, enabled=lambda item: not clip_editor_state["open"]
+        ),
         pystray.MenuItem(
             "Edit Settings...", on_edit_settings, enabled=lambda item: not editor_state["open"]
         ),
