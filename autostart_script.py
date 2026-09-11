@@ -1178,6 +1178,95 @@ def has_sufficient_disk_space(disk_guard_config, fallback_path):
     return free_gb >= minimum_gb
 
 
+DEFAULT_STORAGE_RESERVED_FREE_GB = 20
+
+# Recorded/transcoded clip containers this app itself produces (see RECORDING_FORMAT_OPTIONS and
+# TRANSCODE_OUTPUT_EXTENSION_OPTIONS above) -- storage management only ever deletes files matching
+# one of these, so it can't wander into unrelated files that happen to share the watch folder.
+CLIP_FILE_EXTENSIONS = {".mp4", ".mkv", ".mov", ".flv", ".ts", ".webm", ".avi", ".hls", ".m3u8"}
+
+
+def get_storage_watch_folder(storage_config, obs_config):
+    return storage_config.get("watch_folder") or obs_config.get("output_folder")
+
+
+def iter_clip_files(folder):
+    """Yields (path, mtime) for every recorded/transcoded clip under folder, recursively --
+    recursive because organize_into_game_subfolders nests clips one level deeper, per game."""
+    for root, _dirs, files in os.walk(folder):
+        for name in files:
+            if os.path.splitext(name)[1].lower() not in CLIP_FILE_EXTENSIONS:
+                continue
+            path = os.path.join(root, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            yield path, mtime
+
+
+def enforce_storage_budget(storage_config, obs_config, recording_state=None, icon=None, notifications_config=None):
+    """Keeps at least `reserved_free_gb` free on the watch folder's drive by deleting the oldest
+    clips first, so the app can be left recording indefinitely without manually clearing space.
+    Never touches the file currently being written to by OBS."""
+    if not storage_config.get("enabled"):
+        return
+
+    folder = get_storage_watch_folder(storage_config, obs_config)
+    if not folder or not os.path.isdir(folder):
+        logging.warning(
+            "Storage management: no valid watch folder configured (set storage_management.watch_folder "
+            "or obs.output_folder); skipping."
+        )
+        return
+
+    reserved_gb = storage_config.get("reserved_free_gb", DEFAULT_STORAGE_RESERVED_FREE_GB)
+    try:
+        free_gb = shutil.disk_usage(folder).free / (1024 ** 3)
+    except OSError as exc:
+        logging.warning("Storage management: could not check free space at %s: %s", folder, exc)
+        return
+    if free_gb >= reserved_gb:
+        return
+
+    active_path = os.path.normpath(recording_state["current_path"]) if recording_state and recording_state.get("current_path") else None
+    clips = sorted(
+        (item for item in iter_clip_files(folder) if os.path.normpath(item[0]) != active_path),
+        key=lambda item: item[1],
+    )
+    if not clips:
+        logging.warning(
+            "Storage management: free space (%.1f GB) is below the reserved %.1f GB, but no clips "
+            "were found in %s to delete.", free_gb, reserved_gb, folder,
+        )
+        return
+
+    deleted = []
+    for path, _mtime in clips:
+        if free_gb >= reserved_gb:
+            break
+        try:
+            size_gb = os.path.getsize(path) / (1024 ** 3)
+            os.remove(path)
+        except OSError as exc:
+            logging.error("Storage management: failed to delete %s: %s", path, exc)
+            continue
+        free_gb += size_gb
+        deleted.append(path)
+        logging.info("Storage management: deleted oldest clip %s to free up space.", os.path.basename(path))
+
+    if deleted:
+        notify(
+            icon, notifications_config, "Old clips deleted",
+            f"Deleted {len(deleted)} oldest clip(s) to keep {reserved_gb:g} GB free.",
+        )
+    if free_gb < reserved_gb:
+        logging.warning(
+            "Storage management: still below the reserved %.1f GB free in %s after deleting %d "
+            "clip(s) -- nothing more eligible to delete.", reserved_gb, folder, len(deleted),
+        )
+
+
 def start_replay_buffer(client):
     try:
         client.start_replay_buffer()
@@ -1716,6 +1805,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     game_audio_config = obs_config.get("game_audio_capture", {})
     replay_buffer_config = obs_config.get("replay_buffer", {})
     disk_guard_config = config.get("disk_space_guard", {})
+    storage_config = config.get("storage_management", {})
     notifications_config = config.get("notifications", {})
 
     logging.info("Watching for processes: %s", ", ".join(sorted(watched_games)))
@@ -1749,6 +1839,8 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
         if obs_running_now != obs_running_last_known:
             obs_running_last_known = obs_running_now
             icon.update_menu()
+
+        enforce_storage_budget(storage_config, obs_config, recording_state, icon, notifications_config)
 
         if active_name is None:
             # The recording-driven obs_event_client (established below once a watched game is
@@ -3180,6 +3272,22 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_labeled_entry(cleanup_tab, row, "Warn after (seconds)", silent_warn_after_var)
     row += 1
 
+    storage_config = config.get("storage_management", {})
+    add_section_label(cleanup_tab, row, "Storage Management")
+    row += 1
+    storage_enabled_var = tk.BooleanVar(value=storage_config.get("enabled", False))
+    add_checkbox(cleanup_tab, row, "Delete oldest clips once free space drops below the reserve", storage_enabled_var)
+    row += 1
+    storage_reserved_gb_var = tk.StringVar(
+        value=str(storage_config.get("reserved_free_gb", DEFAULT_STORAGE_RESERVED_FREE_GB))
+    )
+    add_labeled_entry(cleanup_tab, row, "Reserve free space (GB)", storage_reserved_gb_var)
+    row += 1
+    storage_watch_folder_var = tk.StringVar(value=storage_config.get("watch_folder", "") or "")
+    add_labeled_entry(cleanup_tab, row, "Clip folder to manage (optional, defaults to output folder)", storage_watch_folder_var)
+    add_browse_button(cleanup_tab, row, storage_watch_folder_var, mode="dir")
+    row += 1
+
     # --- Post-processing & Notifications ---
     post_tab = make_scrollable_tab(notebook, "Post-Processing")
     post_tab.columnconfigure(1, weight=1)
@@ -3537,6 +3645,19 @@ def _run_config_editor(master_root, restart_callback, on_close):
         silent["warn_after_seconds"] = read_int(
             silent_warn_after_var, "Silent warn-after seconds", silent.get("warn_after_seconds", 30)
         )
+
+        storage = new_config.setdefault("storage_management", {})
+        storage["enabled"] = storage_enabled_var.get()
+        storage["reserved_free_gb"] = read_float(
+            storage_reserved_gb_var,
+            "Reserve free space",
+            storage.get("reserved_free_gb", DEFAULT_STORAGE_RESERVED_FREE_GB),
+        )
+        storage_watch_folder_value = storage_watch_folder_var.get().strip()
+        if storage_watch_folder_value:
+            storage["watch_folder"] = storage_watch_folder_value
+        else:
+            storage.pop("watch_folder", None)
 
         transcode = new_config.setdefault("post_record_transcode", {})
         transcode["enabled"] = transcode_enabled_var.get()
