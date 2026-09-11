@@ -69,6 +69,11 @@
             "warn_after_seconds": 30
         }
     },
+    "storage_management": {
+        "enabled": false,
+        "reserved_free_gb": 20,
+        "watch_folder": ""
+    },
     "notifications": {
         "enabled": false
     },
