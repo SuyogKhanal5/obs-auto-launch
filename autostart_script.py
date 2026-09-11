@@ -1694,6 +1694,147 @@ def transcode_recording(input_path, transcode_config, icon=None, notifications_c
             logging.warning("Could not delete original after transcode: %s", exc)
 
 
+def parse_timestamp(text):
+    """Parses a "HH:MM:SS.mmm" / "MM:SS.mmm" / "SS.mmm" timestamp (colon-separated, most-
+    significant component first, any number of fractional digits) into a float number of
+    seconds. Raises ValueError with a message fit to show directly in the editor's status label
+    on anything empty, unparseable, negative, or with an out-of-range minutes/seconds field."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Timestamp is empty.")
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise ValueError(f"Invalid timestamp '{text}'.")
+    try:
+        values = [float(p) for p in parts]
+    except ValueError:
+        raise ValueError(f"Invalid timestamp '{text}'.")
+    if any(v < 0 for v in values):
+        raise ValueError(f"Timestamp '{text}' can't be negative.")
+    # A bare number (no colons) is a plain seconds value with no upper bound -- "90" means 90
+    # seconds, not an out-of-range SS field. The <60 check only makes sense once there's a more
+    # significant component (minutes and/or hours) actually written alongside it.
+    if len(values) == 1:
+        return values[0]
+    while len(values) < 3:
+        values.insert(0, 0.0)
+    hours, minutes, seconds = values
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError(f"Invalid timestamp '{text}': minutes and seconds must be under 60.")
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def format_timestamp(total_seconds):
+    """Formats a float number of seconds as "HH:MM:SS.mmm" -- the inverse of parse_timestamp,
+    and also what gets passed to ffmpeg's -ss/-t flags in build_trim_command."""
+    total_seconds = max(total_seconds, 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
+
+
+def build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False):
+    """Builds the ffmpeg argv to cut [start_seconds, end_seconds) out of input_path. Always uses
+    -t (duration) rather than -to (absolute end time) even though both express the same cut --
+    -to's meaning shifts depending on whether -ss is an input or output option, a well-known
+    ffmpeg gotcha; -t means the same thing either way, so it sidesteps that ambiguity entirely.
+
+    Fast mode (the default): -ss before -i uses the demuxer's own fast seek, paired with -c copy
+    for a lossless, near-instant stream-copy trim -- but the actual cut snaps to the nearest
+    keyframe at or before start_seconds, which can be off by a couple of seconds depending on the
+    source's keyframe interval.
+
+    Precise mode: -ss after -i decodes from the start of the file up to the cut point instead
+    (slower), paired with a re-encode, since a non-keyframe-aligned start can't be stream-copied
+    at all -- this is what actually buys frame accuracy, not just a different flag position."""
+    start_str = format_timestamp(start_seconds)
+    duration_str = format_timestamp(end_seconds - start_seconds)
+    if precise:
+        return [
+            ffmpeg_path, "-y", "-i", input_path, "-ss", start_str, "-t", duration_str,
+            "-map", "0", "-c:v", "libx264", "-crf", "18", "-c:a", "aac", output_path,
+        ]
+    return [
+        ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str,
+        "-map", "0", "-c", "copy", output_path,
+    ]
+
+
+def compute_trim_output_path(input_path, output_folder=None, suffix="_trimmed"):
+    """Computes where a trimmed clip should be written: inside output_folder if given (created
+    if it doesn't exist yet, mirroring apply_output_folder), otherwise next to the source file.
+    Never overwrites an existing file -- appends " (2)", " (3)", etc. until a free name is found,
+    the same convention Windows Explorer itself uses for a colliding copy."""
+    directory = output_folder or os.path.dirname(input_path)
+    if output_folder:
+        os.makedirs(output_folder, exist_ok=True)
+    base, ext = os.path.splitext(os.path.basename(input_path))
+
+    candidate = os.path.join(directory, f"{base}{suffix}{ext}")
+    if not os.path.exists(candidate):
+        return candidate
+    n = 2
+    while True:
+        candidate = os.path.join(directory, f"{base}{suffix} ({n}){ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
+def trim_clip(
+    input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
+    delete_original=False, icon=None, notifications_config=None,
+):
+    """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
+    way transcode_recording's callers do. Verifies the output file actually exists and has a
+    nonzero size before reporting success or deleting the source; never deletes on a failed or
+    suspicious-looking trim, same rule transcode_recording already follows."""
+    basename = os.path.basename(input_path)
+    if end_seconds <= start_seconds:
+        logging.error("Could not trim %s: end time must be after the start time.", basename)
+        return False
+
+    cmd = build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise)
+    logging.info("Trimming %s: %s", basename, " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except OSError as exc:
+        logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
+        notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
+        return False
+
+    output_ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+    if result.returncode != 0 or not output_ok:
+        logging.error(
+            "ffmpeg trim failed for %s (exit code %s).\nCommand: %s\nstderr:\n%s",
+            input_path, result.returncode, " ".join(cmd), result.stderr[-4000:],
+        )
+        notify(
+            icon, notifications_config, "Trim failed",
+            f"{basename} was kept, but the trim failed -- see the log for details.",
+        )
+        if os.path.isfile(output_path) and not output_ok:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return False
+
+    logging.info("Trimmed clip saved to %s", output_path)
+    notify(icon, notifications_config, "Clip trimmed", os.path.basename(output_path))
+
+    if delete_original:
+        try:
+            os.remove(input_path)
+            logging.info("Deleted original recording after trim: %s", basename)
+        except OSError as exc:
+            logging.warning("Could not delete original after trim: %s", exc)
+
+    return True
+
+
 def rename_with_game_prefix(output_path, game_display_name, split_part=None, silent=False, use_subfolder=False):
     """Renames (and optionally relocates) a finished recording. Returns the resulting path,
     or the original path if renaming was skipped/failed."""
