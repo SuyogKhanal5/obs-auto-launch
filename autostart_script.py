@@ -1733,6 +1733,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     active_display_name = None
     obs_recovery_state = {"last_attempt": 0, "last_start_failure": 0}
     obs_running_last_known = None
+    audio_overlay_launch_state = {"last_attempt": 0}
 
     while not stop_event.is_set():
         processes = get_running_processes()
@@ -1769,6 +1770,17 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                         obs_event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
                     else:
                         audio_state["levels"] = {}
+                        # Show Audio Mixer Levels used to just sit there showing "No active audio
+                        # sources" forever if OBS wasn't already running -- launch it the same way
+                        # a watched game would, so enabling levels alone is enough to get them
+                        # showing. Gated by startup_wait_seconds so this fires once per launch
+                        # attempt instead of spamming a new OBS process every poll while it starts.
+                        now = time.time()
+                        launch_cooldown = obs_config.get("startup_wait_seconds", 8)
+                        if now - audio_overlay_launch_state["last_attempt"] > launch_cooldown:
+                            audio_overlay_launch_state["last_attempt"] = now
+                            logging.info("Show Audio Mixer Levels enabled but OBS isn't running; launching OBS.")
+                            threading.Thread(target=launch_obs, args=(obs_config,), daemon=True).start()
             elif obs_event_client:
                 try:
                     obs_event_client.disconnect()
