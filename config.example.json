@@ -15,6 +15,10 @@
     ],
     "poll_interval_seconds": 1.5,
     "organize_into_game_subfolders": false,
+    "overlay": {
+        "default_monitor_label": "",
+        "start_with_overlay": false
+    },
     "steam": {
         "enabled": true,
         "allowed_drives": ["C", "D"],

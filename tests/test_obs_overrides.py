@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
@@ -59,6 +60,49 @@ class ApplyRecordingFormatTests(unittest.TestCase):
         self.assertEqual(a.get_profile_parameter_value(client, "AdvOut", "RecFormat2"), "some_future_format_code")
 
 
+class WantsMarkersTests(unittest.TestCase):
+    def test_no_keybinds_returns_false(self):
+        self.assertFalse(a.wants_markers([]))
+        self.assertFalse(a.wants_markers(None))
+
+    def test_enabled_add_marker_keybind_returns_true(self):
+        self.assertTrue(a.wants_markers([{"enabled": True, "action": "add_marker"}]))
+
+    def test_disabled_add_marker_keybind_returns_false(self):
+        self.assertFalse(a.wants_markers([{"enabled": False, "action": "add_marker"}]))
+
+    def test_missing_enabled_key_defaults_to_true(self):
+        self.assertTrue(a.wants_markers([{"action": "add_marker"}]))
+
+    def test_other_actions_do_not_count(self):
+        self.assertFalse(a.wants_markers([{"enabled": True, "action": "split_record_file"}]))
+
+
+class EnsureHybridMp4ForMarkersTests(unittest.TestCase):
+    def test_sets_format_and_reports_restart_needed(self):
+        client = FakeObsClient()
+        needs_restart = a.ensure_hybrid_mp4_for_markers(client)
+        self.assertEqual(a.get_profile_parameter_value(client, "AdvOut", "RecFormat2"), "hybrid_mp4")
+        self.assertTrue(needs_restart)
+
+    def test_already_hybrid_mp4_does_not_rewrite_or_need_restart(self):
+        client = FakeObsClient()
+        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
+        client.calls.clear()
+        needs_restart = a.ensure_hybrid_mp4_for_markers(client)
+        self.assertEqual(client.calls, [])
+        self.assertFalse(needs_restart)
+
+    def test_never_raises_when_client_errors(self):
+        class RaisingClient(FakeObsClient):
+            def set_profile_parameter(self, category, name, value):
+                raise RuntimeError("boom")
+
+        client = RaisingClient()
+        needs_restart = a.ensure_hybrid_mp4_for_markers(client)  # must not raise
+        self.assertFalse(needs_restart)
+
+
 class GetReplayBufferModeTests(unittest.TestCase):
     def test_explicit_mode_wins(self):
         self.assertEqual(a.get_replay_buffer_mode({"mode": "only", "enabled": False}), "only")
@@ -72,6 +116,37 @@ class GetReplayBufferModeTests(unittest.TestCase):
     def test_legacy_enabled_false_or_missing_maps_to_off(self):
         self.assertEqual(a.get_replay_buffer_mode({"enabled": False}), "off")
         self.assertEqual(a.get_replay_buffer_mode({}), "off")
+
+
+class AddRecordingMarkerTests(unittest.TestCase):
+    def test_success_calls_create_record_chapter(self):
+        client = FakeObsClient()
+        result = a.add_recording_marker(client)
+        self.assertTrue(result)
+        self.assertIn(("create_record_chapter", None), client.calls)
+
+    def test_unsupported_format_toasts_and_returns_false(self):
+        class RejectingClient(FakeObsClient):
+            def create_record_chapter(self, chapter_name=None):
+                raise a.obsws.error.OBSSDKRequestError("CreateRecordChapter", a.OBS_CHAPTER_NOT_SUPPORTED_CODE, "")
+
+        client = RejectingClient()
+        with unittest.mock.patch.object(a, "notify") as mock_notify:
+            result = a.add_recording_marker(client, icon=None, notifications_config={"enabled": True})
+        self.assertFalse(result)
+        mock_notify.assert_called_once()
+        self.assertIn("format", mock_notify.call_args[0][3].lower())
+
+    def test_other_error_does_not_toast(self):
+        class RejectingClient(FakeObsClient):
+            def create_record_chapter(self, chapter_name=None):
+                raise a.obsws.error.OBSSDKRequestError("CreateRecordChapter", 500, "")
+
+        client = RejectingClient()
+        with unittest.mock.patch.object(a, "notify") as mock_notify:
+            result = a.add_recording_marker(client)
+        self.assertFalse(result)
+        mock_notify.assert_not_called()
 
 
 class ApplyReplayBufferSettingsTests(unittest.TestCase):
@@ -217,6 +292,30 @@ class SetGameAudioCaptureTargetTests(unittest.TestCase):
         with self.assertLogs(level="WARNING"):
             a.set_game_audio_capture_target(client, "Game Audio", "Balatro.exe")  # must not raise
         self.assertNotIn("Game Audio", client.inputs)
+
+
+class ActiveSessionMarkerTests(unittest.TestCase):
+    def setUp(self):
+        tmp_dir = tempfile.mkdtemp()
+        self.marker_path = os.path.join(tmp_dir, ".active_recording_session.json")
+        self.patcher = unittest.mock.patch.object(a, "ACTIVE_SESSION_MARKER_PATH", self.marker_path)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def test_read_returns_none_when_no_marker_written(self):
+        self.assertIsNone(a.read_active_session_marker())
+
+    def test_write_then_read_round_trips_the_display_name(self):
+        a.write_active_session_marker("Street Fighter 6")
+        self.assertEqual(a.read_active_session_marker(), {"display_name": "Street Fighter 6"})
+
+    def test_clear_removes_the_marker(self):
+        a.write_active_session_marker("Street Fighter 6")
+        a.clear_active_session_marker()
+        self.assertIsNone(a.read_active_session_marker())
+
+    def test_clear_does_not_raise_when_no_marker_exists(self):
+        a.clear_active_session_marker()  # must not raise
 
 
 if __name__ == "__main__":

@@ -264,5 +264,30 @@ class DefaultOverlayMonitorIndexTests(unittest.TestCase):
         self.assertIsNone(a.default_overlay_monitor_index([]))
 
 
+class ResolveDefaultOverlayMonitorIndexTests(unittest.TestCase):
+    def setUp(self):
+        self.monitors = [
+            {"left": 0, "top": 0, "right": 1920, "bottom": 1080, "label": "1920x1080 monitor at (0, 0)"},
+            {"left": 1920, "top": 0, "right": 3840, "bottom": 1080, "label": "1920x1080 monitor at (1920, 0)"},
+        ]
+
+    def test_unset_label_returns_none(self):
+        self.assertIsNone(a.resolve_default_overlay_monitor_index(self.monitors, {}))
+
+    def test_matching_label_returns_its_index(self):
+        overlay_config = {"default_monitor_label": "1920x1080 monitor at (1920, 0)"}
+        self.assertEqual(a.resolve_default_overlay_monitor_index(self.monitors, overlay_config), 1)
+
+    def test_stale_label_not_matching_any_current_monitor_returns_none(self):
+        # A saved monitor that's no longer connected (multi-monitor setup changed) should fall
+        # back to Off rather than silently guessing a different monitor.
+        overlay_config = {"default_monitor_label": "2560x1440 monitor at (0, 0)"}
+        self.assertIsNone(a.resolve_default_overlay_monitor_index(self.monitors, overlay_config))
+
+    def test_no_monitors_returns_none(self):
+        overlay_config = {"default_monitor_label": "1920x1080 monitor at (0, 0)"}
+        self.assertIsNone(a.resolve_default_overlay_monitor_index([], overlay_config))
+
+
 if __name__ == "__main__":
     unittest.main()

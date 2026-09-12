@@ -1,22 +1,14 @@
-## VERIFIED STABLE
+### Markers
+- New "Add Marker" custom keybind action: drops an OBS chapter marker into the current recording.
+- Markers show up on the clip editor's timeline as blue flags. Clicking one sets Start to 30s before it and 5s after, still freely adjustable afterward.
+- Markers only work on Hybrid MP4 recordings (an OBS limitation). Picking the Add Marker keybind now automatically switches the recording format to Hybrid MP4 and restarts OBS once so it takes effect; if a save still can't use markers, the app now shows a toast explaining why.
 
-### Clip editor
-- Fixed vertical spacing between the timeline controls and the Start/End row.
-- Output format, resolution, Trim Clip, and Close now share one row instead of being split across separate ones.
-- Zoom buttons are now uniform squares; the rewind/play-pause/forward buttons are now uniform rectangles.
-- The timeline now shows its empty track immediately when the editor opens, instead of staying blank until a file is loaded.
-- The file currently loaded in the editor is now locked against deletion (e.g. by storage management's cleanup, or a manual delete elsewhere) for as long as it's open; the lock releases automatically on switching files or closing the editor.
+### Overlay
+- New "Default monitor" and "Start with audio mixer levels shown" options in Settings → General, so the overlay doesn't need to be turned on by hand from the tray every session.
+- Hardened the overlay's redraw loop against a bad tick permanently freezing the display with no log trace -- it now logs and keeps retrying instead.
 
-### Settings
-- Clicking a Settings tab now expands its label to full text and abbreviates the others, so all eight tabs fit without truncation.
-- Fixed "Edit Clips..." / "Edit Settings..." staying greyed out in the tray menu after closing either window.
+### Reliability
+- Root-caused and fixed a real bug where a recording could be silently orphaned (stuck open, never renamed) if the app was ever killed, crashed, or force-restarted mid-recording. The app now recognizes a recording it started that's still running from an unclean shutdown and automatically stops and finalizes it on the next launch, without ever touching a recording started manually in OBS.
 
-### Replay buffer
-- Replay buffer mode and length are now configurable directly from Settings → OBS, instead of requiring a manual change in OBS's own UI.
-- New "Replay buffer only" mode: skip the full continuous recording entirely and only maintain/save the rolling buffer.
-- Root-caused and fixed a real bug where the replay buffer silently failed to activate: OBS only builds that output when a profile loads, so a live settings change alone was never picked up. The app now automatically restarts OBS when a replay-buffer setting actually changes, so it takes effect immediately.
-- A saved replay-buffer clip is now renamed the same way a manual split is (game name + "Replay" marker) and triggers the same green tray/overlay flash as a split.
-
-### Common Games picker / installer
-- Pruned the "Common Games" quick-add list to drop titles this app's own Steam/Epic/Xbox/Battle.net auto-detection already covers (Counter-Strike 2, Overwatch 2, Fortnite, Rocket League, Minecraft: Bedrock Edition), keeping only titles with a launch path this app can't auto-discover.
-- The installer now has a "Games to watch" page, letting you pre-select from that same list during setup.
+### CI
+- Removed the automatic build-and-release trigger on every push to main/tags -- builds are now triggered manually (workflow_dispatch) instead.

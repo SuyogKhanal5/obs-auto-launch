@@ -158,6 +158,9 @@ class FakeObsClient:
     def split_record_file(self):
         self.calls.append(("split_record_file",))
 
+    def create_record_chapter(self, chapter_name=None):
+        self.calls.append(("create_record_chapter", chapter_name))
+
     def start_record(self):
         self.calls.append(("start_record",))
 
