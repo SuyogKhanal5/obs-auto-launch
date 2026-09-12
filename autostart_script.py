@@ -2,6 +2,7 @@ import ctypes
 import glob
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -685,6 +686,29 @@ def connect_obs_events(config, icon, status, audio_state, recording_state):
         timer.daemon = True
         timer.start()
 
+    def on_replay_buffer_saved(data):
+        # Same flash + renaming treatment as a manual split -- both are "a clip just landed on
+        # disk" events from the user's point of view, so they should look and sound the same.
+        saved_path = getattr(data, "saved_replay_path", None)
+        if not saved_path:
+            return
+        logging.info("Replay buffer saved to %s", saved_path)
+        status["flash_until"] = time.time() + SPLIT_FLASH_SECONDS
+        icon.icon = build_tray_image(current_color(status))
+
+        finalized_path = rename_with_game_prefix(
+            saved_path, recording_state.get("display_name"), use_subfolder=subfolders_enabled, is_replay=True,
+        )
+        if finalized_path:
+            maybe_transcode(finalized_path, transcode_config)
+
+        def revert():
+            icon.icon = build_tray_image(current_color(status))
+
+        timer = threading.Timer(SPLIT_FLASH_SECONDS, revert)
+        timer.daemon = True
+        timer.start()
+
     def on_input_volume_meters(data):
         levels = {}
         peak_overall = 0.0
@@ -735,6 +759,7 @@ def connect_obs_events(config, icon, status, audio_state, recording_state):
 
     event_client.callback.register(on_record_state_changed)
     event_client.callback.register(on_record_file_changed)
+    event_client.callback.register(on_replay_buffer_saved)
     event_client.callback.register(on_input_volume_meters)
     return event_client
 
@@ -776,6 +801,33 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
 
     if not client:
         return None, None
+
+    # A profile-parameter write alone can't make OBS's replay buffer actually available in the
+    # *current* session (see apply_replay_buffer_settings) -- OBS only picks it up by reading its
+    # profile fresh at startup. So when enabling it (or changing its length) actually required a
+    # write, restart OBS right here, before anything tries to use it, rather than leaving every
+    # StartReplayBuffer/SaveReplayBuffer call failing with "not available" until someone thinks to
+    # restart OBS by hand.
+    if apply_replay_buffer_settings(client, obs_config.get("replay_buffer", {})):
+        logging.info(
+            "Replay buffer settings changed -- restarting OBS so the change actually takes effect."
+        )
+        notify(
+            icon, config.get("notifications", {}), "OBS restarted",
+            "Replay buffer settings changed; OBS was restarted so they'd take effect.",
+        )
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        kill_process_by_name(obs_config["process_name"])
+        time.sleep(2)
+        if not launch_obs(obs_config):
+            return None, None
+        client = connect_obs(obs_config["websocket"])
+        if not client:
+            return None, None
+
     sync_multi_track_audio(client, obs_config.get("multi_track_audio", {}))
     apply_output_folder(client, obs_config.get("output_folder"))
     apply_recording_format(client, obs_config.get("recording_format"))
@@ -899,6 +951,46 @@ def apply_recording_format(client, recording_format):
         logging.info("Set OBS's recording format to '%s'.", recording_format)
     except Exception as exc:
         logging.error("Could not set OBS's recording format to '%s': %s", recording_format, exc)
+
+
+def apply_replay_buffer_settings(client, replay_buffer_config):
+    """Best-effort override of OBS's own Replay Buffer settings (Settings -> Output -> Replay
+    Buffer) for whichever profile is currently active -- so choosing a replay buffer mode/length
+    in this app's own Settings actually configures OBS itself, rather than calling
+    StartReplayBuffer against whatever length OBS happened to already have set. Same
+    read-current-value-first precedence as apply_recording_format, and the same reason for
+    checking Output Mode first as sync_multi_track_output_settings: Simple and Advanced output
+    modes keep entirely separate copies of these settings (SimpleOutput vs AdvOut).
+
+    Returns True when enabling the buffer (or changing its length) actually required writing a
+    new value -- confirmed live against a running OBS instance, a profile-parameter write alone
+    doesn't make OBS's replay buffer *available* to Start/SaveReplayBuffer in the current session
+    (OBS only builds that output when a profile loads); callers use this to know a restart is
+    actually needed. Turning the buffer *off* never returns True -- nothing has to restart just to
+    stop calling StartReplayBuffer, and a value that was already "off"/unset (e.g. a fresh install
+    that never touched this setting) shouldn't force a restart that accomplishes nothing."""
+    mode = get_replay_buffer_mode(replay_buffer_config)
+    should_enable = mode != "off"
+    category = "AdvOut" if get_profile_parameter_value(client, "Output", "Mode", "Simple") == "Advanced" else "SimpleOutput"
+    enabled_str = "true" if should_enable else "false"
+    needs_restart = False
+    try:
+        if get_profile_parameter_value(client, category, "RecRB") != enabled_str:
+            client.set_profile_parameter(category, "RecRB", enabled_str)
+            if should_enable:
+                needs_restart = True
+        if should_enable:
+            max_seconds = replay_buffer_config.get("max_seconds", DEFAULT_REPLAY_BUFFER_SECONDS)
+            if get_profile_parameter_value(client, category, "RecRBTime") != str(max_seconds):
+                client.set_profile_parameter(category, "RecRBTime", str(max_seconds))
+                needs_restart = True
+            logging.info("Set OBS's replay buffer to enabled (%ds).", max_seconds)
+        else:
+            logging.info("Set OBS's replay buffer to disabled.")
+    except Exception as exc:
+        logging.warning("Could not apply OBS replay buffer settings: %s", exc)
+        return False
+    return needs_restart
 
 
 DEFAULT_MULTI_TRACK_PROFILE_NAME = "OBS Auto Recorder"
@@ -1267,18 +1359,70 @@ def enforce_storage_budget(storage_config, obs_config, recording_state=None, ico
         )
 
 
+# "off": no replay buffer at all (the pre-existing default). "with_recording": today's original
+# behavior -- the buffer runs alongside a normal full recording. "only": the watcher starts/stops
+# the replay buffer instead of a full recording at all, for someone who only ever wants to save a
+# short clip after the fact and doesn't want a continuous recording eating disk space too.
+REPLAY_BUFFER_MODES = ["off", "with_recording", "only"]
+REPLAY_BUFFER_MODE_LABELS = {
+    "off": "Off",
+    "with_recording": "With full recording",
+    "only": "Replay buffer only (no full recording)",
+}
+REPLAY_BUFFER_MODE_LABELS_BY_LABEL = {label: mode for mode, label in REPLAY_BUFFER_MODE_LABELS.items()}
+DEFAULT_REPLAY_BUFFER_SECONDS = 30
+
+
+def get_replay_buffer_mode(replay_buffer_config):
+    """Resolves obs.replay_buffer's mode, falling back to the old boolean `enabled` field (still
+    read here, though the Settings editor and installer both now write `mode` directly) so a
+    config saved before this option existed keeps behaving exactly as it did before."""
+    mode = replay_buffer_config.get("mode")
+    if mode in REPLAY_BUFFER_MODES:
+        return mode
+    return "with_recording" if replay_buffer_config.get("enabled") else "off"
+
+
+# Confirmed live against a running OBS instance: writing RecRB/RecRBTime via SetProfileParameter
+# (what apply_replay_buffer_settings does) updates the saved profile, but OBS only actually builds
+# the replay buffer output when a profile is loaded -- neither a plain profile-parameter write nor
+# re-selecting the same profile causes it to reconstruct the output mid-session. So the very first
+# time replay buffer is turned on (or its length changed) via this app's Settings, every start/
+# save/stop request fails with this code until OBS is restarted, or the same setting is applied
+# once through OBS's own Settings -> Output -> Replay Buffer dialog.
+OBS_REPLAY_BUFFER_NOT_AVAILABLE_CODE = 604
+OBS_REPLAY_BUFFER_NOT_AVAILABLE_HINT = (
+    "OBS reports the replay buffer isn't available. This setting was written to OBS's profile, "
+    "but OBS only builds the replay buffer output when a profile is loaded, not from a live "
+    "settings change -- restart OBS once (or open Settings -> Output -> Replay Buffer in OBS "
+    "itself and click OK) after turning this on or changing its length here, then it'll work "
+    "normally from then on."
+)
+
+
 def start_replay_buffer(client):
     try:
         client.start_replay_buffer()
         logging.info("Replay buffer started.")
+        return True
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code == OBS_REPLAY_BUFFER_NOT_AVAILABLE_CODE:
+            logging.error("Could not start replay buffer: %s", OBS_REPLAY_BUFFER_NOT_AVAILABLE_HINT)
+        else:
+            logging.warning("Could not start replay buffer: %s", exc)
+        return False
     except Exception as exc:
         logging.warning("Could not start replay buffer: %s", exc)
+        return False
 
 
 def stop_replay_buffer(client):
     try:
         client.stop_replay_buffer()
         logging.info("Replay buffer stopped.")
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code != OBS_REPLAY_BUFFER_NOT_AVAILABLE_CODE:
+            logging.warning("Could not stop replay buffer: %s", exc)
     except Exception as exc:
         logging.warning("Could not stop replay buffer: %s", exc)
 
@@ -1287,6 +1431,11 @@ def save_replay_buffer(client):
     try:
         client.save_replay_buffer()
         logging.info("Replay buffer saved.")
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code == OBS_REPLAY_BUFFER_NOT_AVAILABLE_CODE:
+            logging.error("Could not save replay buffer: %s", OBS_REPLAY_BUFFER_NOT_AVAILABLE_HINT)
+        else:
+            logging.error("Could not save replay buffer: %s", exc)
     except Exception as exc:
         logging.error("Could not save replay buffer: %s", exc)
 
@@ -1822,7 +1971,10 @@ def format_timestamp(total_seconds):
     return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
 
 
-def build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False):
+def build_trim_command(
+    ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False, crf=None,
+    scale_height=None,
+):
     """Builds the ffmpeg argv to cut [start_seconds, end_seconds) out of input_path. Always uses
     -t (duration) rather than -to (absolute end time) even though both express the same cut --
     -to's meaning shifts depending on whether -ss is an input or output option, a well-known
@@ -1831,22 +1983,36 @@ def build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, outp
     Fast mode (the default): -ss before -i uses the demuxer's own fast seek, paired with -c copy
     for a lossless, near-instant stream-copy trim -- but the actual cut snaps to the nearest
     keyframe at or before start_seconds, which can be off by a couple of seconds depending on the
-    source's keyframe interval.
+    source's keyframe interval. Only available when crf and scale_height are both None ("Same as
+    source") -- a stream copy can't change quality or resolution at all, so requesting either
+    forces a re-encode.
 
     Precise mode: -ss after -i decodes from the start of the file up to the cut point instead
     (slower), paired with a re-encode, since a non-keyframe-aligned start can't be stream-copied
-    at all -- this is what actually buys frame accuracy, not just a different flag position."""
+    at all -- this is what actually buys frame accuracy, not just a different flag position.
+
+    crf: an explicit libx264 CRF (lower = higher quality), or None to leave quality unforced.
+    scale_height: an explicit output height in pixels (e.g. 720 for "720p"), applied via
+    -vf scale=-2:HEIGHT (the -2 keeps the source aspect ratio, rounded to an even width as
+    required by libx264), or None to leave the source resolution untouched.
+    Either one forces a re-encode even in fast (non-precise) mode when given -- in that case -ss
+    still goes before -i for the fast-seek speed benefit, it just re-encodes afterward instead of
+    copying."""
     start_str = format_timestamp(start_seconds)
     duration_str = format_timestamp(end_seconds - start_seconds)
-    if precise:
+    if not precise and crf is None and scale_height is None:
         return [
-            ffmpeg_path, "-y", "-i", input_path, "-ss", start_str, "-t", duration_str,
-            "-map", "0", "-c:v", "libx264", "-crf", "18", "-c:a", "aac", output_path,
+            ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str,
+            "-map", "0", "-c", "copy", output_path,
         ]
-    return [
-        ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str,
-        "-map", "0", "-c", "copy", output_path,
-    ]
+    effective_crf = CLIP_EDITOR_DEFAULT_CRF if crf is None else crf
+    encode_args = ["-map", "0"]
+    if scale_height is not None:
+        encode_args += ["-vf", f"scale=-2:{scale_height}"]
+    encode_args += ["-c:v", "libx264", "-crf", str(effective_crf), "-c:a", "aac"]
+    if precise:
+        return [ffmpeg_path, "-y", "-i", input_path, "-ss", start_str, "-t", duration_str] + encode_args + [output_path]
+    return [ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str] + encode_args + [output_path]
 
 
 def compute_trim_output_path(input_path, output_folder=None, suffix="_trimmed", output_ext=None):
@@ -1878,7 +2044,7 @@ def compute_trim_output_path(input_path, output_folder=None, suffix="_trimmed", 
 
 def trim_clip(
     input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
-    delete_original=False, icon=None, notifications_config=None,
+    delete_original=False, icon=None, notifications_config=None, crf=None, scale_height=None,
 ):
     """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
     way transcode_recording's callers do. Verifies the output file actually exists and has a
@@ -1889,7 +2055,9 @@ def trim_clip(
         logging.error("Could not trim %s: end time must be after the start time.", basename)
         return False
 
-    cmd = build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise)
+    cmd = build_trim_command(
+        ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise, crf, scale_height,
+    )
     logging.info("Trimming %s: %s", basename, " ".join(cmd))
     try:
         result = subprocess.run(
@@ -1930,7 +2098,9 @@ def trim_clip(
     return True
 
 
-def rename_with_game_prefix(output_path, game_display_name, split_part=None, silent=False, use_subfolder=False):
+def rename_with_game_prefix(
+    output_path, game_display_name, split_part=None, silent=False, use_subfolder=False, is_replay=False,
+):
     """Renames (and optionally relocates) a finished recording. Returns the resulting path,
     or the original path if renaming was skipped/failed."""
     if not output_path or not game_display_name:
@@ -1950,6 +2120,8 @@ def rename_with_game_prefix(output_path, game_display_name, split_part=None, sil
         name_parts.append(prefix)
     if split_part:
         name_parts.append(f"Split {split_part}")
+    elif is_replay:
+        name_parts.append("Replay")
     new_name = f"{' - '.join(name_parts)} - {filename}" if name_parts else filename
 
     target_dir = directory
@@ -2100,6 +2272,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     active_name = None
     active_pid = None
     active_display_name = None
+    active_replay_buffer_only = False
     obs_recovery_state = {"last_attempt": 0, "last_start_failure": 0}
     obs_running_last_known = None
     audio_overlay_launch_state = {"last_attempt": 0}
@@ -2229,17 +2402,30 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                     config, processes, icon, status, audio_state, recording_state, obs_recovery_state
                 )
                 runtime_state["obs_client"] = obs_client
-                if obs_client and start_recording(obs_client):
+                replay_buffer_mode = get_replay_buffer_mode(replay_buffer_config)
+                replay_buffer_only = replay_buffer_mode == "only"
+                session_started = obs_client and (
+                    start_replay_buffer(obs_client) if replay_buffer_only else start_recording(obs_client)
+                )
+                if session_started:
                     active_name, active_pid = name, pid
                     active_display_name = display_name
+                    active_replay_buffer_only = replay_buffer_only
                     recording_state["display_name"] = active_display_name
-                    status["recording"] = True
-                    set_status(icon, status, f"Recording {active_display_name}")
-                    notify(icon, notifications_config, "Recording started", active_display_name)
+                    # "recording" here specifically means a continuous file is being written --
+                    # replay-buffer-only mode never does that, so it's left False (avoids e.g. the
+                    # silent-recording flag misfiring against a buffer that isn't a monitored file).
+                    status["recording"] = not replay_buffer_only
+                    if replay_buffer_only:
+                        set_status(icon, status, f"Replay buffer active: {active_display_name}")
+                        notify(icon, notifications_config, "Replay buffer active", active_display_name)
+                    else:
+                        set_status(icon, status, f"Recording {active_display_name}")
+                        notify(icon, notifications_config, "Recording started", active_display_name)
+                        if replay_buffer_mode == "with_recording":
+                            start_replay_buffer(obs_client)
                     if game_audio_config.get("enabled"):
                         set_game_audio_capture_target(obs_client, game_audio_config["input_name"], name)
-                    if replay_buffer_config.get("enabled"):
-                        start_replay_buffer(obs_client)
                 else:
                     obs_recovery_state["last_start_failure"] = now
                     logging.error("Could not get OBS ready to record; will keep retrying while %s runs.", exe or name)
@@ -2253,12 +2439,16 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
             if not is_process_running(active_pid):
                 logging.info("%s has exited.", active_display_name or active_name)
                 if obs_client:
-                    if replay_buffer_config.get("enabled"):
+                    if active_replay_buffer_only:
                         stop_replay_buffer(obs_client)
-                    kept = stop_recording(obs_client, icon, active_display_name, recording_state, config)
-                    if kept:
-                        notify(icon, notifications_config, "Recording stopped", active_display_name or active_name)
+                    else:
+                        if get_replay_buffer_mode(replay_buffer_config) == "with_recording":
+                            stop_replay_buffer(obs_client)
+                        kept = stop_recording(obs_client, icon, active_display_name, recording_state, config)
+                        if kept:
+                            notify(icon, notifications_config, "Recording stopped", active_display_name or active_name)
                 active_name, active_pid, active_display_name = None, None, None
+                active_replay_buffer_only = False
                 reset_recording_state(recording_state)
                 status["recording"] = False
                 set_status(icon, status, "Watching")
@@ -2267,9 +2457,12 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
 
     if active_name is not None and obs_client:
         logging.info("Quit requested while recording; stopping recording.")
-        if replay_buffer_config.get("enabled"):
+        if active_replay_buffer_only:
             stop_replay_buffer(obs_client)
-        stop_recording(obs_client, icon, active_display_name, recording_state, config)
+        else:
+            if get_replay_buffer_mode(replay_buffer_config) == "with_recording":
+                stop_replay_buffer(obs_client)
+            stop_recording(obs_client, icon, active_display_name, recording_state, config)
 
 
 OVERLAY_SIZE = 26
@@ -2327,6 +2520,14 @@ def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
         )
         return
     root.withdraw()
+    # "clam" (rather than the platform default "vista") is the ttk theme for the whole app: vista
+    # is drawn by the Windows theme engine itself, which ignores ttk style overrides for a
+    # readonly Combobox's text color -- confirmed by testing the clip editor's dark theme, where
+    # dropdown text stayed low-contrast under vista no matter how the style was configured. clam
+    # is fully Tk-drawn, so custom styles (like the clip editor's dark Combobox/Scale/Progressbar)
+    # actually take effect; it also changes the Settings editor's own dropdowns to this same
+    # flatter look.
+    ttk.Style(root).theme_use("clam")
     # Exposed so the Settings editor can be built as a Toplevel of this same interpreter
     # instead of spinning up a second, independent tk.Tk() on another thread -- PyInstaller's
     # bundled Tcl/Tk isn't reliably safe for that (observed as everything from a silent hang to
@@ -2445,12 +2646,20 @@ def format_csv_field(items):
     return ", ".join(items or [])
 
 
+# Shared dark palette for the Settings editor and the clip editor, so both windows read as the
+# same app instead of one being an unrelated light-themed island next to the other's dark one.
+DARK_BG = "#2b2b2b"
+DARK_FG = "#e6e6e6"
+DARK_ENTRY_BG = "#3c3c3c"
+DARK_MUTED_FG = "#888888"
+
+
 def make_scrollable_tab(notebook, title):
-    outer = tk.Frame(notebook)
+    outer = tk.Frame(notebook, bg=DARK_BG)
     notebook.add(outer, text=title)
-    canvas = tk.Canvas(outer, highlightthickness=0)
+    canvas = tk.Canvas(outer, highlightthickness=0, bg=DARK_BG)
     scrollbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-    inner = tk.Frame(canvas)
+    inner = tk.Frame(canvas, bg=DARK_BG)
 
     inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
     canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -2470,16 +2679,19 @@ def make_scrollable_tab(notebook, title):
 
 
 def add_labeled_entry(parent, row, label_text, var, width=36):
-    tk.Label(parent, text=label_text, anchor="w").grid(row=row, column=0, sticky="w", padx=(10, 6), pady=4)
-    entry = tk.Entry(parent, textvariable=var, width=width)
+    tk.Label(parent, text=label_text, anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    entry = tk.Entry(parent, textvariable=var, width=width, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG)
     entry.grid(row=row, column=1, sticky="we", padx=(0, 10), pady=4)
     return entry
 
 
 def add_checkbox(parent, row, label_text, var, columnspan=2):
-    tk.Checkbutton(parent, text=label_text, variable=var).grid(
-        row=row, column=0, columnspan=columnspan, sticky="w", padx=10, pady=4
-    )
+    tk.Checkbutton(
+        parent, text=label_text, variable=var, bg=DARK_BG, fg=DARK_FG,
+        activebackground=DARK_BG, activeforeground=DARK_FG, selectcolor=DARK_ENTRY_BG,
+    ).grid(row=row, column=0, columnspan=columnspan, sticky="w", padx=10, pady=4)
 
 
 def add_browse_button(parent, row, var, mode="file", filetypes=(("Executable", "*.exe"), ("All files", "*.*"))):
@@ -2488,11 +2700,14 @@ def add_browse_button(parent, row, var, mode="file", filetypes=(("Executable", "
         if path:
             var.set(os.path.normpath(path))
 
-    tk.Button(parent, text="Browse...", command=browse).grid(row=row, column=2, padx=(0, 10), pady=4)
+    tk.Button(
+        parent, text="Browse...", command=browse, bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    ).grid(row=row, column=2, padx=(0, 10), pady=4)
 
 
 def add_section_label(parent, row, text):
-    tk.Label(parent, text=text, font=("Segoe UI", 9, "bold")).grid(
+    tk.Label(parent, text=text, font=("Segoe UI", 9, "bold"), bg=DARK_BG, fg=DARK_FG).grid(
         row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(14, 2)
     )
 
@@ -2568,18 +2783,20 @@ def open_process_picker(parent, on_add, multiselect=True, already_selected=None)
 # exhaustive: "Pick Running..." (while the game is open) or typing the exe name by hand always
 # still works for anything not listed here. Minecraft: Java Edition needs a window-title rule
 # rather than a plain exe entry since javaw.exe is shared by any Java app.
+
+# Only games with at least one realistic launch path this app *can't* already auto-discover
+# belong here -- Steam/Epic/GOG/Xbox/Battle.net installs are all found automatically via the
+# Launchers tab's own directory scanning, so a Steam-only title (e.g. Counter-Strike 2) would
+# just be clutter. A title with its own dedicated launcher (or a distribution platform this app
+# has no scanner for, like Riot Client or the EA app) stays, even if it's *also* on one of the
+# scanned platforms -- e.g. Warframe (Steam or its own launcher) and Apex Legends (Steam or EA).
 COMMON_GAMES = [
     {"name": "League of Legends", "process_name": "league of legends.exe"},
     {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
     {"name": "Valorant", "process_name": "VALORANT-Win64-Shipping.exe"},
     {"name": "Warframe", "process_name": "Warframe.x64.exe"},
     {"name": "Minecraft: Java Edition", "process_name": "javaw.exe", "title_contains": "minecraft"},
-    {"name": "Minecraft: Bedrock Edition", "process_name": "Minecraft.Windows.exe"},
-    {"name": "Fortnite", "process_name": "FortniteClient-Win64-Shipping.exe"},
     {"name": "Apex Legends", "process_name": "r5apex.exe"},
-    {"name": "Overwatch 2", "process_name": "Overwatch.exe"},
-    {"name": "Counter-Strike 2", "process_name": "cs2.exe"},
-    {"name": "Rocket League", "process_name": "RocketLeague.exe"},
     {"name": "Roblox", "process_name": "RobloxPlayerBeta.exe"},
     {"name": "Genshin Impact", "process_name": "GenshinImpact.exe"},
 ]
@@ -2654,20 +2871,26 @@ def open_common_games_picker(parent, insert_unique, current_watched_lower, add_w
 
 
 def build_watched_games_editor(parent, initial_games, on_pick_common=None):
-    tk.Label(parent, text="Watched game processes (exact exe name, e.g. cs2.exe)", anchor="w").pack(
-        anchor="w", padx=10, pady=(10, 2)
-    )
-    frame = tk.Frame(parent)
+    tk.Label(
+        parent, text="Watched game processes (exact exe name, e.g. cs2.exe)", anchor="w",
+        bg=DARK_BG, fg=DARK_FG,
+    ).pack(anchor="w", padx=10, pady=(10, 2))
+    frame = tk.Frame(parent, bg=DARK_BG)
     frame.pack(fill="x", padx=10, pady=(0, 10))
-    listbox = tk.Listbox(frame, height=8, width=32, exportselection=False)
+    listbox = tk.Listbox(
+        frame, height=8, width=32, exportselection=False, bg=DARK_ENTRY_BG, fg=DARK_FG,
+        selectbackground=DARK_FG, selectforeground=DARK_BG, highlightthickness=0,
+    )
     listbox.pack(side="left", fill="both", expand=True)
     for g in initial_games:
         listbox.insert("end", g)
 
-    controls = tk.Frame(frame)
+    controls = tk.Frame(frame, bg=DARK_BG)
     controls.pack(side="left", fill="y", padx=(10, 0))
     entry_var = tk.StringVar()
-    tk.Entry(controls, textvariable=entry_var, width=22).pack(pady=(0, 4))
+    tk.Entry(
+        controls, textvariable=entry_var, width=22, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG,
+    ).pack(pady=(0, 4))
 
     def current_watched_lower():
         return {listbox.get(i).lower() for i in range(listbox.size())}
@@ -2693,39 +2916,51 @@ def build_watched_games_editor(parent, initial_games, on_pick_common=None):
             already_selected=current_watched_lower,
         )
 
-    tk.Button(controls, text="Add", command=add_game).pack(fill="x")
-    tk.Button(controls, text="Remove Selected", command=remove_selected).pack(fill="x", pady=(4, 0))
-    tk.Button(controls, text="Pick Running...", command=pick_from_running).pack(fill="x", pady=(4, 0))
+    def dark_button(parent_, **kwargs):
+        return tk.Button(
+            parent_, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG, **kwargs
+        )
+
+    dark_button(controls, text="Add", command=add_game).pack(fill="x")
+    dark_button(controls, text="Remove Selected", command=remove_selected).pack(fill="x", pady=(4, 0))
+    dark_button(controls, text="Pick Running...", command=pick_from_running).pack(fill="x", pady=(4, 0))
     if on_pick_common:
-        tk.Button(
+        dark_button(
             controls, text="Common Games...", command=lambda: on_pick_common(insert_unique, current_watched_lower)
         ).pack(fill="x", pady=(4, 0))
     return listbox
 
 
 def build_watched_windows_editor(parent, initial_rows):
+    def dark_button(parent_, **kwargs):
+        return tk.Button(
+            parent_, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG, **kwargs
+        )
+
     tk.Label(
-        parent, text="Window-title rules (for games sharing a generic process name, e.g. javaw.exe)", anchor="w"
+        parent, text="Window-title rules (for games sharing a generic process name, e.g. javaw.exe)", anchor="w",
+        bg=DARK_BG, fg=DARK_FG,
     ).pack(anchor="w", padx=10, pady=(10, 2))
 
-    header = tk.Frame(parent)
+    header = tk.Frame(parent, bg=DARK_BG)
     header.pack(fill="x", padx=10)
     for text, w in (("Process name", 16), ("Title contains", 16), ("Display name", 16)):
-        tk.Label(header, text=text, width=w, anchor="w").pack(side="left", padx=2)
+        tk.Label(header, text=text, width=w, anchor="w", bg=DARK_BG, fg=DARK_FG).pack(side="left", padx=2)
 
-    container = tk.Frame(parent)
+    container = tk.Frame(parent, bg=DARK_BG)
     container.pack(fill="x", padx=10)
     rows = []
 
     def add_row(process="", title="", display=""):
-        row_frame = tk.Frame(container)
+        row_frame = tk.Frame(container, bg=DARK_BG)
         row_frame.pack(fill="x", pady=2)
         process_var = tk.StringVar(value=process)
         title_var = tk.StringVar(value=title)
         display_var = tk.StringVar(value=display)
-        tk.Entry(row_frame, textvariable=process_var, width=16).pack(side="left", padx=2)
-        tk.Entry(row_frame, textvariable=title_var, width=16).pack(side="left", padx=2)
-        tk.Entry(row_frame, textvariable=display_var, width=16).pack(side="left", padx=2)
+        for var in (process_var, title_var, display_var):
+            tk.Entry(
+                row_frame, textvariable=var, width=16, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG,
+            ).pack(side="left", padx=2)
         entry = {"process": process_var, "title": title_var, "display": display_var}
 
         def pick():
@@ -2733,19 +2968,19 @@ def build_watched_windows_editor(parent, initial_rows):
                 parent, on_add=lambda names: process_var.set(names[0]) if names else None, multiselect=False
             )
 
-        tk.Button(row_frame, text="Pick...", command=pick).pack(side="left", padx=2)
+        dark_button(row_frame, text="Pick...", command=pick).pack(side="left", padx=2)
 
         def remove():
             row_frame.destroy()
             rows.remove(entry)
 
-        tk.Button(row_frame, text="Remove", command=remove).pack(side="left", padx=4)
+        dark_button(row_frame, text="Remove", command=remove).pack(side="left", padx=4)
         rows.append(entry)
 
     for w in initial_rows:
         add_row(w.get("process_name", ""), w.get("title_contains", ""), w.get("display_name", ""))
 
-    tk.Button(parent, text="+ Add Window Rule", command=lambda: add_row()).pack(anchor="w", padx=10, pady=(4, 10))
+    dark_button(parent, text="+ Add Window Rule", command=lambda: add_row()).pack(anchor="w", padx=10, pady=(4, 10))
     return rows, add_row
 
 
@@ -2842,19 +3077,24 @@ def build_custom_keybinds_editor(parent, initial_rows):
             "above under Manual Split. A key already claimed by another running app may fail to "
             "register; check the log if a keybind doesn't seem to fire."
         ),
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).pack(fill="x", padx=10, pady=(10, 6))
+
+    def dark_checkbutton(parent_, **kwargs):
+        return tk.Checkbutton(
+            parent_, bg=DARK_BG, activebackground=DARK_BG, selectcolor=DARK_ENTRY_BG, **kwargs
+        )
 
     # A grid table (not pack) so header labels and row widgets share real column boundaries --
     # packing a Label(width=N) next to a Checkbutton(width=N) or Combobox(width=N) doesn't
     # actually line them up, since a Checkbutton's width includes its indicator box on top of the
     # same character-width unit, so identical widths still render as different pixel widths.
-    table = tk.Frame(parent)
+    table = tk.Frame(parent, bg=DARK_BG)
     table.pack(fill="x", padx=10)
     for col, text in enumerate(["On", "Action", "Ctrl", "Alt", "Shift", "Win", "Key", ""]):
-        tk.Label(table, text=text, anchor="w", font=("Segoe UI", 9, "bold")).grid(
-            row=0, column=col, sticky="w", padx=4, pady=(0, 4)
-        )
+        tk.Label(
+            table, text=text, anchor="w", font=("Segoe UI", 9, "bold"), bg=DARK_BG, fg=DARK_FG,
+        ).grid(row=0, column=col, sticky="w", padx=4, pady=(0, 4))
 
     rows = []
 
@@ -2868,13 +3108,13 @@ def build_custom_keybinds_editor(parent, initial_rows):
         r = len(rows) + 1
 
         enabled_var = tk.BooleanVar(value=enabled)
-        enabled_cb = tk.Checkbutton(table, variable=enabled_var)
+        enabled_cb = dark_checkbutton(table, variable=enabled_var)
         enabled_cb.grid(row=r, column=0, padx=4, pady=1)
 
         action_label_var = tk.StringVar(value=CUSTOM_KEYBIND_ACTIONS.get(action, action))
         action_combo = ttk.Combobox(
             table, textvariable=action_label_var, values=list(CUSTOM_KEYBIND_ACTIONS.values()),
-            state="readonly", width=24,
+            state="readonly", width=24, style="Settings.TCombobox",
         )
         action_combo.grid(row=r, column=1, sticky="w", padx=4, pady=1)
 
@@ -2882,18 +3122,19 @@ def build_custom_keybinds_editor(parent, initial_rows):
         alt_var = tk.BooleanVar(value="alt" in modifiers)
         shift_var = tk.BooleanVar(value="shift" in modifiers)
         win_var = tk.BooleanVar(value="win" in modifiers)
-        ctrl_cb = tk.Checkbutton(table, variable=ctrl_var)
+        ctrl_cb = dark_checkbutton(table, variable=ctrl_var)
         ctrl_cb.grid(row=r, column=2, padx=4, pady=1)
-        alt_cb = tk.Checkbutton(table, variable=alt_var)
+        alt_cb = dark_checkbutton(table, variable=alt_var)
         alt_cb.grid(row=r, column=3, padx=4, pady=1)
-        shift_cb = tk.Checkbutton(table, variable=shift_var)
+        shift_cb = dark_checkbutton(table, variable=shift_var)
         shift_cb.grid(row=r, column=4, padx=4, pady=1)
-        win_cb = tk.Checkbutton(table, variable=win_var)
+        win_cb = dark_checkbutton(table, variable=win_var)
         win_cb.grid(row=r, column=5, padx=4, pady=1)
 
         key_var = tk.StringVar(value=(key or "S").upper())
         key_combo = ttk.Combobox(
             table, textvariable=key_var, values=CUSTOM_KEYBIND_KEY_OPTIONS, state="readonly", width=4,
+            style="Settings.TCombobox",
         )
         key_combo.grid(row=r, column=6, padx=4, pady=1)
 
@@ -2912,7 +3153,10 @@ def build_custom_keybinds_editor(parent, initial_rows):
             rows.remove(entry)
             renumber()
 
-        remove_btn = tk.Button(table, text="Remove", command=remove)
+        remove_btn = tk.Button(
+            table, text="Remove", command=remove, bg=DARK_ENTRY_BG, fg=DARK_FG,
+            activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+        )
         remove_btn.grid(row=r, column=7, padx=4, pady=1)
         widgets.append(remove_btn)
         rows.append(entry)
@@ -2923,7 +3167,10 @@ def build_custom_keybinds_editor(parent, initial_rows):
             kb.get("modifiers", []), kb.get("key", "S"),
         )
 
-    tk.Button(parent, text="+ Add Keybind", command=lambda: add_row()).pack(anchor="w", padx=10, pady=(4, 10))
+    tk.Button(
+        parent, text="+ Add Keybind", command=lambda: add_row(), bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    ).pack(anchor="w", padx=10, pady=(4, 10))
     return rows, add_row
 
 
@@ -3129,41 +3376,51 @@ def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_ap
 
 
 def build_multi_track_audio_editor(parent, initial_rows, get_ws_config):
+    def dark_button(parent_, **kwargs):
+        return tk.Button(
+            parent_, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG, **kwargs
+        )
+
     tk.Label(
-        parent, text="Which input feeds which recording track, in the dedicated profile below", anchor="w"
+        parent, text="Which input feeds which recording track, in the dedicated profile below", anchor="w",
+        bg=DARK_BG, fg=DARK_FG,
     ).pack(anchor="w", padx=10, pady=(10, 2))
 
-    header = tk.Frame(parent)
+    header = tk.Frame(parent, bg=DARK_BG)
     header.pack(fill="x", padx=10)
-    tk.Label(header, text="Input name (exact, as in OBS)", width=30, anchor="w").pack(side="left", padx=2)
-    tk.Label(header, text="Track", width=6, anchor="w").pack(side="left", padx=2)
+    tk.Label(header, text="Input name (exact, as in OBS)", width=30, anchor="w", bg=DARK_BG, fg=DARK_FG).pack(
+        side="left", padx=2
+    )
+    tk.Label(header, text="Track", width=6, anchor="w", bg=DARK_BG, fg=DARK_FG).pack(side="left", padx=2)
 
-    container = tk.Frame(parent)
+    container = tk.Frame(parent, bg=DARK_BG)
     container.pack(fill="x", padx=10)
     rows = []
 
     def add_row(input_name="", track=1):
-        row_frame = tk.Frame(container)
+        row_frame = tk.Frame(container, bg=DARK_BG)
         row_frame.pack(fill="x", pady=2)
         name_var = tk.StringVar(value=input_name)
         track_var = tk.StringVar(value=str(track))
-        tk.Entry(row_frame, textvariable=name_var, width=30).pack(side="left", padx=2)
+        tk.Entry(
+            row_frame, textvariable=name_var, width=30, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG,
+        ).pack(side="left", padx=2)
         ttk.Combobox(
             row_frame, textvariable=track_var, values=[str(i) for i in range(1, 7)],
-            state="readonly", width=4,
+            state="readonly", width=4, style="Settings.TCombobox",
         ).pack(side="left", padx=2)
         entry = {"input_name": name_var, "track": track_var}
 
         def pick():
             open_obs_input_picker(parent, get_ws_config, on_pick=lambda name: name_var.set(name))
 
-        tk.Button(row_frame, text="Pick...", command=pick).pack(side="left", padx=2)
+        dark_button(row_frame, text="Pick...", command=pick).pack(side="left", padx=2)
 
         def remove():
             row_frame.destroy()
             rows.remove(entry)
 
-        tk.Button(row_frame, text="Remove", command=remove).pack(side="left", padx=4)
+        dark_button(row_frame, text="Remove", command=remove).pack(side="left", padx=4)
         entry["frame"] = row_frame
         rows.append(entry)
 
@@ -3175,7 +3432,7 @@ def build_multi_track_audio_editor(parent, initial_rows, get_ws_config):
     for t in initial_rows:
         add_row(t.get("input_name", ""), t.get("track", 1))
 
-    tk.Button(parent, text="+ Add Track Mapping", command=lambda: add_row()).pack(
+    dark_button(parent, text="+ Add Track Mapping", command=lambda: add_row()).pack(
         anchor="w", padx=10, pady=(4, 10)
     )
     return rows, add_row, clear_rows
@@ -3254,10 +3511,36 @@ def _run_config_editor(master_root, restart_callback, on_close):
     root.title("OBS Auto Recorder - Settings")
     root.geometry("620x560")
     root.minsize(520, 420)
+    root.configure(bg=DARK_BG)
     root.lift()
     root.focus_force()
 
-    notebook = ttk.Notebook(root)
+    # Named "Settings.TNotebook" (rather than reconfiguring "TNotebook" directly) so a future
+    # ttk widget elsewhere that hasn't opted into the dark theme doesn't inherit this by accident.
+    style = ttk.Style()
+    style.configure("Settings.TNotebook", background=DARK_BG, borderwidth=0)
+    style.configure(
+        "Settings.TNotebook.Tab", background=DARK_ENTRY_BG, foreground=DARK_FG, padding=(10, 4),
+    )
+    style.map(
+        "Settings.TNotebook.Tab",
+        background=[("selected", DARK_BG)], foreground=[("selected", DARK_FG)],
+    )
+    style.configure(
+        "Settings.TCombobox", fieldbackground=DARK_ENTRY_BG, background=DARK_BG, foreground=DARK_FG,
+        arrowcolor=DARK_FG,
+    )
+    style.map(
+        "Settings.TCombobox",
+        fieldbackground=[("readonly", DARK_ENTRY_BG), ("disabled", DARK_ENTRY_BG), ("!disabled", DARK_ENTRY_BG)],
+        foreground=[("readonly", DARK_FG), ("disabled", DARK_MUTED_FG), ("!disabled", DARK_FG)],
+        selectbackground=[("readonly", DARK_ENTRY_BG), ("!disabled", DARK_ENTRY_BG)],
+        selectforeground=[("readonly", DARK_FG), ("!disabled", DARK_FG)],
+        arrowcolor=[("readonly", DARK_FG), ("!disabled", DARK_FG)],
+    )
+    style.configure("Settings.Horizontal.TProgressbar", background="#f5a623", troughcolor=DARK_ENTRY_BG)
+
+    notebook = ttk.Notebook(root, style="Settings.TNotebook")
     notebook.pack(fill="both", expand=True)
 
     # --- General ---
@@ -3275,7 +3558,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
     startup_label = "Launch automatically when Windows starts"
     if not is_frozen:
         startup_label += " (only available from the built .exe)"
-    startup_checkbox = tk.Checkbutton(general_tab, text=startup_label, variable=startup_var)
+    startup_checkbox = tk.Checkbutton(
+        general_tab, text=startup_label, variable=startup_var, bg=DARK_BG, fg=DARK_FG,
+        activebackground=DARK_BG, activeforeground=DARK_FG, selectcolor=DARK_ENTRY_BG,
+        disabledforeground=DARK_MUTED_FG,
+    )
     startup_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=4)
     if not is_frozen:
         startup_checkbox.config(state="disabled")
@@ -3340,11 +3627,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_browse_button(obs_tab, row, output_folder_var, mode="dir")
     row += 1
     recording_format_var = tk.StringVar(value=obs_config.get("recording_format", "") or "")
-    tk.Label(obs_tab, text="Recording format (optional)", anchor="w").grid(
+    tk.Label(obs_tab, text="Recording format (optional)", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
         row=row, column=0, sticky="w", padx=(10, 6), pady=4
     )
     ttk.Combobox(
         obs_tab, textvariable=recording_format_var, values=RECORDING_FORMAT_OPTIONS, width=16,
+        style="Settings.TCombobox",
     ).grid(row=row, column=1, sticky="w", pady=4)
     row += 1
     tk.Label(
@@ -3354,7 +3642,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "reliable choices if multi-track audio is on; you can also type in any other format "
             "code OBS supports."
         ),
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
 
@@ -3378,9 +3666,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_checkbox(obs_tab, row, "OBS's automatic file splitting is enabled", auto_split_enabled_var)
     row += 1
     auto_split_by_var = tk.StringVar(value=auto_split_config.get("by", "time"))
-    tk.Label(obs_tab, text="Split by", anchor="w").grid(row=row, column=0, sticky="w", padx=(10, 6), pady=4)
+    tk.Label(obs_tab, text="Split by", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
     ttk.Combobox(
-        obs_tab, textvariable=auto_split_by_var, values=["time", "size"], state="readonly", width=10
+        obs_tab, textvariable=auto_split_by_var, values=["time", "size"], state="readonly", width=10,
+        style="Settings.TCombobox",
     ).grid(row=row, column=1, sticky="w", pady=4)
     row += 1
     auto_split_minutes_var = tk.StringVar(value=str(auto_split_config.get("minutes", 20)))
@@ -3405,7 +3696,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "    Adds a \"Split Recording File\" item to the tray menu that splits the current "
             "recording on demand, after an optional delay -- separate from OBS's own split hotkey."
         ),
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
     manual_split_enabled_var = tk.BooleanVar(value=manual_split_config.get("enabled", False))
@@ -3457,7 +3748,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "a dedicated OBS profile below, created automatically and cloned from your current "
             "profile's recording path/quality/format -- your existing profile is never touched."
         ),
-        anchor="w", justify="left", wraplength=520,
+        anchor="w", justify="left", wraplength=520, bg=DARK_BG, fg=DARK_FG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
     row += 1
     multi_track_enabled_var = tk.BooleanVar(value=multi_track_config.get("enabled", False))
@@ -3490,16 +3781,17 @@ def _run_config_editor(master_root, restart_callback, on_close):
             on_quick_setup_apply,
         )
 
-    tk.Button(obs_tab, text="Quick Setup...", command=open_quick_setup).grid(
-        row=row, column=0, sticky="w", padx=10, pady=(0, 6)
-    )
+    tk.Button(
+        obs_tab, text="Quick Setup...", command=open_quick_setup, bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    ).grid(row=row, column=0, sticky="w", padx=10, pady=(0, 6))
     row += 1
 
     # --- Custom Keybinds ---
     keybinds_tab = make_scrollable_tab(notebook, "Custom Keybinds")
     custom_keybind_rows, _ = build_custom_keybinds_editor(keybinds_tab, obs_config.get("custom_keybinds", []))
 
-    multi_track_list_frame = tk.Frame(obs_tab)
+    multi_track_list_frame = tk.Frame(obs_tab, bg=DARK_BG)
     multi_track_list_frame.grid(row=row, column=0, columnspan=3, sticky="we")
     multi_track_rows, multi_track_add_row, multi_track_clear_rows = build_multi_track_audio_editor(
         multi_track_list_frame, multi_track_config.get("tracks", []), get_current_ws_config
@@ -3509,8 +3801,41 @@ def _run_config_editor(master_root, restart_callback, on_close):
     replay_buffer_config = obs_config.get("replay_buffer", {})
     add_section_label(obs_tab, row, "Replay Buffer")
     row += 1
-    replay_buffer_enabled_var = tk.BooleanVar(value=replay_buffer_config.get("enabled", False))
-    add_checkbox(obs_tab, row, "Start/stop OBS's replay buffer with recording", replay_buffer_enabled_var)
+    current_replay_buffer_mode = get_replay_buffer_mode(replay_buffer_config)
+    replay_buffer_mode_var = tk.StringVar(value=REPLAY_BUFFER_MODE_LABELS[current_replay_buffer_mode])
+    tk.Label(obs_tab, text="Mode", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        obs_tab, textvariable=replay_buffer_mode_var, values=list(REPLAY_BUFFER_MODE_LABELS.values()),
+        state="readonly", width=34, style="Settings.TCombobox",
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    \"With full recording\" keeps the buffer running alongside a normal full "
+            "recording, same as before. \"Replay buffer only\" skips the full recording entirely -- "
+            "nothing is saved unless you trigger Save Replay Buffer (tray menu or a custom keybind)."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    replay_buffer_seconds_var = tk.StringVar(
+        value=str(replay_buffer_config.get("max_seconds", DEFAULT_REPLAY_BUFFER_SECONDS))
+    )
+    add_labeled_entry(obs_tab, row, "Replay buffer length (seconds)", replay_buffer_seconds_var, width=8)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    Sets OBS's own \"Maximum Replay Time\" (Settings → Output → Replay Buffer) "
+            "automatically. Restart OBS once after turning this on (or changing the length) -- OBS "
+            "only builds the replay buffer when a profile loads, so a live change here won't take "
+            "effect until then."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
 
     # --- Cleanup & Guards ---
@@ -3587,10 +3912,10 @@ def _run_config_editor(master_root, restart_callback, on_close):
     # is preserved on Save even while its controls are hidden.
     transcode_panel_row = row
     row += 1
-    transcode_options_frame = tk.Frame(post_tab)
+    transcode_options_frame = tk.Frame(post_tab, bg=DARK_BG)
     transcode_options_frame.grid(row=transcode_panel_row, column=0, columnspan=3, sticky="we")
     transcode_options_frame.columnconfigure(1, weight=1)
-    ffmpeg_missing_frame = tk.Frame(post_tab)
+    ffmpeg_missing_frame = tk.Frame(post_tab, bg=DARK_BG)
     ffmpeg_missing_frame.grid(row=transcode_panel_row, column=0, columnspan=3, sticky="we")
 
     opt_row = 0
@@ -3619,9 +3944,10 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 parent=post_tab,
             )
 
-    tk.Button(transcode_options_frame, text="Auto-detect ffmpeg", command=detect_ffmpeg).grid(
-        row=opt_row, column=0, sticky="w", padx=10, pady=(0, 6)
-    )
+    tk.Button(
+        transcode_options_frame, text="Auto-detect ffmpeg", command=detect_ffmpeg, bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    ).grid(row=opt_row, column=0, sticky="w", padx=10, pady=(0, 6))
     opt_row += 1
     transcode_args_var = tk.StringVar(
         value=" ".join(transcode_config.get("args", ["-map", "0", "-c:v", "libx264", "-crf", "23", "-c:a", "aac"]))
@@ -3629,18 +3955,18 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_labeled_entry(transcode_options_frame, opt_row, "ffmpeg args (space-separated)", transcode_args_var, width=44)
     opt_row += 1
     transcode_output_extension_var = tk.StringVar(value=transcode_config.get("output_extension", "") or "")
-    tk.Label(transcode_options_frame, text="Output extension (optional)", anchor="w").grid(
+    tk.Label(transcode_options_frame, text="Output extension (optional)", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
         row=opt_row, column=0, sticky="w", padx=(10, 6), pady=4
     )
     ttk.Combobox(
         transcode_options_frame, textvariable=transcode_output_extension_var,
-        values=TRANSCODE_OUTPUT_EXTENSION_OPTIONS, width=16,
+        values=TRANSCODE_OUTPUT_EXTENSION_OPTIONS, width=16, style="Settings.TCombobox",
     ).grid(row=opt_row, column=1, sticky="w", pady=4)
     opt_row += 1
     tk.Label(
         transcode_options_frame,
         text="    Leave blank to keep the original recording's extension.",
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=opt_row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     opt_row += 1
 
@@ -3650,7 +3976,8 @@ def _run_config_editor(master_root, restart_callback, on_close):
 
     tk.Button(
         transcode_options_frame, text="Use MKV → MP4 preset (preserve every audio track)",
-        command=use_mkv_to_mp4_preset,
+        command=use_mkv_to_mp4_preset, bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     ).grid(row=opt_row, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
     opt_row += 1
     tk.Label(
@@ -3660,7 +3987,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "re-encoding, no quality loss -- just repackaged into MP4. Overwrites the ffmpeg args "
             "and output extension above; leave the suffix/delete-original settings as you like."
         ),
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=opt_row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     opt_row += 1
     transcode_suffix_var = tk.StringVar(value=transcode_config.get("suffix", "_compressed"))
@@ -3681,7 +4008,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "MP4) isn't available yet. Install it below, then this panel switches to the full "
             "options automatically -- no need to reopen Settings."
         ),
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
 
     def reveal_transcode_options_if_ffmpeg_found():
@@ -3715,11 +4042,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
     if has_winget():
         winget_install_button = tk.Button(
             ffmpeg_missing_frame, text="Install ffmpeg via winget", command=install_ffmpeg_via_winget,
+            bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
         )
         winget_install_button.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 4))
 
     ffmpeg_download_link = tk.Label(
-        ffmpeg_missing_frame, text="Or download it manually from ffmpeg.org ↗", fg="#2563eb",
+        ffmpeg_missing_frame, text="Or download it manually from ffmpeg.org ↗", fg="#5b9dff", bg=DARK_BG,
         font=("Segoe UI", 9, "underline"), cursor="hand2",
     )
     ffmpeg_download_link.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
@@ -3750,7 +4078,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
     tk.Label(
         clip_editor_tab,
         text="    Leave blank to save trimmed clips in the same folder as the source recording.",
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
     clip_delete_original_var = tk.BooleanVar(value=clip_editor_config.get("delete_original_after_trim", False))
@@ -3763,12 +4091,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
     if configured_default_format not in CLIP_EDITOR_OUTPUT_FORMATS:
         configured_default_format = CLIP_EDITOR_OUTPUT_FORMATS[0]
     clip_default_format_var = tk.StringVar(value=configured_default_format)
-    tk.Label(clip_editor_tab, text="Default export format", anchor="w").grid(
+    tk.Label(clip_editor_tab, text="Default export format", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
         row=row, column=0, sticky="w", padx=(10, 6), pady=4
     )
     ttk.Combobox(
         clip_editor_tab, textvariable=clip_default_format_var, values=CLIP_EDITOR_OUTPUT_FORMATS,
-        state="readonly", width=16,
+        state="readonly", width=16, style="Settings.TCombobox",
     ).grid(row=row, column=1, sticky="w", pady=4)
     row += 1
     tk.Label(
@@ -3778,7 +4106,29 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "clips as MP4 without transcoding the whole recording first. The editor's own "
             "dropdown can still override this per trim."
         ),
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    configured_default_quality = clip_editor_config.get("default_quality", CLIP_EDITOR_QUALITY_OPTIONS[0])
+    if configured_default_quality not in CLIP_EDITOR_QUALITY_OPTIONS:
+        configured_default_quality = CLIP_EDITOR_QUALITY_OPTIONS[0]
+    clip_default_quality_var = tk.StringVar(value=configured_default_quality)
+    tk.Label(clip_editor_tab, text="Default resolution", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        clip_editor_tab, textvariable=clip_default_quality_var, values=CLIP_EDITOR_QUALITY_OPTIONS,
+        state="readonly", width=16, style="Settings.TCombobox",
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    \"Same as source\" keeps the fast, lossless stream-copy trim whenever possible. "
+            "Downscaling forces ffmpeg to re-encode (slower, smaller file) even when \"Precise\" "
+            "isn't checked. The editor's own dropdown can still override this per trim."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
 
@@ -3790,15 +4140,15 @@ def _run_config_editor(master_root, restart_callback, on_close):
     # delete-original are meaningful to configure even before VLC is installed.
     vlc_panel_row = row
     row += 1
-    vlc_found_frame = tk.Frame(clip_editor_tab)
+    vlc_found_frame = tk.Frame(clip_editor_tab, bg=DARK_BG)
     vlc_found_frame.grid(row=vlc_panel_row, column=0, columnspan=3, sticky="we")
-    vlc_missing_frame = tk.Frame(clip_editor_tab)
+    vlc_missing_frame = tk.Frame(clip_editor_tab, bg=DARK_BG)
     vlc_missing_frame.grid(row=vlc_panel_row, column=0, columnspan=3, sticky="we")
 
     tk.Label(
         vlc_found_frame,
         text="VLC install found. Override its location only if you have more than one installed:",
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     clip_vlc_path_var = tk.StringVar(value=clip_editor_config.get("vlc_path", "") or "")
     add_labeled_entry(vlc_found_frame, 1, "VLC install folder (optional)", clip_vlc_path_var)
@@ -3811,7 +4161,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "Install it below -- this panel switches over automatically once it's found, no need "
             "to reopen Settings."
         ),
-        anchor="w", justify="left", wraplength=520, fg="#555555",
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
 
     def reveal_vlc_options_if_found():
@@ -3845,11 +4195,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
     if has_winget():
         winget_install_vlc_button = tk.Button(
             vlc_missing_frame, text="Install VLC via winget", command=install_vlc_via_winget,
+            bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
         )
         winget_install_vlc_button.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 4))
 
     vlc_download_link = tk.Label(
-        vlc_missing_frame, text="Or download it manually from videolan.org ↗", fg="#2563eb",
+        vlc_missing_frame, text="Or download it manually from videolan.org ↗", fg="#5b9dff", bg=DARK_BG,
         font=("Segoe UI", 9, "underline"), cursor="hand2",
     )
     vlc_download_link.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
@@ -3860,8 +4211,34 @@ def _run_config_editor(master_root, restart_callback, on_close):
     else:
         vlc_found_frame.grid_remove()
 
+    # The selected tab shows its full label; every other tab shrinks to an abbreviation so all
+    # eight can still fit across the tab strip without the notebook needing to be much wider.
+    # ttk.Notebook doesn't do this on its own -- it just re-measures each tab's width from
+    # whatever text is currently set, so swapping text on <<NotebookTabChanged>> is what actually
+    # drives the resize.
+    TAB_SHORT_LABELS = {
+        "General": "Gen",
+        "Watched Games": "Games",
+        "Launchers": "Launch",
+        "OBS": "OBS",
+        "Custom Keybinds": "Keybinds",
+        "Cleanup & Guards": "Cleanup",
+        "Post-Processing": "Post-Proc",
+        "Clip Editor": "Clip",
+    }
+    tab_full_titles = {tab_id: notebook.tab(tab_id, "text") for tab_id in notebook.tabs()}
+
+    def update_tab_labels(_event=None):
+        selected = notebook.select()
+        for tab_id in notebook.tabs():
+            full = tab_full_titles[tab_id]
+            notebook.tab(tab_id, text=full if tab_id == selected else TAB_SHORT_LABELS.get(full, full))
+
+    notebook.bind("<<NotebookTabChanged>>", update_tab_labels)
+    update_tab_labels()
+
     # --- Save / Cancel ---
-    status_label = tk.Label(root, text="", fg="#b00020", anchor="w")
+    status_label = tk.Label(root, text="", fg="#ef4444", bg=DARK_BG, anchor="w")
     status_label.pack(fill="x", padx=10)
 
     def collect_config():
@@ -4023,7 +4400,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
         ]
 
         replay_buffer = obs.setdefault("replay_buffer", {})
-        replay_buffer["enabled"] = replay_buffer_enabled_var.get()
+        replay_buffer["mode"] = REPLAY_BUFFER_MODE_LABELS_BY_LABEL.get(replay_buffer_mode_var.get(), "off")
+        replay_buffer.pop("enabled", None)  # superseded by "mode" -- drop so it can't contradict it
+        replay_buffer["max_seconds"] = read_int(
+            replay_buffer_seconds_var, "Replay buffer length (seconds)", DEFAULT_REPLAY_BUFFER_SECONDS
+        )
 
         disk_guard = new_config.setdefault("disk_space_guard", {})
         disk_guard["enabled"] = disk_guard_enabled_var.get()
@@ -4090,6 +4471,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             clip_editor.pop("output_folder", None)
         clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
         clip_editor["default_output_format"] = clip_default_format_var.get()
+        clip_editor["default_quality"] = clip_default_quality_var.get()
         clip_vlc_path_value = clip_vlc_path_var.get().strip()
         if clip_vlc_path_value:
             clip_editor["vlc_path"] = clip_vlc_path_value
@@ -4126,11 +4508,17 @@ def _run_config_editor(master_root, restart_callback, on_close):
             )
             root.destroy()
 
-    button_bar = tk.Frame(root)
+    def dark_settings_button(**kwargs):
+        return tk.Button(
+            button_bar, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+            **kwargs
+        )
+
+    button_bar = tk.Frame(root, bg=DARK_BG)
     button_bar.pack(fill="x", padx=10, pady=10)
-    tk.Button(button_bar, text="Cancel", command=root.destroy).pack(side="right")
-    tk.Button(button_bar, text="Save", command=lambda: do_save(False)).pack(side="right", padx=8)
-    tk.Button(button_bar, text="Save and Restart", command=lambda: do_save(True)).pack(side="right")
+    dark_settings_button(text="Cancel", command=root.destroy).pack(side="right")
+    dark_settings_button(text="Save", command=lambda: do_save(False)).pack(side="right", padx=8)
+    dark_settings_button(text="Save and Restart", command=lambda: do_save(True)).pack(side="right")
 
 
 CLIP_EDITOR_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".flv", ".ts", ".webm", ".avi"}
@@ -4138,6 +4526,25 @@ CLIP_EDITOR_MAX_RECENT_RECORDINGS = 30
 # First entry means "keep the source file's own extension" -- do_trim() checks for it by identity
 # rather than treating it as a real container, so it must stay first.
 CLIP_EDITOR_OUTPUT_FORMATS = ["Same as source", ".mp4", ".mkv", ".mov", ".avi", ".webm"]
+# First entry means "don't force a re-encode for quality's sake" -- trim_clip() still stream-copies
+# in fast mode when quality is left at this default, exactly like it always has. Picking a specific
+# resolution forces a real ffmpeg re-encode (even in fast, non-precise mode) since a stream copy
+# can't rescale video at all -- get_quality_scale_height() below resolves the trade-off.
+CLIP_EDITOR_QUALITY_OPTIONS = ["Same as source", "1080p", "720p", "480p"]
+CLIP_EDITOR_QUALITY_HEIGHTS = {"1080p": 1080, "720p": 720, "480p": 480}
+# The libx264 CRF used whenever a re-encode happens -- whether forced by "Precise", by a chosen
+# resolution, or both -- since resolution and encode quality are independent knobs and this app
+# only exposes the former; this is the same value build_trim_command always used for its one re-
+# encode path before resolution scaling existed.
+CLIP_EDITOR_DEFAULT_CRF = 18
+
+
+def get_quality_scale_height(quality_choice):
+    """Resolves a CLIP_EDITOR_QUALITY_OPTIONS choice to a target output height in pixels (passed
+    to ffmpeg as -vf scale=-2:HEIGHT, which keeps the source aspect ratio), or None for "Same as
+    source" -- None specifically means "no explicit resize," which is what lets build_trim_command
+    still choose a lossless stream copy when nothing else forces a re-encode."""
+    return CLIP_EDITOR_QUALITY_HEIGHTS.get(quality_choice)
 
 
 def list_recent_recordings(folder, limit=CLIP_EDITOR_MAX_RECENT_RECORDINGS):
@@ -4298,19 +4705,75 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         _open_vlc_missing_window(master_root, on_close)
         return
 
+    # Shares the same dark palette as the Settings editor (DARK_BG etc.) so the timeline doesn't
+    # sit in a visibly different-colored strip against a lighter window -- there's deliberately
+    # no seam between the timeline canvas and the frames around it. Local aliases here just keep
+    # the rest of this function's many references short.
+    EDITOR_BG = DARK_BG
+    EDITOR_FG = DARK_FG
+    ENTRY_BG = DARK_ENTRY_BG
+    SEEKER_COLOR = "#f5a623"
+    START_MARKER_COLOR = "#22c55e"
+    END_MARKER_COLOR = "#ef4444"
+    # Reused everywhere this window shows status text, so the editor doesn't mix these with a
+    # second, uncoordinated red/green/gray palette -- success/error/warning always match the
+    # timeline's own start/end/seeker colors, and secondary text always matches the ruler's gray.
+    MUTED_TEXT_COLOR = DARK_MUTED_FG
+
     root = tk.Toplevel(master_root)
     root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
     root.title("OBS Auto Recorder - Clip Editor")
-    root.geometry("820x600")
-    root.minsize(600, 420)
+    root.geometry("1260x600")
+    root.minsize(760, 420)
+    root.configure(bg=EDITOR_BG)
     root.lift()
     root.focus_force()
     logging.info("Clip editor opened.")
 
+    # Custom style names (rather than reconfiguring "TCombobox"/etc. directly) so this doesn't
+    # leak into the Settings editor's own comboboxes, which stay on the app's normal light theme.
+    style = ttk.Style()
+    style.configure(
+        "ClipEditor.TCombobox", fieldbackground=ENTRY_BG, background=EDITOR_BG, foreground=EDITOR_FG,
+        arrowcolor=EDITOR_FG,
+    )
+    style.map(
+        "ClipEditor.TCombobox",
+        fieldbackground=[("readonly", ENTRY_BG), ("disabled", ENTRY_BG), ("!disabled", ENTRY_BG)],
+        foreground=[("readonly", EDITOR_FG), ("disabled", MUTED_TEXT_COLOR), ("!disabled", EDITOR_FG)],
+        selectbackground=[("readonly", ENTRY_BG), ("!disabled", ENTRY_BG)],
+        selectforeground=[("readonly", EDITOR_FG), ("!disabled", EDITOR_FG)],
+        arrowcolor=[("readonly", EDITOR_FG), ("!disabled", EDITOR_FG)],
+    )
+    style.configure("ClipEditor.Horizontal.TScale", background=EDITOR_BG, troughcolor=ENTRY_BG)
+    style.configure("ClipEditor.Horizontal.TProgressbar", background=SEEKER_COLOR, troughcolor=ENTRY_BG)
+
     instance = create_vlc_instance_with_logging(vlc_module)
     player = instance.media_player_new()
 
+    def release_file_lock():
+        # A plain read-only handle, kept open only so Windows blocks a delete of whatever's
+        # currently loaded (e.g. storage management's cleanup, or the user deleting it by hand)
+        # while the editor has it open -- confirmed live that VLC's own file access does NOT do
+        # this (a file it has open can still be deleted out from under it, mid-playback, without
+        # error), and confirmed a second plain handle here coexists fine alongside VLC's.
+        handle = state.get("file_handle")
+        if handle:
+            try:
+                handle.close()
+            except Exception:
+                pass
+            state["file_handle"] = None
+
+    def acquire_file_lock(path):
+        try:
+            state["file_handle"] = open(path, "rb")
+        except OSError as exc:
+            state["file_handle"] = None
+            logging.warning("Clip editor: could not lock %s against deletion while open: %s", os.path.basename(path), exc)
+
     def cleanup():
+        release_file_lock()
         try:
             player.stop()
             instance.release()
@@ -4332,10 +4795,26 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     root.protocol("WM_DELETE_WINDOW", close_editor)
     root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
 
-    # --- Open file row ---
-    open_row = tk.Frame(root)
+    def dark_button(parent, **kwargs):
+        return tk.Button(parent, bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG, **kwargs)
+
+    def fixed_size_button(parent, text, width_px, height_px, command, font=("Segoe UI", 11)):
+        # tk.Button's own width/height options are in text-grid units, not pixels, so identical
+        # single-character icons can still render as visibly different sizes depending on glyph
+        # width -- wrapping in a fixed-size container with propagation disabled is the reliable
+        # way to get genuinely equal-sized buttons regardless of what each one's icon looks like.
+        container = tk.Frame(parent, width=width_px, height=height_px, bg=EDITOR_BG)
+        container.pack_propagate(False)
+        btn = dark_button(container, text=text, font=font, command=command)
+        btn.pack(fill="both", expand=True)
+        return container, btn
+
+    # --- Open file row (audio track picker lives here too, right-justified against it) ---
+    open_row = tk.Frame(root, bg=EDITOR_BG)
     open_row.pack(fill="x", padx=10, pady=(10, 4))
-    tk.Button(open_row, text="Browse for a recording...", command=lambda: browse_for_file()).pack(side="left")
+    dark_button(
+        open_row, text="📂", font=("Segoe UI", 11), command=lambda: browse_for_file(),
+    ).pack(side="left")
 
     recent_recordings = list_recent_recordings(config.get("obs", {}).get("output_folder"))
     recent_var = tk.StringVar()
@@ -4343,7 +4822,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         recent_combo = ttk.Combobox(
             open_row, textvariable=recent_var,
             values=[os.path.basename(p) for p in recent_recordings],
-            state="readonly", width=40,
+            state="readonly", width=40, style="ClipEditor.TCombobox",
         )
         recent_combo.pack(side="left", padx=(8, 0))
 
@@ -4354,6 +4833,40 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
         recent_combo.bind("<<ComboboxSelected>>", on_recent_selected)
 
+    audio_track_var = tk.StringVar()
+    audio_track_ids = []
+    audio_track_combo = ttk.Combobox(
+        open_row, textvariable=audio_track_var, state="readonly", width=28, values=[],
+        style="ClipEditor.TCombobox",
+    )
+    audio_track_combo.pack(side="right")
+    tk.Label(open_row, text="Audio track:", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="right", padx=(0, 6))
+
+    def refresh_audio_tracks():
+        try:
+            descriptions = player.audio_get_track_description()
+        except Exception:
+            descriptions = []
+        # id -1 is libvlc's own "Disable" pseudo-track (mutes audio entirely) -- kept in the list
+        # since it's a real, selectable option, not filtered out.
+        audio_track_ids[:] = [track_id for track_id, _name in descriptions]
+        names = [
+            (name.decode("utf-8", "replace") if isinstance(name, bytes) else str(name))
+            for _track_id, name in descriptions
+        ]
+        audio_track_combo["values"] = names
+        current_id = player.audio_get_track()
+        if current_id in audio_track_ids:
+            audio_track_combo.current(audio_track_ids.index(current_id))
+        state["tracks_loaded"] = True
+
+    def on_audio_track_selected(_event):
+        index = audio_track_combo.current()
+        if 0 <= index < len(audio_track_ids):
+            player.audio_set_track(audio_track_ids[index])
+
+    audio_track_combo.bind("<<ComboboxSelected>>", on_audio_track_selected)
+
     # --- Video preview ---
     video_frame = tk.Frame(root, bg="black")
     video_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
@@ -4361,51 +4874,108 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     player.set_hwnd(video_frame.winfo_id())
 
     # --- Timeline (click/drag anywhere to seek; start/end markers drawn in their own colors so
-    # they're never confused with the playback seeker) ---
-    TIMELINE_HEIGHT = 40
-    SEEKER_COLOR = "#f5a623"
-    START_MARKER_COLOR = "#22c55e"
-    END_MARKER_COLOR = "#ef4444"
+    # they're never confused with the playback seeker; scroll to zoom, right-drag to pan once
+    # zoomed in, for frame-level accuracy on longer recordings) ---
+    TIMELINE_HEIGHT = 56
+    TRACK_Y = 16
+    RULER_TICK_TOP = TRACK_Y + 6
+    RULER_LABEL_Y = TIMELINE_HEIGHT - 4
+    MIN_VIEW_SECONDS = 0.5
+    TICK_INTERVALS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600]
 
-    time_label = tk.Label(root, text="00:00:00.000 / 00:00:00.000", anchor="e")
+    time_label = tk.Label(root, text="00:00:00.000 / 00:00:00.000", anchor="e", bg=EDITOR_BG, fg=EDITOR_FG)
     time_label.pack(fill="x", padx=10, pady=(0, 2))
 
-    timeline_canvas = tk.Canvas(root, height=TIMELINE_HEIGHT, bg="#2b2b2b", highlightthickness=0)
+    timeline_canvas = tk.Canvas(root, height=TIMELINE_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
     timeline_canvas.pack(fill="x", padx=10, pady=(0, 4))
+
+    # The visible [start, end) window into the clip -- always the full clip until the user zooms
+    # in, at which point this shrinks and the ruler/markers/seeker are all drawn relative to it
+    # instead of the full duration.
+    view_state = {"start": 0.0, "end": 0.0, "initialized": False}
+    pan_state = {"active": False, "start_x": 0, "start_view_start": 0.0}
+
+    def reset_view():
+        view_state["start"] = 0.0
+        view_state["end"] = state["duration"] or 0.0
+        view_state["initialized"] = True
 
     def canvas_x_to_seconds(x):
         width = timeline_canvas.winfo_width()
-        duration = state["duration"]
-        if width <= 0 or not duration:
+        span = view_state["end"] - view_state["start"]
+        if width <= 0 or span <= 0:
             return 0.0
-        return min(max(x / width, 0.0), 1.0) * duration
+        frac = min(max(x / width, 0.0), 1.0)
+        return view_state["start"] + frac * span
 
     def seconds_to_canvas_x(seconds):
+        # Deliberately not clamped to [0, width] -- callers need to tell an off-screen marker
+        # (which should be skipped) apart from one that's legitimately at the very edge.
         width = timeline_canvas.winfo_width()
-        duration = state["duration"]
-        if width <= 0 or not duration:
+        span = view_state["end"] - view_state["start"]
+        if width <= 0 or span <= 0:
             return 0
-        return min(max(seconds / duration, 0.0), 1.0) * width
+        return (seconds - view_state["start"]) / span * width
+
+    def choose_tick_interval(span, width):
+        if span <= 0 or width <= 0:
+            return TICK_INTERVALS[0]
+        target_count = max(width / 90, 1)
+        raw_interval = span / target_count
+        for interval in TICK_INTERVALS:
+            if interval >= raw_interval:
+                return interval
+        return TICK_INTERVALS[-1]
+
+    def draw_ruler(width, span):
+        interval = choose_tick_interval(span, width)
+        first_tick = math.floor(view_state["start"] / interval) * interval
+        t = first_tick
+        # A few extra iterations beyond view_state["end"] is cheap insurance against float drift
+        # accumulating across many small `interval` steps on a long, deeply zoomed-in clip.
+        guard = 0
+        while t <= view_state["end"] + interval and guard < 500:
+            x = seconds_to_canvas_x(t)
+            if 0 <= x <= width:
+                timeline_canvas.create_line(x, RULER_TICK_TOP, x, RULER_TICK_TOP + 6, fill="#888888")
+                label = format_timestamp(max(t, 0))
+                if interval >= 1:
+                    label = label.split(".")[0]
+                timeline_canvas.create_text(
+                    x, RULER_LABEL_Y, text=label, fill="#aaaaaa", font=("Segoe UI", 7), anchor="s"
+                )
+            t += interval
+            guard += 1
 
     def draw_timeline():
         timeline_canvas.delete("all")
         width = timeline_canvas.winfo_width()
-        if width <= 1 or not state["duration"]:
+        if width <= 1:
             return
-        mid = TIMELINE_HEIGHT // 2
-        timeline_canvas.create_rectangle(0, mid - 3, width, mid + 3, fill="#555555", outline="")
+        # The empty track is always visible (even with nothing loaded yet) -- only the ruler
+        # numbers and the colored markers/seeker need an actual clip with a known duration.
+        timeline_canvas.create_rectangle(0, TRACK_Y - 3, width, TRACK_Y + 3, fill="#555555", outline="")
+        if not state["duration"]:
+            return
+        if not view_state["initialized"]:
+            reset_view()
+        span = view_state["end"] - view_state["start"]
+        draw_ruler(width, span)
         try:
             x = seconds_to_canvas_x(parse_timestamp(start_var.get()))
-            timeline_canvas.create_line(x, 0, x, TIMELINE_HEIGHT, fill=START_MARKER_COLOR, width=3)
+            if 0 <= x <= width:
+                timeline_canvas.create_line(x, 0, x, TRACK_Y + 3, fill=START_MARKER_COLOR, width=3)
         except ValueError:
             pass
         try:
             x = seconds_to_canvas_x(parse_timestamp(end_var.get()))
-            timeline_canvas.create_line(x, 0, x, TIMELINE_HEIGHT, fill=END_MARKER_COLOR, width=3)
+            if 0 <= x <= width:
+                timeline_canvas.create_line(x, 0, x, TRACK_Y + 3, fill=END_MARKER_COLOR, width=3)
         except ValueError:
             pass
         x = seconds_to_canvas_x(player.get_time() / 1000)
-        timeline_canvas.create_line(x, 0, x, TIMELINE_HEIGHT, fill=SEEKER_COLOR, width=2)
+        if 0 <= x <= width:
+            timeline_canvas.create_line(x, 0, x, TRACK_Y + 3, fill=SEEKER_COLOR, width=2)
 
     def seek_to_canvas_x(x):
         if not state["path"] or not state["duration"]:
@@ -4413,60 +4983,199 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         player.set_time(int(canvas_x_to_seconds(x) * 1000))
         draw_timeline()
 
+    def zoom_view(factor, center_seconds):
+        duration = state["duration"]
+        if not duration:
+            return
+        span = view_state["end"] - view_state["start"]
+        if span <= 0:
+            return
+        new_span = max(MIN_VIEW_SECONDS, min(span / factor, duration))
+        left_frac = (center_seconds - view_state["start"]) / span
+        new_start = center_seconds - left_frac * new_span
+        new_start = max(0.0, min(new_start, duration - new_span))
+        view_state["start"] = new_start
+        view_state["end"] = new_start + new_span
+        draw_timeline()
+
+    def on_timeline_wheel(event):
+        if not state["duration"]:
+            return
+        factor = 1.25 if event.delta > 0 else (1 / 1.25)
+        zoom_view(factor, canvas_x_to_seconds(event.x))
+
+    def zoom_in_button():
+        if not state["duration"]:
+            return
+        mid = (view_state["start"] + view_state["end"]) / 2
+        zoom_view(1.5, mid)
+
+    def zoom_out_button():
+        if not state["duration"]:
+            return
+        mid = (view_state["start"] + view_state["end"]) / 2
+        zoom_view(1 / 1.5, mid)
+
+    def zoom_reset_button():
+        reset_view()
+        draw_timeline()
+
+    def on_pan_press(event):
+        pan_state["active"] = True
+        pan_state["start_x"] = event.x
+        pan_state["start_view_start"] = view_state["start"]
+
+    def on_pan_drag(event):
+        duration = state["duration"]
+        width = timeline_canvas.winfo_width()
+        if not pan_state["active"] or not duration or width <= 0:
+            return
+        span = view_state["end"] - view_state["start"]
+        dx_seconds = (event.x - pan_state["start_x"]) / width * span
+        new_start = max(0.0, min(pan_state["start_view_start"] - dx_seconds, duration - span))
+        view_state["start"] = new_start
+        view_state["end"] = new_start + span
+        draw_timeline()
+
+    def on_pan_release(_event):
+        pan_state["active"] = False
+
+    def ensure_playhead_visible():
+        # Only auto-scrolls during actual playback -- otherwise this would fight a deliberate pan
+        # or scrub made while paused, snapping straight back to the playhead the instant the user
+        # releases the mouse (confirmed live: panning while paused had no visible effect at all
+        # until this guard was added).
+        duration = state["duration"]
+        if not duration or pan_state["active"] or not player.is_playing():
+            return
+        span = view_state["end"] - view_state["start"]
+        current = player.get_time() / 1000
+        if current < view_state["start"] or current > view_state["end"]:
+            new_start = max(0.0, min(current - span / 2, duration - span))
+            view_state["start"] = new_start
+            view_state["end"] = new_start + span
+
     timeline_canvas.bind("<Button-1>", lambda event: seek_to_canvas_x(event.x))
     timeline_canvas.bind("<B1-Motion>", lambda event: seek_to_canvas_x(event.x))
+    timeline_canvas.bind("<Button-3>", on_pan_press)
+    timeline_canvas.bind("<B3-Motion>", on_pan_drag)
+    timeline_canvas.bind("<ButtonRelease-3>", on_pan_release)
+    timeline_canvas.bind("<MouseWheel>", on_timeline_wheel)
     timeline_canvas.bind("<Configure>", lambda event: draw_timeline())
 
-    # --- Transport controls (below the timeline: rewind/forward flank play-pause, all centered) ---
-    transport_row = tk.Frame(root)
-    transport_row.pack(fill="x", padx=10, pady=4)
-    transport_buttons = tk.Frame(transport_row)
-    transport_buttons.pack()  # no side/fill -- pack centers a parcel-filling child by default
-    tk.Button(transport_buttons, text="⏪ Rewind 5s", command=lambda: seek_relative(-5)).pack(side="left")
-    play_pause_button = tk.Button(transport_buttons, text="Play/Pause", command=lambda: toggle_play_pause())
-    play_pause_button.pack(side="left", padx=6)
-    tk.Button(transport_buttons, text="Forward 5s ⏩", command=lambda: seek_relative(5)).pack(side="left")
+    # --- Controls row: zoom (left), transport (centered), volume (right) ---
+    controls_row = tk.Frame(root, bg=EDITOR_BG)
+    controls_row.pack(fill="x", padx=10, pady=(4, 12))
+    controls_row.columnconfigure(0, weight=1)
+    controls_row.columnconfigure(1, weight=0)
+    controls_row.columnconfigure(2, weight=1)
 
-    # --- Start/End controls ---
-    range_row = tk.Frame(root)
+    ZOOM_BUTTON_SIZE = 32
+    TRANSPORT_BUTTON_WIDTH = 50
+    TRANSPORT_BUTTON_HEIGHT = 32
+
+    zoom_group = tk.Frame(controls_row, bg=EDITOR_BG)
+    zoom_group.grid(row=0, column=0, sticky="w")
+    zoom_in_container, _ = fixed_size_button(zoom_group, "➕", ZOOM_BUTTON_SIZE, ZOOM_BUTTON_SIZE, zoom_in_button)
+    zoom_in_container.pack(side="left")
+    zoom_reset_container, _ = fixed_size_button(
+        zoom_group, "↺", ZOOM_BUTTON_SIZE, ZOOM_BUTTON_SIZE, zoom_reset_button,
+    )
+    zoom_reset_container.pack(side="left", padx=(6, 0))
+    zoom_out_container, _ = fixed_size_button(zoom_group, "➖", ZOOM_BUTTON_SIZE, ZOOM_BUTTON_SIZE, zoom_out_button)
+    zoom_out_container.pack(side="left", padx=(6, 0))
+
+    transport_buttons = tk.Frame(controls_row, bg=EDITOR_BG)
+    transport_buttons.grid(row=0, column=1)
+    rewind_container, _ = fixed_size_button(
+        transport_buttons, "⏪", TRANSPORT_BUTTON_WIDTH, TRANSPORT_BUTTON_HEIGHT, lambda: seek_relative(-5),
+    )
+    rewind_container.pack(side="left")
+    play_pause_container, play_pause_button = fixed_size_button(
+        transport_buttons, "▶", TRANSPORT_BUTTON_WIDTH, TRANSPORT_BUTTON_HEIGHT, lambda: toggle_play_pause(),
+    )
+    play_pause_container.pack(side="left", padx=6)
+    forward_container, _ = fixed_size_button(
+        transport_buttons, "⏩", TRANSPORT_BUTTON_WIDTH, TRANSPORT_BUTTON_HEIGHT, lambda: seek_relative(5),
+    )
+    forward_container.pack(side="left")
+
+    def update_play_pause_icon():
+        play_pause_button.config(text="⏸" if player.is_playing() else "▶")
+
+    volume_group = tk.Frame(controls_row, bg=EDITOR_BG)
+    volume_group.grid(row=0, column=2, sticky="e")
+    tk.Label(volume_group, text="🔊", font=("Segoe UI", 11), bg=EDITOR_BG, fg=EDITOR_FG).pack(side="left", padx=(0, 6))
+    volume_var = tk.IntVar(value=100)
+
+    def on_volume_change(value):
+        try:
+            player.audio_set_volume(int(float(value)))
+        except Exception:
+            pass
+
+    ttk.Scale(
+        volume_group, from_=0, to=100, orient="horizontal", variable=volume_var, command=on_volume_change,
+        length=140, style="ClipEditor.Horizontal.TScale",
+    ).pack(side="left")
+
+    # --- Start/End controls (quality picker lives on this same line as the Precise preset) ---
+    range_row = tk.Frame(root, bg=EDITOR_BG)
     range_row.pack(fill="x", padx=10, pady=4)
     start_var = tk.StringVar(value="00:00:00.000")
     end_var = tk.StringVar(value="00:00:00.000")
-    tk.Button(range_row, text="Set Start", command=lambda: set_start()).pack(side="left")
-    tk.Entry(range_row, textvariable=start_var, width=14).pack(side="left", padx=(4, 16))
-    tk.Button(range_row, text="Set End", command=lambda: set_end()).pack(side="left")
-    tk.Entry(range_row, textvariable=end_var, width=14).pack(side="left", padx=(4, 16))
+    dark_button(range_row, text="Start", command=lambda: set_start()).pack(side="left")
+    tk.Entry(
+        range_row, textvariable=start_var, width=14, bg=ENTRY_BG, fg=EDITOR_FG, insertbackground=EDITOR_FG,
+    ).pack(side="left", padx=(4, 16))
+    dark_button(range_row, text="End", command=lambda: set_end()).pack(side="left")
+    tk.Entry(
+        range_row, textvariable=end_var, width=14, bg=ENTRY_BG, fg=EDITOR_FG, insertbackground=EDITOR_FG,
+    ).pack(side="left", padx=(4, 16))
     precise_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(range_row, text="Precise (slower, frame-accurate)", variable=precise_var).pack(side="left")
+    tk.Checkbutton(
+        range_row, text="Precise (slower, frame-accurate)", variable=precise_var,
+        bg=EDITOR_BG, fg=EDITOR_FG, activebackground=EDITOR_BG, activeforeground=EDITOR_FG,
+        selectcolor=ENTRY_BG,
+    ).pack(side="left")
+
+    default_quality = clip_editor_config.get("default_quality", CLIP_EDITOR_QUALITY_OPTIONS[0])
+    if default_quality not in CLIP_EDITOR_QUALITY_OPTIONS:
+        default_quality = CLIP_EDITOR_QUALITY_OPTIONS[0]
+    tk.Label(range_row, text="Resolution:", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="left", padx=(16, 0))
+    quality_var = tk.StringVar(value=default_quality)
+    ttk.Combobox(
+        range_row, textvariable=quality_var, values=CLIP_EDITOR_QUALITY_OPTIONS, state="readonly", width=16,
+        style="ClipEditor.TCombobox",
+    ).pack(side="left", padx=(6, 0))
 
     start_var.trace_add("write", lambda *_args: draw_timeline())
     end_var.trace_add("write", lambda *_args: draw_timeline())
 
-    # --- Output format ---
+    # --- Output format (same line as Resolution) + Close/Trim (same line as Output format) ---
     default_format = clip_editor_config.get("default_output_format", CLIP_EDITOR_OUTPUT_FORMATS[0])
     if default_format not in CLIP_EDITOR_OUTPUT_FORMATS:
         default_format = CLIP_EDITOR_OUTPUT_FORMATS[0]
-    format_row = tk.Frame(root)
-    format_row.pack(fill="x", padx=10, pady=(0, 4))
-    tk.Label(format_row, text="Output format:").pack(side="left")
+    tk.Label(range_row, text="Output format:", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="left", padx=(16, 0))
     format_var = tk.StringVar(value=default_format)
     ttk.Combobox(
-        format_row, textvariable=format_var, values=CLIP_EDITOR_OUTPUT_FORMATS, state="readonly", width=16,
+        range_row, textvariable=format_var, values=CLIP_EDITOR_OUTPUT_FORMATS, state="readonly", width=16,
+        style="ClipEditor.TCombobox",
     ).pack(side="left", padx=(6, 0))
 
-    # --- Status + trim ---
-    status_label = tk.Label(root, text="", fg="#b00020", anchor="w", justify="left", wraplength=780)
-    status_label.pack(fill="x", padx=10, pady=(4, 0))
+    trim_button = dark_button(range_row, text="✂ Trim Clip", command=lambda: do_trim())
+    trim_button.pack(side="right")
+    dark_button(range_row, text="✕ Close", command=close_editor).pack(side="right", padx=(0, 8))
 
-    progress = ttk.Progressbar(root, mode="indeterminate")
+    # --- Status + trim progress ---
+    status_label = tk.Label(
+        root, text="", fg=END_MARKER_COLOR, bg=EDITOR_BG, anchor="w", justify="left", wraplength=780,
+    )
+    status_label.pack(fill="x", padx=10, pady=(8, 0))
 
-    bottom_row = tk.Frame(root)
-    bottom_row.pack(fill="x", padx=10, pady=10, side="bottom")
-    tk.Button(bottom_row, text="Close", command=close_editor).pack(side="right")
-    trim_button = tk.Button(bottom_row, text="Trim Clip", command=lambda: do_trim())
-    trim_button.pack(side="right", padx=(0, 8))
+    progress = ttk.Progressbar(root, mode="indeterminate", style="ClipEditor.Horizontal.TProgressbar")
 
-    state = {"path": None, "duration": 0.0}
+    state = {"path": None, "duration": 0.0, "tracks_loaded": False, "file_handle": None}
 
     def browse_for_file():
         path = filedialog.askopenfilename(
@@ -4478,12 +5187,18 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     def load_file(path):
         if is_file_being_recorded(path, recording_state):
             logging.warning("Clip editor: refused to open %s -- it's still being recorded.", os.path.basename(path))
-            status_label.config(text="That recording is still in progress -- wait for it to finish before trimming it.")
+            status_label.config(
+                fg=SEEKER_COLOR,
+                text="That recording is still in progress -- wait for it to finish before trimming it.",
+            )
             return
+        release_file_lock()
         player.stop()
         media = instance.media_new(path)
         player.set_media(media)
+        player.audio_set_volume(volume_var.get())
         player.play()
+        acquire_file_lock(path)
 
         # Pausing immediately after play() races VLC's own async open/buffer state -- called
         # this early, pause() is liable to be silently dropped, leaving the clip playing all the
@@ -4496,6 +5211,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 return
             if player.get_state() == vlc_module.State.Playing:
                 player.pause()
+                update_play_pause_icon()
             elif attempts < 50:
                 root.after(100, lambda: pause_once_playing(attempts + 1))
 
@@ -4503,6 +5219,11 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
         state["path"] = path
         state["duration"] = 0.0
+        state["tracks_loaded"] = False
+        view_state["initialized"] = False
+        audio_track_ids.clear()
+        audio_track_combo.set("")
+        audio_track_combo["values"] = []
         start_var.set(format_timestamp(0))
         end_var.set(format_timestamp(0))
         status_label.config(text="")
@@ -4516,6 +5237,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             player.pause()
         else:
             player.play()
+        update_play_pause_icon()
 
     def seek_relative(seconds):
         if not state["path"]:
@@ -4538,26 +5260,27 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     def do_trim():
         if not state["path"]:
             logging.warning("Clip editor: Trim Clip clicked with no recording open.")
-            status_label.config(text="Open a recording first.")
+            status_label.config(fg=END_MARKER_COLOR, text="Open a recording first.")
             return
         try:
             start_seconds = parse_timestamp(start_var.get())
             end_seconds = parse_timestamp(end_var.get())
         except ValueError as exc:
             logging.warning("Clip editor: could not start trim -- %s", exc)
-            status_label.config(text=str(exc))
+            status_label.config(fg=END_MARKER_COLOR, text=str(exc))
             return
         error = validate_trim_range(start_seconds, end_seconds, state["duration"] or None)
         if error:
             logging.warning("Clip editor: could not start trim -- %s", error)
-            status_label.config(text=error)
+            status_label.config(fg=END_MARKER_COLOR, text=error)
             return
 
         ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
         if not ffmpeg_path:
             logging.error("Clip editor: could not start trim -- ffmpeg not found.")
             status_label.config(
-                text="ffmpeg isn't installed -- install it from Settings > Post-Processing, then try again."
+                fg=END_MARKER_COLOR,
+                text="ffmpeg isn't installed -- install it from Settings > Post-Processing, then try again.",
             )
             return
 
@@ -4568,18 +5291,19 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         )
         delete_original = clip_editor_config.get("delete_original_after_trim", False)
         precise = precise_var.get()
+        scale_height = get_quality_scale_height(quality_var.get())
         source_path = state["path"]
 
-        status_label.config(fg="#555555", text=f"Trimming to {os.path.basename(output_path)}...")
+        status_label.config(fg=MUTED_TEXT_COLOR, text=f"Trimming to {os.path.basename(output_path)}...")
         trim_button.config(state="disabled")
-        progress.pack(fill="x", padx=10, pady=(0, 6), before=bottom_row)
+        progress.pack(fill="x", padx=10, pady=(0, 6), before=status_label)
         progress.start(12)
 
         def worker():
             success = trim_clip(
                 source_path, start_seconds, end_seconds, output_path, ffmpeg_path=ffmpeg_path,
                 precise=precise, delete_original=delete_original, icon=icon,
-                notifications_config=notifications_config,
+                notifications_config=notifications_config, scale_height=scale_height,
             )
 
             def finish():
@@ -4592,9 +5316,9 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 progress.pack_forget()
                 trim_button.config(state="normal")
                 if success:
-                    status_label.config(fg="#15803d", text=f"Saved to {output_path}")
+                    status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}")
                 else:
-                    status_label.config(fg="#b00020", text="Trim failed -- see the log for details.")
+                    status_label.config(fg=END_MARKER_COLOR, text="Trim failed -- see the log for details.")
 
             try:
                 root.after(0, finish)
@@ -4610,12 +5334,22 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             length = player.get_length()
             if length > 0:
                 state["duration"] = length / 1000
+            if not state["tracks_loaded"] and player.audio_get_track_count() > 0:
+                refresh_audio_tracks()
+            ensure_playhead_visible()
             draw_timeline()
+            update_play_pause_icon()
             time_label.config(
                 text=f"{format_timestamp(player.get_time() / 1000)} / {format_timestamp(state['duration'])}"
             )
         root.after(200, poll)
 
+    # Draws the empty track immediately so the timeline is visible from the moment the editor
+    # opens, rather than waiting for a <Configure> event or the first file load -- relying on
+    # <Configure> alone left the canvas blank at startup in testing since it can fire before the
+    # window's real geometry has settled.
+    root.update_idletasks()
+    draw_timeline()
     root.after(200, poll)
 
 

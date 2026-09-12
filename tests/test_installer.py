@@ -36,6 +36,27 @@ class BuildConfigTests(unittest.TestCase):
         self.assertEqual(config["watched_games"], [])
         self.assertEqual(config["watched_windows"], [])
 
+    def test_selected_plain_exe_game_lands_in_watched_games(self):
+        options = base_options(selected_games=["Warframe"])
+        config = installer.build_config(self.template, None, "pw", options)
+        self.assertEqual(config["watched_games"], ["Warframe.x64.exe"])
+        self.assertEqual(config["watched_windows"], [])
+
+    def test_selected_title_contains_game_lands_in_watched_windows(self):
+        options = base_options(selected_games=["Minecraft: Java Edition"])
+        config = installer.build_config(self.template, None, "pw", options)
+        self.assertEqual(config["watched_games"], [])
+        self.assertEqual(
+            config["watched_windows"],
+            [{"process_name": "javaw.exe", "title_contains": "minecraft", "display_name": "Minecraft: Java Edition"}],
+        )
+
+    def test_unknown_selected_game_name_is_ignored(self):
+        options = base_options(selected_games=["Some Game Not In The List"])
+        config = installer.build_config(self.template, None, "pw", options)
+        self.assertEqual(config["watched_games"], [])
+        self.assertEqual(config["watched_windows"], [])
+
     def test_advanced_options_all_apply_when_enabled(self):
         options = base_options(
             multi_track_audio=True, output_folder=r"D:\Recs", game_audio_isolation=True,
@@ -45,14 +66,14 @@ class BuildConfigTests(unittest.TestCase):
         self.assertTrue(config["obs"]["multi_track_audio"]["enabled"])
         self.assertEqual(config["obs"]["output_folder"], r"D:\Recs")
         self.assertTrue(config["obs"]["game_audio_capture"]["enabled"])
-        self.assertTrue(config["obs"]["replay_buffer"]["enabled"])
+        self.assertEqual(config["obs"]["replay_buffer"]["mode"], "with_recording")
         self.assertEqual(config["disk_space_guard"], {"enabled": True, "minimum_free_gb": 25.0})
 
     def test_advanced_options_default_off(self):
         config = installer.build_config(self.template, None, "pw", base_options())
         self.assertFalse(config["obs"]["multi_track_audio"]["enabled"])
         self.assertFalse(config["obs"]["game_audio_capture"]["enabled"])
-        self.assertFalse(config["obs"]["replay_buffer"]["enabled"])
+        self.assertEqual(config["obs"]["replay_buffer"]["mode"], "off")
         self.assertFalse(config["disk_space_guard"]["enabled"])
         self.assertNotIn("output_folder", config["obs"])
 

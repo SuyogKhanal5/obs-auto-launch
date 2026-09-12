@@ -89,6 +89,7 @@
         "output_folder": "",
         "delete_original_after_trim": false,
         "default_output_format": "Same as source",
+        "default_quality": "Same as source",
         "vlc_path": ""
     },
     "obs": {
@@ -133,7 +134,8 @@
             "app_captures": []
         },
         "replay_buffer": {
-            "enabled": false
+            "mode": "off",
+            "max_seconds": 30
         }
     },
     "log_file": "autostart_script.log"

@@ -40,6 +40,22 @@ OBS_WINGET_ID = "OBSProject.OBSStudio"
 FFMPEG_WINGET_ID = "Gyan.FFmpeg"
 FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
 
+# Duplicated from autostart_script.py's COMMON_GAMES rather than imported (see the module
+# docstring on why this installer stays independent of the main app's code/dependencies). Only
+# games with at least one launch path this app can't auto-discover belong here -- Steam, Epic,
+# GOG, Xbox, and Battle.net installs are all found automatically once those launchers are enabled
+# in Settings, so a Steam-only title would just be redundant clutter on this page.
+COMMON_GAMES = [
+    {"name": "League of Legends", "process_name": "league of legends.exe"},
+    {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
+    {"name": "Valorant", "process_name": "VALORANT-Win64-Shipping.exe"},
+    {"name": "Warframe", "process_name": "Warframe.x64.exe"},
+    {"name": "Minecraft: Java Edition", "process_name": "javaw.exe", "title_contains": "minecraft"},
+    {"name": "Apex Legends", "process_name": "r5apex.exe"},
+    {"name": "Roblox", "process_name": "RobloxPlayerBeta.exe"},
+    {"name": "Genshin Impact", "process_name": "GenshinImpact.exe"},
+]
+
 
 def has_winget():
     return shutil.which("winget") is not None
@@ -230,8 +246,21 @@ def try_configure_obs_websocket(password):
 
 def build_config(template, obs_path, password, options):
     config = json.loads(json.dumps(template))
-    config["watched_games"] = []
-    config["watched_windows"] = []
+    watched_games = []
+    watched_windows = []
+    for game in COMMON_GAMES:
+        if game["name"] not in options.get("selected_games", []):
+            continue
+        if "title_contains" in game:
+            watched_windows.append({
+                "process_name": game["process_name"],
+                "title_contains": game["title_contains"],
+                "display_name": game["name"],
+            })
+        else:
+            watched_games.append(game["process_name"])
+    config["watched_games"] = watched_games
+    config["watched_windows"] = watched_windows
     config["obs"]["path"] = obs_path or template["obs"]["path"]
     config["obs"]["websocket"]["password"] = password
     config["obs"]["auto_split"]["enabled"] = options["split_long_recordings"]
@@ -242,7 +271,7 @@ def build_config(template, obs_path, password, options):
     if options["output_folder"]:
         config["obs"]["output_folder"] = options["output_folder"]
     config["obs"]["game_audio_capture"]["enabled"] = options["game_audio_isolation"]
-    config["obs"]["replay_buffer"]["enabled"] = options["replay_buffer"]
+    config["obs"]["replay_buffer"]["mode"] = "with_recording" if options["replay_buffer"] else "off"
     config["disk_space_guard"]["enabled"] = options["disk_space_guard"]
     if options["disk_space_guard_min_gb"]:
         try:
@@ -562,6 +591,31 @@ def main():
         variable=folders_var, bg=PAGE_BG,
     ).pack(anchor="w", pady=4)
 
+    # ---------- Common Games ----------
+    games_page = page_frame()
+    register("games", games_page)
+    heading(games_page, "Games to watch")
+    body_text(
+        games_page,
+        "Check any of these you play. You can add more, or edit these, later from the app's Settings.",
+    )
+
+    game_vars = {}
+    for game in COMMON_GAMES:
+        var = tk.BooleanVar(value=False)
+        tk.Checkbutton(games_page, text=game["name"], variable=var, bg=PAGE_BG).pack(anchor="w", pady=2)
+        game_vars[game["name"]] = var
+
+    tk.Label(
+        games_page,
+        text=(
+            "    Steam, Epic, GOG, Xbox, and Battle.net games are all detected automatically once "
+            "those launchers are enabled in Settings → Launchers -- these are just for games "
+            "with their own separate launcher, so nothing here is required."
+        ),
+        bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w", justify="left", wraplength=510,
+    ).pack(anchor="w", pady=(12, 0))
+
     # ---------- Advanced (optional, skippable) ----------
     advanced_page = page_frame()
     register("advanced", advanced_page)
@@ -607,8 +661,12 @@ def main():
     ).pack(anchor="w", pady=(10, 4))
     tk.Label(
         advanced_page,
-        text="    Configure the buffer's length and save location in OBS's own Settings \u2192 Output.",
-        bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w",
+        text=(
+            "    Defaults to a 30-second buffer -- change the length, or switch to replay-buffer-"
+            "only mode (skips full recordings entirely), later from this app's Settings \u2192 OBS. "
+            "OBS needs one restart after this is turned on before the buffer actually works."
+        ),
+        bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w", justify="left", wraplength=490,
     ).pack(anchor="w")
 
     disk_guard_var = tk.BooleanVar(value=False)
@@ -694,7 +752,7 @@ def main():
     launch_check.pack(anchor="w", pady=(8, 0))
 
     # ---------- Navigation ----------
-    order = ["welcome", "location", "obs", "options", "advanced", "ready", "finish"]
+    order = ["welcome", "location", "obs", "options", "games", "advanced", "ready", "finish"]
     current = {"index": 0, "install_dir": DEFAULT_INSTALL_DIR, "on_existing": False}
 
     back_btn = tk.Button(nav, text="< Back")
@@ -737,6 +795,7 @@ def main():
             "replay_buffer": replay_buffer_var.get(),
             "disk_space_guard": disk_guard_var.get(),
             "disk_space_guard_min_gb": disk_guard_min_gb_var.get().strip(),
+            "selected_games": [name for name, var in game_vars.items() if var.get()],
         }
 
     def go_to_index(index):
@@ -749,10 +808,13 @@ def main():
             back_btn.config(state="normal")
             existing = os.path.join(dir_var.get(), "config.json")
             preserved_note = " (your existing settings will be kept)" if os.path.isfile(existing) else ""
+            selected_games = [name for name, var in game_vars.items() if var.get()]
+            games_note = ", ".join(selected_games) if selected_games else "none selected"
             summary_label.config(
                 text=(
                     f"Install folder: {dir_var.get()}{preserved_note}\n"
                     f"OBS location: {obs_var.get() or 'not set yet'}\n"
+                    f"Games to watch: {games_note}\n"
                     f"Desktop shortcut: {'Yes' if desktop_var.get() else 'No'}\n"
                     f"Start with Windows: {'Yes' if startup_var.get() else 'No'}"
                 )

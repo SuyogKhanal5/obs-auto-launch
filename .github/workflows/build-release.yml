@@ -58,7 +58,17 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.zip config.example.json --title "${{ github.ref_name }}" --generate-notes
+        shell: bash
+        # RELEASE_NOTES.md is an optional, hand-written description for whatever tag is currently
+        # being cut -- checked in only when a release needs specific text (e.g. "VERIFIED STABLE"
+        # plus a curated changelist) instead of GitHub's auto-generated commit list. It's meant to
+        # be overwritten (or removed) before the next tag, not accumulated release-over-release.
+        run: |
+          if [ -f RELEASE_NOTES.md ]; then
+            gh release create "${{ github.ref_name }}" dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.zip config.example.json --title "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
+          else
+            gh release create "${{ github.ref_name }}" dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.zip config.example.json --title "${{ github.ref_name }}" --generate-notes
+          fi
 
       - name: Publish rolling "latest" build (main branch)
         if: github.ref == 'refs/heads/main'

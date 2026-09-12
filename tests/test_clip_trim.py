@@ -97,6 +97,70 @@ class BuildTrimCommandTests(unittest.TestCase):
         cmd = a.build_trim_command(r"C:\custom\ffmpeg.exe", "in.mkv", 0, 5, "out.mkv")
         self.assertEqual(cmd[0], r"C:\custom\ffmpeg.exe")
 
+    def test_explicit_crf_forces_reencode_even_in_fast_mode(self):
+        # A stream copy can't change quality at all -- picking a quality forces a real encode
+        # even when "Precise" isn't checked.
+        cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=False, crf=23)
+        self.assertNotIn("copy", cmd)
+        self.assertIn("-crf", cmd)
+        self.assertEqual(cmd[cmd.index("-crf") + 1], "23")
+        i_index = cmd.index("-i")
+        ss_index = cmd.index("-ss")
+        self.assertLess(ss_index, i_index)  # still fast-seeks before -i despite re-encoding
+
+    def test_explicit_crf_with_precise_seeks_after_input(self):
+        cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=True, crf=28)
+        i_index = cmd.index("-i")
+        ss_index = cmd.index("-ss")
+        self.assertGreater(ss_index, i_index)
+        self.assertEqual(cmd[cmd.index("-crf") + 1], "28")
+
+    def test_precise_without_crf_uses_default_crf(self):
+        cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=True, crf=None)
+        self.assertEqual(cmd[cmd.index("-crf") + 1], str(a.CLIP_EDITOR_DEFAULT_CRF))
+
+    def test_fast_mode_with_no_crf_still_stream_copies(self):
+        cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=False, crf=None)
+        self.assertIn("copy", cmd)
+        self.assertNotIn("-crf", cmd)
+
+    def test_scale_height_forces_reencode_even_in_fast_mode(self):
+        # A stream copy can't rescale video at all -- picking a resolution forces a real encode
+        # even when "Precise" isn't checked.
+        cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=False, scale_height=720)
+        self.assertNotIn("copy", cmd)
+        self.assertIn("-vf", cmd)
+        self.assertEqual(cmd[cmd.index("-vf") + 1], "scale=-2:720")
+        self.assertIn("-crf", cmd)
+        self.assertEqual(cmd[cmd.index("-crf") + 1], str(a.CLIP_EDITOR_DEFAULT_CRF))
+        i_index = cmd.index("-i")
+        ss_index = cmd.index("-ss")
+        self.assertLess(ss_index, i_index)  # still fast-seeks before -i despite re-encoding
+
+    def test_scale_height_with_precise_seeks_after_input(self):
+        cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=True, scale_height=480)
+        i_index = cmd.index("-i")
+        ss_index = cmd.index("-ss")
+        self.assertGreater(ss_index, i_index)
+        self.assertEqual(cmd[cmd.index("-vf") + 1], "scale=-2:480")
+
+    def test_no_scale_height_omits_vf_flag(self):
+        cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=True)
+        self.assertNotIn("-vf", cmd)
+
+
+class GetQualityScaleHeightTests(unittest.TestCase):
+    def test_same_as_source_returns_none(self):
+        self.assertIsNone(a.get_quality_scale_height("Same as source"))
+
+    def test_known_presets_map_to_expected_height(self):
+        self.assertEqual(a.get_quality_scale_height("1080p"), 1080)
+        self.assertEqual(a.get_quality_scale_height("720p"), 720)
+        self.assertEqual(a.get_quality_scale_height("480p"), 480)
+
+    def test_unknown_choice_returns_none(self):
+        self.assertIsNone(a.get_quality_scale_height("nonsense"))
+
 
 class ComputeTrimOutputPathTests(unittest.TestCase):
     def test_defaults_to_source_folder(self):
