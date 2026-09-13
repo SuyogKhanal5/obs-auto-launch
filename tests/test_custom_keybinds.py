@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
@@ -99,6 +100,42 @@ class FireCustomKeybindTests(unittest.TestCase):
             get_manual_split_buffer_seconds=lambda: 0,
         )
         self.assertIn(("save_replay_buffer",), client.calls)
+
+
+class RunCustomKeybindListenerRegistrationRetryTests(unittest.TestCase):
+    # A self-restart doesn't guarantee the previous process's hotkey registrations are released
+    # by the time this thread starts -- confirmed live as a real bug: a keybind that lost this
+    # race on one restart stayed dead for the rest of that session with only one WARNING logged.
+    def setUp(self):
+        self.mock_user32 = unittest.mock.Mock()
+        self.mock_user32.GetMessageW.return_value = 0  # exit the message loop immediately
+        self.bindings = [{"enabled": True, "action": "add_marker", "modifiers": ["ctrl"], "key": "F3"}]
+        self.patchers = [
+            unittest.mock.patch.object(a.ctypes.windll, "user32", self.mock_user32),
+            unittest.mock.patch.object(a.time, "sleep"),
+        ]
+        for p in self.patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_retries_and_succeeds_after_transient_failures(self):
+        self.mock_user32.RegisterHotKey.side_effect = [False, False, True]
+        a.run_custom_keybind_listener(
+            self.bindings, get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
+        )
+        self.assertEqual(self.mock_user32.RegisterHotKey.call_count, 3)
+
+    def test_gives_up_after_max_retries_and_notifies(self):
+        self.mock_user32.RegisterHotKey.return_value = False
+        icon = unittest.mock.Mock()
+        with unittest.mock.patch.object(a, "notify") as mock_notify:
+            with self.assertLogs(level="WARNING"):
+                a.run_custom_keybind_listener(
+                    self.bindings, get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
+                    icon=icon, notifications_config={"enabled": True},
+                )
+        self.assertEqual(self.mock_user32.RegisterHotKey.call_count, 5)
+        mock_notify.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -199,6 +199,32 @@ class SyncMultiTrackAudioAppCapturesTests(unittest.TestCase):
         multi_track_config = {"enabled": True, "tracks": [{"input_name": "Desktop Audio", "track": 1}]}
         a.sync_multi_track_audio(client, multi_track_config)  # must not raise
 
+    def test_applies_process_capture_sync_offset_to_every_app_capture(self):
+        # Confirmed live: OBS's per-process audio capture (what every app_captures entry uses)
+        # runs ~55ms behind Desktop Audio's plain device capture -- each app capture gets the
+        # same correction applied on every recording start, same as its window re-point.
+        client = FakeObsClient(profile_name="OBS Auto Recorder")
+        multi_track_config = {
+            "enabled": True,
+            "tracks": [{"input_name": "Discord", "track": 4}],
+            "app_captures": [{"input_name": "Discord", "process_name": "Discord.exe"}],
+        }
+        a.sync_multi_track_audio(client, multi_track_config, process_capture_sync_offset_ms=-55)
+        self.assertEqual(client.inputs["Discord"]["sync_offset"], -55)
+
+    def test_never_applies_sync_offset_to_desktop_audio(self):
+        client = FakeObsClient(
+            profile_name="OBS Auto Recorder",
+            inputs={"Desktop Audio": {"kind": "wasapi_output_capture", "tracks": {str(i): False for i in range(1, 7)}}},
+        )
+        multi_track_config = {
+            "enabled": True,
+            "tracks": [{"input_name": "Desktop Audio", "track": 1}],
+            "app_captures": [],
+        }
+        a.sync_multi_track_audio(client, multi_track_config, process_capture_sync_offset_ms=-55)
+        self.assertNotIn("sync_offset", client.inputs["Desktop Audio"])
+
 
 if __name__ == "__main__":
     unittest.main()

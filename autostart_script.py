@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -850,8 +851,12 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
         if not client:
             return None, None
 
-    sync_multi_track_audio(client, obs_config.get("multi_track_audio", {}))
+    sync_multi_track_audio(
+        client, obs_config.get("multi_track_audio", {}),
+        obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
+    )
     apply_output_folder(client, obs_config.get("output_folder"))
+    apply_recording_resolution(client, obs_config)
     if markers_wanted:
         configured_format = obs_config.get("recording_format")
         if configured_format and configured_format != "hybrid_mp4":
@@ -923,6 +928,347 @@ def set_game_audio_capture_target(client, input_name, process_name):
         logging.warning("Could not create '%s' audio capture input in OBS: %s", input_name, exc)
 
 
+# Confirmed live via a controlled cross-correlation test: a real-world sound captured
+# simultaneously through OBS's two WASAPI audio capture paths lands later on a
+# wasapi_process_output_capture input (Application Audio Capture -- what Game Audio and every
+# multi_track_audio.app_captures entry use) than on wasapi_output_capture (Desktop Audio) --
+# a genuine, inherent latency difference between Windows' per-process audio capture and plain
+# device loopback capture, not a bug in this app or in OBS. Left uncorrected, an isolated
+# app-audio track drifts audibly out of sync with Desktop Audio -- exactly the "doubling"/echo
+# effect a multi-track-aware player (Premiere, Discord's mobile app) produces when it plays
+# more than one track's audio at once, since it's mixing in a track that's really playing late.
+#
+# The original measurement of this constant was -55ms, taken before measure_audio_lag_ms's
+# click-pairing was hardened (clustering + nearest-neighbor-within-tolerance + per-click
+# cross-correlation refinement, see CALIBRATION_CLICK_POSITIONS_SECONDS below) -- it turned out
+# to be a noisy outlier: three fresh calibration runs against the SAME physical setup with the
+# hardened algorithm measured a tight, repeatable -24/-27/-29ms instead, confirmed live after a
+# user report that audio was "still out of sync" even with -55ms applied (i.e. -55 was
+# overcorrecting by roughly 2x). Since this default only matters for a user who hasn't run
+# their own calibration yet, it's set to the more trustworthy figure.
+DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS = -27
+
+
+def apply_process_capture_sync_offset(client, input_name, offset_ms):
+    """Applies a compensating OBS "Sync Offset" (ms) to a wasapi_process_output_capture input so
+    its audio lines back up with device-capture sources like Desktop Audio -- see
+    DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS. Desktop Audio itself is never touched; it's the
+    reference everything else is corrected against. Read-compare-write, same as every other
+    OBS-state override in this file, so this doesn't generate a write (and doesn't risk needing
+    whatever restart behavior that write might trigger) once it's already correct."""
+    try:
+        current = client.get_input_audio_sync_offset(input_name).input_audio_sync_offset
+    except Exception as exc:
+        logging.warning("Could not read sync offset for audio input '%s': %s", input_name, exc)
+        return
+    if current == offset_ms:
+        return
+    try:
+        client.set_input_audio_sync_offset(input_name, offset_ms)
+        logging.info(
+            "Set audio input '%s' sync offset to %sms (compensating for process-capture latency).",
+            input_name, offset_ms,
+        )
+    except Exception as exc:
+        logging.warning("Could not set sync offset for audio input '%s': %s", input_name, exc)
+
+
+CALIBRATION_TONE_SAMPLE_RATE = 48000
+CALIBRATION_TONE_DURATION_SECONDS = 20.0
+# Confirmed live that real background/ambient noise (Desktop Audio alone can pick up plenty of
+# it) knocks out enough individual clicks that 7 data points isn't always enough redundancy for
+# the median to stay reliable run-to-run (observed swinging between ~20ms and ~55ms across
+# otherwise-identical runs) -- roughly double the clicks over a longer tone directly buys back
+# that robustness, since measure_audio_lag_ms already discards anything without a confident match.
+CALIBRATION_CLICK_POSITIONS_SECONDS = [1.0 + i for i in range(18)]
+CALIBRATION_CLICK_DURATION_SECONDS = 0.003
+# Reference for extraction purposes only -- the reference input's OWN existing track is read
+# live and left untouched; only the target input gets temporarily moved here for the test.
+CALIBRATION_TARGET_TRACK = 6
+
+
+def generate_calibration_tone(output_path):
+    """Writes a short WAV of sharp broadband click impulses at known positions to output_path --
+    used as run_audio_sync_calibration's test signal. Broadband noise bursts (rather than a pure
+    tone) correlate sharply even after lossy AAC encoding, which is what actually gets measured
+    here (both capture paths re-encode through OBS's own AAC encoder before this ever reads
+    them back)."""
+    import wave
+    import numpy as np
+
+    sr = CALIBRATION_TONE_SAMPLE_RATE
+    audio = np.zeros(int(sr * CALIBRATION_TONE_DURATION_SECONDS), dtype=np.float32)
+    click_len = int(CALIBRATION_CLICK_DURATION_SECONDS * sr)
+    rng = np.random.default_rng()
+    for pos_sec in CALIBRATION_CLICK_POSITIONS_SECONDS:
+        start = int(pos_sec * sr)
+        audio[start:start + click_len] = rng.uniform(-1.0, 1.0, click_len)
+    audio_i16 = (audio * 32767).astype(np.int16)
+    with wave.open(output_path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(sr)
+        f.writeframes(audio_i16.tobytes())
+
+
+CALIBRATION_CLUSTER_MIN_GAP_MS = 200
+CALIBRATION_TEMPLATE_HALF_WINDOW_MS = 8
+CALIBRATION_SEARCH_MARGIN_MS = 15
+
+
+def measure_audio_lag_ms(reference_wav_path, target_wav_path):
+    """Measures how many ms the audio in target_wav_path lags behind reference_wav_path, given
+    two recordings of the same generate_calibration_tone() clicks captured simultaneously through
+    different paths.
+
+    Three-stage approach, in order of what each stage is actually for:
+
+    1. Coarse detection: find candidate clicks via a simple energy threshold. AAC's own
+       transient smearing typically splits one real click into a whole cluster of consecutive
+       above-threshold samples, not a single spike -- collapsing each cluster down to one
+       representative point is what keeps a single real click from registering as several.
+
+    2. Matching: pair up each reference point with its nearest target point, but only within a
+       generous tolerance for the actual latency being measured -- NOT by list index. Confirmed
+       live that real recordings aren't as clean as clustering alone assumes: Desktop Audio alone
+       picked up enough background/ambient noise to register several extra "clicks" unrelated to
+       the test tone, and a real audio-rendering process missed its own first click to a
+       cold-start glitch right after launch -- both mean the two signals can end up with a
+       genuinely different number of points at different positions, not just the same clicks
+       smeared differently. Index-pairing that situation silently matches up unrelated events
+       (confirmed live: produced multi-*second* garbage). Nearest-neighbor-within-tolerance
+       matching instead just discards anything without a genuine counterpart.
+
+    3. Refinement: for each matched pair, cross-correlate the actual click *waveform* (a small
+       window around the coarse point) rather than trusting a single loudest sample -- the
+       standard time-delay-of-arrival technique (the same idea behind GPS/audio-ranging), and
+       meaningfully more precise than comparing two independently-noisy single-sample peak picks.
+
+    Returns the median of all the refined per-click lags -- median rather than mean specifically
+    so one bad click can't skew the result. Returns None if fewer than 3 clicks were confidently
+    matched in both signals (e.g. one input never actually received the test tone, or too much
+    background noise drowned it out)."""
+    import wave
+    import numpy as np
+
+    def load_mono(path):
+        with wave.open(path, "rb") as f:
+            sr = f.getframerate()
+            n = f.getnframes()
+            ch = f.getnchannels()
+            data = np.frombuffer(f.readframes(n), dtype=np.int16).astype(np.float64)
+            if ch > 1:
+                data = data.reshape(-1, ch).mean(axis=1)
+            return data, sr
+
+    def find_click_positions(sig, sr, threshold_frac=0.3, min_gap_ms=CALIBRATION_CLUSTER_MIN_GAP_MS):
+        abs_sig = np.abs(sig)
+        peak = abs_sig.max()
+        if peak <= 0:
+            return []
+        threshold = peak * threshold_frac
+        above_idx = np.flatnonzero(abs_sig > threshold)
+        if len(above_idx) == 0:
+            return []
+        min_gap = int(min_gap_ms * sr / 1000)
+        clusters = []
+        cluster_start = prev = above_idx[0]
+        for idx in above_idx[1:]:
+            if idx - prev > min_gap:
+                clusters.append((cluster_start, prev))
+                cluster_start = idx
+            prev = idx
+        clusters.append((cluster_start, prev))
+        # One representative point per cluster: the single loudest sample in it. Only a coarse
+        # anchor for stage 2 below -- its own precision doesn't matter much.
+        return [start + int(np.argmax(abs_sig[start:end + 1])) for start, end in clusters]
+
+    def refine_lag_samples(ref_point, target_point):
+        half = int(CALIBRATION_TEMPLATE_HALF_WINDOW_MS * sr / 1000)
+        margin = int(CALIBRATION_SEARCH_MARGIN_MS * sr / 1000)
+        r0, r1 = ref_point - half, ref_point + half
+        if r0 < 0 or r1 > len(ref):
+            return None
+        template = ref[r0:r1]
+        template = template - template.mean()
+
+        t0, t1 = target_point - half - margin, target_point + half + margin
+        t0c, t1c = max(0, t0), min(len(target), t1)
+        region = target[t0c:t1c]
+        if len(region) < len(template):
+            return None
+        region = region - region.mean()
+        # "valid" mode: for every position the template could sit fully inside region, how well
+        # it matches there -- its argmax is where the click's waveform shape actually lines up
+        # best, not just where a single sample happens to be loudest.
+        corr = np.correlate(region, template, mode="valid")
+        best_offset = int(np.argmax(corr))
+        target_equivalent = t0c + best_offset + half
+        return target_equivalent - ref_point
+
+    ref, sr_ref = load_mono(reference_wav_path)
+    target, sr_target = load_mono(target_wav_path)
+    if sr_ref != sr_target or sr_ref <= 0:
+        return None
+    sr = sr_ref
+
+    ref_points = find_click_positions(ref, sr)
+    target_points = find_click_positions(target, sr)
+
+    # Real recordings aren't as clean as the coarse threshold assumes: confirmed live that
+    # Desktop Audio alone can pick up enough ambient/background noise to register several extra
+    # "clicks" that have nothing to do with the test tone, and a real audio-rendering process
+    # can miss its own very first click to a cold-start glitch right after launch -- both mean
+    # the two signals can end up with a genuinely different NUMBER of detected points, at
+    # different positions, not just the same clicks smeared differently. Pairing by list index
+    # in that situation silently matches up completely unrelated events (confirmed live: this
+    # produced multi-*second* garbage results). Matching each reference point to its nearest
+    # target point, but only within a generous tolerance for the real latency being measured,
+    # correctly discards anything that doesn't have a genuine counterpart instead of forcing a
+    # bogus pairing -- standard nearest-neighbor-with-a-gate matching, not index alignment.
+    max_expected_lag_ms = 150
+    max_lag_samples = int(max_expected_lag_ms * sr / 1000)
+    unmatched_targets = list(target_points)
+    pairs = []
+    for rp in ref_points:
+        candidates = [tp for tp in unmatched_targets if abs(tp - rp) <= max_lag_samples]
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda tp: abs(tp - rp))
+        unmatched_targets.remove(best)
+        pairs.append((rp, best))
+    if len(pairs) < 3:
+        return None
+
+    lags_ms = []
+    for ref_point, target_point in pairs:
+        lag_samples = refine_lag_samples(ref_point, target_point)
+        if lag_samples is None:
+            lag_samples = target_point - ref_point  # fall back to the coarse estimate
+        lags_ms.append(lag_samples * 1000.0 / sr)
+    lags_ms.sort()
+    return lags_ms[len(lags_ms) // 2]
+
+
+def run_audio_sync_calibration(client, ffmpeg_path, target_input_name, reference_input_name="Desktop Audio"):
+    """Live-measures the actual latency difference between target_input_name (a
+    wasapi_process_output_capture input -- Game Audio or an app_captures entry) and
+    reference_input_name (Desktop Audio) on THIS machine, using the exact method confirmed
+    during development: play a short click-tone through a real audio-rendering process (ffplay,
+    which needs a genuine visible window for OBS's own process-capture to find it at all -- an
+    invisible/-nodisp player was confirmed live to go undetected) while recording both inputs
+    simultaneously to a throwaway scratch file, then cross-correlate the two tracks.
+
+    Returns the measured offset in ms to apply to target_input_name (negative -- how much
+    earlier it needs to shift to line back up with reference_input_name), or None if calibration
+    couldn't complete (ffplay not found, OBS not reachable, or too few clicks detected to be
+    confident). Restores every OBS setting it touches -- record directory, target_input_name's
+    window/priority, its sync offset, and its track routing -- before returning either way."""
+    ffplay_path = os.path.join(os.path.dirname(ffmpeg_path), "ffplay.exe")
+    if not os.path.isfile(ffplay_path):
+        logging.warning("Audio sync calibration: ffplay.exe not found next to ffmpeg; skipping.")
+        return None
+
+    try:
+        if client.get_record_status().output_active:
+            logging.warning("Audio sync calibration: refusing to run while OBS is already recording.")
+            return None
+    except Exception as exc:
+        logging.warning("Audio sync calibration: could not check OBS's recording state: %s", exc)
+        return None
+
+    tmp_dir = tempfile.mkdtemp(prefix="obsautorec_synccal_")
+    tone_path = os.path.join(tmp_dir, "tone.wav")
+    try:
+        generate_calibration_tone(tone_path)
+    except Exception as exc:
+        logging.warning("Audio sync calibration: could not generate the test tone: %s", exc)
+        return None
+
+    try:
+        orig_dir = client.get_record_directory().record_directory
+        orig_target_settings = client.get_input_settings(target_input_name).input_settings
+        orig_target_offset = client.get_input_audio_sync_offset(target_input_name).input_audio_sync_offset
+        orig_target_tracks = client.get_input_audio_tracks(target_input_name).input_audio_tracks
+        ref_track = next((i for i in range(1, 7) if client.get_input_audio_tracks(reference_input_name).input_audio_tracks.get(str(i))), None)
+    except Exception as exc:
+        logging.warning("Audio sync calibration: could not read current OBS state: %s", exc)
+        return None
+    if ref_track is None:
+        logging.warning("Audio sync calibration: '%s' isn't routed to any track.", reference_input_name)
+        return None
+
+    proc = None
+    measured_ms = None
+    try:
+        client.set_input_settings(
+            target_input_name, {"window": "::ffplay.exe", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}, True,
+        )
+        client.set_input_audio_sync_offset(target_input_name, 0)
+        target_tracks = {str(i): (i == CALIBRATION_TARGET_TRACK) for i in range(1, 7)}
+        client.set_input_audio_tracks(target_input_name, target_tracks)
+        client.set_record_directory(tmp_dir)
+        client.start_record()
+        time.sleep(1.0)
+        proc = subprocess.Popen([ffplay_path, "-autoexit", "-loglevel", "quiet", tone_path])
+        time.sleep(1.5)  # let the window actually appear before ffplay starts playing
+        proc.wait(timeout=CALIBRATION_TONE_DURATION_SECONDS + 10)
+        time.sleep(1.0)
+    except Exception as exc:
+        logging.warning("Audio sync calibration: recording step failed: %s", exc)
+    finally:
+        if proc and proc.poll() is None:
+            proc.kill()
+        output_path = None
+        try:
+            resp = client.stop_record()
+            output_path = getattr(resp, "output_path", None)
+        except Exception as exc:
+            logging.warning("Audio sync calibration: could not stop the test recording: %s", exc)
+        for attempt in range(8):
+            try:
+                client.set_record_directory(orig_dir)
+                break
+            except Exception:
+                time.sleep(3)
+        try:
+            client.set_input_settings(target_input_name, orig_target_settings, False)
+            client.set_input_audio_sync_offset(target_input_name, orig_target_offset)
+            client.set_input_audio_tracks(target_input_name, orig_target_tracks)
+        except Exception as exc:
+            logging.warning("Audio sync calibration: could not restore '%s': %s", target_input_name, exc)
+
+        if output_path and os.path.isfile(output_path):
+            ref_wav = os.path.join(tmp_dir, "ref.wav")
+            target_wav = os.path.join(tmp_dir, "target.wav")
+            try:
+                subprocess.run(
+                    [
+                        ffmpeg_path, "-y", "-i", output_path,
+                        "-map", f"0:a:{ref_track - 1}", "-c:a", "pcm_s16le", ref_wav,
+                        "-map", f"0:a:{CALIBRATION_TARGET_TRACK - 1}", "-c:a", "pcm_s16le", target_wav,
+                    ],
+                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=30,
+                )
+                measured_ms = measure_audio_lag_ms(ref_wav, target_wav)
+            except Exception as exc:
+                logging.warning("Audio sync calibration: could not analyze the test recording: %s", exc)
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    if measured_ms is None:
+        logging.warning("Audio sync calibration: could not confidently measure a lag; leaving the offset unchanged.")
+        return None
+    result_ms = -round(measured_ms)
+    logging.info(
+        "Audio sync calibration measured '%s' lagging '%s' by %.1fms -> offset %sms.",
+        target_input_name, reference_input_name, measured_ms, result_ms,
+    )
+    return result_ms
+
+
 def apply_output_folder(client, output_folder):
     """Best-effort override of OBS's recording directory for whichever profile is currently
     active (the dedicated multi-track profile if that ran first, otherwise whatever the user
@@ -982,6 +1328,52 @@ def apply_recording_format(client, recording_format):
         logging.info("Set OBS's recording format to '%s'.", recording_format)
     except Exception as exc:
         logging.error("Could not set OBS's recording format to '%s': %s", recording_format, exc)
+
+
+OBS_RESOLUTION_OPTIONS = ["Match canvas (no scaling)", "1080p", "720p", "480p"]
+
+
+def resolve_recording_resolution(base_width, base_height, resolution_choice):
+    """Resolves an OBS_RESOLUTION_OPTIONS choice to an explicit (width, height) output
+    resolution, given the canvas's current base resolution. "Match canvas" (or anything
+    unrecognized, e.g. not yet set) just returns the base resolution unchanged -- the same "do
+    nothing extra" default OBS itself starts with. A named preset keeps the base canvas's own
+    aspect ratio, scaling width from CLIP_EDITOR_QUALITY_HEIGHTS' height and rounding to the
+    nearest even number, same convention build_trim_command's -2 scale filter already uses,
+    since libx264 (what OBS's own encoders are built on too) requires even dimensions."""
+    height = CLIP_EDITOR_QUALITY_HEIGHTS.get(resolution_choice)
+    if height is None or not base_width or not base_height:
+        return base_width, base_height
+    width = round(base_width * height / base_height / 2) * 2
+    return width, height
+
+
+def apply_recording_resolution(client, obs_config):
+    """Best-effort override of OBS's output (scaled) resolution -- confirmed live that, unlike
+    the recording format or replay buffer, this genuinely takes effect immediately with no OBS
+    restart needed. Leaves the canvas (base) resolution and frame rate untouched; only the
+    output dimensions actually used for encoding/recording change."""
+    resolution_choice = obs_config.get("recording_resolution")
+    if not resolution_choice:
+        return
+    try:
+        video = client.get_video_settings()
+    except Exception as exc:
+        logging.warning("Could not read video settings to apply the configured recording resolution: %s", exc)
+        return
+    target_width, target_height = resolve_recording_resolution(
+        video.base_width, video.base_height, resolution_choice
+    )
+    if (video.output_width, video.output_height) == (target_width, target_height):
+        return
+    try:
+        client.set_video_settings(
+            video.fps_numerator, video.fps_denominator,
+            video.base_width, video.base_height, target_width, target_height,
+        )
+        logging.info("Set OBS's recording resolution to %dx%d.", target_width, target_height)
+    except Exception as exc:
+        logging.error("Could not set OBS's recording resolution to %dx%d: %s", target_width, target_height, exc)
 
 
 def wants_markers(custom_keybinds_config):
@@ -1282,7 +1674,7 @@ def apply_multi_track_routing(client, entries):
             logging.warning("Could not clear stale track routing on '%s': %s", name, exc)
 
 
-def sync_multi_track_audio(client, multi_track_config):
+def sync_multi_track_audio(client, multi_track_config, process_capture_sync_offset_ms=DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS):
     if not multi_track_config.get("enabled"):
         return
     entries = normalize_track_entries(multi_track_config.get("tracks"))
@@ -1302,12 +1694,14 @@ def sync_multi_track_audio(client, multi_track_config):
         # which then goes stale the moment the app's window title changes (Discord's includes the
         # current server/channel name) -- exactly what "isolation randomly stops working" turns
         # out to be. This re-point isn't a one-time fix, it runs on every recording start, same as
-        # obs.game_audio_capture already gets.
+        # obs.game_audio_capture already gets. The sync-offset correction rides along with it for
+        # the same reason -- see DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS.
         for app_capture in multi_track_config.get("app_captures", []):
             input_name = app_capture.get("input_name")
             process_name = app_capture.get("process_name")
             if input_name and process_name:
                 set_game_audio_capture_target(client, input_name, process_name)
+                apply_process_capture_sync_offset(client, input_name, process_capture_sync_offset_ms)
         apply_multi_track_routing(client, entries)
     except Exception:
         logging.exception("Unexpected error while syncing multi-track audio settings.")
@@ -1511,10 +1905,24 @@ OBS_CHAPTER_NOT_SUPPORTED_HINT = (
 )
 
 
-def add_recording_marker(client, icon=None, notifications_config=None):
+def add_recording_marker(client, icon=None, notifications_config=None, status=None):
     try:
         client.create_record_chapter()
         logging.info("Added a marker to the current recording.")
+        # Same flash treatment as a manual split or a replay-buffer save -- from the user's
+        # point of view, all three are "something just landed/happened, here's confirmation".
+        # Unlike those two, there's no OBS event for this (CreateRecordChapter doesn't emit
+        # one), so the flash has to be fired right here at the point of success instead.
+        if icon is not None and status is not None:
+            status["flash_until"] = time.time() + SPLIT_FLASH_SECONDS
+            icon.icon = build_tray_image(current_color(status))
+
+            def revert():
+                icon.icon = build_tray_image(current_color(status))
+
+            timer = threading.Timer(SPLIT_FLASH_SECONDS, revert)
+            timer.daemon = True
+            timer.start()
         return True
     except obsws.error.OBSSDKRequestError as exc:
         if exc.code == OBS_CHAPTER_NOT_SUPPORTED_CODE:
@@ -1615,7 +2023,6 @@ MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 _CUSTOM_KEYBIND_MODIFIER_FLAGS = {"ctrl": MOD_CONTROL, "alt": MOD_ALT, "shift": MOD_SHIFT, "win": MOD_WIN}
 
-
 def vk_code_for_key(key):
     """Maps a CUSTOM_KEYBIND_KEY_OPTIONS entry to its Win32 virtual-key code. Letters and digits
     share their ASCII codes with Windows' VK_0-VK_9/VK_A-VK_Z, so those need no lookup table."""
@@ -1641,12 +2048,14 @@ def describe_keybind(binding):
     return "+".join(parts)
 
 
-def perform_keybind_action(client, action, manual_split_buffer_seconds=0, icon=None, notifications_config=None):
+def perform_keybind_action(
+    client, action, manual_split_buffer_seconds=0, icon=None, notifications_config=None, status=None,
+):
     try:
         if action == "split_record_file":
             trigger_buffered_split(client, manual_split_buffer_seconds)
         elif action == "add_marker":
-            if not add_recording_marker(client, icon, notifications_config):
+            if not add_recording_marker(client, icon, notifications_config, status):
                 # add_recording_marker already logged the specific reason (and toasted it, if the
                 # format is the culprit) -- returning here skips the misleading "performed" log.
                 return
@@ -1678,16 +2087,20 @@ def perform_keybind_action(client, action, manual_split_buffer_seconds=0, icon=N
         logging.error("Custom keybind action '%s' failed: %s", action, exc)
 
 
-def fire_custom_keybind(binding, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None):
+def fire_custom_keybind(
+    binding, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
+):
     client = get_client()
     if not client:
         logging.warning("Custom keybind %s pressed but OBS is not connected.", describe_keybind(binding))
         return
-    perform_keybind_action(client, binding.get("action"), get_manual_split_buffer_seconds(), icon, notifications_config)
+    perform_keybind_action(
+        client, binding.get("action"), get_manual_split_buffer_seconds(), icon, notifications_config, status,
+    )
 
 
 def run_custom_keybind_listener(
-    bindings, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None,
+    bindings, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
 ):
     """Runs for its whole lifetime on one dedicated daemon thread: RegisterHotKey (and the
     WM_HOTKEY messages it produces) has thread affinity, so every binding must be registered from
@@ -1704,13 +2117,31 @@ def run_custom_keybind_listener(
             continue
         mods = mod_flags_for(binding.get("modifiers")) | MOD_NOREPEAT
         hotkey_id = index + 1
-        if user32.RegisterHotKey(None, hotkey_id, mods, vk):
+        # A self-restart (e.g. after a Settings save) doesn't post WM_QUIT to this thread, so
+        # the previous process's hotkey registrations are only released by Windows noticing that
+        # process has actually terminated -- a brief, variable-length teardown window that can
+        # still be in progress by the time the new process gets here. Without retrying, losing
+        # that race silently and permanently disables the keybind for the rest of this session
+        # (confirmed live: an "Add Marker" keybind that lost this race never worked again until
+        # the next restart, with no further sign of it beyond one cold WARNING log line).
+        registered_ok = False
+        for _attempt in range(5):
+            if user32.RegisterHotKey(None, hotkey_id, mods, vk):
+                registered_ok = True
+                break
+            time.sleep(0.3)
+        if registered_ok:
             registered.append((hotkey_id, binding))
             logging.info("Registered custom keybind %s -> %s", describe_keybind(binding), binding.get("action"))
         else:
             logging.warning(
                 "Could not register custom keybind %s (it may already be in use by another app).",
                 describe_keybind(binding),
+            )
+            notify(
+                icon, notifications_config, "Keybind not registered",
+                f"{describe_keybind(binding)} could not be registered -- it may already be in use by "
+                "another app. This keybind won't work until the app is restarted again.",
             )
 
     if not registered:
@@ -1725,7 +2156,7 @@ def run_custom_keybind_listener(
                 if binding:
                     threading.Thread(
                         target=fire_custom_keybind,
-                        args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config),
+                        args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
                         daemon=True,
                     ).start()
             user32.TranslateMessage(ctypes.byref(msg))
@@ -2070,6 +2501,48 @@ def format_timestamp(total_seconds):
     return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
 
 
+# libvlc/avcodec per-media options for the clip editor's own preview playback only -- never
+# touches the actual trimmed output, which always goes through ffmpeg separately. Confirmed live
+# (via a controlled test playing the same file with/without these) that hardware decoding itself
+# wasn't the specific cause of a playback stutter investigated in this app -- but on a machine
+# where the GPU/driver genuinely is the bottleneck, trading decode quality for speed here (or
+# forcing software decoding) is still a real, useful lever, so it's exposed rather than assumed
+# away. Applied via Media.add_option() before the media is ever handed to the player, since that's
+# the only point these can be set at all.
+CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS = [
+    "Best (hardware decode)", "Balanced", "Performance (software decode)",
+]
+# Confirmed live: VLC's hardware-accelerated decode path (D3D11VA) showed real stutter
+# ("picture is too late to be displayed") on Hybrid MP4 recordings during development --
+# Performance is the safer default for the editor's own preview until that's understood better,
+# not "Best" despite the label. Never touches the exported file either way.
+CLIP_EDITOR_DEFAULT_PREVIEW_QUALITY = CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS[2]
+CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS = {
+    "Best (hardware decode)": [],
+    "Balanced": [":avcodec-skiploopfilter=nonref"],
+    "Performance (software decode)": [":avcodec-hw=none", ":avcodec-skiploopfilter=all", ":avcodec-fast"],
+}
+
+CLIP_EDITOR_TARGET_AUDIO_BITRATE_KBPS = 128
+# Real-world encodes tend to land slightly above a pure bitrate x duration prediction (container
+# overhead, VBV peaks near hard cuts/scene changes) -- this leaves headroom so "target 10 MB"
+# reliably comes out at or under 10 MB instead of just over it.
+CLIP_EDITOR_BITRATE_SAFETY_MARGIN = 0.95
+
+
+def compute_target_video_bitrate_kbps(duration_seconds, target_size_mb, audio_bitrate_kbps=CLIP_EDITOR_TARGET_AUDIO_BITRATE_KBPS):
+    """Resolves a target output file size to the video bitrate (kbps) needed to hit it, given the
+    clip's duration and a fixed audio bitrate carved out of the same size budget. 1 MB is treated
+    as 8192 kbit (the 1024-based convention most "target file size" bitrate calculators use).
+    Returns None if there's no target, a non-positive duration, or not enough of the budget left
+    for any video bitrate at all once audio's fixed share is subtracted."""
+    if not target_size_mb or duration_seconds <= 0:
+        return None
+    total_kbps = (target_size_mb * 8192 * CLIP_EDITOR_BITRATE_SAFETY_MARGIN) / duration_seconds
+    video_kbps = int(total_kbps - audio_bitrate_kbps)
+    return video_kbps if video_kbps > 0 else None
+
+
 def build_trim_command(
     ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False, crf=None,
     scale_height=None,
@@ -2096,22 +2569,88 @@ def build_trim_command(
     required by libx264), or None to leave the source resolution untouched.
     Either one forces a re-encode even in fast (non-precise) mode when given -- in that case -ss
     still goes before -i for the fast-seek speed benefit, it just re-encodes afterward instead of
-    copying."""
+    copying.
+
+    A target output *size* (as opposed to quality) isn't handled here at all -- see
+    build_two_pass_size_targeted_commands, which needs a fundamentally different (two-pass)
+    command shape to hit a size target accurately rather than just approximately."""
     start_str = format_timestamp(start_seconds)
     duration_str = format_timestamp(end_seconds - start_seconds)
+    # Only video and audio -- not "-map 0" for every stream. OBS's Hybrid MP4 recordings carry
+    # an extra "bin_data" chapter-metadata track (its own custom format for the marker feature)
+    # whose internal timestamps a plain stream copy can't rebase to the new, shorter timeline.
+    # Confirmed live: leaving it in produced a copied chapter track reporting a wildly wrong
+    # duration (visible in ffprobe, and very likely what made VLC show an inaccurate length for
+    # the trimmed clip) -- excluding it here fixes that, and a short trimmed clip has no real
+    # use for chapter markers about the original recording's timeline anyway.
+    stream_maps = ["-map", "0:v", "-map", "0:a"]
+    # Moves the MP4 "moov" atom (the index of where every frame lives in the file) to the front
+    # instead of ffmpeg's default of appending it at the end -- a plain stream copy doesn't do
+    # this on its own. Browsers and embedded web players (e.g. Discord's inline preview) need it
+    # up front to start streaming at all; VLC and most desktop players are lenient enough to play
+    # either way, which is why this can look fine locally and still fail elsewhere. Harmless no-op
+    # for non-MP4 containers (confirmed: ffmpeg just ignores it for a Matroska/.mkv output).
+    faststart_args = ["-movflags", "+faststart"]
     if not precise and crf is None and scale_height is None:
         return [
             ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str,
-            "-map", "0", "-c", "copy", output_path,
+            *stream_maps, "-c", "copy", *faststart_args, output_path,
         ]
     effective_crf = CLIP_EDITOR_DEFAULT_CRF if crf is None else crf
-    encode_args = ["-map", "0"]
+    encode_args = list(stream_maps)
     if scale_height is not None:
         encode_args += ["-vf", f"scale=-2:{scale_height}"]
-    encode_args += ["-c:v", "libx264", "-crf", str(effective_crf), "-c:a", "aac"]
+    encode_args += ["-c:v", "libx264", "-crf", str(effective_crf), "-c:a", "aac", *faststart_args]
     if precise:
         return [ffmpeg_path, "-y", "-i", input_path, "-ss", start_str, "-t", duration_str] + encode_args + [output_path]
     return [ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str] + encode_args + [output_path]
+
+
+def build_two_pass_size_targeted_commands(
+    ffmpeg_path, input_path, start_seconds, end_seconds, output_path, target_size_mb, scale_height=None,
+    passlog_prefix=None,
+):
+    """Builds a two-pass ffmpeg encode aimed at landing at or under target_size_mb. A single-pass
+    average-bitrate encode (-b:v alone) reliably overshoots its nominal target in practice --
+    confirmed live: a single-pass attempt at a 10 MB target came out at 10.89 MB, a 9% overshoot
+    that would defeat the whole point against a hard upload limit. A first pass (video only,
+    analysis discarded to NUL) lets x264 spend the bitrate budget accurately across the whole
+    clip on the real, second pass -- the standard technique for actually hitting a size target
+    rather than just approximating it.
+
+    Always frame-accurate (-ss after -i) on both passes -- a size target is only meaningful
+    against the exact real duration being encoded, and both passes must encode identical content
+    for pass 2's stats file to apply correctly.
+
+    Only the *first* audio track is included (0:a:0), not every track like build_trim_command's
+    "-map 0:a" -- confirmed live this matters a lot: this app's own multi-track-audio recordings
+    can carry 5-6 separate tracks, each independently encoded to ~128 kbps, which blew a 10 MB
+    target out to nearly 15 MB when all of them were kept (the audio budget below only ever
+    accounts for one). A size-constrained "share this clip" export has no real use for 6 parallel
+    audio tracks anyway -- most players only ever play the first one by default.
+
+    Returns (pass1_cmd, pass2_cmd); pass1_cmd must be run to completion before pass2_cmd.
+    passlog_prefix is where ffmpeg writes/reads its pass stats (e.g. "<prefix>-0.log") -- pass a
+    path in a writable temp location; the caller is responsible for cleaning up the log file(s)
+    afterward, since ffmpeg never does."""
+    start_str = format_timestamp(start_seconds)
+    duration_str = format_timestamp(end_seconds - start_seconds)
+    video_kbps = compute_target_video_bitrate_kbps(end_seconds - start_seconds, target_size_mb) or 1
+    bufsize_kbps = video_kbps * 2
+    video_args = ["-c:v", "libx264", "-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k", "-bufsize", f"{bufsize_kbps}k"]
+    if scale_height is not None:
+        video_args += ["-vf", f"scale=-2:{scale_height}"]
+    pass1 = [
+        ffmpeg_path, "-y", "-i", input_path, "-ss", start_str, "-t", duration_str,
+        "-map", "0:v", *video_args, "-pass", "1", "-passlogfile", passlog_prefix,
+        "-an", "-f", "null", "NUL",
+    ]
+    pass2 = [
+        ffmpeg_path, "-y", "-i", input_path, "-ss", start_str, "-t", duration_str,
+        "-map", "0:v", "-map", "0:a:0", *video_args, "-pass", "2", "-passlogfile", passlog_prefix,
+        "-c:a", "aac", "-b:a", f"{CLIP_EDITOR_TARGET_AUDIO_BITRATE_KBPS}k", "-movflags", "+faststart", output_path,
+    ]
+    return pass1, pass2
 
 
 def compute_trim_output_path(input_path, output_folder=None, suffix="_trimmed", output_ext=None):
@@ -2141,9 +2680,21 @@ def compute_trim_output_path(input_path, output_folder=None, suffix="_trimmed", 
         n += 1
 
 
+def cleanup_two_pass_log_files(passlog_prefix):
+    """Removes the pass-stats file(s) ffmpeg writes for a two-pass encode (<prefix>-0.log, and
+    sometimes <prefix>-0.log.mbtree for x264's mb-tree ratecontrol) -- ffmpeg never cleans these
+    up itself, and they're only ever useful for the one encode that just ran."""
+    for suffix in ("-0.log", "-0.log.mbtree"):
+        try:
+            os.remove(passlog_prefix + suffix)
+        except OSError:
+            pass
+
+
 def trim_clip(
     input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
     delete_original=False, icon=None, notifications_config=None, crf=None, scale_height=None,
+    target_size_mb=None,
 ):
     """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
     way transcode_recording's callers do. Verifies the output file actually exists and has a
@@ -2154,10 +2705,39 @@ def trim_clip(
         logging.error("Could not trim %s: end time must be after the start time.", basename)
         return False
 
-    cmd = build_trim_command(
-        ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise, crf, scale_height,
-    )
-    logging.info("Trimming %s: %s", basename, " ".join(cmd))
+    passlog_prefix = None
+    if target_size_mb:
+        passlog_prefix = os.path.join(tempfile.gettempdir(), f"obsautorec_2pass_{os.getpid()}_{int(time.time() * 1000)}")
+        pass1_cmd, pass2_cmd = build_two_pass_size_targeted_commands(
+            ffmpeg_path, input_path, start_seconds, end_seconds, output_path, target_size_mb, scale_height,
+            passlog_prefix,
+        )
+        logging.info("Trimming %s (pass 1/2, targeting %s MB): %s", basename, target_size_mb, " ".join(pass1_cmd))
+        try:
+            result1 = subprocess.run(
+                pass1_cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except OSError as exc:
+            logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
+            notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
+            return False
+        if result1.returncode != 0:
+            logging.error(
+                "ffmpeg trim (pass 1/2) failed for %s (exit code %s).\nCommand: %s\nstderr:\n%s",
+                input_path, result1.returncode, " ".join(pass1_cmd), result1.stderr[-4000:],
+            )
+            notify(
+                icon, notifications_config, "Trim failed",
+                f"{basename} was kept, but the trim failed -- see the log for details.",
+            )
+            cleanup_two_pass_log_files(passlog_prefix)
+            return False
+        cmd = pass2_cmd
+        logging.info("Trimming %s (pass 2/2): %s", basename, " ".join(cmd))
+    else:
+        cmd = build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise, crf, scale_height)
+        logging.info("Trimming %s: %s", basename, " ".join(cmd))
+
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
@@ -2166,6 +2746,9 @@ def trim_clip(
         logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
         notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
         return False
+    finally:
+        if passlog_prefix:
+            cleanup_two_pass_log_files(passlog_prefix)
 
     output_ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
     if result.returncode != 0 or not output_ok:
@@ -2586,6 +3169,10 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                             start_replay_buffer(obs_client)
                     if game_audio_config.get("enabled"):
                         set_game_audio_capture_target(obs_client, game_audio_config["input_name"], name)
+                        apply_process_capture_sync_offset(
+                            obs_client, game_audio_config["input_name"],
+                            obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
+                        )
                 else:
                     obs_recovery_state["last_start_failure"] = now
                     logging.error("Could not get OBS ready to record; will keep retrying while %s runs.", exe or name)
@@ -3849,6 +4436,28 @@ def _run_config_editor(master_root, restart_callback, on_close):
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
+    configured_resolution = obs_config.get("recording_resolution") or OBS_RESOLUTION_OPTIONS[0]
+    if configured_resolution not in OBS_RESOLUTION_OPTIONS:
+        configured_resolution = OBS_RESOLUTION_OPTIONS[0]
+    recording_resolution_var = tk.StringVar(value=configured_resolution)
+    tk.Label(obs_tab, text="Recording resolution", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        obs_tab, textvariable=recording_resolution_var, values=OBS_RESOLUTION_OPTIONS,
+        state="readonly", width=24, style="Settings.TCombobox",
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    OBS's actual Output (Scaled) Resolution -- this is what a recording is really "
+            "encoded at, independent of the canvas size. A named preset keeps the canvas's own "
+            "aspect ratio."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
 
     ws_config = obs_config.get("websocket", {})
     add_section_label(obs_tab, row, "WebSocket")
@@ -3931,6 +4540,93 @@ def _run_config_editor(master_root, restart_callback, on_close):
     game_audio_input_var = tk.StringVar(value=game_audio_config.get("input_name", "Game Audio"))
     add_labeled_entry(obs_tab, row, "Input source name", game_audio_input_var)
     row += 1
+    process_capture_sync_offset_var = tk.StringVar(
+        value=str(obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS))
+    )
+    add_labeled_entry(obs_tab, row, "Audio capture sync offset (ms)", process_capture_sync_offset_var, width=10)
+    row += 1
+    calibrate_button = tk.Button(
+        obs_tab, text="Calibrate Audio Sync...", bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    )
+    calibrate_button.grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    Applied to Game Audio and every app capture below (Discord, Spotify, ...), never "
+            "to Desktop Audio -- confirmed live that OBS's per-process audio capture runs "
+            "noticeably behind plain device capture on Windows, which is audible as a "
+            "doubled/echoed sound in any player that mixes more than one track together "
+            "(Premiere, Discord's mobile app). The default is a reasonable starting point, but "
+            "the exact amount varies by machine; \"Calibrate Audio Sync\" "
+            "measures your own machine's real offset instead of guessing -- it briefly shows a "
+            "small player window and plays a short clicking sound while OBS records a ~25 second "
+            "test clip, so only run it while OBS is idle (not already recording something real)."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    def run_calibration_worker(ws_config, target_input):
+        client = connect_obs(ws_config, retries=1, delay=0)
+
+        def finish(result_ms, error_message):
+            calibrate_button.config(state="normal", text="Calibrate Audio Sync...")
+            if error_message:
+                messagebox.showwarning("Can't calibrate", error_message, parent=obs_tab)
+            elif result_ms is None:
+                messagebox.showwarning(
+                    "Calibration inconclusive",
+                    "Could not confidently measure the sync offset, so the current value was left "
+                    "unchanged. Make sure OBS is idle and ffplay.exe is installed alongside ffmpeg, "
+                    "then try again -- check the log for details.",
+                    parent=obs_tab,
+                )
+            else:
+                process_capture_sync_offset_var.set(str(result_ms))
+                messagebox.showinfo(
+                    "Calibration complete",
+                    f"Measured offset: {result_ms}ms. The field above has been updated -- click "
+                    "Save for it to take effect.",
+                    parent=obs_tab,
+                )
+
+        if not client:
+            obs_tab.after(0, finish, None, (
+                "Could not connect to OBS over its WebSocket using the settings above. Make sure "
+                "OBS is running and the host/port/password are correct, then try again."
+            ))
+            return
+        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+        if not ffmpeg_path:
+            client.disconnect()
+            obs_tab.after(0, finish, None, "ffmpeg isn't installed -- install it from Settings > Post-Processing first.")
+            return
+        try:
+            result_ms = run_audio_sync_calibration(client, ffmpeg_path, target_input)
+        finally:
+            client.disconnect()
+        obs_tab.after(0, finish, result_ms, None)
+
+    def start_calibration():
+        target_input = game_audio_input_var.get().strip() or "Game Audio"
+        proceed = messagebox.askyesno(
+            "Calibrate Audio Sync",
+            f"This measures '{target_input}'s real audio latency on this machine by briefly "
+            "showing a small player window and playing a short clicking sound while OBS records "
+            "a ~25 second test clip.\n\nMake sure OBS is idle (not already recording something "
+            "real) before continuing -- it refuses to run otherwise.\n\nContinue?",
+            parent=obs_tab,
+        )
+        if not proceed:
+            return
+        calibrate_button.config(state="disabled", text="Calibrating...")
+        threading.Thread(
+            target=run_calibration_worker, args=(get_current_ws_config(), target_input), daemon=True,
+        ).start()
+
+    calibrate_button.config(command=start_calibration)
 
     multi_track_config = obs_config.get("multi_track_audio", {})
     # Keyed by input name so re-running Quick Setup (or hand-editing tracks afterward) never
@@ -4291,6 +4987,65 @@ def _run_config_editor(master_root, restart_callback, on_close):
         clip_delete_original_var,
     )
     row += 1
+    configured_trim_mode = clip_editor_config.get("trim_mode", "precise")
+    if configured_trim_mode not in CLIP_EDITOR_TRIM_MODE_OPTIONS:
+        configured_trim_mode = "precise"
+    trim_mode_var = tk.StringVar(value=CLIP_EDITOR_TRIM_MODE_LABELS[configured_trim_mode])
+    tk.Label(clip_editor_tab, text="Trim mode", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        clip_editor_tab, textvariable=trim_mode_var, values=list(CLIP_EDITOR_TRIM_MODE_LABELS.values()),
+        state="readonly", width=36, style="Settings.TCombobox",
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Precise re-encodes, so it's slower, but the trimmed clip always starts cleanly. "
+            "Fast is a lossless, near-instant stream copy, but can leave a broken leading frame "
+            "at the cut point on some recordings -- confirmed to show up as a glitch in strict "
+            "players (VLC) even when more forgiving ones (Premiere) hide it. Most people want "
+            "Precise; Fast is here for when export speed genuinely matters more than that risk."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    clip_target_size_var = tk.StringVar(value=str(clip_editor_config.get("default_target_size_mb") or ""))
+    add_labeled_entry(clip_editor_tab, row, "Default target size (MB, blank = off)", clip_target_size_var, width=10)
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Pre-fills and pre-checks the editor's own \"Limit size to\" option with this "
+            "value (e.g. to fit a specific upload limit) -- still freely changeable per trim."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    configured_preview_quality = clip_editor_config.get("preview_quality", CLIP_EDITOR_DEFAULT_PREVIEW_QUALITY)
+    if configured_preview_quality not in CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS:
+        configured_preview_quality = CLIP_EDITOR_DEFAULT_PREVIEW_QUALITY
+    clip_preview_quality_var = tk.StringVar(value=configured_preview_quality)
+    tk.Label(clip_editor_tab, text="Default preview quality", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        clip_editor_tab, textvariable=clip_preview_quality_var, values=CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS,
+        state="readonly", width=28, style="Settings.TCombobox",
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Only affects the editor's own preview playback -- never the trimmed output, "
+            "which is always encoded separately by ffmpeg regardless of this. Lower settings "
+            "trade decode quality for smoother playback if the preview is stuttering; also "
+            "changeable per session from the editor's own \"Preview\" dropdown."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
     configured_default_format = clip_editor_config.get("default_output_format", CLIP_EDITOR_OUTPUT_FORMATS[0])
     if configured_default_format not in CLIP_EDITOR_OUTPUT_FORMATS:
         configured_default_format = CLIP_EDITOR_OUTPUT_FORMATS[0]
@@ -4535,6 +5290,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
             obs["recording_format"] = recording_format_value
         else:
             obs.pop("recording_format", None)
+        # Always written, even when left on "Match canvas" -- that's a real, active choice (set
+        # output = canvas resolution) rather than a "leave OBS's own value untouched" sentinel,
+        # unlike recording_format's blank-Entry default. Once Settings has been saved once, this
+        # is honored on every subsequent launch, same as every other field in this dialog.
+        obs["recording_resolution"] = recording_resolution_var.get()
 
         ws = obs.setdefault("websocket", {})
         ws["host"] = ws_host_var.get().strip() or "localhost"
@@ -4592,6 +5352,9 @@ def _run_config_editor(master_root, restart_callback, on_close):
         game_audio = obs.setdefault("game_audio_capture", {})
         game_audio["enabled"] = game_audio_enabled_var.get()
         game_audio["input_name"] = game_audio_input_var.get().strip() or "Game Audio"
+        obs["process_audio_capture_sync_offset_ms"] = read_int(
+            process_capture_sync_offset_var, "Audio capture sync offset", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS,
+        )
 
         multi_track_audio = obs.setdefault("multi_track_audio", {})
         multi_track_audio["enabled"] = multi_track_enabled_var.get()
@@ -4685,6 +5448,16 @@ def _run_config_editor(master_root, restart_callback, on_close):
         else:
             clip_editor.pop("output_folder", None)
         clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
+        clip_editor["trim_mode"] = CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL.get(trim_mode_var.get(), "precise")
+        if clip_target_size_var.get().strip():
+            target_size_value = read_float(clip_target_size_var, "Default target size", None)
+            if target_size_value is not None and target_size_value > 0:
+                clip_editor["default_target_size_mb"] = target_size_value
+            elif target_size_value is not None:
+                errors.append("'Default target size' must be a positive number of MB")
+        else:
+            clip_editor.pop("default_target_size_mb", None)
+        clip_editor["preview_quality"] = clip_preview_quality_var.get()
         clip_editor["default_output_format"] = clip_default_format_var.get()
         clip_editor["default_quality"] = clip_default_quality_var.get()
         clip_vlc_path_value = clip_vlc_path_var.get().strip()
@@ -4703,6 +5476,51 @@ def _run_config_editor(master_root, restart_callback, on_close):
         if not new_config.get("obs", {}).get("path"):
             status_label.config(text="'OBS executable path' is required")
             return
+
+        # Auto-calibrate the moment Game Audio Isolation is actually turned on (not on every
+        # save -- only the OFF -> ON transition), so the process-capture latency is already
+        # corrected the first time it would otherwise cause an audible doubling,
+        # without the user needing to know this measurement exists at all, let alone run it by
+        # hand. Synchronous (blocks the Settings window for ~25s) rather than a background
+        # thread deliberately: "Save and Restart" kills this process right after do_save
+        # returns, which would kill an async calibration thread mid-run before it could finish.
+        game_audio_just_enabled = (
+            new_config.get("obs", {}).get("game_audio_capture", {}).get("enabled")
+            and not config.get("obs", {}).get("game_audio_capture", {}).get("enabled")
+        )
+        if game_audio_just_enabled:
+            status_label.config(
+                fg="#f5a623",
+                text="Calibrating audio sync for Game Audio -- ~25s, plays a brief test sound...",
+            )
+            root.update_idletasks()
+            target_input = new_config["obs"]["game_audio_capture"].get("input_name") or "Game Audio"
+            client = connect_obs(get_current_ws_config(), retries=1, delay=0)
+            result_ms = None
+            if client:
+                ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+                if ffmpeg_path:
+                    try:
+                        result_ms = run_audio_sync_calibration(client, ffmpeg_path, target_input)
+                    finally:
+                        client.disconnect()
+                else:
+                    logging.warning("Could not auto-calibrate audio sync offset: ffmpeg isn't installed.")
+            else:
+                logging.warning("Could not auto-calibrate audio sync offset: OBS is not reachable.")
+            if result_ms is not None:
+                new_config["obs"]["process_audio_capture_sync_offset_ms"] = result_ms
+                process_capture_sync_offset_var.set(str(result_ms))
+                logging.info(
+                    "Auto-calibrated audio sync offset to %sms after enabling Game Audio Isolation.", result_ms,
+                )
+            else:
+                logging.warning(
+                    "Could not auto-calibrate audio sync offset after enabling Game Audio Isolation; "
+                    "using the configured default. Use \"Calibrate Audio Sync...\" to retry.",
+                )
+            status_label.config(fg="#ef4444", text="")
+
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(new_config, f, indent=4)
@@ -4747,6 +5565,16 @@ CLIP_EDITOR_OUTPUT_FORMATS = ["Same as source", ".mp4", ".mkv", ".mov", ".avi", 
 # can't rescale video at all -- get_quality_scale_height() below resolves the trade-off.
 CLIP_EDITOR_QUALITY_OPTIONS = ["Same as source", "1080p", "720p", "480p"]
 CLIP_EDITOR_QUALITY_HEIGHTS = {"1080p": 1080, "720p": 720, "480p": 480}
+# "trim_mode" internal values (stored in config) -- Precise is the default, applied whenever the
+# key is absent/unrecognized, since most people would rather wait slightly longer than risk the
+# broken-leading-frame glitch Fast (lossless stream copy) can leave at the cut point. Fast lives
+# only in Settings now, not as a per-trim choice in the editor itself, for exactly that reason.
+CLIP_EDITOR_TRIM_MODE_OPTIONS = ["precise", "fast"]
+CLIP_EDITOR_TRIM_MODE_LABELS = {
+    "precise": "Precise (recommended -- re-encodes, always starts cleanly)",
+    "fast": "Fast (stream copy -- quicker, may glitch at the cut point)",
+}
+CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL = {v: k for k, v in CLIP_EDITOR_TRIM_MODE_LABELS.items()}
 # The libx264 CRF used whenever a re-encode happens -- whether forced by "Precise", by a chosen
 # resolution, or both -- since resolution and encode quality are independent knobs and this app
 # only exposes the former; this is the same value build_trim_command always used for its one re-
@@ -4931,6 +5759,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     START_MARKER_COLOR = "#22c55e"
     END_MARKER_COLOR = "#ef4444"
     CHAPTER_MARKER_COLOR = "#3b82f6"
+    TEMP_TIMESTAMP_COLOR = "#e5e7eb"
     # Reused everywhere this window shows status text, so the editor doesn't mix these with a
     # second, uncoordinated red/green/gray palette -- success/error/warning always match the
     # timeline's own start/end/seeker colors, and secondary text always matches the ruler's gray.
@@ -5058,6 +5887,49 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     audio_track_combo.pack(side="right")
     tk.Label(open_row, text="Audio track:", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="right", padx=(0, 6))
 
+    configured_preview_quality = clip_editor_config.get("preview_quality", CLIP_EDITOR_DEFAULT_PREVIEW_QUALITY)
+    if configured_preview_quality not in CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS:
+        configured_preview_quality = CLIP_EDITOR_DEFAULT_PREVIEW_QUALITY
+    preview_quality_var = tk.StringVar(value=configured_preview_quality)
+    preview_quality_combo = ttk.Combobox(
+        open_row, textvariable=preview_quality_var, values=CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS,
+        state="readonly", width=24, style="ClipEditor.TCombobox",
+    )
+    preview_quality_combo.pack(side="right", padx=(0, 16))
+    tk.Label(open_row, text="Preview:", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="right", padx=(0, 6))
+
+    def on_preview_quality_selected(_event):
+        # Media options only take effect if set before set_media() -- changing this mid-playback
+        # can't be applied retroactively to the media object already handed to the player, so the
+        # only way to actually apply a new choice is to reopen the current file from scratch.
+        # load_file() always resets to 0 and pauses there (its own pause_once_playing logic), so
+        # both the previous position and play state have to be restored afterward once the newly
+        # reopened media has actually finished loading -- same retry-until-ready pattern that
+        # logic itself already uses, since there's no signal for "the new media is ready" besides
+        # polling for a real length.
+        if not state["path"]:
+            return
+        path = state["path"]
+        reopen_seconds = player.get_time() / 1000
+        was_playing = player.is_playing()
+        load_file(path)
+
+        def restore_position(attempts=0):
+            if not root.winfo_exists():
+                return
+            if player.get_length() > 0:
+                player.set_time(int(reopen_seconds * 1000))
+                if was_playing:
+                    player.play()
+                update_play_pause_icon()
+                draw_timeline()
+            elif attempts < 50:
+                root.after(100, lambda: restore_position(attempts + 1))
+
+        root.after(150, restore_position)
+
+    preview_quality_combo.bind("<<ComboboxSelected>>", on_preview_quality_selected)
+
     def refresh_audio_tracks():
         try:
             descriptions = player.audio_get_track_description()
@@ -5110,6 +5982,9 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     # instead of the full duration.
     view_state = {"start": 0.0, "end": 0.0, "initialized": False}
     pan_state = {"active": False, "start_x": 0, "start_view_start": 0.0}
+    # Set only when the Play button is actually pressed (see toggle_play_pause), never by a
+    # timeline click -- a click always just seeks and plays from there.
+    temp_timestamp_state = {"seconds": None}
 
     def reset_view():
         view_state["start"] = 0.0
@@ -5202,6 +6077,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                     mx - 5, TRACK_Y - 3, mx + 5, TRACK_Y - 3, mx, TRACK_Y - 10,
                     fill=CHAPTER_MARKER_COLOR, outline="",
                 )
+        if temp_timestamp_state["seconds"] is not None:
+            tx = seconds_to_canvas_x(temp_timestamp_state["seconds"])
+            if 0 <= tx <= width:
+                timeline_canvas.create_line(
+                    tx, 0, tx, TRACK_Y + 3, fill=TEMP_TIMESTAMP_COLOR, width=2, dash=(3, 2)
+                )
 
     def refresh_markers():
         # OBS chapter markers ("markers" in the app's own terminology) -- only ever present on a
@@ -5214,7 +6095,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             descriptions = None
         if descriptions is None:
             return
-        state["markers"] = sorted(d.time_offset / 1000 for d in descriptions)
+        # Confirmed live: OBS's own Hybrid MP4 output always carries an implicit chapter at
+        # time_offset 0 (named "Start") on top of any the user actually places -- not a real
+        # marker, just a container-format artifact every such recording has, so it's filtered
+        # out here rather than shown as a confusing phantom marker at the very start of a clip
+        # that never had "Add Marker" pressed at all.
+        state["markers"] = sorted(d.time_offset / 1000 for d in descriptions if d.time_offset > 0)
         state["markers_loaded"] = True
         draw_timeline()
 
@@ -5226,8 +6112,10 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
     def jump_to_marker(marker_seconds):
         duration = state["duration"] or 0.0
-        start_var.set(format_timestamp(max(0.0, marker_seconds - 30)))
+        start_seconds = max(0.0, marker_seconds - 30)
+        start_var.set(format_timestamp(start_seconds))
         end_var.set(format_timestamp(min(duration, marker_seconds + 5) if duration else marker_seconds + 5))
+        player.set_time(int(start_seconds * 1000))
         draw_timeline()
         status_label.config(
             fg=CHAPTER_MARKER_COLOR,
@@ -5240,12 +6128,76 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         player.set_time(int(canvas_x_to_seconds(x) * 1000))
         draw_timeline()
 
-    def on_timeline_click(x):
-        marker_seconds = find_marker_near_x(x) if state["duration"] else None
+    EDGE_HIT_TOLERANCE = 6
+
+    def find_edge_near_x(x):
+        # End is checked first -- on a short clip where Start and End sit close together,
+        # grabbing whichever handle is currently on top (End is drawn after Start) matches
+        # what the user would actually see under the cursor.
+        try:
+            end_x = seconds_to_canvas_x(parse_timestamp(end_var.get()))
+            if abs(end_x - x) <= EDGE_HIT_TOLERANCE:
+                return "end"
+        except ValueError:
+            pass
+        try:
+            start_x = seconds_to_canvas_x(parse_timestamp(start_var.get()))
+            if abs(start_x - x) <= EDGE_HIT_TOLERANCE:
+                return "start"
+        except ValueError:
+            pass
+        return None
+
+    drag_state = {"target": None}
+
+    def on_timeline_press(x):
+        drag_state["target"] = None
+        if not state["duration"]:
+            return
+        edge = find_edge_near_x(x)
+        if edge:
+            drag_state["target"] = edge
+            return
+        marker_seconds = find_marker_near_x(x)
         if marker_seconds is not None:
             jump_to_marker(marker_seconds)
-        else:
+            return
+        # Only while actually playing -- scrubbing through the timeline while paused (the normal
+        # way to find a point) needs every click to seek and show that frame immediately, same
+        # as always -- and now also starts playback from there, so a plain click always both
+        # seeks and plays. Marking a candidate point happens separately, only when Play is
+        # actually pressed (see toggle_play_pause).
+        drag_state["target"] = "seek"
+        seek_to_canvas_x(x)
+        player.play()
+        reclaim_focus_after_play()
+        update_play_pause_icon()
+
+    def on_timeline_drag(x):
+        target = drag_state["target"]
+        if target == "seek":
             seek_to_canvas_x(x)
+            return
+        if target not in ("start", "end"):
+            return
+        duration = state["duration"] or 0.0
+        seconds = canvas_x_to_seconds(x)
+        if target == "start":
+            try:
+                end_seconds = parse_timestamp(end_var.get())
+            except ValueError:
+                end_seconds = duration
+            start_var.set(format_timestamp(max(0.0, min(seconds, end_seconds))))
+        else:
+            try:
+                start_seconds = parse_timestamp(start_var.get())
+            except ValueError:
+                start_seconds = 0.0
+            end_var.set(format_timestamp(max(start_seconds, min(seconds, duration))))
+        draw_timeline()
+
+    def on_timeline_release(_x):
+        drag_state["target"] = None
 
     def zoom_view(factor, center_seconds):
         duration = state["duration"]
@@ -5267,6 +6219,23 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             return
         factor = 1.25 if event.delta > 0 else (1 / 1.25)
         zoom_view(factor, canvas_x_to_seconds(event.x))
+
+    def on_timeline_horizontal_wheel(event):
+        # A horizontal tilt-wheel/trackpad swipe reaches Tk as <Shift-MouseWheel> on Windows
+        # (and Shift+plain-wheel is the standard fallback for a mouse without one) -- pans the
+        # visible window instead of zooming, since zoom already owns the plain wheel.
+        duration = state["duration"]
+        if not duration:
+            return
+        span = view_state["end"] - view_state["start"]
+        if span <= 0:
+            return
+        step = span * 0.1
+        direction = -1 if event.delta > 0 else 1
+        new_start = max(0.0, min(view_state["start"] + direction * step, duration - span))
+        view_state["start"] = new_start
+        view_state["end"] = new_start + span
+        draw_timeline()
 
     def zoom_in_button():
         if not state["duration"]:
@@ -5319,12 +6288,14 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             view_state["start"] = new_start
             view_state["end"] = new_start + span
 
-    timeline_canvas.bind("<Button-1>", lambda event: on_timeline_click(event.x))
-    timeline_canvas.bind("<B1-Motion>", lambda event: seek_to_canvas_x(event.x))
+    timeline_canvas.bind("<Button-1>", lambda event: on_timeline_press(event.x))
+    timeline_canvas.bind("<B1-Motion>", lambda event: on_timeline_drag(event.x))
+    timeline_canvas.bind("<ButtonRelease-1>", on_timeline_release)
     timeline_canvas.bind("<Button-3>", on_pan_press)
     timeline_canvas.bind("<B3-Motion>", on_pan_drag)
     timeline_canvas.bind("<ButtonRelease-3>", on_pan_release)
     timeline_canvas.bind("<MouseWheel>", on_timeline_wheel)
+    timeline_canvas.bind("<Shift-MouseWheel>", on_timeline_horizontal_wheel)
     timeline_canvas.bind("<Configure>", lambda event: draw_timeline())
 
     # --- Controls row: zoom (left), transport (centered), volume (right) ---
@@ -5359,10 +6330,33 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         transport_buttons, "▶", TRANSPORT_BUTTON_WIDTH, TRANSPORT_BUTTON_HEIGHT, lambda: toggle_play_pause(),
     )
     play_pause_container.pack(side="left", padx=6)
+    stop_container, _ = fixed_size_button(
+        transport_buttons, "⏹", TRANSPORT_BUTTON_WIDTH, TRANSPORT_BUTTON_HEIGHT, lambda: stop_to_target(),
+    )
+    stop_container.pack(side="left")
     forward_container, _ = fixed_size_button(
         transport_buttons, "⏩", TRANSPORT_BUTTON_WIDTH, TRANSPORT_BUTTON_HEIGHT, lambda: seek_relative(5),
     )
-    forward_container.pack(side="left")
+    forward_container.pack(side="left", padx=(6, 0))
+
+    def stop_to_target():
+        # Priority: wherever the last timeline click left a temporary marker: else Start (the
+        # green marker, which is 0:00 by default on a freshly opened file, satisfying "go to the
+        # beginning of the clip" as the natural last resort without needing a separate check).
+        if not state["path"]:
+            return
+        if temp_timestamp_state["seconds"] is not None:
+            target = temp_timestamp_state["seconds"]
+        else:
+            try:
+                target = parse_timestamp(start_var.get())
+            except ValueError:
+                target = 0.0
+        if player.is_playing():
+            player.pause()
+        player.set_time(int(max(0.0, target) * 1000))
+        update_play_pause_icon()
+        draw_timeline()
 
     def update_play_pause_icon():
         play_pause_button.config(text="⏸" if player.is_playing() else "▶")
@@ -5396,13 +6390,6 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     tk.Entry(
         range_row, textvariable=end_var, width=14, bg=ENTRY_BG, fg=EDITOR_FG, insertbackground=EDITOR_FG,
     ).pack(side="left", padx=(4, 16))
-    precise_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(
-        range_row, text="Precise (slower, frame-accurate)", variable=precise_var,
-        bg=EDITOR_BG, fg=EDITOR_FG, activebackground=EDITOR_BG, activeforeground=EDITOR_FG,
-        selectcolor=ENTRY_BG,
-    ).pack(side="left")
-
     default_quality = clip_editor_config.get("default_quality", CLIP_EDITOR_QUALITY_OPTIONS[0])
     if default_quality not in CLIP_EDITOR_QUALITY_OPTIONS:
         default_quality = CLIP_EDITOR_QUALITY_OPTIONS[0]
@@ -5412,6 +6399,23 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         range_row, textvariable=quality_var, values=CLIP_EDITOR_QUALITY_OPTIONS, state="readonly", width=16,
         style="ClipEditor.TCombobox",
     ).pack(side="left", padx=(6, 0))
+
+    # Forces a re-encode targeting an explicit bitrate (see compute_target_video_bitrate_kbps)
+    # instead of CRF -- e.g. so a clip comes out under a specific upload-size limit. Settings'
+    # own default target size (if any) pre-fills and pre-checks this; still freely overridable
+    # per trim.
+    default_target_size = clip_editor_config.get("default_target_size_mb")
+    limit_size_var = tk.BooleanVar(value=bool(default_target_size))
+    target_size_var = tk.StringVar(value=str(default_target_size) if default_target_size else "")
+    tk.Checkbutton(
+        range_row, text="Limit size to", variable=limit_size_var,
+        bg=EDITOR_BG, fg=EDITOR_FG, activebackground=EDITOR_BG, activeforeground=EDITOR_FG,
+        selectcolor=ENTRY_BG,
+    ).pack(side="left", padx=(16, 0))
+    tk.Entry(
+        range_row, textvariable=target_size_var, width=6, bg=ENTRY_BG, fg=EDITOR_FG, insertbackground=EDITOR_FG,
+    ).pack(side="left", padx=(4, 4))
+    tk.Label(range_row, text="MB", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="left")
 
     start_var.trace_add("write", lambda *_args: draw_timeline())
     end_var.trace_add("write", lambda *_args: draw_timeline())
@@ -5462,9 +6466,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         release_file_lock()
         player.stop()
         media = instance.media_new(path)
+        for option in CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS.get(preview_quality_var.get(), []):
+            media.add_option(option)
         player.set_media(media)
         player.audio_set_volume(volume_var.get())
         player.play()
+        reclaim_focus_after_play()
         acquire_file_lock(path)
 
         # Pausing immediately after play() races VLC's own async open/buffer state -- called
@@ -5489,6 +6496,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         state["tracks_loaded"] = False
         state["markers"] = []
         state["markers_loaded"] = False
+        temp_timestamp_state["seconds"] = None
         view_state["initialized"] = False
         audio_track_ids.clear()
         audio_track_combo.set("")
@@ -5505,8 +6513,46 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         if player.is_playing():
             player.pause()
         else:
+            # Marks wherever playback is about to resume from as the candidate point Start/End
+            # pick up next -- the one deliberate moment ("I'm choosing to play from here") that
+            # actually means something, as opposed to every incidental timeline click.
+            temp_timestamp_state["seconds"] = player.get_time() / 1000
+            draw_timeline()
             player.play()
+            reclaim_focus_after_play()
         update_play_pause_icon()
+
+    # Space-bar play/pause is disabled for now -- three separate Tk-focus-chasing attempts and a
+    # low-level WH_KEYBOARD_LL hook (which also crashed the app when it called into Tk/VLC from
+    # inside the raw hook callback) all failed to reliably toggle playback once the embedded VLC
+    # video surface holds real Win32 keyboard focus. Use the on-screen play/pause button instead.
+
+    def reclaim_focus_now():
+        widget = root.focus_get()
+        if not isinstance(widget, (tk.Entry, ttk.Entry, ttk.Combobox)):
+            root.focus_set()
+
+    def reclaim_focus_on_click(_event):
+        # The video preview is embedded via a raw native HWND (set_hwnd), which Tk doesn't own
+        # at all -- once real Win32 keyboard focus lands there, <space> above never fires again,
+        # since the keystroke never reaches Tk's own event loop in the first place. Reclaiming on
+        # every left-click anywhere in the window (bound once here, at the toplevel, rather than
+        # on each individual button/canvas) covers clicking away from the video. This
+        # deliberately does NOT run on a timer: an earlier version re-forced focus every 200ms
+        # unconditionally, which visibly stuttered the video itself -- repeatedly yanking window
+        # focus while VLC's D3D11 hardware decoder is actively rendering is a well-known way to
+        # disrupt it.
+        reclaim_focus_now()
+
+    root.bind("<Button-1>", reclaim_focus_on_click, add="+")
+
+    def reclaim_focus_after_play():
+        # A click on the video itself was confirmed to steal focus even before this fix existed
+        # -- but libvlc's own player also appears to (re)grab it shortly after playback actually
+        # starts rendering, regardless of what triggered play(), which would silently undo an
+        # immediate reclaim done in the same call. One short delayed retry after every play()
+        # call specifically (not a repeating timer, so no risk of the stutter above) catches that.
+        root.after(150, reclaim_focus_now)
 
     def seek_relative(seconds):
         if not state["path"]:
@@ -5518,13 +6564,24 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         player.set_time(max(0, new_time))
         draw_timeline()
 
+    def consume_temp_timestamp():
+        # "Temporary": once Start or End actually uses it, it's gone -- otherwise a later,
+        # unrelated Start/End press would silently reuse a click from a while ago instead of
+        # falling back to the live playhead like it always used to.
+        seconds = temp_timestamp_state["seconds"]
+        if seconds is not None:
+            temp_timestamp_state["seconds"] = None
+            draw_timeline()
+            return seconds
+        return player.get_time() / 1000
+
     def set_start():
         if state["path"]:
-            start_var.set(format_timestamp(player.get_time() / 1000))
+            start_var.set(format_timestamp(consume_temp_timestamp()))
 
     def set_end():
         if state["path"]:
-            end_var.set(format_timestamp(player.get_time() / 1000))
+            end_var.set(format_timestamp(consume_temp_timestamp()))
 
     def do_trim():
         if not state["path"]:
@@ -5559,8 +6616,23 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             state["path"], clip_editor_config.get("output_folder") or None, output_ext=output_ext
         )
         delete_original = clip_editor_config.get("delete_original_after_trim", False)
-        precise = precise_var.get()
+        # Precise (re-encode) is the default -- a plain stream-copy ("Fast") trim can leave a
+        # broken leading frame at the cut point on OBS's open-GOP encodes (confirmed live: shows
+        # as a glitch in strict decoders like VLC, even though more forgiving ones like Premiere
+        # hide it). Most users would rather wait a bit longer than risk that, so Fast is now an
+        # opt-in default tucked into Settings instead of a per-trim choice in the editor itself.
+        precise = clip_editor_config.get("trim_mode", "precise") != "fast"
         scale_height = get_quality_scale_height(quality_var.get())
+        target_size_mb = None
+        if limit_size_var.get():
+            try:
+                target_size_mb = float(target_size_var.get())
+                if target_size_mb <= 0:
+                    raise ValueError("must be positive")
+            except ValueError:
+                logging.warning("Clip editor: could not start trim -- invalid target size %r.", target_size_var.get())
+                status_label.config(fg=END_MARKER_COLOR, text="Target size must be a positive number of MB.")
+                return
         source_path = state["path"]
 
         status_label.config(fg=MUTED_TEXT_COLOR, text=f"Trimming to {os.path.basename(output_path)}...")
@@ -5573,6 +6645,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 source_path, start_seconds, end_seconds, output_path, ffmpeg_path=ffmpeg_path,
                 precise=precise, delete_original=delete_original, icon=icon,
                 notifications_config=notifications_config, scale_height=scale_height,
+                target_size_mb=target_size_mb,
             )
 
             def finish():
@@ -5850,7 +6923,7 @@ def main():
             target=run_custom_keybind_listener,
             args=(
                 custom_keybinds, lambda: runtime_state.get("obs_client"), lambda: manual_split_buffer_seconds,
-                icon, config.get("notifications", {}),
+                icon, config.get("notifications", {}), status,
             ),
             daemon=True,
         )

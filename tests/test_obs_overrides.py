@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -147,6 +148,23 @@ class AddRecordingMarkerTests(unittest.TestCase):
             result = a.add_recording_marker(client)
         self.assertFalse(result)
         mock_notify.assert_not_called()
+
+    def test_success_flashes_the_tray_icon_when_icon_and_status_given(self):
+        # Same "something just happened" flash as a manual split or a replay-buffer save --
+        # there's no OBS event for a chapter being created, so this only fires from here.
+        client = FakeObsClient()
+        icon = unittest.mock.Mock()
+        status = {"recording": True}
+        before = time.time()
+        result = a.add_recording_marker(client, icon=icon, status=status)
+        self.assertTrue(result)
+        self.assertGreater(status.get("flash_until", 0), before)
+        self.assertIsInstance(icon.icon, a.Image.Image)  # build_tray_image() actually ran
+
+    def test_success_does_not_flash_without_icon_or_status(self):
+        client = FakeObsClient()
+        result = a.add_recording_marker(client)  # icon=None, status=None -- must not raise
+        self.assertTrue(result)
 
 
 class ApplyReplayBufferSettingsTests(unittest.TestCase):
@@ -316,6 +334,91 @@ class ActiveSessionMarkerTests(unittest.TestCase):
 
     def test_clear_does_not_raise_when_no_marker_exists(self):
         a.clear_active_session_marker()  # must not raise
+
+
+class ResolveRecordingResolutionTests(unittest.TestCase):
+    def test_match_canvas_returns_base_resolution_unchanged(self):
+        self.assertEqual(a.resolve_recording_resolution(1920, 1080, "Match canvas (no scaling)"), (1920, 1080))
+
+    def test_unrecognized_choice_falls_back_to_base_resolution(self):
+        self.assertEqual(a.resolve_recording_resolution(1920, 1080, "nonsense"), (1920, 1080))
+
+    def test_1080p_preset_keeps_canvas_aspect_ratio(self):
+        self.assertEqual(a.resolve_recording_resolution(1920, 1080, "1080p"), (1920, 1080))
+
+    def test_720p_preset_scales_width_from_canvas_aspect_ratio(self):
+        self.assertEqual(a.resolve_recording_resolution(1920, 1080, "720p"), (1280, 720))
+
+    def test_ultrawide_canvas_still_rounds_width_to_even(self):
+        # 3440x1440 at height 720 -> width 1720.0 exactly, but exercised with a canvas whose
+        # ratio doesn't divide evenly to confirm the even-rounding actually does something.
+        width, height = a.resolve_recording_resolution(3441, 1440, "720p")
+        self.assertEqual(height, 720)
+        self.assertEqual(width % 2, 0)
+
+
+class ApplyRecordingResolutionTests(unittest.TestCase):
+    def test_no_configured_choice_does_not_touch_video_settings(self):
+        client = FakeObsClient()
+        a.apply_recording_resolution(client, {})
+        self.assertNotIn("set_video_settings", [c[0] for c in client.calls])
+
+    def test_changes_output_resolution_when_different_from_target(self):
+        client = FakeObsClient()  # base/output default to 1920x1080
+        a.apply_recording_resolution(client, {"recording_resolution": "720p"})
+        calls = [c for c in client.calls if c[0] == "set_video_settings"]
+        self.assertEqual(len(calls), 1)
+        video = client.get_video_settings()
+        self.assertEqual((video.output_width, video.output_height), (1280, 720))
+        # base resolution and fps must be left untouched
+        self.assertEqual((video.base_width, video.base_height), (1920, 1080))
+
+    def test_no_write_when_already_at_the_target_resolution(self):
+        client = FakeObsClient()
+        client.set_video_settings(60, 1, 1920, 1080, 1280, 720)
+        client.calls.clear()
+        a.apply_recording_resolution(client, {"recording_resolution": "720p"})
+        self.assertNotIn("set_video_settings", [c[0] for c in client.calls])
+
+    def test_match_canvas_actively_undoes_an_existing_downscale(self):
+        # This is the whole point of the "Match canvas" option -- fixing exactly the "my
+        # recording came out smaller than the canvas" problem it was added for, not just being
+        # a synonym for "leave whatever OBS already has".
+        client = FakeObsClient()
+        client.set_video_settings(60, 1, 1920, 1080, 1280, 720)
+        client.calls.clear()
+        a.apply_recording_resolution(client, {"recording_resolution": "Match canvas (no scaling)"})
+        video = client.get_video_settings()
+        self.assertEqual((video.output_width, video.output_height), (1920, 1080))
+
+    def test_client_error_is_logged_not_raised(self):
+        client = FakeObsClient()
+
+        def raise_error(*_args):
+            raise RuntimeError("boom")
+
+        client.set_video_settings = raise_error
+        with self.assertLogs(level="ERROR"):
+            a.apply_recording_resolution(client, {"recording_resolution": "720p"})  # must not raise
+
+
+class ApplyProcessCaptureSyncOffsetTests(unittest.TestCase):
+    def test_sets_offset_when_different(self):
+        client = FakeObsClient(inputs={"Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}}})
+        a.apply_process_capture_sync_offset(client, "Game Audio", -55)
+        self.assertIn(("set_input_audio_sync_offset", "Game Audio", -55), client.calls)
+        self.assertEqual(client.get_input_audio_sync_offset("Game Audio").input_audio_sync_offset, -55)
+
+    def test_no_write_when_already_correct(self):
+        client = FakeObsClient(inputs={"Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}}})
+        client.inputs["Game Audio"]["sync_offset"] = -55
+        a.apply_process_capture_sync_offset(client, "Game Audio", -55)
+        self.assertNotIn("set_input_audio_sync_offset", [c[0] for c in client.calls])
+
+    def test_missing_input_is_logged_not_raised(self):
+        client = FakeObsClient()
+        with self.assertLogs(level="WARNING"):
+            a.apply_process_capture_sync_offset(client, "Nonexistent", -55)  # must not raise
 
 
 if __name__ == "__main__":

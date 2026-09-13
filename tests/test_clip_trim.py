@@ -93,6 +93,41 @@ class BuildTrimCommandTests(unittest.TestCase):
         cmd = a.build_trim_command("ffmpeg", "in.mkv", 0, 5, "out.mkv")
         self.assertEqual(cmd[-1], "out.mkv")
 
+    def test_maps_only_video_and_audio_not_every_stream(self):
+        # "-map 0" would also stream-copy OBS's own chapter-marker metadata track -- confirmed
+        # live that its internal timestamps can't be rebased by a plain copy, producing a wildly
+        # wrong duration on that track that's very likely what made VLC misreport the trimmed
+        # clip's overall length.
+        cmd = a.build_trim_command("ffmpeg", "in.mp4", 5, 10, "out.mp4", precise=False)
+        map_targets = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-map"]
+        self.assertEqual(sorted(map_targets), ["0:a", "0:v"])
+
+    def test_precise_mode_also_maps_only_video_and_audio(self):
+        cmd = a.build_trim_command("ffmpeg", "in.mp4", 5, 10, "out.mp4", precise=True)
+        map_targets = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-map"]
+        self.assertEqual(sorted(map_targets), ["0:a", "0:v"])
+
+    def test_fast_mode_moves_moov_atom_to_front(self):
+        # Needed for reliable playback in browsers/embedded web players (e.g. Discord's inline
+        # preview) -- confirmed live that a plain stream-copy trim without this could play fine
+        # in VLC but still misbehave there.
+        cmd = a.build_trim_command("ffmpeg", "in.mp4", 5, 10, "out.mp4", precise=False)
+        self.assertEqual(cmd[cmd.index("-movflags") + 1], "+faststart")
+        self.assertEqual(cmd[-1], "out.mp4")
+
+    def test_reencode_modes_also_move_moov_atom_to_front(self):
+        cmd = a.build_trim_command("ffmpeg", "in.mp4", 5, 10, "out.mp4", precise=True, crf=20)
+        self.assertEqual(cmd[cmd.index("-movflags") + 1], "+faststart")
+        self.assertEqual(cmd[-1], "out.mp4")
+
+    def test_never_produces_bitrate_targeting_flags(self):
+        # A target output size needs a fundamentally different (two-pass) command shape to hit
+        # accurately -- build_trim_command itself never takes a size target at all anymore; see
+        # BuildTwoPassSizeTargetedCommandsTests below.
+        cmd = a.build_trim_command("ffmpeg", "in.mp4", 0, 10, "out.mp4", precise=True)
+        self.assertNotIn("-b:v", cmd)
+        self.assertNotIn("-maxrate", cmd)
+
     def test_uses_configured_ffmpeg_path(self):
         cmd = a.build_trim_command(r"C:\custom\ffmpeg.exe", "in.mkv", 0, 5, "out.mkv")
         self.assertEqual(cmd[0], r"C:\custom\ffmpeg.exe")
@@ -147,6 +182,75 @@ class BuildTrimCommandTests(unittest.TestCase):
     def test_no_scale_height_omits_vf_flag(self):
         cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=True)
         self.assertNotIn("-vf", cmd)
+
+
+class BuildTwoPassSizeTargetedCommandsTests(unittest.TestCase):
+    def test_pass1_analyzes_video_only_and_discards_output(self):
+        pass1, _pass2 = a.build_two_pass_size_targeted_commands(
+            "ffmpeg", "in.mp4", 0, 10, "out.mp4", target_size_mb=5, passlog_prefix="prefix",
+        )
+        self.assertIn("-an", pass1)
+        self.assertEqual(pass1[pass1.index("-pass") + 1], "1")
+        self.assertNotIn("out.mp4", pass1)
+        map_targets = [pass1[i + 1] for i, arg in enumerate(pass1) if arg == "-map"]
+        self.assertEqual(map_targets, ["0:v"])
+
+    def test_pass2_encodes_video_and_audio_to_the_real_output(self):
+        _pass1, pass2 = a.build_two_pass_size_targeted_commands(
+            "ffmpeg", "in.mp4", 0, 10, "out.mp4", target_size_mb=5, passlog_prefix="prefix",
+        )
+        self.assertEqual(pass2[pass2.index("-pass") + 1], "2")
+        self.assertEqual(pass2[-1], "out.mp4")
+        # Only the first audio track -- confirmed live that including every track on a
+        # multi-track recording blows the size target way past what the bitrate math accounts
+        # for (each extra track adds its own ~128 kbps on top of the single-track budget).
+        map_targets = [pass2[i + 1] for i, arg in enumerate(pass2) if arg == "-map"]
+        self.assertEqual(sorted(map_targets), ["0:a:0", "0:v"])
+        self.assertEqual(pass2[pass2.index("-movflags") + 1], "+faststart")
+
+    def test_both_passes_use_the_same_bitrate_and_passlog(self):
+        pass1, pass2 = a.build_two_pass_size_targeted_commands(
+            "ffmpeg", "in.mp4", 0, 10, "out.mp4", target_size_mb=5, passlog_prefix="myprefix",
+        )
+        self.assertEqual(pass1[pass1.index("-b:v") + 1], pass2[pass2.index("-b:v") + 1])
+        self.assertEqual(pass1[pass1.index("-passlogfile") + 1], "myprefix")
+        self.assertEqual(pass2[pass2.index("-passlogfile") + 1], "myprefix")
+
+    def test_both_passes_seek_after_input_for_frame_accuracy(self):
+        pass1, pass2 = a.build_two_pass_size_targeted_commands(
+            "ffmpeg", "in.mp4", 5, 10, "out.mp4", target_size_mb=5, passlog_prefix="prefix",
+        )
+        for cmd in (pass1, pass2):
+            self.assertGreater(cmd.index("-ss"), cmd.index("-i"))
+
+    def test_scale_height_applies_to_both_passes(self):
+        pass1, pass2 = a.build_two_pass_size_targeted_commands(
+            "ffmpeg", "in.mp4", 0, 10, "out.mp4", target_size_mb=5, scale_height=720, passlog_prefix="prefix",
+        )
+        for cmd in (pass1, pass2):
+            self.assertEqual(cmd[cmd.index("-vf") + 1], "scale=-2:720")
+
+
+class ComputeTargetVideoBitrateKbpsTests(unittest.TestCase):
+    def test_none_target_returns_none(self):
+        self.assertIsNone(a.compute_target_video_bitrate_kbps(60, None))
+
+    def test_zero_or_negative_duration_returns_none(self):
+        self.assertIsNone(a.compute_target_video_bitrate_kbps(0, 10))
+        self.assertIsNone(a.compute_target_video_bitrate_kbps(-5, 10))
+
+    def test_computes_a_sane_bitrate_for_a_typical_clip(self):
+        # 10 MB over 60s, minus the fixed 128 kbps audio share -- should land in a plausible
+        # video-bitrate range, comfortably under a pure (no-margin, no-audio) estimate.
+        kbps = a.compute_target_video_bitrate_kbps(60, 10)
+        naive_estimate = 10 * 8192 / 60
+        self.assertLess(kbps, naive_estimate)
+        self.assertGreater(kbps, 0)
+
+    def test_returns_none_when_budget_is_smaller_than_audio_alone(self):
+        # A tiny target size over a long duration leaves no room for video at all once audio's
+        # fixed share is subtracted -- must not return a zero or negative bitrate.
+        self.assertIsNone(a.compute_target_video_bitrate_kbps(3600, 1))
 
 
 class GetQualityScaleHeightTests(unittest.TestCase):
@@ -290,6 +394,46 @@ class TrimClipTests(unittest.TestCase):
                 with self.assertLogs(level="ERROR"):
                     result = a.trim_clip(src, 0, 5, out)  # must not raise
             self.assertFalse(result)
+
+    def test_target_size_runs_two_passes_and_cleans_up_passlog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.mp4")
+            open(src, "w").close()
+            out = os.path.join(tmp, "out.mp4")
+            calls = []
+
+            def run(cmd, capture_output, text, creationflags):
+                calls.append(cmd)
+                if cmd[-1] != "NUL":
+                    with open(cmd[-1], "wb") as f:
+                        f.write(b"data")
+                return type("Result", (), {"returncode": 0, "stderr": ""})()
+
+            with patch.object(a.subprocess, "run", side_effect=run):
+                result = a.trim_clip(src, 0, 5, out, target_size_mb=5)
+            self.assertTrue(result)
+            self.assertEqual(len(calls), 2)
+            self.assertIn("-an", calls[0])  # pass 1 is video-only
+            self.assertEqual(calls[1][-1], out)  # pass 2 writes the real output
+            passlog_prefix = calls[0][calls[0].index("-passlogfile") + 1]
+            self.assertFalse(os.path.exists(passlog_prefix + "-0.log"))
+
+    def test_target_size_pass1_failure_stops_before_pass2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.mp4")
+            open(src, "w").close()
+            out = os.path.join(tmp, "out.mp4")
+            calls = []
+
+            def run(cmd, capture_output, text, creationflags):
+                calls.append(cmd)
+                return type("Result", (), {"returncode": 1, "stderr": "boom"})()
+
+            with patch.object(a.subprocess, "run", side_effect=run):
+                with self.assertLogs(level="ERROR"):
+                    result = a.trim_clip(src, 0, 5, out, target_size_mb=5)
+            self.assertFalse(result)
+            self.assertEqual(len(calls), 1)  # never reached pass 2
 
 
 class IsFileBeingRecordedTests(unittest.TestCase):

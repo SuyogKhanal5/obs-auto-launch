@@ -34,6 +34,7 @@ class FakeObsClient:
         # name -> {"kind": str, "tracks": {"1": bool, ..., "6": bool}}
         self.inputs = inputs or {}
         self.calls = []
+        self.recording_active = False
 
     def _profile(self):
         return self.profiles[self.current_profile]
@@ -115,6 +116,24 @@ class FakeObsClient:
             raise FakeObsError(f"No source was found by the name of `{name}`")
         self.inputs[name]["tracks"] = dict(track)
         self.calls.append(("set_input_audio_tracks", name, dict(track)))
+
+    def get_input_audio_sync_offset(self, name):
+        if name not in self.inputs:
+            raise OBSSDKRequestError(
+                "GetInputAudioSyncOffset", RESOURCE_NOT_FOUND_CODE, f"No source was found by the name of `{name}`"
+            )
+        return SimpleNamespace(input_audio_sync_offset=self.inputs[name].get("sync_offset", 0))
+
+    def get_record_status(self):
+        return SimpleNamespace(output_active=self.recording_active)
+
+    def set_input_audio_sync_offset(self, name, offset):
+        if name not in self.inputs:
+            raise OBSSDKRequestError(
+                "SetInputAudioSyncOffset", RESOURCE_NOT_FOUND_CODE, f"No source was found by the name of `{name}`"
+            )
+        self.inputs[name]["sync_offset"] = offset
+        self.calls.append(("set_input_audio_sync_offset", name, offset))
 
     def get_input_settings(self, name):
         if name not in self.inputs:
