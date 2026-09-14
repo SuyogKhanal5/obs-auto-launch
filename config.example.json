@@ -89,8 +89,17 @@
         "suffix": "_compressed",
         "delete_original": false
     },
+    "audio_sync_shift": {
+        "enabled": false,
+        "ffmpeg_path": "ffmpeg",
+        "tracks": [],
+        "shift_ms": 0,
+        "suffix": "_synced",
+        "delete_original": false
+    },
     "clip_editor": {
         "output_folder": "",
+        "output_suffix": "_trimmed",
         "delete_original_after_trim": false,
         "trim_mode": "precise",
         "default_output_format": "Same as source",

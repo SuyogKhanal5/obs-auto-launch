@@ -33,6 +33,130 @@ class NormalizeTrackEntriesTests(unittest.TestCase):
         self.assertEqual(a.normalize_track_entries([]), [])
 
 
+class ComputeProcessCaptureTracksTests(unittest.TestCase):
+    def test_returns_empty_when_multi_track_disabled_or_missing(self):
+        self.assertEqual(a.compute_process_capture_tracks({}), [])
+        self.assertEqual(a.compute_process_capture_tracks({"multi_track_audio": {}}), [])
+
+    def test_game_audio_track_included_when_enabled(self):
+        obs_config = {
+            "game_audio_capture": {"enabled": True, "input_name": "Game Audio"},
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Desktop Audio", "track": 1},
+                    {"input_name": "Game Audio", "track": 3},
+                ],
+            },
+        }
+        self.assertEqual(a.compute_process_capture_tracks(obs_config), [3])
+
+    def test_game_audio_track_excluded_when_isolation_disabled(self):
+        obs_config = {
+            "game_audio_capture": {"enabled": False, "input_name": "Game Audio"},
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Desktop Audio", "track": 1},
+                    {"input_name": "Game Audio", "track": 3},
+                ],
+            },
+        }
+        self.assertEqual(a.compute_process_capture_tracks(obs_config), [])
+
+    def test_app_captures_included_regardless_of_game_audio(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Desktop Audio", "track": 1},
+                    {"input_name": "Discord", "track": 4},
+                    {"input_name": "Spotify", "track": 5},
+                ],
+                "app_captures": [
+                    {"input_name": "Discord", "process_name": "Discord.exe"},
+                    {"input_name": "Spotify", "process_name": "Spotify.exe"},
+                ],
+            },
+        }
+        self.assertEqual(a.compute_process_capture_tracks(obs_config), [4, 5])
+
+    def test_desktop_audio_never_included_even_if_misconfigured_as_app_capture(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [{"input_name": "Desktop Audio", "track": 1}],
+                "app_captures": [],
+            },
+        }
+        self.assertEqual(a.compute_process_capture_tracks(obs_config), [])
+
+    def test_result_is_sorted_and_deduplicated(self):
+        obs_config = {
+            "game_audio_capture": {"enabled": True, "input_name": "Game Audio"},
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Discord", "track": 5},
+                    {"input_name": "Game Audio", "track": 3},
+                ],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord.exe"}],
+            },
+        }
+        self.assertEqual(a.compute_process_capture_tracks(obs_config), [3, 5])
+
+    def test_defaults_game_audio_input_name_when_missing(self):
+        obs_config = {
+            "game_audio_capture": {"enabled": True},
+            "multi_track_audio": {"tracks": [{"input_name": "Game Audio", "track": 3}]},
+        }
+        self.assertEqual(a.compute_process_capture_tracks(obs_config), [3])
+
+
+class ComputeReferenceTrackTests(unittest.TestCase):
+    def test_finds_desktop_audio_track(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Desktop Audio", "track": 2},
+                    {"input_name": "Game Audio", "track": 3},
+                ],
+            },
+        }
+        self.assertEqual(a.compute_reference_track(obs_config), 2)
+
+    def test_returns_none_when_not_configured(self):
+        self.assertIsNone(a.compute_reference_track({}))
+        self.assertIsNone(a.compute_reference_track({"multi_track_audio": {"tracks": []}}))
+
+    def test_custom_reference_input_name(self):
+        obs_config = {"multi_track_audio": {"tracks": [{"input_name": "Line In", "track": 4}]}}
+        self.assertEqual(a.compute_reference_track(obs_config, reference_input_name="Line In"), 4)
+
+
+class TrackNameHintsTests(unittest.TestCase):
+    def test_maps_track_numbers_to_input_names(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Desktop Audio", "track": 1},
+                    {"input_name": "Game Audio", "track": 3},
+                ],
+            },
+        }
+        self.assertEqual(a.track_name_hints(obs_config), {1: "Desktop Audio", 3: "Game Audio"})
+
+    def test_multiple_inputs_sharing_a_track_are_joined(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Desktop Audio", "track": 1},
+                    {"input_name": "Scarlet", "track": 1},
+                ],
+            },
+        }
+        self.assertEqual(a.track_name_hints(obs_config), {1: "Desktop Audio+Scarlet"})
+
+    def test_returns_empty_when_not_configured(self):
+        self.assertEqual(a.track_name_hints({}), {})
+        self.assertEqual(a.track_name_hints({"multi_track_audio": {"tracks": []}}), {})
+
+
 class ApplyMultiTrackRoutingTests(unittest.TestCase):
     def setUp(self):
         self.client = FakeObsClient(inputs={

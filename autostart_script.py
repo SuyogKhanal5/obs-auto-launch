@@ -613,6 +613,14 @@ def maybe_transcode(path, transcode_config, icon=None, notifications_config=None
         ).start()
 
 
+def maybe_apply_audio_sync_shift(path, audio_sync_shift_config, icon=None, notifications_config=None):
+    if audio_sync_shift_config.get("enabled") and path:
+        threading.Thread(
+            target=apply_audio_sync_shift, args=(path, audio_sync_shift_config, icon, notifications_config),
+            daemon=True,
+        ).start()
+
+
 def is_event_client_connected(event_client):
     """Best-effort liveness check for an obsws_python EventClient -- e.g. OBS was closed while
     the idle audio-mixer connection was open, silently dropping the socket. Used to decide
@@ -630,6 +638,7 @@ def connect_obs_events(config, icon, status, audio_state, recording_state):
     auto_split_config = config["obs"].get("auto_split", {})
     silent_config = config.get("cleanup", {}).get("flag_silent_recordings", {})
     transcode_config = config.get("post_record_transcode", {})
+    audio_sync_shift_config = config.get("audio_sync_shift", {})
     notifications_config = config.get("notifications", {})
     subfolders_enabled = config.get("organize_into_game_subfolders", False)
 
@@ -690,6 +699,7 @@ def connect_obs_events(config, icon, status, audio_state, recording_state):
         if finalized_path:
             recording_state.setdefault("segment_files", []).append(finalized_path)
             maybe_transcode(finalized_path, transcode_config)
+            maybe_apply_audio_sync_shift(finalized_path, audio_sync_shift_config)
 
         recording_state["current_path"] = new_path
         recording_state["segment_start_time"] = time.time()
@@ -717,6 +727,7 @@ def connect_obs_events(config, icon, status, audio_state, recording_state):
         )
         if finalized_path:
             maybe_transcode(finalized_path, transcode_config)
+            maybe_apply_audio_sync_shift(finalized_path, audio_sync_shift_config)
 
         def revert():
             icon.icon = build_tray_image(current_color(status))
@@ -973,6 +984,54 @@ def apply_process_capture_sync_offset(client, input_name, offset_ms):
         logging.warning("Could not set sync offset for audio input '%s': %s", input_name, exc)
 
 
+def compute_process_capture_tracks(obs_config):
+    """Returns the sorted list of OBS track numbers (1-6) currently routed to a
+    wasapi_process_output_capture input -- Game Audio (if game_audio_capture.enabled) and every
+    multi_track_audio.app_captures entry -- the same set apply_process_capture_sync_offset
+    already corrects live at record time. Lets the clip editor's "Fix audio track sync" checkbox
+    know which tracks are worth measuring/shifting without the user needing to look up or type in
+    track numbers themselves. Returns [] if multi-track audio isn't set up (or none of its
+    entries are actually process-capture inputs) -- there's nothing to shift in that case."""
+    multi_track_config = obs_config.get("multi_track_audio", {})
+    entries = normalize_track_entries(multi_track_config.get("tracks"))
+    if not entries:
+        return []
+    process_capture_names = {
+        app.get("input_name") for app in multi_track_config.get("app_captures", []) if app.get("input_name")
+    }
+    game_audio_config = obs_config.get("game_audio_capture", {})
+    if game_audio_config.get("enabled"):
+        process_capture_names.add(game_audio_config.get("input_name") or "Game Audio")
+    return sorted({track for name, track in entries if name in process_capture_names})
+
+
+def compute_reference_track(obs_config, reference_input_name="Desktop Audio"):
+    """Returns the OBS track number reference_input_name is routed to in
+    obs.multi_track_audio.tracks, or None if it isn't configured there at all -- the same
+    reference run_audio_sync_calibration and apply_process_capture_sync_offset already correct
+    every process-capture input against. Used to know which track in an existing clip actually
+    holds the "ground truth" audio to measure a process-capture track's real lag against."""
+    entries = normalize_track_entries(obs_config.get("multi_track_audio", {}).get("tracks"))
+    for name, track in entries:
+        if name == reference_input_name:
+            return track
+    return None
+
+
+def track_name_hints(obs_config):
+    """Returns {track_number: "Name1+Name2"} from obs.multi_track_audio.tracks -- purely a
+    display hint for the clip editor's Track Routing dialog, so its column headers can show
+    "3 (Game Audio)" instead of a bare, meaningless track number when this app's own config
+    happens to explain what's routed there. Multiple input names sharing one track number (OBS
+    lets several inputs mix into the same track) are joined with "+". Returns {} if
+    multi_track_audio isn't configured at all -- the dialog just shows bare numbers then."""
+    entries = normalize_track_entries(obs_config.get("multi_track_audio", {}).get("tracks"))
+    names_by_track = {}
+    for name, track in entries:
+        names_by_track.setdefault(track, []).append(name)
+    return {track: "+".join(names) for track, names in names_by_track.items()}
+
+
 CALIBRATION_TONE_SAMPLE_RATE = 48000
 CALIBRATION_TONE_DURATION_SECONDS = 20.0
 # Confirmed live that real background/ambient noise (Desktop Audio alone can pick up plenty of
@@ -1148,6 +1207,343 @@ def measure_audio_lag_ms(reference_wav_path, target_wav_path):
         lags_ms.append(lag_samples * 1000.0 / sr)
     lags_ms.sort()
     return lags_ms[len(lags_ms) // 2]
+
+
+WAVEFORM_LAG_MIN_CONFIDENCE = 0.05
+WAVEFORM_LAG_CHUNK_SECONDS = 6.0
+WAVEFORM_LAG_MIN_CHUNKS_FOR_MAJORITY_CHECK = 3
+WAVEFORM_LAG_AGREEMENT_TOLERANCE_MS = 8.0
+
+
+def measure_waveform_lag_ms(reference_wav_path, target_wav_path, max_expected_lag_ms=150, label=""):
+    """Measures how many ms the audio in target_wav_path lags behind reference_wav_path via
+    FFT cross-correlation. Unlike measure_audio_lag_ms (built specifically for the calibration
+    tone's isolated, sparse clicks), this works on ordinary continuous real audio content -- e.g.
+    the clip editor's "Fix audio track sync" measuring an actual already-recorded clip directly,
+    rather than trusting a fixed pre-calibrated offset that might not exactly match this
+    particular clip. Works because Desktop Audio (device capture, picks up the full system mix)
+    and an isolated process-capture track (Game Audio, Discord, ...) both contain the SAME
+    underlying game/app sound, just via two different capture paths -- correlating them recovers
+    the real delay between those two paths directly from the clip's own audio.
+
+    FFT-based rather than np.correlate(..., mode="full") -- confirmed earlier this session that
+    direct full-mode correlation hangs for minutes on arrays in the ~480,000-sample range this
+    deals with; FFT correlation is the standard, far faster equivalent.
+
+    Confidence is a chunk's peak normalized correlation score (peak / (||ref|| * ||target||),
+    the audio equivalent of a Pearson correlation coefficient for the best-aligned overlap)
+    rather than a fixed multiple of the correlation's own noise floor -- confirmed empirically
+    that the latter gives false-positive "confident" matches on two genuinely UNRELATED signals
+    purely by chance (a wide search window makes some random peak clearing "3x the noise floor"
+    likely). Real matching content scores far above WAVEFORM_LAG_MIN_CONFIDENCE even under heavy
+    independent capture noise on each side; unrelated signals hover near the ~1/sqrt(N) floor
+    random noise produces, confirmed via direct testing to stay roughly an order of magnitude
+    below that threshold.
+
+    A single confidently-scored correlation over a long window isn't enough on its own, though --
+    confirmed live against a real recording that one ~30s window can score a HIGHER confidence at
+    a spurious, physically-implausible lag (a menu/loading moment with only sporadic matching
+    content) than a genuinely correct ~30s window elsewhere in the very same file scores at the
+    real lag. Splitting the signal into WAVEFORM_LAG_CHUNK_SECONDS-long pieces, measuring each
+    independently, and requiring a majority of the confident ones to agree within
+    WAVEFORM_LAG_AGREEMENT_TOLERANCE_MS of their median (confirmed empirically: correct chunks
+    from the same real recording landed within a fraction of a ms of each other, while a
+    chunk-batch with no real consensus scattered tens of ms apart) is what actually catches that
+    -- the same "redundant measurements + agreement, not one single shot" lesson this session's
+    audio-sync calibration work already learned the hard way. Signals too short to split into at
+    least WAVEFORM_LAG_MIN_CHUNKS_FOR_MAJORITY_CHECK chunks fall back to one whole-signal
+    measurement instead, since there's nothing to cross-check in that case anyway.
+
+    Returns None if either signal is at or near silence, no chunk's best match within
+    +/- max_expected_lag_ms clears the confidence bar, or (for long-enough signals) the confident
+    chunks don't actually agree with each other -- i.e. the two tracks don't appear to share
+    reliably-alignable content, so trusting a "measured" lag here would be worse than not
+    measuring at all."""
+    import wave
+    import numpy as np
+
+    # Logged at INFO (not DEBUG) unconditionally -- confirmed live that a real in-app "Fix audio
+    # track sync" run can return an empty/no-confidence result on a file+window where the exact
+    # same extracted audio, measured standalone, comes back confident. Without this, there was no
+    # way to tell WHY a specific real run failed (short of re-running it outside the app and
+    # hoping the same result reproduces) -- these lines are the difference between guessing and
+    # actually seeing the per-chunk scores/lags for the run that failed.
+    tag = f" [{label}]" if label else ""
+
+    def load_mono(path):
+        with wave.open(path, "rb") as f:
+            sr = f.getframerate()
+            n = f.getnframes()
+            ch = f.getnchannels()
+            data = np.frombuffer(f.readframes(n), dtype=np.int16).astype(np.float64)
+            if ch > 1:
+                data = data.reshape(-1, ch).mean(axis=1)
+            return data, sr
+
+    def measure_segment(ref_seg, target_seg, sr):
+        n = len(ref_seg)
+        ref_seg = ref_seg - ref_seg.mean()
+        target_seg = target_seg - target_seg.mean()
+        ref_norm = float(np.sqrt(np.sum(ref_seg ** 2)))
+        target_norm = float(np.sqrt(np.sum(target_seg ** 2)))
+        if ref_norm <= 1e-9 or target_norm <= 1e-9:
+            return None, None  # this segment is effectively silent on one side
+        max_lag_samples = int(max_expected_lag_ms * sr / 1000)
+        fft_size = 1
+        while fft_size < 2 * n:
+            fft_size *= 2
+        ref_f = np.fft.rfft(ref_seg, fft_size)
+        target_f = np.fft.rfft(target_seg, fft_size)
+        corr = np.fft.irfft(ref_f * np.conj(target_f), fft_size)
+        lags = np.concatenate([np.arange(0, max_lag_samples + 1), np.arange(-max_lag_samples, 0)])
+        scores = corr[lags]
+        best_idx = int(np.argmax(scores))
+        best_lag_samples = int(lags[best_idx])
+        normalized_peak = float(scores[best_idx] / (ref_norm * target_norm))
+        # corr[k] = sum_n ref[n] * target[n-k] -- confirmed empirically (a synthetic signal with
+        # a known, deliberately-introduced delay) that when target genuinely lags ref by d
+        # samples, the peak lands at k = -d, so the lag itself is the negation of that.
+        lag_ms = -best_lag_samples * 1000.0 / sr
+        if normalized_peak < WAVEFORM_LAG_MIN_CONFIDENCE:
+            return None, (lag_ms, normalized_peak)
+        return lag_ms, (lag_ms, normalized_peak)
+
+    # A WAV that ffmpeg reported success on (exit code 0, non-trivial file size -- everything
+    # extract_audio_track_wav itself checks) can still be malformed enough that Python's own wave
+    # module can't parse it (a truncated data chunk, a header/byte-count mismatch from a write
+    # that got interrupted partway) -- caught here and logged instead of left to crash this whole
+    # function, which previously silently aborted measurement for every remaining track too (an
+    # uncaught exception here propagates out of the caller's loop entirely, not just this track).
+    try:
+        ref, sr_ref = load_mono(reference_wav_path)
+        target, sr_target = load_mono(target_wav_path)
+    except Exception as exc:
+        logging.warning("Audio sync measurement%s: could not read extracted audio (%s).", tag, exc)
+        return None
+    if sr_ref != sr_target or sr_ref <= 0:
+        logging.info(
+            "Audio sync measurement%s: sample rate mismatch (reference=%sHz, target=%sHz) -- can't correlate.",
+            tag, sr_ref, sr_target,
+        )
+        return None
+    sr = sr_ref
+
+    n = min(len(ref), len(target))
+    logging.info(
+        "Audio sync measurement%s: loaded %.2fs of reference audio and %.2fs of target audio at %dHz.",
+        tag, len(ref) / sr if sr else 0, len(target) / sr if sr else 0, sr,
+    )
+    if n <= 0:
+        return None
+    ref = ref[:n]
+    target = target[:n]
+
+    chunk_len = int(WAVEFORM_LAG_CHUNK_SECONDS * sr)
+    chunk_bounds = [(i, min(i + chunk_len, n)) for i in range(0, n, chunk_len)]
+    chunk_bounds = [(s, e) for s, e in chunk_bounds if e - s >= chunk_len * 0.5]
+    if len(chunk_bounds) < WAVEFORM_LAG_MIN_CHUNKS_FOR_MAJORITY_CHECK:
+        lag_ms, diag = measure_segment(ref, target, sr)
+        logging.info(
+            "Audio sync measurement%s: only %d chunk(s) available (need %d) -- using one whole-"
+            "signal measurement instead: %s.",
+            tag, len(chunk_bounds), WAVEFORM_LAG_MIN_CHUNKS_FOR_MAJORITY_CHECK,
+            f"lag={diag[0]:.1f}ms score={diag[1]:.4f} (threshold {WAVEFORM_LAG_MIN_CONFIDENCE})"
+            if diag else "silent on one side",
+        )
+        return lag_ms
+
+    measurements = []
+    diagnostics = []
+    for s, e in chunk_bounds:
+        lag_ms, diag = measure_segment(ref[s:e], target[s:e], sr)
+        diagnostics.append(diag)
+        if lag_ms is not None:
+            measurements.append(lag_ms)
+    logging.info(
+        "Audio sync measurement%s: %d/%d chunk(s) confident (threshold %s) -- %s",
+        tag, len(measurements), len(chunk_bounds), WAVEFORM_LAG_MIN_CONFIDENCE,
+        ", ".join(
+            f"chunk{i}:lag={d[0]:.1f}ms/score={d[1]:.4f}" if d else f"chunk{i}:silent"
+            for i, d in enumerate(diagnostics)
+        ),
+    )
+    if len(measurements) < WAVEFORM_LAG_MIN_CHUNKS_FOR_MAJORITY_CHECK:
+        logging.info(
+            "Audio sync measurement%s: only %d confident chunk(s) (need %d) -- no result.",
+            tag, len(measurements), WAVEFORM_LAG_MIN_CHUNKS_FOR_MAJORITY_CHECK,
+        )
+        return None
+    measurements.sort()
+    median = measurements[len(measurements) // 2]
+    agreeing = [m for m in measurements if abs(m - median) <= WAVEFORM_LAG_AGREEMENT_TOLERANCE_MS]
+    if len(agreeing) < max(WAVEFORM_LAG_MIN_CHUNKS_FOR_MAJORITY_CHECK, len(measurements) / 2):
+        logging.info(
+            "Audio sync measurement%s: confident chunks disagree (median=%.1fms, only %d/%d "
+            "within %.1fms of it) -- no result.",
+            tag, median, len(agreeing), len(measurements), WAVEFORM_LAG_AGREEMENT_TOLERANCE_MS,
+        )
+        return None
+    agreeing.sort()
+    return agreeing[len(agreeing) // 2]
+
+
+def extract_audio_track_wav(ffmpeg_path, input_path, track_number, output_wav_path, start_seconds=0, duration_seconds=None):
+    """Extracts one 1-based OBS audio track (== ffmpeg stream 0:a:{track-1}) from input_path to a
+    mono PCM WAV file, optionally limited to [start_seconds, start_seconds+duration_seconds) --
+    used to feed measure_waveform_lag_ms a short segment instead of decoding an entire clip.
+    Returns True on success. Timeout is deliberately generous per call (see
+    AUDIO_SYNC_MEASUREMENT_EXTRACTION_TIMEOUT_SECONDS) -- measure_clip_audio_sync_shifts_ms's own
+    overall wall-clock budget is what actually bounds a full multi-track measurement's worst
+    case, not this.
+
+    Logs a warning (with the exit code/stderr or exception) on every failure path -- confirmed
+    live that a silent False here (a failed extraction just quietly dropping that track from the
+    result) made a real in-app measurement failure impossible to diagnose after the fact, since
+    the same extraction succeeded reliably in every standalone reproduction outside the app."""
+    cmd = [ffmpeg_path, "-y"]
+    if start_seconds:
+        cmd += ["-ss", format_timestamp(start_seconds)]
+    cmd += ["-i", input_path]
+    if duration_seconds:
+        cmd += ["-t", format_timestamp(duration_seconds)]
+    cmd += ["-map", f"0:a:{track_number - 1}", "-ac", "1", "-c:a", "pcm_s16le", output_wav_path]
+    try:
+        # encoding/errors explicit rather than relying on text=True's own locale-based default --
+        # ffmpeg's stderr can contain bytes that aren't valid under whatever codepage a packaged
+        # (--noconsole) build resolves as its default, and an undecodable byte there would raise
+        # UnicodeDecodeError from inside subprocess.run() itself, before either except clause
+        # below gets a chance to catch it -- a genuinely silent crash straight out of this
+        # function, indistinguishable from the measurement having simply found nothing.
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=AUDIO_SYNC_MEASUREMENT_EXTRACTION_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logging.warning(
+            "Audio sync measurement: extracting track %s from %s timed out after %ss.",
+            track_number, os.path.basename(input_path), AUDIO_SYNC_MEASUREMENT_EXTRACTION_TIMEOUT_SECONDS,
+        )
+        return False
+    except OSError as exc:
+        logging.warning(
+            "Audio sync measurement: could not run ffmpeg to extract track %s from %s: %s",
+            track_number, os.path.basename(input_path), exc,
+        )
+        return False
+    if result.returncode != 0:
+        logging.warning(
+            "Audio sync measurement: extracting track %s from %s failed (exit code %s).\nstderr:\n%s",
+            track_number, os.path.basename(input_path), result.returncode, result.stderr[-2000:],
+        )
+        return False
+    if not (os.path.isfile(output_wav_path) and os.path.getsize(output_wav_path) > 44):
+        logging.warning(
+            "Audio sync measurement: extracting track %s from %s produced no usable output.",
+            track_number, os.path.basename(input_path),
+        )
+        return False
+    return True
+
+
+AUDIO_SYNC_MEASUREMENT_EXTRACTION_TIMEOUT_SECONDS = 20
+# A hard ceiling across an ENTIRE multi-track measurement, not per track -- confirmed live in
+# earlier testing that a single measurement can occasionally take far longer than expected inside
+# the packaged app specifically (an in-app-only symptom -- standalone script timing on the exact
+# same file/hardware was consistently sub-second). The clip editor now pauses VLC's own preview
+# before starting any measurement, since concurrent access to the SAME large source file from
+# both VLC's decode/render pipeline and ffmpeg's own decode is a very plausible explanation for
+# that gap (no standalone test ever had VLC concurrently reading the file); this budget exists
+# regardless as a worst-case backstop that guarantees the clip editor's "Fix audio track sync"
+# always resolves in bounded time either way, falling back to per-track defaults for whatever it
+# didn't get to, rather than the UI looking stuck indefinitely the way it did before this existed.
+AUDIO_SYNC_MEASUREMENT_OVERALL_BUDGET_SECONDS = 45
+# The most of the SOURCE FILE (starting at the trim's own start point, but not bounded by the
+# trim's own -- possibly very short -- duration) the clip editor's "Fix audio track sync" samples
+# per track; a majority-agreement measurement (see measure_waveform_lag_ms) doesn't need more
+# than a representative window to be confident.
+AUDIO_SYNC_FIX_MAX_MEASUREMENT_SECONDS = 30
+# The least it samples, REGARDLESS of how short the actual trim selection is -- confirmed live
+# that a ~5-second trim gave the correlation algorithm too little audio to confidently match on
+# ANY track, silently falling back to the configured default for all of them. The per-track lag
+# being measured is a property of the recording itself (WASAPI capture mechanics), not of
+# whatever range happens to get exported, so sampling further into the source file than just the
+# trimmed selection is exactly as valid. Comfortably clears WAVEFORM_LAG_MIN_CHUNKS_FOR_MAJORITY_
+# CHECK chunks of WAVEFORM_LAG_CHUNK_SECONDS each with real margin to spare.
+AUDIO_SYNC_FIX_MIN_MEASUREMENT_SECONDS = 24
+# An unconditional ceiling the clip editor waits on the ENTIRE measurement (every track combined)
+# before giving up and falling back to the configured default for all of them -- deliberately
+# independent of measure_clip_audio_sync_shifts_ms's own internal timeouts (confirmed live, twice,
+# that those alone weren't enough to keep the UI from appearing stuck in the real packaged app
+# even on a short clip, for reasons never conclusively root-caused; every standalone reproduction
+# outside the app ran in 1-3 seconds). Enforced via threading.Thread.join(timeout=...), which
+# doesn't depend on subprocess/OS process semantics being correct the way those internal timeouts
+# do, so it's a genuinely independent backstop.
+AUDIO_SYNC_MEASUREMENT_HARD_TIMEOUT_SECONDS = 20
+
+
+def measure_clip_audio_sync_shifts_ms(
+    ffmpeg_path, input_path, reference_track, target_tracks, start_seconds=0, duration_seconds=None,
+    progress_callback=None,
+):
+    """Measures the real, per-track audio sync shift (ms) needed to line each of target_tracks
+    back up with reference_track in input_path -- independently per track, not one shared value,
+    since real process-capture tracks were confirmed live to each lag Desktop Audio by a
+    genuinely DIFFERENT amount within the very same recording (e.g. Discord's own network/
+    jitter-buffer pipeline adds latency a locally-rendered game never has) -- a single shared
+    correction was confirmed to still leave a visible residual on whichever tracks it didn't
+    match.
+
+    progress_callback(index, total, track_number), if given, is called just before starting each
+    track's own measurement -- lets a caller show "Measuring track 2 of 4..." while this runs.
+    Exceptions from it are swallowed so a UI glitch there can't abort the measurement itself.
+
+    Bounded so this can never hang indefinitely: each extraction has its own subprocess timeout
+    (see extract_audio_track_wav), and AUDIO_SYNC_MEASUREMENT_OVERALL_BUDGET_SECONDS caps the
+    total wall-clock time across every track combined -- once exceeded, remaining tracks are
+    skipped rather than attempted, and the caller decides what to fall back to for them.
+
+    Returns {track_number: shift_ms} (negative advances that track earlier, matching
+    DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS's own sign convention) -- only for tracks that
+    were both extracted successfully and confidently measured (see measure_waveform_lag_ms); any
+    target_tracks missing from the result simply weren't confidently measurable in the time
+    available, and the caller decides what to do about those (e.g. fall back to a configured
+    default, or leave them unshifted)."""
+    tmp_dir = tempfile.mkdtemp(prefix="obsautorec_clipsync_")
+    results = {}
+    overall_deadline = time.time() + AUDIO_SYNC_MEASUREMENT_OVERALL_BUDGET_SECONDS
+    try:
+        ref_wav = os.path.join(tmp_dir, "ref.wav")
+        if not extract_audio_track_wav(ffmpeg_path, input_path, reference_track, ref_wav, start_seconds, duration_seconds):
+            return results
+        for index, track in enumerate(target_tracks):
+            if time.time() >= overall_deadline:
+                logging.warning(
+                    "Audio sync measurement: stopping after %.0fs with %d track(s) left unmeasured "
+                    "-- falling back to defaults for those.",
+                    AUDIO_SYNC_MEASUREMENT_OVERALL_BUDGET_SECONDS, len(target_tracks) - index,
+                )
+                break
+            if progress_callback:
+                try:
+                    progress_callback(index, len(target_tracks), track)
+                except Exception:
+                    logging.exception("Audio sync measurement progress callback failed.")
+            target_wav = os.path.join(tmp_dir, f"target_{track}.wav")
+            if not extract_audio_track_wav(ffmpeg_path, input_path, track, target_wav, start_seconds, duration_seconds):
+                continue
+            measured_ms = measure_waveform_lag_ms(
+                ref_wav, target_wav, label=f"track {track} vs reference track {reference_track}",
+            )
+            if measured_ms is not None:
+                results[track] = -round(measured_ms)
+            try:
+                os.remove(target_wav)
+            except OSError:
+                pass
+        return results
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def run_audio_sync_calibration(client, ffmpeg_path, target_input_name, reference_input_name="Desktop Audio"):
@@ -2462,6 +2858,104 @@ def transcode_recording(input_path, transcode_config, icon=None, notifications_c
             logging.warning("Could not delete original after transcode: %s", exc)
 
 
+def apply_audio_sync_shift(input_path, audio_sync_shift_config, icon=None, notifications_config=None):
+    """Runs a standalone ffmpeg pass over a finished recording that shifts the configured
+    track(s) by shift_ms -- for fixing a recording made before
+    DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS (or a live calibration) was applied at record
+    time, whose isolated audio track(s) still sound a few ms out of sync with the rest. See
+    build_audio_track_filter_args for the actual filter this builds.
+
+    Independent of post_record_transcode -- its own enabled/ffmpeg_path/delete_original, so it
+    can run whether or not transcoding is also configured. Video is always stream-copied; every
+    audio track gets re-encoded to AAC uniformly (see build_audio_track_filter_args) since a
+    filter graph can't be stream-copied. Blocking; callers run this on a background thread the
+    same way transcode_recording's callers do.
+
+    Returns the resulting path on success (the caller doesn't need it today, but it mirrors
+    transcode_recording's shape for anyone chaining post-record steps together later), or None if
+    nothing was done or the shift failed."""
+    if not audio_sync_shift_config.get("enabled") or not input_path:
+        return None
+    shift_ms = audio_sync_shift_config.get("shift_ms", 0)
+    tracks = audio_sync_shift_config.get("tracks") or []
+    if not shift_ms or not tracks:
+        return None
+
+    configured_ffmpeg_path = audio_sync_shift_config.get("ffmpeg_path", "ffmpeg")
+    ffmpeg_path = resolve_ffmpeg_path(configured_ffmpeg_path)
+    if not ffmpeg_path:
+        logging.error(
+            "ffmpeg not found (checked '%s', PATH, and common install locations); skipping the "
+            "audio sync shift for %s. The original recording is untouched.",
+            configured_ffmpeg_path, os.path.basename(input_path),
+        )
+        notify(
+            icon, notifications_config, "ffmpeg not found",
+            f"{os.path.basename(input_path)} was kept, but its audio sync shift was skipped: ffmpeg isn't installed or configured.",
+        )
+        return None
+
+    basename = os.path.basename(input_path)
+    audio_stream_count = probe_audio_stream_count(ffmpeg_path, input_path)
+    if not audio_stream_count:
+        logging.warning("Audio sync shift: could not determine %s's audio track count; skipping.", basename)
+        return None
+    filter_complex_args, map_args = build_audio_track_filter_args(
+        audio_stream_count, {t: shift_ms for t in tracks},
+    )
+    if not filter_complex_args:
+        logging.warning(
+            "Audio sync shift: none of the configured track(s) %s exist in %s (it has %s audio "
+            "track(s)); skipping.", tracks, basename, audio_stream_count,
+        )
+        return None
+
+    suffix = audio_sync_shift_config.get("suffix", "_synced")
+    directory = os.path.dirname(input_path)
+    base, ext = os.path.splitext(basename)
+    output_path = os.path.join(directory, f"{base}{suffix}{ext}")
+    delete_original = audio_sync_shift_config.get("delete_original", False)
+
+    cmd = [
+        ffmpeg_path, "-y", "-i", input_path, "-map", "0:v", "-c:v", "copy",
+        *filter_complex_args, *map_args, "-c:a", "aac", "-movflags", "+faststart", output_path,
+    ]
+    logging.info("Applying audio sync shift to %s: %s", basename, " ".join(cmd))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    except OSError as exc:
+        logging.error("Could not run ffmpeg at '%s' to shift audio for %s: %s", ffmpeg_path, basename, exc)
+        notify(icon, notifications_config, "Audio sync shift failed", f"Could not shift {basename}: ffmpeg failed to run.")
+        return None
+
+    output_ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+    if result.returncode != 0 or not output_ok:
+        logging.error(
+            "Audio sync shift failed for %s (exit code %s).\nCommand: %s\nstderr:\n%s",
+            input_path, result.returncode, " ".join(cmd), result.stderr[-4000:],
+        )
+        notify(
+            icon, notifications_config, "Audio sync shift failed",
+            f"{basename} was kept, but its audio sync shift failed -- see the log for details.",
+        )
+        if os.path.isfile(output_path) and not output_ok:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return None
+
+    logging.info("Audio sync shift applied: %s", output_path)
+    notify(icon, notifications_config, "Audio sync shift applied", os.path.basename(output_path))
+    if delete_original:
+        try:
+            os.remove(input_path)
+            logging.info("Deleted original recording after audio sync shift: %s", basename)
+        except OSError as exc:
+            logging.warning("Could not delete original after audio sync shift: %s", exc)
+    return output_path
+
+
 def parse_timestamp(text):
     """Parses a "HH:MM:SS.mmm" / "MM:SS.mmm" / "SS.mmm" timestamp (colon-separated, most-
     significant component first, any number of fractional digits) into a float number of
@@ -2543,9 +3037,193 @@ def compute_target_video_bitrate_kbps(duration_seconds, target_size_mb, audio_bi
     return video_kbps if video_kbps > 0 else None
 
 
+def parse_track_numbers(text):
+    """Parses a comma-separated "3, 4, 5" style entry (as typed into the audio-sync-shift UI)
+    into [3, 4, 5], silently dropping anything that isn't a positive integer rather than raising
+    -- a stray comma or space shouldn't block a trim. Returns [] for blank/None input."""
+    numbers = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError:
+            continue
+        if n > 0:
+            numbers.append(n)
+    return numbers
+
+
+def build_audio_track_filter_args(audio_stream_count, shift_ms_by_track=None, muted_tracks=None):
+    """Builds (-filter_complex ..., -map ... -map ...) args that independently shift and/or mute
+    given 1-based OBS track number(s) (== ffmpeg audio stream index N-1, the same convention
+    run_audio_sync_calibration already relies on) while leaving every other track's content
+    unchanged.
+
+    shift_ms_by_track: {track_number: shift_ms} -- a per-track amount rather than one uniform
+    value, since real isolated app-audio tracks (Game Audio, Discord, ...) were confirmed live to
+    each lag Desktop Audio by a genuinely DIFFERENT amount in the same recording (e.g. Discord's
+    own network/jitter-buffer pipeline adds latency a locally-rendered game never has), so a
+    single shared correction still leaves a visible residual on whichever tracks it doesn't
+    match. Positive delays a given track (adelay); negative advances it (atrim + asetpts,
+    dropping the first |shift_ms| of that track so everything after it lines up that much
+    earlier).
+
+    Muting silences a track (volume=0) while still keeping it present in the output -- e.g. to
+    drop a Discord call or background music from a shared clip without losing the multi-track
+    structure a player like Premiere expects. A track in both shift_ms_by_track and muted_tracks
+    is just muted -- there's nothing audible left for a shift to line up.
+
+    Every audio stream is routed through the SAME filter graph -- muted tracks via volume=0,
+    shifted tracks via adelay/atrim, every other track via a harmless no-op (anull) -- rather than
+    mixing filtered and plain-mapped streams, so the caller can always re-encode every audio
+    stream with one uniform -c:a instead of juggling per-stream copy/re-encode codec flags.
+    Returns ([], []) if there's nothing to do (audio_stream_count is falsy, or neither
+    shift_ms_by_track nor muted_tracks land within [1, audio_stream_count]) -- the caller falls
+    back to its own plain "-map 0:a" wildcard in that case."""
+    if not audio_stream_count:
+        return [], []
+    shift_by_index = {
+        t - 1: ms for t, ms in (shift_ms_by_track or {}).items() if 1 <= t <= audio_stream_count and ms
+    }
+    muted_indexes = {t - 1 for t in (muted_tracks or []) if 1 <= t <= audio_stream_count}
+    if not shift_by_index and not muted_indexes:
+        return [], []
+    filter_parts = []
+    map_args = []
+    for i in range(audio_stream_count):
+        label = f"atrack{i}"
+        if i in muted_indexes:
+            filter_parts.append(f"[0:a:{i}]volume=0[{label}]")
+        elif i in shift_by_index:
+            shift_ms = shift_by_index[i]
+            if shift_ms > 0:
+                filter_parts.append(f"[0:a:{i}]adelay={int(round(shift_ms))}:all=1[{label}]")
+            else:
+                filter_parts.append(f"[0:a:{i}]atrim=start={abs(shift_ms) / 1000:.6f},asetpts=PTS-STARTPTS[{label}]")
+        else:
+            filter_parts.append(f"[0:a:{i}]anull[{label}]")
+        map_args += ["-map", f"[{label}]"]
+    return ["-filter_complex", ";".join(filter_parts)], map_args
+
+
+def build_audio_routing_filter_args(audio_stream_count, routing=None, muted_destinations=None, shift_ms_by_track=None):
+    """Builds (-filter_complex ..., -map ... -map ...) args for the clip editor's Track Routing
+    dialog -- lets a user consolidate multiple source tracks into fewer output tracks (e.g. mix
+    Spotify and Firefox together), drop a source entirely (e.g. remove Desktop Audio from the
+    export), and mute an output track, on top of whatever per-source sync-fix shift already
+    applies -- rather than the simpler 1:1 build_audio_track_filter_args, which has no notion of
+    combining or dropping tracks at all.
+
+    routing: {destination_track: [source_track, ...]} -- which 1-based source track(s) (as in the
+    original file) get mixed together into each 1-based destination track of the output. Defaults
+    to an identity mapping (each source becomes its own same-numbered destination) when not
+    given. A destination with 2+ sources is combined via ffmpeg's amix (auto-normalized so
+    combining doesn't clip); with exactly 1, it's a straight passthrough. A source not referenced
+    by ANY destination is dropped from the output entirely -- this is how "consolidate tracks 2-6
+    into track 1 and remove track 1 (Desktop Audio)" is expressed: route sources 2-6 to
+    destination 1, and simply never list source 1 under any destination.
+
+    muted_destinations: DESTINATION track numbers (post-routing/mixing) to silence (volume=0)
+    while still keeping them present in the output -- e.g. muting destination 2 silences whatever
+    ended up mixed into it, regardless of which source(s) that was.
+
+    shift_ms_by_track: SOURCE track numbers (pre-routing, same convention as
+    measure_clip_audio_sync_shifts_ms) to shift before mixing, so a per-track sync-fix correction
+    still applies correctly to a source even after it's combined with others.
+
+    Returns ([], []) if the result would be a pure identity passthrough with nothing muted or
+    shifted -- the caller falls back to its own plain "-map 0:a" wildcard (eligible for a fast
+    stream copy) in that case, same as build_audio_track_filter_args always has."""
+    if not audio_stream_count:
+        return [], []
+    identity_routing = {t: [t] for t in range(1, audio_stream_count + 1)}
+    routing = routing if routing is not None else identity_routing
+    muted_destinations = set(muted_destinations or [])
+    shift_by_source = {t: ms for t, ms in (shift_ms_by_track or {}).items() if ms}
+
+    if not muted_destinations and not shift_by_source and routing == identity_routing:
+        return [], []
+
+    referenced_sources = sorted({
+        s for sources in routing.values() for s in sources if 1 <= s <= audio_stream_count
+    })
+    if not referenced_sources:
+        return [], []
+
+    # Stage 1: per-source filters (shift only -- destination muting happens in stage 2, after
+    # mixing, so it silences the COMBINED result of everything routed there, not just one
+    # contributing source).
+    filter_parts = []
+    for s in referenced_sources:
+        i = s - 1
+        label = f"asrc{s}"
+        if s in shift_by_source:
+            shift_ms = shift_by_source[s]
+            if shift_ms > 0:
+                filter_parts.append(f"[0:a:{i}]adelay={int(round(shift_ms))}:all=1[{label}]")
+            else:
+                filter_parts.append(f"[0:a:{i}]atrim=start={abs(shift_ms) / 1000:.6f},asetpts=PTS-STARTPTS[{label}]")
+        else:
+            filter_parts.append(f"[0:a:{i}]anull[{label}]")
+
+    # Stage 2: mix each destination's source(s) (or pass the one straight through), then mute if
+    # asked. A destination with no valid sources at all is simply omitted from the output.
+    map_args = []
+    for dest in sorted(routing.keys()):
+        sources = [s for s in routing[dest] if 1 <= s <= audio_stream_count]
+        if not sources:
+            continue
+        if len(sources) == 1:
+            mixed_label = f"asrc{sources[0]}"
+        else:
+            mixed_label = f"amix{dest}"
+            inputs = "".join(f"[asrc{s}]" for s in sources)
+            filter_parts.append(
+                f"{inputs}amix=inputs={len(sources)}:duration=longest:dropout_transition=0[{mixed_label}]"
+            )
+        if dest in muted_destinations:
+            final_label = f"adest{dest}"
+            filter_parts.append(f"[{mixed_label}]volume=0[{final_label}]")
+        else:
+            final_label = mixed_label
+        map_args += ["-map", f"[{final_label}]"]
+    if not map_args:
+        return [], []
+    return ["-filter_complex", ";".join(filter_parts)], map_args
+
+
+def probe_audio_stream_count(ffmpeg_path, input_path):
+    """Best-effort count of audio streams in input_path via ffprobe, assumed to sit next to
+    ffmpeg_path -- the normal case for a real ffmpeg install (confirmed live: winget's ffmpeg
+    package puts both in the same bin/ folder). build_audio_track_filter_args needs the real
+    count to correctly re-map every track when only some of them are being shifted or muted;
+    returns None (rather than guessing) if ffprobe can't be found or the probe fails, since a
+    caller can't safely build a filter graph without knowing it."""
+    ffprobe_path = os.path.join(os.path.dirname(ffmpeg_path), "ffprobe.exe")
+    if not os.path.isfile(ffprobe_path):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_path, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                "-of", "csv=p=0", input_path,
+            ],
+            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    count = len([line for line in result.stdout.splitlines() if line.strip()])
+    return count or None
+
+
 def build_trim_command(
     ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False, crf=None,
-    scale_height=None,
+    scale_height=None, audio_shift_ms_by_track=None, audio_stream_count=None,
+    audio_routing=None, muted_destinations=None,
 ):
     """Builds the ffmpeg argv to cut [start_seconds, end_seconds) out of input_path. Always uses
     -t (duration) rather than -to (absolute end time) even though both express the same cut --
@@ -2573,9 +3251,25 @@ def build_trim_command(
 
     A target output *size* (as opposed to quality) isn't handled here at all -- see
     build_two_pass_size_targeted_commands, which needs a fundamentally different (two-pass)
-    command shape to hit a size target accurately rather than just approximately."""
+    command shape to hit a size target accurately rather than just approximately.
+
+    audio_shift_ms_by_track/audio_stream_count: shift each given 1-based OBS track number by its
+    own ms amount (a per-track dict, since real process-capture tracks were confirmed live to
+    each lag Desktop Audio by a genuinely different amount) to fix a clip whose isolated audio
+    track(s) still sound a few ms out of sync with the rest. audio_routing/muted_destinations:
+    the clip editor's Track Routing dialog -- consolidate multiple source tracks into fewer
+    output tracks, drop a source entirely, and/or mute an output track; see
+    build_audio_routing_filter_args, which this delegates to (and which also applies
+    audio_shift_ms_by_track to the right SOURCE tracks before any consolidation mixes them
+    together). Requires audio_stream_count (e.g. from probe_audio_stream_count) to correctly
+    re-map every track; using any of this forces the AUDIO side to re-encode (a filter graph
+    can't be stream-copied) but never touches video's own copy-vs-re-encode decision above."""
     start_str = format_timestamp(start_seconds)
     duration_str = format_timestamp(end_seconds - start_seconds)
+    filter_complex_args, shifted_audio_map_args = build_audio_routing_filter_args(
+        audio_stream_count, audio_routing, muted_destinations, audio_shift_ms_by_track,
+    )
+    filtering_audio = bool(filter_complex_args)
     # Only video and audio -- not "-map 0" for every stream. OBS's Hybrid MP4 recordings carry
     # an extra "bin_data" chapter-metadata track (its own custom format for the marker feature)
     # whose internal timestamps a plain stream copy can't rebase to the new, shorter timeline.
@@ -2583,7 +3277,8 @@ def build_trim_command(
     # duration (visible in ffprobe, and very likely what made VLC show an inaccurate length for
     # the trimmed clip) -- excluding it here fixes that, and a short trimmed clip has no real
     # use for chapter markers about the original recording's timeline anyway.
-    stream_maps = ["-map", "0:v", "-map", "0:a"]
+    audio_map_args = shifted_audio_map_args or ["-map", "0:a"]
+    stream_maps = ["-map", "0:v", *audio_map_args]
     # Moves the MP4 "moov" atom (the index of where every frame lives in the file) to the front
     # instead of ffmpeg's default of appending it at the end -- a plain stream copy doesn't do
     # this on its own. Browsers and embedded web players (e.g. Discord's inline preview) need it
@@ -2591,16 +3286,18 @@ def build_trim_command(
     # either way, which is why this can look fine locally and still fail elsewhere. Harmless no-op
     # for non-MP4 containers (confirmed: ffmpeg just ignores it for a Matroska/.mkv output).
     faststart_args = ["-movflags", "+faststart"]
-    if not precise and crf is None and scale_height is None:
+    if not precise and crf is None and scale_height is None and not filtering_audio:
         return [
             ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str,
             *stream_maps, "-c", "copy", *faststart_args, output_path,
         ]
     effective_crf = CLIP_EDITOR_DEFAULT_CRF if crf is None else crf
-    encode_args = list(stream_maps)
+    plain_reencode = precise or crf is not None or scale_height is not None
+    encode_args = list(filter_complex_args) + stream_maps
     if scale_height is not None:
         encode_args += ["-vf", f"scale=-2:{scale_height}"]
-    encode_args += ["-c:v", "libx264", "-crf", str(effective_crf), "-c:a", "aac", *faststart_args]
+    encode_args += ["-c:v", "libx264", "-crf", str(effective_crf)] if plain_reencode else ["-c:v", "copy"]
+    encode_args += ["-c:a", "aac", *faststart_args]
     if precise:
         return [ffmpeg_path, "-y", "-i", input_path, "-ss", start_str, "-t", duration_str] + encode_args + [output_path]
     return [ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str] + encode_args + [output_path]
@@ -2691,15 +3388,76 @@ def cleanup_two_pass_log_files(passlog_prefix):
             pass
 
 
+def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress):
+    """Runs cmd (ffmpeg_path must be cmd[0]) via subprocess.Popen with -progress piped back to
+    this process instead of trim_clip's usual subprocess.run, which only ever reports anything
+    once the WHOLE command has already finished -- calls on_progress(fraction), fraction in
+    [0, 1], as real encoding progress comes in (parsed off ffmpeg's own out_time= field), so a
+    caller can show something better than a bare "Trimming..." for however long a re-encode
+    actually takes. Only used when a caller actually wants that (trim_clip's own progress_callback
+    param); every other caller keeps using plain subprocess.run completely unchanged.
+
+    Returns (returncode, stderr_text) -- the same two fields callers already read off a
+    subprocess.run() CompletedProcess, so the caller's existing success/failure handling doesn't
+    need to know which of the two actually ran."""
+    progress_cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
+    proc = subprocess.Popen(
+        progress_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    stderr_chunks = []
+
+    def drain_stderr():
+        if proc.stderr is not None:
+            for line in proc.stderr:
+                stderr_chunks.append(line)
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            if total_duration_seconds <= 0:
+                continue
+            line = line.strip()
+            if not line.startswith("out_time="):
+                continue
+            try:
+                elapsed = parse_timestamp(line.split("=", 1)[1])
+            except ValueError:
+                continue
+            try:
+                on_progress(min(1.0, max(0.0, elapsed / total_duration_seconds)))
+            except Exception:
+                logging.exception("Trim progress callback failed.")
+
+    proc.wait()
+    stderr_thread.join(timeout=5)
+    return proc.returncode, "".join(stderr_chunks)
+
+
 def trim_clip(
     input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
     delete_original=False, icon=None, notifications_config=None, crf=None, scale_height=None,
-    target_size_mb=None,
+    target_size_mb=None, audio_shift_ms_by_track=None, audio_routing=None, muted_destinations=None,
+    progress_callback=None,
 ):
     """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
     way transcode_recording's callers do. Verifies the output file actually exists and has a
     nonzero size before reporting success or deleting the source; never deletes on a failed or
-    suspicious-looking trim, same rule transcode_recording already follows."""
+    suspicious-looking trim, same rule transcode_recording already follows.
+
+    audio_shift_ms_by_track/audio_routing/muted_destinations: see build_audio_routing_filter_args.
+    Only probes the source's real audio track count (an extra ffprobe subprocess) when any of
+    them is actually requested -- the common case (none) pays nothing extra. Not supported
+    together with target_size_mb: a size-targeted export already keeps only the first audio track
+    (see build_two_pass_size_targeted_commands), so there's nothing left to shift, route, or
+    mute.
+
+    progress_callback(phase_text, fraction), if given, is called repeatedly with real progress
+    (fraction in [0, 1]) as the actual output-producing encode runs -- see
+    _run_ffmpeg_with_progress. Left as None (the default), every ffmpeg invocation here still
+    goes through plain subprocess.run exactly as before, unchanged."""
     basename = os.path.basename(input_path)
     if end_seconds <= start_seconds:
         logging.error("Could not trim %s: end time must be after the start time.", basename)
@@ -2707,12 +3465,24 @@ def trim_clip(
 
     passlog_prefix = None
     if target_size_mb:
+        if audio_shift_ms_by_track or audio_routing or muted_destinations:
+            logging.warning(
+                "Clip editor: ignoring the audio sync shift/routing/mute for %s -- a "
+                "size-targeted export only keeps the first audio track, so there's nothing left "
+                "to apply it to.",
+                basename,
+            )
         passlog_prefix = os.path.join(tempfile.gettempdir(), f"obsautorec_2pass_{os.getpid()}_{int(time.time() * 1000)}")
         pass1_cmd, pass2_cmd = build_two_pass_size_targeted_commands(
             ffmpeg_path, input_path, start_seconds, end_seconds, output_path, target_size_mb, scale_height,
             passlog_prefix,
         )
         logging.info("Trimming %s (pass 1/2, targeting %s MB): %s", basename, target_size_mb, " ".join(pass1_cmd))
+        if progress_callback:
+            try:
+                progress_callback("Analyzing (pass 1 of 2)", 0.0)
+            except Exception:
+                logging.exception("Trim progress callback failed.")
         try:
             result1 = subprocess.run(
                 pass1_cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
@@ -2733,15 +3503,36 @@ def trim_clip(
             cleanup_two_pass_log_files(passlog_prefix)
             return False
         cmd = pass2_cmd
+        phase_text = "Encoding (pass 2 of 2)"
         logging.info("Trimming %s (pass 2/2): %s", basename, " ".join(cmd))
     else:
-        cmd = build_trim_command(ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise, crf, scale_height)
+        audio_stream_count = None
+        if audio_shift_ms_by_track or audio_routing or muted_destinations:
+            audio_stream_count = probe_audio_stream_count(ffmpeg_path, input_path)
+            if not audio_stream_count:
+                logging.warning(
+                    "Clip editor: could not determine %s's audio track count -- skipping the "
+                    "requested audio sync shift/routing/mute.", basename,
+                )
+        cmd = build_trim_command(
+            ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise, crf, scale_height,
+            audio_shift_ms_by_track, audio_stream_count, audio_routing, muted_destinations,
+        )
+        phase_text = "Encoding clip"
         logging.info("Trimming %s: %s", basename, " ".join(cmd))
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
-        )
+        if progress_callback:
+            progress_callback(phase_text, 0.0)
+            returncode, stderr_text = _run_ffmpeg_with_progress(
+                cmd, end_seconds - start_seconds,
+                lambda fraction: progress_callback(phase_text, fraction),
+            )
+        else:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            returncode, stderr_text = result.returncode, result.stderr
     except OSError as exc:
         logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
         notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
@@ -2751,10 +3542,10 @@ def trim_clip(
             cleanup_two_pass_log_files(passlog_prefix)
 
     output_ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
-    if result.returncode != 0 or not output_ok:
+    if returncode != 0 or not output_ok:
         logging.error(
             "ffmpeg trim failed for %s (exit code %s).\nCommand: %s\nstderr:\n%s",
-            input_path, result.returncode, " ".join(cmd), result.stderr[-4000:],
+            input_path, returncode, " ".join(cmd), stderr_text[-4000:],
         )
         notify(
             icon, notifications_config, "Trim failed",
@@ -2877,6 +3668,7 @@ def stop_recording(client, icon, game_display_name=None, recording_state=None, c
         recording_state.setdefault("segment_files", []).append(new_path)
 
     maybe_transcode(new_path, config.get("post_record_transcode", {}), icon, notifications_config)
+    maybe_apply_audio_sync_shift(new_path, config.get("audio_sync_shift", {}), icon, notifications_config)
     return True
 
 
@@ -4900,6 +5692,49 @@ def _run_config_editor(master_root, restart_callback, on_close):
     )
     opt_row += 1
 
+    # --- Audio sync shift: independent of the transcode above, its own ffmpeg pass fixing a
+    # recording made before DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS (or a live calibration)
+    # was applied at record time, whose isolated audio track(s) still sound a few ms out of sync
+    # with the rest -- see build_audio_track_filter_args.
+    audio_sync_shift_config = config.get("audio_sync_shift", {})
+    add_section_label(transcode_options_frame, opt_row, "Audio Sync Shift (ffmpeg)")
+    opt_row += 1
+    audio_sync_shift_enabled_var = tk.BooleanVar(value=audio_sync_shift_config.get("enabled", False))
+    add_checkbox(
+        transcode_options_frame, opt_row, "Shift track(s) to fix out-of-sync audio on every finished recording",
+        audio_sync_shift_enabled_var,
+    )
+    opt_row += 1
+    audio_sync_shift_tracks_var = tk.StringVar(
+        value=",".join(str(t) for t in audio_sync_shift_config.get("tracks", []))
+    )
+    add_labeled_entry(transcode_options_frame, opt_row, "Track(s) to shift (comma-separated)", audio_sync_shift_tracks_var, width=10)
+    opt_row += 1
+    audio_sync_shift_ms_var = tk.StringVar(value=str(audio_sync_shift_config.get("shift_ms") or ""))
+    add_labeled_entry(transcode_options_frame, opt_row, "Shift by (ms)", audio_sync_shift_ms_var, width=10)
+    opt_row += 1
+    tk.Label(
+        transcode_options_frame,
+        text=(
+            "    Track numbers match OBS's own track numbering (1-6). Positive ms delays those "
+            "tracks, negative advances them. Video is always kept as-is; only audio is "
+            "re-encoded. Runs as its own pass on every finished recording, independent of the "
+            "transcode above -- use the clip editor's own \"Fix audio sync\" option instead for a "
+            "one-off fix on a single existing clip."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=opt_row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    opt_row += 1
+    audio_sync_shift_suffix_var = tk.StringVar(value=audio_sync_shift_config.get("suffix", "_synced"))
+    add_labeled_entry(transcode_options_frame, opt_row, "Output filename suffix", audio_sync_shift_suffix_var)
+    opt_row += 1
+    audio_sync_shift_delete_original_var = tk.BooleanVar(value=audio_sync_shift_config.get("delete_original", False))
+    add_checkbox(
+        transcode_options_frame, opt_row, "Delete original after a successful audio sync shift",
+        audio_sync_shift_delete_original_var,
+    )
+    opt_row += 1
+
     add_section_label(ffmpeg_missing_frame, 0, "Post-Record Transcode (ffmpeg)")
     tk.Label(
         ffmpeg_missing_frame,
@@ -4980,6 +5815,9 @@ def _run_config_editor(master_root, restart_callback, on_close):
         text="    Leave blank to save trimmed clips in the same folder as the source recording.",
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    clip_output_suffix_var = tk.StringVar(value=clip_editor_config.get("output_suffix", "_trimmed"))
+    add_labeled_entry(clip_editor_tab, row, "Output filename suffix", clip_output_suffix_var, width=16)
     row += 1
     clip_delete_original_var = tk.BooleanVar(value=clip_editor_config.get("delete_original_after_trim", False))
     add_checkbox(
@@ -5438,6 +6276,21 @@ def _run_config_editor(master_root, restart_callback, on_close):
         transcode["suffix"] = transcode_suffix_var.get()
         transcode["delete_original"] = transcode_delete_original_var.get()
 
+        audio_sync_shift = new_config.setdefault("audio_sync_shift", {})
+        audio_sync_shift["enabled"] = audio_sync_shift_enabled_var.get()
+        # Shares the transcode's own ffmpeg path rather than asking the user to configure/find
+        # ffmpeg a second time for a feature that lives in this same panel.
+        audio_sync_shift["ffmpeg_path"] = transcode["ffmpeg_path"]
+        audio_sync_shift["tracks"] = parse_track_numbers(audio_sync_shift_tracks_var.get())
+        if audio_sync_shift_ms_var.get().strip():
+            shift_ms_value = read_int(audio_sync_shift_ms_var, "Audio sync shift", None)
+            if shift_ms_value is not None:
+                audio_sync_shift["shift_ms"] = shift_ms_value
+        else:
+            audio_sync_shift.pop("shift_ms", None)
+        audio_sync_shift["suffix"] = audio_sync_shift_suffix_var.get()
+        audio_sync_shift["delete_original"] = audio_sync_shift_delete_original_var.get()
+
         notifications = new_config.setdefault("notifications", {})
         notifications["enabled"] = notifications_enabled_var.get()
 
@@ -5447,6 +6300,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             clip_editor["output_folder"] = clip_output_folder_value
         else:
             clip_editor.pop("output_folder", None)
+        clip_editor["output_suffix"] = clip_output_suffix_var.get()
         clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
         clip_editor["trim_mode"] = CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL.get(trim_mode_var.get(), "precise")
         if clip_target_size_var.get().strip():
@@ -5739,6 +6593,7 @@ def _open_vlc_missing_window(master_root, on_close):
 
 def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     clip_editor_config = config.get("clip_editor", {})
+    obs_config = config.get("obs", {})
     notifications_config = config.get("notifications", {})
 
     vlc_dir = resolve_vlc_path(clip_editor_config.get("vlc_path", ""))
@@ -6435,6 +7290,174 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     trim_button.pack(side="right")
     dark_button(range_row, text="✕ Close", command=close_editor).pack(side="right", padx=(0, 8))
 
+    # --- Audio tracks row: "Fix audio track sync" checkbox (left) + "Track Routing..." button
+    # (right), both on one line. A prior version of the sync fix reapplied one fixed, configured
+    # offset to every process-capture track at trim time -- removed after it was confirmed live
+    # to double-correct a recording that already had the live per-record fix baked in (see
+    # sync_multi_track_audio/apply_process_capture_sync_offset, run on every OBS-ready check),
+    # producing a NEW ~27ms misalignment that wasn't there before. This version instead measures
+    # the ACTUAL clip's own audio when Trim Clip is pressed -- independently per track, since real
+    # process-capture tracks were confirmed live to each lag Desktop Audio by a genuinely
+    # different amount within the same recording (Discord's own jitter-buffer pipeline adds
+    # latency a locally-rendered game never has) -- so it stays correct whether or not the live
+    # fix already applied, and whatever it applies is grounded in this specific clip rather than a
+    # single shared guess. See measure_clip_audio_sync_shifts_ms.
+    audio_tracks_row = tk.Frame(root, bg=EDITOR_BG)
+    audio_tracks_row.pack(fill="x", padx=10, pady=4)
+    fix_sync_tracks = compute_process_capture_tracks(obs_config)
+    fix_sync_reference_track = compute_reference_track(obs_config)
+    fix_sync_var = tk.BooleanVar(value=False)
+    fix_sync_checkbox = tk.Checkbutton(
+        audio_tracks_row, text="Fix audio track sync", variable=fix_sync_var,
+        bg=EDITOR_BG, fg=EDITOR_FG, activebackground=EDITOR_BG, activeforeground=EDITOR_FG,
+        selectcolor=ENTRY_BG,
+    )
+    fix_sync_checkbox.pack(side="left")
+    if fix_sync_tracks and fix_sync_reference_track:
+        tk.Label(
+            audio_tracks_row,
+            text=f"  (measures & aligns track(s) {', '.join(str(t) for t in fix_sync_tracks)} when trimmed)",
+            bg=EDITOR_BG, fg=MUTED_TEXT_COLOR,
+        ).pack(side="left")
+    else:
+        fix_sync_checkbox.config(state="disabled")
+        tk.Label(
+            audio_tracks_row, text="  (not configured in Settings)", bg=EDITOR_BG, fg=MUTED_TEXT_COLOR,
+        ).pack(side="left")
+
+    # --- Track Routing: consolidate multiple source tracks into fewer output tracks (e.g. mix
+    # Spotify and Firefox together), drop a source entirely (e.g. remove Desktop Audio), and mute
+    # an output track -- all via a checkbox matrix, mirroring the OBS-side Quick Multi-Track Setup
+    # dialog's role (open_multi_track_quick_setup) but operating on an already-recorded file's
+    # tracks instead of live OBS inputs. Subsumes the simpler old per-track mute checkboxes: an
+    # output track with every source unchecked is just excluded from the file, and a
+    # checked-but-muted output track stays present but silent -- see
+    # build_audio_routing_filter_args. State (routing_state) is rebuilt from scratch, and any
+    # open dialog closed, every time a different file loads, since track count varies per
+    # recording and stale routing for a since-replaced file's track layout could silently apply
+    # to the wrong tracks.
+    track_name_hints_map = track_name_hints(obs_config)
+    routing_state = {"track_count": 0, "routing_vars": {}, "mute_vars": {}}
+    routing_dialog_state = {"window": None}
+
+    def rebuild_routing_state(track_count):
+        if routing_dialog_state["window"] is not None:
+            try:
+                if routing_dialog_state["window"].winfo_exists():
+                    routing_dialog_state["window"].destroy()
+            except tk.TclError:
+                pass
+            routing_dialog_state["window"] = None
+        routing_state["track_count"] = track_count
+        routing_state["routing_vars"] = {
+            dest: {src: tk.BooleanVar(value=(src == dest)) for src in range(1, track_count + 1)}
+            for dest in range(1, track_count + 1)
+        }
+        routing_state["mute_vars"] = {dest: tk.BooleanVar(value=False) for dest in range(1, track_count + 1)}
+        track_routing_button.config(state="normal" if track_count else "disabled")
+
+    def probe_track_count_for_routing(path):
+        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+        count = probe_audio_stream_count(ffmpeg_path, path) if ffmpeg_path else None
+
+        def apply():
+            if root.winfo_exists() and state["path"] == path:  # guards against a stale probe
+                rebuild_routing_state(count or 0)
+
+        try:
+            root.after(0, apply)
+        except tk.TclError:
+            pass
+
+    def open_track_routing_dialog():
+        n = routing_state["track_count"]
+        if not n:
+            return
+        if routing_dialog_state["window"] is not None:
+            try:
+                if routing_dialog_state["window"].winfo_exists():
+                    routing_dialog_state["window"].lift()
+                    return
+            except tk.TclError:
+                pass
+
+        dialog = tk.Toplevel(root)
+        dialog.title("Track Routing")
+        dialog.configure(bg=EDITOR_BG)
+        dialog.transient(root)
+        routing_dialog_state["window"] = dialog
+
+        def on_dialog_close():
+            routing_dialog_state["window"] = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+
+        tk.Label(
+            dialog,
+            text=(
+                "Check which source track(s) (columns) feed into each output track (rows) below "
+                "-- check several under one output to mix them together, leave a source "
+                "unchecked everywhere to drop it from the export entirely, or check \"Mute\" to "
+                "keep an output track present but silent."
+            ),
+            bg=EDITOR_BG, fg=EDITOR_FG, anchor="w", justify="left", wraplength=60 + 46 * n,
+        ).grid(row=0, column=0, columnspan=n + 2, sticky="w", padx=10, pady=(10, 8))
+
+        header_row = 1
+        for src in range(1, n + 1):
+            hint = track_name_hints_map.get(src)
+            header_text = f"{src}\n({hint})" if hint else str(src)
+            tk.Label(dialog, text=header_text, bg=EDITOR_BG, fg=EDITOR_FG, justify="center").grid(
+                row=header_row, column=src, padx=4, pady=(0, 4)
+            )
+        tk.Label(dialog, text="Mute", bg=EDITOR_BG, fg=EDITOR_FG).grid(
+            row=header_row, column=n + 1, padx=(14, 10)
+        )
+
+        for dest in range(1, n + 1):
+            row = header_row + dest
+            tk.Label(dialog, text=f"Output {dest}:", bg=EDITOR_BG, fg=EDITOR_FG, anchor="w").grid(
+                row=row, column=0, sticky="w", padx=(10, 4), pady=2
+            )
+            for src in range(1, n + 1):
+                # indicatoron=False + a real width/height renders as a solid block that swaps
+                # its WHOLE background color between bg (off) and selectcolor (on), rather than
+                # a native tiny indicator square with a checkmark drawn inside it -- confirmed
+                # live that the native indicator's checkmark was hard to see against this dark
+                # theme (a dark glyph on a dark selectcolor fill has very little contrast); a
+                # full color swap is unambiguous regardless of theme.
+                tk.Checkbutton(
+                    dialog, variable=routing_state["routing_vars"][dest][src],
+                    indicatoron=False, width=2, height=1,
+                    bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG,
+                    selectcolor=START_MARKER_COLOR,
+                ).grid(row=row, column=src, pady=2, padx=1)
+            tk.Checkbutton(
+                dialog, variable=routing_state["mute_vars"][dest],
+                indicatoron=False, width=2, height=1,
+                bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG,
+                selectcolor=END_MARKER_COLOR,
+            ).grid(row=row, column=n + 1, padx=(14, 10), pady=2)
+
+        def reset_to_defaults():
+            for dest in range(1, n + 1):
+                for src in range(1, n + 1):
+                    routing_state["routing_vars"][dest][src].set(src == dest)
+                routing_state["mute_vars"][dest].set(False)
+
+        button_row = header_row + n + 1
+        dark_button(dialog, text="Reset to defaults", command=reset_to_defaults).grid(
+            row=button_row, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 10)
+        )
+        dark_button(dialog, text="Close", command=on_dialog_close).grid(
+            row=button_row, column=n - 1, columnspan=3, sticky="e", padx=10, pady=(8, 10)
+        )
+
+    track_routing_button = dark_button(audio_tracks_row, text="Track Routing...", command=open_track_routing_dialog)
+    track_routing_button.pack(side="left", padx=(16, 0))
+    track_routing_button.config(state="disabled")
+
     # --- Status + trim progress ---
     status_label = tk.Label(
         root, text="", fg=END_MARKER_COLOR, bg=EDITOR_BG, anchor="w", justify="left", wraplength=780,
@@ -6506,6 +7529,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         status_label.config(text="")
         root.title(f"OBS Auto Recorder - Clip Editor - {os.path.basename(path)}")
         logging.info("Clip editor: opened %s", os.path.basename(path))
+        rebuild_routing_state(0)
+        threading.Thread(target=probe_track_count_for_routing, args=(path,), daemon=True).start()
 
     def toggle_play_pause():
         if not state["path"]:
@@ -6613,7 +7638,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         format_choice = format_var.get()
         output_ext = None if format_choice == CLIP_EDITOR_OUTPUT_FORMATS[0] else format_choice
         output_path = compute_trim_output_path(
-            state["path"], clip_editor_config.get("output_folder") or None, output_ext=output_ext
+            state["path"], clip_editor_config.get("output_folder") or None, output_ext=output_ext,
+            suffix=clip_editor_config.get("output_suffix", "_trimmed"),
         )
         delete_original = clip_editor_config.get("delete_original_after_trim", False)
         # Precise (re-encode) is the default -- a plain stream-copy ("Fast") trim can leave a
@@ -6633,19 +7659,182 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 logging.warning("Clip editor: could not start trim -- invalid target size %r.", target_size_var.get())
                 status_label.config(fg=END_MARKER_COLOR, text="Target size must be a positive number of MB.")
                 return
+        n = routing_state["track_count"]
+        audio_routing = None
+        muted_destinations = None
+        if n:
+            routing = {}
+            for dest in range(1, n + 1):
+                sources = [src for src, var in routing_state["routing_vars"][dest].items() if var.get()]
+                if sources:
+                    routing[dest] = sources
+            muted = [dest for dest, var in routing_state["mute_vars"].items() if var.get()]
+            identity_routing = {t: [t] for t in range(1, n + 1)}
+            if routing != identity_routing or muted:
+                audio_routing = routing
+                muted_destinations = muted
         source_path = state["path"]
 
-        status_label.config(fg=MUTED_TEXT_COLOR, text=f"Trimming to {os.path.basename(output_path)}...")
+        # Measures a representative window starting at the trim's own start point -- but NOT
+        # capped to the trim's own (possibly very short) duration. Confirmed live: a ~5-second
+        # trim gave the correlation algorithm too little audio to confidently match against on
+        # ANY track, silently falling back to the configured default for all of them (which is
+        # itself known to be inaccurate for at least some tracks, e.g. Discord's own jitter-
+        # buffer pipeline needs a completely different correction than a locally-rendered game).
+        # The underlying per-track lag is a property of the RECORDING (WASAPI capture mechanics),
+        # not of whatever range happens to get exported, so measuring further into the source
+        # file than just the trimmed selection is exactly as valid -- same principle as "if
+        # latency is constant, measure once and apply everywhere" already relied on elsewhere
+        # here. AUDIO_SYNC_FIX_MIN_MEASUREMENT_SECONDS gives the majority-agreement check (see
+        # measure_waveform_lag_ms) a real chance regardless of how short the actual export is.
+        fix_sync_enabled = fix_sync_var.get() and bool(fix_sync_tracks) and bool(fix_sync_reference_track)
+        measure_start = start_seconds
+        measure_duration = max(end_seconds - start_seconds, AUDIO_SYNC_FIX_MIN_MEASUREMENT_SECONDS)
+        measure_duration = min(measure_duration, AUDIO_SYNC_FIX_MAX_MEASUREMENT_SECONDS)
+        source_duration = state.get("duration") or 0
+        if source_duration > 0:
+            measure_duration = min(measure_duration, max(source_duration - measure_start, 0))
+        configured_shift_ms = obs_config.get(
+            "process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS,
+        )
+
+        def set_status(text, color=MUTED_TEXT_COLOR):
+            def update():
+                if root.winfo_exists():
+                    status_label.config(fg=color, text=text)
+            try:
+                root.after(0, update)
+            except tk.TclError:
+                pass
+
+        # Fully releasing VLC's hold on the source file -- not just pausing it -- before handing
+        # that same file to ffmpeg (for measuring and/or trimming). Confirmed live: the identical
+        # measurement window (same file, same offsets, same tracks), run through this exact code
+        # path, returned a confident result when reproduced standalone but an empty one inside the
+        # real app, even though extraction itself reported success both times -- consistent with a
+        # paused-but-still-open VLC input continuing to prefetch/read the file in the background
+        # and quietly corrupting or truncating what ffmpeg reads back, in a way that a bare
+        # pause() (which leaves VLC's demuxer/input open) doesn't rule out. player.stop() actually
+        # closes that input. The preview's position is restored afterward (see finish() below),
+        # reopening the file the same way load_file()/on_preview_quality_selected() already do --
+        # but always left PAUSED there regardless of whether it was playing before this started,
+        # rather than resuming autoplay, since a freshly exported clip is exactly the moment
+        # someone's about to go check the output file, not keep watching the source play through.
+        reopen_seconds = player.get_time() / 1000 if state["path"] else 0.0
+        player.stop()
+        update_play_pause_icon()
+
+        set_status(f"Trimming to {os.path.basename(output_path)}...")
         trim_button.config(state="disabled")
+        progress.config(mode="indeterminate")
         progress.pack(fill="x", padx=10, pady=(0, 6), before=status_label)
         progress.start(12)
 
+        def set_progress_determinate(fraction):
+            def update():
+                if root.winfo_exists():
+                    if str(progress["mode"]) != "determinate":
+                        progress.stop()
+                        progress.config(mode="determinate", maximum=100)
+                    progress["value"] = max(0.0, min(1.0, fraction)) * 100
+            try:
+                root.after(0, update)
+            except tk.TclError:
+                pass
+
+        def on_trim_progress(phase_text, fraction):
+            set_status(f"{phase_text}... {int(round(fraction * 100))}%")
+            set_progress_determinate(fraction)
+
         def worker():
+            audio_shift_ms_by_track = None
+            if fix_sync_enabled:
+                set_status("Measuring audio sync...")
+                # Guards on_progress below against updating the status label with a stale
+                # "Measuring track N..." message if the measurement thread is abandoned (see the
+                # watchdog below) but keeps running in the background and eventually gets around
+                # to calling it anyway -- by then the trim itself may already be running or done,
+                # and overwriting THAT status with old measurement progress would be confusing.
+                measurement_abandoned = {"value": False}
+
+                def on_progress(index, total, track):
+                    if not measurement_abandoned["value"]:
+                        set_status(f"Measuring audio sync -- track {track} ({index + 1} of {total})...")
+
+                # Run the measurement on its OWN thread and give up waiting on it past a hard,
+                # unconditional ceiling -- confirmed live (twice) that measure_clip_audio_sync_
+                # shifts_ms's own internal timeouts (each ffmpeg extraction's subprocess.run
+                # timeout, plus an overall budget checked between tracks) were not enough to keep
+                # this from appearing stuck in the real packaged app even on a short clip, for
+                # reasons never conclusively root-caused (every standalone reproduction outside
+                # the app ran in 1-3 seconds). Thread.join(timeout=...) doesn't depend on
+                # subprocess/OS process semantics being correct the way those internal timeouts
+                # do, so it's a genuinely independent backstop: if the measurement thread hasn't
+                # finished by AUDIO_SYNC_MEASUREMENT_HARD_TIMEOUT_SECONDS, this simply stops
+                # waiting and proceeds with the configured fallback for every track. The
+                # measurement thread itself is left to finish (or not) in the background --
+                # Python can't forcibly kill a thread, but it's a daemon thread, so it can never
+                # block the app from closing, and its result is just discarded if it does
+                # eventually land.
+                measurement_result = {}
+
+                def measure_worker():
+                    # Explicitly caught and logged -- confirmed live that an uncaught exception in
+                    # a background thread is otherwise swallowed with NO trace whatsoever in this
+                    # app's packaged (--noconsole) build: Python's default thread-exception hook
+                    # writes to sys.stderr, which this build has none of, so it goes nowhere. This
+                    # was the real explanation for repeated real-world "empty result, no warnings
+                    # logged at all" reports that never reproduced standalone -- there was a real
+                    # exception happening every time, just one nothing ever surfaced.
+                    try:
+                        measurement_result["value"] = measure_clip_audio_sync_shifts_ms(
+                            ffmpeg_path, source_path, fix_sync_reference_track, fix_sync_tracks,
+                            measure_start, measure_duration, progress_callback=on_progress,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "Clip editor: audio sync measurement for %s crashed -- falling back "
+                            "to the configured default for every track.",
+                            os.path.basename(source_path),
+                        )
+                        measurement_result["value"] = {}
+
+                measure_thread = threading.Thread(target=measure_worker, daemon=True)
+                measure_thread.start()
+                measure_thread.join(timeout=AUDIO_SYNC_MEASUREMENT_HARD_TIMEOUT_SECONDS)
+                if measure_thread.is_alive():
+                    measurement_abandoned["value"] = True
+                    logging.warning(
+                        "Clip editor: audio sync measurement for %s did not finish within %.0fs -- "
+                        "giving up on it and using the configured %sms default for every track "
+                        "instead. (It may still finish in the background; its result is discarded.)",
+                        os.path.basename(source_path), AUDIO_SYNC_MEASUREMENT_HARD_TIMEOUT_SECONDS,
+                        configured_shift_ms,
+                    )
+                    measured = {}
+                else:
+                    measured = measurement_result.get("value", {})
+                    logging.info(
+                        "Clip editor: audio sync measurement for %s: %s (configured fallback %sms for "
+                        "any track not confidently measured).",
+                        os.path.basename(source_path), measured, configured_shift_ms,
+                    )
+                # Falls back to the app's own configured/calibrated offset for any track that
+                # wasn't confidently measured (e.g. it had no real activity in the measured
+                # window) -- the same known-good default this feature is meant to improve on,
+                # rather than leaving that specific track unshifted.
+                audio_shift_ms_by_track = {
+                    track: measured.get(track, configured_shift_ms) for track in fix_sync_tracks
+                }
+                set_status(f"Trimming to {os.path.basename(output_path)}...")
+
             success = trim_clip(
                 source_path, start_seconds, end_seconds, output_path, ffmpeg_path=ffmpeg_path,
                 precise=precise, delete_original=delete_original, icon=icon,
                 notifications_config=notifications_config, scale_height=scale_height,
-                target_size_mb=target_size_mb,
+                target_size_mb=target_size_mb, audio_routing=audio_routing,
+                muted_destinations=muted_destinations, audio_shift_ms_by_track=audio_shift_ms_by_track,
+                progress_callback=on_trim_progress,
             )
 
             def finish():
@@ -6661,6 +7850,42 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                     status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}")
                 else:
                     status_label.config(fg=END_MARKER_COLOR, text="Trim failed -- see the log for details.")
+
+                # Reopens the same source file player.stop() released above, restoring the
+                # position it had before this trim started -- but always left paused (see the
+                # comment where player.stop() was called above), regardless of whether it was
+                # playing before. Skipped if the user switched to a different file while this was
+                # running (state["path"] no longer matches), or if this trim deleted the original
+                # (delete_original_after_trim).
+                if state["path"] == source_path and not delete_original and os.path.isfile(source_path):
+                    media = instance.media_new(source_path)
+                    for option in CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS.get(preview_quality_var.get(), []):
+                        media.add_option(option)
+                    player.set_media(media)
+                    player.audio_set_volume(volume_var.get())
+                    player.play()
+                    reclaim_focus_after_play()
+
+                    def restore_after_trim(attempts=0):
+                        if not root.winfo_exists() or state["path"] != source_path:
+                            return
+                        if player.get_length() > 0:
+                            player.set_time(int(max(0.0, reopen_seconds) * 1000))
+                            draw_timeline()
+                            pause_once_ready()
+                        elif attempts < 50:
+                            root.after(100, lambda: restore_after_trim(attempts + 1))
+
+                    def pause_once_ready(attempts=0):
+                        if not root.winfo_exists() or state["path"] != source_path:
+                            return
+                        if player.get_state() == vlc_module.State.Playing:
+                            player.pause()
+                            update_play_pause_icon()
+                        elif attempts < 50:
+                            root.after(100, lambda: pause_once_ready(attempts + 1))
+
+                    root.after(150, restore_after_trim)
 
             try:
                 root.after(0, finish)

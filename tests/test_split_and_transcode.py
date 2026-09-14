@@ -164,6 +164,127 @@ class TranscodeRecordingTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(input_path))
 
 
+class ApplyAudioSyncShiftTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(a, "resolve_ffmpeg_path", return_value=r"C:\fake\ffmpeg.exe")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        probe_patcher = patch.object(a, "probe_audio_stream_count", return_value=3)
+        probe_patcher.start()
+        self.addCleanup(probe_patcher.stop)
+
+    def _fake_run(self, returncode=0, stderr="", write_output=True, output_bytes=b"data"):
+        def run(cmd, capture_output, text, creationflags):
+            self.last_cmd = cmd
+            if write_output:
+                output_path = cmd[-1]
+                with open(output_path, "wb") as f:
+                    f.write(output_bytes)
+            return type("Result", (), {"returncode": returncode, "stderr": stderr})()
+        return run
+
+    def _config(self, **overrides):
+        config = {"enabled": True, "tracks": [2], "shift_ms": 27}
+        config.update(overrides)
+        return config
+
+    def test_disabled_does_nothing(self):
+        with patch.object(a.subprocess, "run") as mock_run:
+            result = a.apply_audio_sync_shift("in.mp4", self._config(enabled=False))
+        self.assertIsNone(result)
+        mock_run.assert_not_called()
+
+    def test_no_tracks_configured_does_nothing(self):
+        with patch.object(a.subprocess, "run") as mock_run:
+            result = a.apply_audio_sync_shift("in.mp4", self._config(tracks=[]))
+        self.assertIsNone(result)
+        mock_run.assert_not_called()
+
+    def test_zero_shift_ms_does_nothing(self):
+        with patch.object(a.subprocess, "run") as mock_run:
+            result = a.apply_audio_sync_shift("in.mp4", self._config(shift_ms=0))
+        self.assertIsNone(result)
+        mock_run.assert_not_called()
+
+    def test_successful_shift_writes_suffixed_output_and_returns_its_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "recording.mp4")
+            open(input_path, "w").close()
+            with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                result = a.apply_audio_sync_shift(input_path, self._config())
+            self.assertEqual(result, os.path.join(tmp, "recording_synced.mp4"))
+            self.assertTrue(os.path.isfile(result))
+            self.assertIn("-filter_complex", self.last_cmd)
+            self.assertEqual(self.last_cmd[self.last_cmd.index("-c:v") + 1], "copy")
+
+    def test_custom_suffix_is_respected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "recording.mp4")
+            open(input_path, "w").close()
+            with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                result = a.apply_audio_sync_shift(input_path, self._config(suffix="_fixed"))
+            self.assertEqual(result, os.path.join(tmp, "recording_fixed.mp4"))
+
+    def test_deletes_original_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "recording.mp4")
+            open(input_path, "w").close()
+            with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                a.apply_audio_sync_shift(input_path, self._config(delete_original=True))
+            self.assertFalse(os.path.isfile(input_path))
+
+    def test_does_not_delete_original_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "recording.mp4")
+            open(input_path, "w").close()
+            with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                a.apply_audio_sync_shift(input_path, self._config())
+            self.assertTrue(os.path.isfile(input_path))
+
+    def test_failed_shift_does_not_delete_original_and_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "recording.mp4")
+            open(input_path, "w").close()
+            with patch.object(a.subprocess, "run", side_effect=self._fake_run(returncode=1, stderr="boom")):
+                with self.assertLogs(level="ERROR"):
+                    result = a.apply_audio_sync_shift(input_path, self._config(delete_original=True))
+            self.assertIsNone(result)
+            self.assertTrue(os.path.isfile(input_path))
+
+    def test_missing_ffmpeg_is_logged_and_does_not_touch_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "recording.mp4")
+            open(input_path, "w").close()
+            with patch.object(a, "resolve_ffmpeg_path", return_value=None):
+                with self.assertLogs(level="ERROR") as log_ctx:
+                    result = a.apply_audio_sync_shift(input_path, self._config())
+            self.assertTrue(any("ffmpeg not found" in message for message in log_ctx.output))
+            self.assertIsNone(result)
+            self.assertTrue(os.path.isfile(input_path))
+
+    def test_unresolvable_track_count_is_logged_and_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "recording.mp4")
+            open(input_path, "w").close()
+            with patch.object(a, "probe_audio_stream_count", return_value=None):
+                with patch.object(a.subprocess, "run") as mock_run:
+                    with self.assertLogs(level="WARNING"):
+                        result = a.apply_audio_sync_shift(input_path, self._config())
+            self.assertIsNone(result)
+            mock_run.assert_not_called()
+
+    def test_track_out_of_range_is_logged_and_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "recording.mp4")
+            open(input_path, "w").close()
+            with patch.object(a, "probe_audio_stream_count", return_value=1):
+                with patch.object(a.subprocess, "run") as mock_run:
+                    with self.assertLogs(level="WARNING"):
+                        result = a.apply_audio_sync_shift(input_path, self._config(tracks=[5]))
+            self.assertIsNone(result)
+            mock_run.assert_not_called()
+
+
 class ResolveFfmpegPathTests(unittest.TestCase):
     def test_existing_absolute_path_is_used_as_is(self):
         with tempfile.TemporaryDirectory() as tmp:
