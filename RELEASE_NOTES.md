@@ -1,7 +1,6 @@
-**VERIFIED STABLE** -- every change below was confirmed against a real running OBS instance and/or a real recording during development, not just unit tests.
+### Installer
+- The WebSocket password on the finish page is now in a selectable/copyable field with a Copy button, instead of being buried in plain paragraph text you'd have to retype by hand.
+- Added a progress bar to the install, update, and uninstall flows -- previously the update/uninstall flows gave no visual feedback at all beyond the button disabling, and progress messages during them were silently discarded.
+- The Ready-to-install page now warns upfront if OBS is currently running (WebSocket auto-config can't happen while it's open), instead of only surfacing that after install finishes.
 
-### Clip editor
-- Space bar play/pause now works, including while the embedded video preview itself has keyboard focus -- previously disabled after repeated attempts at reclaiming Tk-level focus couldn't reliably work around that. Implemented as a foreground-window-gated global hotkey instead, verified live against a real OS-level hook and synthesized key events, not just mocked tests.
-
-### Reliability
-- Fixed a real bug (introduced, then caught, during this same round of work) where `ttk.Combobox` -- itself a subclass of `ttk.Entry` -- was still treated as a text field even after being explicitly excluded from a focus check, since the exclusion only removed it from an `isinstance` tuple that `ttk.Entry` alone already matched via inheritance.
+These installer changes are covered by scripted Tk smoke tests (real button clicks driving the actual wizard code, not just mocked unit tests of isolated logic) but have not yet been run through a real end-user install.

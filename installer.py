@@ -22,7 +22,7 @@ import threading
 import tkinter as tk
 import webbrowser
 import winreg
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 import psutil
 
@@ -706,8 +706,14 @@ def main():
         ready_page, text="", bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510
     )
     summary_label.pack(fill="x", pady=(0, 12))
+    obs_running_notice = tk.Label(
+        ready_page, text="", bg=PAGE_BG, fg="#b45309", font=("Segoe UI", 9, "italic"),
+        anchor="w", wraplength=510, justify="left",
+    )
+    obs_running_notice.pack(fill="x", pady=(0, 12))
     progress_label = tk.Label(ready_page, text="", bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w")
     progress_label.pack(fill="x")
+    progress_bar = ttk.Progressbar(ready_page, mode="indeterminate")
 
     # ---------- Already installed ----------
     existing_page = page_frame()
@@ -737,6 +743,11 @@ def main():
         existing_page, text="", bg=PAGE_BG, fg="#b91c1c", font=("Segoe UI", 9), anchor="w", wraplength=510
     )
     existing_error.pack(fill="x", pady=(12, 0))
+    existing_progress_label = tk.Label(
+        existing_page, text="", bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w",
+    )
+    existing_progress_label.pack(fill="x", pady=(4, 0))
+    existing_progress_bar = ttk.Progressbar(existing_page, mode="indeterminate")
 
     # ---------- Finish ----------
     finish_page = page_frame()
@@ -747,6 +758,23 @@ def main():
         finish_page, text="", bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510
     )
     finish_body.pack(fill="x", pady=(0, 12))
+    # Shown only when manual WebSocket setup is needed (see show_install_finish) -- a real Entry,
+    # not just more Label text, specifically so the password can actually be selected and copied
+    # rather than retyped by hand into OBS.
+    password_row = tk.Frame(finish_page, bg=PAGE_BG)
+    password_var = tk.StringVar(value="")
+    password_entry = tk.Entry(password_row, textvariable=password_var, width=28, state="readonly")
+    password_entry.pack(side="left")
+    password_copied_label = tk.Label(password_row, text="", bg=PAGE_BG, fg="#15803d", font=("Segoe UI", 9))
+
+    def copy_password():
+        root.clipboard_clear()
+        root.clipboard_append(password_var.get())
+        password_copied_label.config(text="Copied!")
+        root.after(2000, lambda: password_copied_label.config(text=""))
+
+    tk.Button(password_row, text="Copy", command=copy_password).pack(side="left", padx=(8, 8))
+    password_copied_label.pack(side="left")
     launch_var = tk.BooleanVar(value=True)
     launch_check = tk.Checkbutton(finish_page, text=f"Launch {APP_NAME} now", variable=launch_var, bg=PAGE_BG)
     launch_check.pack(anchor="w", pady=(8, 0))
@@ -819,6 +847,21 @@ def main():
                     f"Start with Windows: {'Yes' if startup_var.get() else 'No'}"
                 )
             )
+            # Checked here (before install starts) rather than only reported after the fact on
+            # the finish page -- try_configure_obs_websocket silently skips whenever OBS is
+            # running, so without this notice the first the user hears about needing a manual
+            # WebSocket setup step is after install has already finished.
+            if is_obs_running():
+                obs_running_notice.config(
+                    text=(
+                        "⚠  OBS is currently running -- its WebSocket server can't be configured "
+                        "automatically while it's open. Close OBS first if you'd like that done for "
+                        "you, or continue and set the password manually afterward (shown on the "
+                        "finish page)."
+                    )
+                )
+            else:
+                obs_running_notice.config(text="")
             progress_label.config(text="")
             next_btn.config(text="Install", state="normal", command=start_install)
         else:
@@ -855,6 +898,8 @@ def main():
     def start_install():
         next_btn.config(state="disabled")
         back_btn.config(state="disabled")
+        progress_bar.pack(fill="x", pady=(6, 0))
+        progress_bar.start(12)
 
         def worker():
             return do_install(dir_var.get(), obs_var.get() or None, collect_options(), report_progress)
@@ -863,6 +908,8 @@ def main():
             root.after(0, lambda: progress_label.config(text=message))
 
         def done(result, error):
+            progress_bar.stop()
+            progress_bar.pack_forget()
             if error is not None:
                 next_btn.config(state="normal")
                 back_btn.config(state="normal")
@@ -890,7 +937,7 @@ def main():
         else:
             lines.append(
                 "One manual step is still needed: open OBS \u2192 Tools \u2192 WebSocket Server "
-                f"Settings, turn it on, and set the password to:\n\n{result['password']}\n\n"
+                "Settings, turn it on, and set the password to the one below.\n"
                 "(Or copy whatever password OBS already shows there into this app's Settings instead.)"
             )
         ffmpeg_status = result.get("ffmpeg_status")
@@ -906,6 +953,12 @@ def main():
                 "and this app will find it on its own, or point Settings → Post-Processing at it directly."
             )
         finish_body.config(text="\n".join(lines))
+        if result["password"] is not None and not result["obs_ws_configured"]:
+            password_var.set(result["password"])
+            password_copied_label.config(text="")
+            password_row.pack(anchor="w", pady=(0, 12))
+        else:
+            password_row.pack_forget()
         launch_check.pack(anchor="w", pady=(8, 0))
         current["install_dir"] = dir_var.get()
         show("finish")
@@ -917,6 +970,7 @@ def main():
         finish_body.config(text=f"{APP_NAME} has been removed from {dir_var.get()}.")
         launch_var.set(False)
         launch_check.pack_forget()
+        password_row.pack_forget()
         current["install_dir"] = None
         show("finish")
         show_nav(back=False, next_=True, cancel=False)
@@ -930,11 +984,20 @@ def main():
             return
         update_btn.config(state="disabled")
         uninstall_btn.config(state="disabled")
+        existing_error.config(text="")
+        existing_progress_bar.pack(fill="x", pady=(4, 0))
+        existing_progress_bar.start(12)
+
+        def report_progress(message):
+            root.after(0, lambda: existing_progress_label.config(text=message))
 
         def worker():
-            return do_install(dir_var.get(), None, collect_options(), lambda _msg: None, write_config=False)
+            return do_install(dir_var.get(), None, collect_options(), report_progress, write_config=False)
 
         def done(result, error):
+            existing_progress_bar.stop()
+            existing_progress_bar.pack_forget()
+            existing_progress_label.config(text="")
             update_btn.config(state="normal")
             uninstall_btn.config(state="normal")
             if error is not None:
@@ -952,11 +1015,20 @@ def main():
             return
         update_btn.config(state="disabled")
         uninstall_btn.config(state="disabled")
+        existing_error.config(text="")
+        existing_progress_bar.pack(fill="x", pady=(4, 0))
+        existing_progress_bar.start(12)
+
+        def report_progress(message):
+            root.after(0, lambda: existing_progress_label.config(text=message))
 
         def worker():
-            do_uninstall(dir_var.get(), keep_config_var.get(), lambda _msg: None)
+            do_uninstall(dir_var.get(), keep_config_var.get(), report_progress)
 
         def done(_result, error):
+            existing_progress_bar.stop()
+            existing_progress_bar.pack_forget()
+            existing_progress_label.config(text="")
             update_btn.config(state="normal")
             uninstall_btn.config(state="normal")
             if error is not None:
