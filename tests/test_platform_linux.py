@@ -1,5 +1,7 @@
 import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 import unittest.mock
@@ -129,6 +131,39 @@ class GetWindowTitlesTests(unittest.TestCase):
 
         self.assertEqual(result, {4321: ["Balatro"], 5555: ["Discord"]})
         fake_display.close.assert_called_once()
+
+
+class AutostartTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="obsautorec_test_xdg_config_")
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+        self.env_patcher = unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp_dir}, clear=False)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    def test_disabled_by_default(self):
+        self.assertFalse(pl.is_autostart_enabled())
+
+    def test_enable_then_disable_round_trips(self):
+        self.assertTrue(pl.enable_autostart("/opt/obsautorecorder/OBSAutoRecorder", "/opt/obsautorecorder"))
+        self.assertTrue(pl.is_autostart_enabled())
+
+        desktop_path = os.path.join(self.tmp_dir, "autostart", "OBSAutoRecorder.desktop")
+        with open(desktop_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn('Exec="/opt/obsautorecorder/OBSAutoRecorder"', content)
+        self.assertIn("Path=/opt/obsautorecorder", content)
+        self.assertIn("[Desktop Entry]", content)
+
+        self.assertTrue(pl.disable_autostart())
+        self.assertFalse(pl.is_autostart_enabled())
+
+    def test_disable_when_never_enabled_is_a_no_op(self):
+        self.assertTrue(pl.disable_autostart())
+
+    def test_enable_failure_returns_false_not_raised(self):
+        with unittest.mock.patch.object(pl.os, "makedirs", side_effect=OSError("boom")):
+            self.assertFalse(pl.enable_autostart("/opt/app/app", "/opt/app"))
 
 
 class EmbedVideoPlayerTests(unittest.TestCase):

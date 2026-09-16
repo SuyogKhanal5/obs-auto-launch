@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -275,6 +276,88 @@ WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
 VK_SPACE = 0x20
 GA_ROOT = 2
+
+
+# --- Shortcuts / autostart (Startup-folder .lnk) ---
+# Moved wholesale from installer.py's old create_shortcut/get_desktop_shortcut_path/
+# get_startup_shortcut_path and autostart_script.py's old get_startup_shortcut_path/
+# is_startup_shortcut_enabled/set_startup_shortcut_enabled -- both call sites used their own
+# separate (but identical) PowerShell-shortcut implementation before this move; now there's one,
+# reached from both through platform_common.is_autostart_enabled/enable_autostart/
+# disable_autostart, per CROSS_PLATFORM_PLAN.md Phase 5.
+APP_NAME = "OBS Auto Recorder"
+STARTUP_SHORTCUT_NAME = "OBSAutoRecorder.lnk"
+
+
+def _ps_single_quote(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def create_shortcut(link_path, target, working_dir):
+    try:
+        os.makedirs(os.path.dirname(link_path), exist_ok=True)
+    except OSError:
+        pass
+    ps_script = (
+        "$WshShell = New-Object -ComObject WScript.Shell; "
+        f"$Shortcut = $WshShell.CreateShortcut({_ps_single_quote(link_path)}); "
+        f"$Shortcut.TargetPath = {_ps_single_quote(target)}; "
+        f"$Shortcut.WorkingDirectory = {_ps_single_quote(working_dir)}; "
+        "$Shortcut.Save()"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def get_desktop_shortcut_path():
+    desktop = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop")
+    return os.path.join(desktop, f"{APP_NAME}.lnk")
+
+
+def get_startup_shortcut_path():
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", STARTUP_SHORTCUT_NAME)
+
+
+def is_autostart_enabled():
+    path = get_startup_shortcut_path()
+    return bool(path and os.path.isfile(path))
+
+
+def enable_autostart(target_path, working_dir):
+    path = get_startup_shortcut_path()
+    if not path:
+        logging.warning("Could not resolve the Startup folder; cannot manage the startup shortcut.")
+        return False
+    if create_shortcut(path, target_path, working_dir):
+        logging.info("Created startup shortcut at %s", path)
+        return True
+    logging.error("Failed to create startup shortcut at %s", path)
+    return False
+
+
+def disable_autostart():
+    path = get_startup_shortcut_path()
+    if not path:
+        logging.warning("Could not resolve the Startup folder; cannot manage the startup shortcut.")
+        return False
+    if os.path.isfile(path):
+        try:
+            os.remove(path)
+            logging.info("Removed startup shortcut.")
+        except OSError as exc:
+            logging.error("Failed to remove startup shortcut: %s", exc)
+            return False
+    return True
 
 
 def embed_video_player(player, tk_widget):

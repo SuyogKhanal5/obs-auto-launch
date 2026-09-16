@@ -510,71 +510,25 @@ def cleanup_orphaned_pyinstaller_temp_dirs():
         logging.info("Cleaned up %d orphaned PyInstaller temp folder(s) from a previous run.", removed)
 
 
-STARTUP_SHORTCUT_NAME = "OBSAutoRecorder.lnk"
-
-
-def get_startup_shortcut_path():
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
-        return None
-    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", STARTUP_SHORTCUT_NAME)
-
-
 def is_startup_shortcut_enabled():
-    path = get_startup_shortcut_path()
-    return bool(path and os.path.isfile(path))
-
-
-def _ps_single_quote(value):
-    return "'" + value.replace("'", "''") + "'"
+    """Thin dispatcher -- the real per-OS autostart mechanism (a Startup-folder .lnk on Windows,
+    an XDG autostart .desktop file on Linux, a LaunchAgents .plist on macOS) now lives in
+    platform_common.is_autostart_enabled() / platform_windows.py / platform_linux.py /
+    platform_macos.py, see CROSS_PLATFORM_PLAN.md Phase 5."""
+    return platform_common.is_autostart_enabled()
 
 
 def set_startup_shortcut_enabled(enabled):
-    """Adds or removes a Startup-folder shortcut so the app launches at login.
-    Only works from the built exe (nothing standalone to point a shortcut at when
-    running from source)."""
-    path = get_startup_shortcut_path()
-    if not path:
-        logging.warning("Could not resolve the Startup folder; cannot manage the startup shortcut.")
-        return False
-
+    """Enables/disables autostart for THIS running app (sys.executable) -- see
+    is_startup_shortcut_enabled's own docstring for where the real per-OS work happens. Only
+    works from a built/frozen executable (nothing standalone to point an autostart entry at when
+    running from source -- sys.executable would just be the Python interpreter itself)."""
     if not enabled:
-        if os.path.isfile(path):
-            try:
-                os.remove(path)
-                logging.info("Removed startup shortcut.")
-            except OSError as exc:
-                logging.error("Failed to remove startup shortcut: %s", exc)
-                return False
-        return True
-
+        return platform_common.disable_autostart()
     if not getattr(sys, "frozen", False):
-        logging.warning("Cannot create a startup shortcut while running from source; use the built .exe.")
+        logging.warning("Cannot enable autostart while running from source; use the built app.")
         return False
-
-    target = sys.executable
-    working_dir = os.path.dirname(target)
-    ps_script = (
-        "$WshShell = New-Object -ComObject WScript.Shell; "
-        f"$Shortcut = $WshShell.CreateShortcut({_ps_single_quote(path)}); "
-        f"$Shortcut.TargetPath = {_ps_single_quote(target)}; "
-        f"$Shortcut.WorkingDirectory = {_ps_single_quote(working_dir)}; "
-        "$Shortcut.Save()"
-    )
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True, text=True, timeout=15,
-            **platform_common.hide_console_subprocess_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logging.error("Failed to create startup shortcut: %s", exc)
-        return False
-    if result.returncode != 0:
-        logging.error("Failed to create startup shortcut: %s", result.stderr.strip())
-        return False
-    logging.info("Created startup shortcut at %s", path)
-    return True
+    return platform_common.enable_autostart()
 
 
 def launch_obs(obs_config):
@@ -5095,9 +5049,9 @@ def _run_config_editor(master_root, restart_callback, on_close):
 
     is_frozen = getattr(sys, "frozen", False)
     startup_var = tk.BooleanVar(value=is_startup_shortcut_enabled())
-    startup_label = "Launch automatically when Windows starts"
+    startup_label = "Launch automatically at login"
     if not is_frozen:
-        startup_label += " (only available from the built .exe)"
+        startup_label += " (only available from the built app)"
     startup_checkbox = tk.Checkbutton(
         general_tab, text=startup_label, variable=startup_var, bg=DARK_BG, fg=DARK_FG,
         activebackground=DARK_BG, activeforeground=DARK_FG, selectcolor=DARK_ENTRY_BG,

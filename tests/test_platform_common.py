@@ -187,6 +187,42 @@ class GetWindowTitlesTests(unittest.TestCase):
         self.assertEqual(result, {})
 
 
+class IsAutostartEnabledTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.is_autostart_enabled.return_value = True
+            result = pc.is_autostart_enabled(platform_name="linux")
+        mock_select.assert_called_once_with("linux")
+        self.assertTrue(result)
+
+
+class EnableAutostartTests(unittest.TestCase):
+    def test_defaults_to_sys_executable(self):
+        with unittest.mock.patch.object(pc.sys, "executable", "/usr/bin/myapp"):
+            with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+                pc.enable_autostart(platform_name="linux")
+        mock_select.return_value.enable_autostart.assert_called_once_with("/usr/bin/myapp", "/usr/bin")
+
+    def test_uses_explicit_target_and_working_dir(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.enable_autostart(target_path="/opt/app/app", working_dir="/opt/app", platform_name="linux")
+        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app")
+
+    def test_working_dir_derived_from_target_path_when_omitted(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.enable_autostart(target_path="/opt/app/app", platform_name="linux")
+        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app")
+
+
+class DisableAutostartTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.disable_autostart.return_value = True
+            result = pc.disable_autostart(platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        self.assertTrue(result)
+
+
 class EmbedVideoPlayerTests(unittest.TestCase):
     def test_dispatches_to_backend(self):
         player = unittest.mock.Mock()

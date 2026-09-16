@@ -373,6 +373,59 @@ def run_custom_keybind_listener(
 # rule already scopes it that way.
 
 
+# --- Autostart (XDG autostart .desktop file) ---
+_AUTOSTART_DESKTOP_FILENAME = "OBSAutoRecorder.desktop"
+
+
+def _autostart_desktop_path():
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(config_home, "autostart", _AUTOSTART_DESKTOP_FILENAME)
+
+
+def is_autostart_enabled():
+    return os.path.isfile(_autostart_desktop_path())
+
+
+def enable_autostart(target_path, working_dir):
+    """Writes a .desktop file to the XDG autostart directory -- every mainstream Linux desktop
+    environment (GNOME, KDE, XFCE, ...) launches every entry there once at login, no elevation
+    needed since it's entirely under the user's own home directory."""
+    path = _autostart_desktop_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Exec's value is a single already-quoted command line per the XDG desktop-entry spec,
+        # not a shell string -- a target path containing a space (a real possibility under e.g.
+        # ~/.local/share/OBS Auto Recorder) needs its own quoting here, not shell-style escaping.
+        exec_value = f'"{target_path}"'
+        content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=OBS Auto Recorder\n"
+            f"Exec={exec_value}\n"
+            f"Path={working_dir}\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        logging.info("Created autostart entry at %s", path)
+        return True
+    except OSError as exc:
+        logging.error("Failed to create autostart entry at %s: %s", path, exc)
+        return False
+
+
+def disable_autostart():
+    path = _autostart_desktop_path()
+    if os.path.isfile(path):
+        try:
+            os.remove(path)
+            logging.info("Removed autostart entry.")
+        except OSError as exc:
+            logging.error("Failed to remove autostart entry: %s", exc)
+            return False
+    return True
+
+
 def embed_video_player(player, tk_widget):
     """Embeds a python-vlc player's output into tk_widget -- X11 takes the plain numeric X window
     id, the same integer Tk's own winfo_id() already returns (unlike macOS, where python-vlc's

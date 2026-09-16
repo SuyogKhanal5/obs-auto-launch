@@ -6,6 +6,7 @@ import glob
 import logging
 import os
 import shutil
+import subprocess
 import threading
 
 # The canonical libvlc shared-library name on macOS. Only used as a presence signal by
@@ -327,6 +328,69 @@ def run_custom_keybind_listener(
         )
 
     _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied)
+
+
+# --- Autostart (LaunchAgents .plist) ---
+_LAUNCH_AGENT_LABEL = "com.obsautorecorder.autostart"
+
+
+def _launch_agent_plist_path():
+    return os.path.expanduser(f"~/Library/LaunchAgents/{_LAUNCH_AGENT_LABEL}.plist")
+
+
+def is_autostart_enabled():
+    return os.path.isfile(_launch_agent_plist_path())
+
+
+def enable_autostart(target_path, working_dir):
+    """Writes a per-user LaunchAgent .plist and loads it via launchctl -- no elevation needed,
+    unlike a system-level LaunchDaemon, since this only ever needs to run in the logged-in user's
+    own session. RunAtLoad makes launchd start it once immediately at login (matching "start at
+    login" as understood on Windows/Linux); KeepAlive is deliberately NOT set, since this should
+    run once at login like a normal app, not be relaunched by launchd every time it exits."""
+    import plistlib
+
+    path = _launch_agent_plist_path()
+    plist = {
+        "Label": _LAUNCH_AGENT_LABEL,
+        "ProgramArguments": [target_path],
+        "WorkingDirectory": working_dir,
+        "RunAtLoad": True,
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            plistlib.dump(plist, f)
+    except OSError as exc:
+        logging.error("Failed to write LaunchAgent plist at %s: %s", path, exc)
+        return False
+
+    try:
+        subprocess.run(["launchctl", "load", "-w", path], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logging.error("Failed to load the LaunchAgent via launchctl: %s", exc)
+        return False
+    logging.info("Created and loaded LaunchAgent at %s", path)
+    return True
+
+
+def disable_autostart():
+    path = _launch_agent_plist_path()
+    if not os.path.isfile(path):
+        return True
+    try:
+        subprocess.run(["launchctl", "unload", path], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # Not fatal on its own -- still try to remove the plist file below so a stale/already-
+        # unloaded agent doesn't keep launchd re-running it at every future login regardless.
+        logging.warning("launchctl unload failed (continuing to remove the plist anyway): %s", exc)
+    try:
+        os.remove(path)
+        logging.info("Removed LaunchAgent plist.")
+    except OSError as exc:
+        logging.error("Failed to remove LaunchAgent plist: %s", exc)
+        return False
+    return True
 
 
 def embed_video_player(player, tk_widget):

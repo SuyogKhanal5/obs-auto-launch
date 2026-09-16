@@ -203,6 +203,32 @@ def run_custom_keybind_listener(
     )
 
 
+def is_autostart_enabled(platform_name=None):
+    """True if this app is currently configured to launch automatically at login -- a Startup-
+    folder .lnk on Windows, an XDG autostart .desktop file on Linux, a LaunchAgents .plist on
+    macOS. All 3 mechanisms are just presence checks (there's only ever one such entry per app),
+    so this needs no target path the way enable_autostart below does."""
+    return _select_backend(platform_name).is_autostart_enabled()
+
+
+def enable_autostart(target_path=None, working_dir=None, platform_name=None):
+    """Configures this app to launch automatically at login. target_path/working_dir default to
+    sys.executable and its own directory (this app enabling autostart for itself, e.g. from its
+    own Settings toggle) -- pass them explicitly when a DIFFERENT process needs to enable it for
+    an app it just installed elsewhere (e.g. installer.py, a separate running process from the
+    app it just wrote to disk). Returns False (logged) rather than raising on any failure --
+    autostart has always been opt-in, best-effort, never something this app hard-requires."""
+    target_path = target_path or sys.executable
+    working_dir = working_dir or os.path.dirname(target_path)
+    return _select_backend(platform_name).enable_autostart(target_path, working_dir)
+
+
+def disable_autostart(platform_name=None):
+    """Removes whatever enable_autostart set up, if anything -- a no-op (returns True) if
+    autostart wasn't enabled to begin with, on every backend."""
+    return _select_backend(platform_name).disable_autostart()
+
+
 def embed_video_player(player, tk_widget, platform_name=None):
     """Embeds a python-vlc player's video output into tk_widget -- set_hwnd on Windows,
     set_xwindow on Linux/X11 (both take the plain numeric id tk_widget.winfo_id() already

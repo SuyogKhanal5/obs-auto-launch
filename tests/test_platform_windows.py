@@ -131,6 +131,54 @@ class GetWindowTitlesTests(unittest.TestCase):
             self.assertIsInstance(titles, list)
 
 
+class AutostartTests(unittest.TestCase):
+    def test_disabled_when_no_shortcut_file(self):
+        with unittest.mock.patch.dict(pw.os.environ, {"APPDATA": r"C:\Users\Test\AppData\Roaming"}, clear=False):
+            with unittest.mock.patch.object(pw.os.path, "isfile", return_value=False):
+                self.assertFalse(pw.is_autostart_enabled())
+
+    def test_enabled_when_shortcut_file_exists(self):
+        with unittest.mock.patch.dict(pw.os.environ, {"APPDATA": r"C:\Users\Test\AppData\Roaming"}, clear=False):
+            with unittest.mock.patch.object(pw.os.path, "isfile", return_value=True):
+                self.assertTrue(pw.is_autostart_enabled())
+
+    def test_enable_calls_create_shortcut_with_startup_path(self):
+        startup_path = r"C:\Users\Test\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\OBSAutoRecorder.lnk"
+        with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=startup_path):
+            with unittest.mock.patch.object(pw, "create_shortcut", return_value=True) as mock_create:
+                self.assertTrue(pw.enable_autostart(r"C:\App\app.exe", r"C:\App"))
+        mock_create.assert_called_once_with(startup_path, r"C:\App\app.exe", r"C:\App")
+
+    def test_enable_returns_false_when_startup_path_unresolvable(self):
+        with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=None):
+            self.assertFalse(pw.enable_autostart(r"C:\App\app.exe", r"C:\App"))
+
+    def test_enable_returns_false_when_create_shortcut_fails(self):
+        with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=r"C:\Startup\x.lnk"):
+            with unittest.mock.patch.object(pw, "create_shortcut", return_value=False):
+                self.assertFalse(pw.enable_autostart(r"C:\App\app.exe", r"C:\App"))
+
+    def test_disable_removes_existing_shortcut(self):
+        with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=r"C:\Startup\x.lnk"):
+            with unittest.mock.patch.object(pw.os.path, "isfile", return_value=True):
+                with unittest.mock.patch.object(pw.os, "remove") as mock_remove:
+                    self.assertTrue(pw.disable_autostart())
+        mock_remove.assert_called_once_with(r"C:\Startup\x.lnk")
+
+    def test_disable_is_a_no_op_when_nothing_to_remove(self):
+        with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=r"C:\Startup\x.lnk"):
+            with unittest.mock.patch.object(pw.os.path, "isfile", return_value=False):
+                with unittest.mock.patch.object(pw.os, "remove") as mock_remove:
+                    self.assertTrue(pw.disable_autostart())
+        mock_remove.assert_not_called()
+
+    def test_disable_returns_false_on_removal_failure(self):
+        with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=r"C:\Startup\x.lnk"):
+            with unittest.mock.patch.object(pw.os.path, "isfile", return_value=True):
+                with unittest.mock.patch.object(pw.os, "remove", side_effect=OSError("boom")):
+                    self.assertFalse(pw.disable_autostart())
+
+
 class EmbedVideoPlayerTests(unittest.TestCase):
     def test_calls_set_hwnd_with_widgets_winfo_id(self):
         player = unittest.mock.Mock()

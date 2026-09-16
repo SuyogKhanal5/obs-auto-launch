@@ -25,6 +25,7 @@ from tkinter import filedialog, messagebox, ttk
 import psutil
 
 import platform_common
+import platform_windows
 
 APP_NAME = "OBS Auto Recorder"
 EXE_NAME = "OBSAutoRecorder.exe"
@@ -103,43 +104,14 @@ def resource_path(name):
     return os.path.join(base, name)
 
 
-def _ps_single_quote(value):
-    return "'" + value.replace("'", "''") + "'"
-
-
-def create_shortcut(link_path, target, working_dir):
-    try:
-        os.makedirs(os.path.dirname(link_path), exist_ok=True)
-    except OSError:
-        pass
-    ps_script = (
-        "$WshShell = New-Object -ComObject WScript.Shell; "
-        f"$Shortcut = $WshShell.CreateShortcut({_ps_single_quote(link_path)}); "
-        f"$Shortcut.TargetPath = {_ps_single_quote(target)}; "
-        f"$Shortcut.WorkingDirectory = {_ps_single_quote(working_dir)}; "
-        "$Shortcut.Save()"
-    )
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True, text=True, timeout=15,
-            **platform_common.hide_console_subprocess_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
 def get_desktop_shortcut_path():
-    desktop = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop")
-    return os.path.join(desktop, f"{APP_NAME}.lnk")
-
-
-def get_startup_shortcut_path():
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
-        return None
-    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "OBSAutoRecorder.lnk")
+    """The "Create a shortcut on my Desktop" installer option -- still Windows-only (no
+    Linux/macOS equivalent implemented yet, unlike autostart below, which CROSS_PLATFORM_PLAN.md
+    Phase 5 did port); reaches directly into platform_windows.py rather than through
+    platform_common since this isn't part of the cross-platform interface. create_shortcut/
+    get_startup_shortcut_path moved there too -- see platform_windows.py's own "Shortcuts /
+    autostart" section."""
+    return platform_windows.get_desktop_shortcut_path()
 
 
 def find_obs_exe():
@@ -291,13 +263,15 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
 
     if options.get("desktop_shortcut"):
         on_progress("Creating desktop shortcut...")
-        create_shortcut(get_desktop_shortcut_path(), exe_path, install_dir)
+        platform_windows.create_shortcut(get_desktop_shortcut_path(), exe_path, install_dir)
 
     if options.get("start_at_login"):
         on_progress("Setting up automatic startup...")
-        startup_path = get_startup_shortcut_path()
-        if startup_path:
-            create_shortcut(startup_path, exe_path, install_dir)
+        # exe_path/install_dir here are the freshly-installed app's own location -- NOT
+        # sys.executable (this installer's own path), which is why they're passed explicitly
+        # rather than relying on enable_autostart's sys.executable default (see that function's
+        # own docstring).
+        platform_common.enable_autostart(exe_path, install_dir)
 
     on_progress("Done.")
     return {
@@ -311,12 +285,13 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
 
 def do_uninstall(install_dir, keep_config, on_progress):
     on_progress("Removing shortcuts...")
-    for path in [get_desktop_shortcut_path(), get_startup_shortcut_path()]:
-        try:
-            if path and os.path.isfile(path):
-                os.remove(path)
-        except OSError:
-            pass
+    desktop_path = get_desktop_shortcut_path()
+    try:
+        if desktop_path and os.path.isfile(desktop_path):
+            os.remove(desktop_path)
+    except OSError:
+        pass
+    platform_common.disable_autostart()
 
     on_progress("Removing application files...")
     internal_dir = os.path.join(install_dir, APP_INTERNAL_DIR_NAME)

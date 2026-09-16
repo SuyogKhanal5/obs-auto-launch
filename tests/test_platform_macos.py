@@ -1,5 +1,7 @@
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import unittest
 import unittest.mock
@@ -116,6 +118,56 @@ class GetWindowTitlesTests(unittest.TestCase):
         with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
             with self.assertLogs(level="WARNING"):
                 self.assertEqual(pmac.get_window_titles(), {})
+
+
+class AutostartTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp_home = tempfile.mkdtemp(prefix="obsautorec_test_home_")
+        self.addCleanup(shutil.rmtree, self.tmp_home, ignore_errors=True)
+        self.home_patcher = unittest.mock.patch.dict(os.environ, {"HOME": self.tmp_home}, clear=False)
+        self.home_patcher.start()
+        self.addCleanup(self.home_patcher.stop)
+
+    def test_disabled_by_default(self):
+        self.assertFalse(pmac.is_autostart_enabled())
+
+    def test_enable_then_disable_round_trips(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0)
+            self.assertTrue(pmac.enable_autostart("/Applications/OBSAutoRecorder.app/Contents/MacOS/OBSAutoRecorder", "/Applications"))
+        self.assertTrue(pmac.is_autostart_enabled())
+        mock_run.assert_called_once()
+        self.assertEqual(mock_run.call_args[0][0][0], "launchctl")
+        self.assertEqual(mock_run.call_args[0][0][1], "load")
+
+        plist_path = pmac._launch_agent_plist_path()
+        with open(plist_path, "rb") as f:
+            import plistlib
+            plist = plistlib.load(f)
+        self.assertEqual(plist["Label"], pmac._LAUNCH_AGENT_LABEL)
+        self.assertTrue(plist["RunAtLoad"])
+
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run2:
+            mock_run2.return_value = unittest.mock.Mock(returncode=0)
+            self.assertTrue(pmac.disable_autostart())
+        self.assertFalse(pmac.is_autostart_enabled())
+
+    def test_disable_when_never_enabled_is_a_no_op(self):
+        self.assertTrue(pmac.disable_autostart())
+
+    def test_enable_failure_to_write_plist_returns_false(self):
+        with unittest.mock.patch.object(pmac.os, "makedirs", side_effect=OSError("boom")):
+            self.assertFalse(pmac.enable_autostart("/Applications/App.app/Contents/MacOS/App", "/Applications"))
+
+    def test_launchctl_unload_failure_still_removes_plist(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0)
+            pmac.enable_autostart("/Applications/App.app/Contents/MacOS/App", "/Applications")
+
+        with unittest.mock.patch.object(pmac.subprocess, "run", side_effect=OSError("launchctl missing")):
+            with self.assertLogs(level="WARNING"):
+                self.assertTrue(pmac.disable_autostart())
+        self.assertFalse(pmac.is_autostart_enabled())
 
 
 class EmbedVideoPlayerTests(unittest.TestCase):
