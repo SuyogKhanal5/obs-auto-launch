@@ -161,38 +161,51 @@ def get_running_processes():
 
 
 def get_window_titles():
-    titles = {}
-    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-
-    def callback(hwnd, lparam):
-        if not ctypes.windll.user32.IsWindowVisible(hwnd):
-            return 1
-        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-        if length == 0:
-            return 1
-        buf = ctypes.create_unicode_buffer(length + 1)
-        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-        pid = wintypes.DWORD()
-        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        titles.setdefault(pid.value, []).append(buf.value)
-        return 1
-
-    ctypes.windll.user32.EnumWindows(EnumWindowsProc(callback), 0)
-    return titles
+    """Maps each visible top-level window's owning PID to a list of that window's titles -- used
+    for "window title contains X" game-detection rules (e.g. Minecraft's javaw.exe, whose process
+    name alone is too generic to watch for on its own). Thin wrapper -- the real per-OS
+    implementation now lives in platform_common.get_window_titles() / platform_windows.py /
+    platform_linux.py / platform_macos.py, see CROSS_PLATFORM_PLAN.md Phase 2. Returns {} (not an
+    error) when this isn't supported in the current session at all -- e.g. a Wayland desktop,
+    which has no unprivileged cross-compositor API for this."""
+    return platform_common.get_window_titles()
 
 
 def get_steam_install_path():
-    for hive, subkey in (
-        (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
-    ):
-        try:
-            with winreg.OpenKey(hive, subkey) as key:
-                value = winreg.QueryValueEx(key, "SteamPath")[0]
-                return os.path.normpath(value)
-        except OSError:
+    """Best-effort search for Steam's install root. Thin wrapper -- the real per-OS search (the
+    registry on Windows, well-known install locations on Linux/macOS, since Steam ships a native
+    client on all 3) now lives in platform_common.find_steam_install_path() /
+    platform_windows.py / platform_linux.py / platform_macos.py, see
+    CROSS_PLATFORM_PLAN.md Phase 2."""
+    return platform_common.find_steam_install_path()
+
+
+def normalize_allowed_library_roots(allowed_entries):
+    """Migrates/normalizes each configured "allowed Steam library root" entry into a real path
+    prefix, usable identically on every OS. Pre-redesign configs may still hold bare Windows
+    drive letters (the old "allowed_drives": ["C", "D"] scheme, back when this filter only
+    understood drive letters) -- those expand to that drive's root (e.g. "C" -> "C:\\") when
+    running on Windows, where they're still meaningful, and are dropped (with a one-time log, not
+    a crash) everywhere else, since there's no equivalent concept to fall back to on a POSIX
+    mount-point layout. Anything else is treated as a real folder path prefix as-is, which is what
+    makes this filter work the same way on Linux/macOS (e.g. "/mnt/data", "/Volumes/External")."""
+    normalized = []
+    for raw in allowed_entries or []:
+        entry = str(raw).strip()
+        if not entry:
             continue
-    return None
+        is_bare_drive_letter = len(entry.rstrip("\\/:")) == 1 and entry[0].isalpha()
+        if is_bare_drive_letter:
+            if sys.platform == "win32":
+                normalized.append(entry[0].upper() + ":\\")
+            else:
+                logging.warning(
+                    "Ignoring legacy drive-letter Steam library filter '%s' -- drive letters "
+                    "aren't meaningful on this OS; use a full folder path instead.", entry,
+                )
+            continue
+        normalized.append(entry)
+    return normalized
 
 
 def get_steam_common_dirs(steam_config):
@@ -201,7 +214,7 @@ def get_steam_common_dirs(steam_config):
 
     install_path = get_steam_install_path()
     if not install_path:
-        logging.warning("Could not locate Steam install path via registry.")
+        logging.warning("Could not locate a Steam install on this machine.")
         return []
 
     library_paths = [install_path]
@@ -212,10 +225,18 @@ def get_steam_common_dirs(steam_config):
         for match in re.finditer(r'"path"\s+"([^"]+)"', content):
             library_paths.append(os.path.normpath(match.group(1).replace("\\\\", "\\")))
 
-    allowed_drives = steam_config.get("allowed_drives")
-    if allowed_drives:
-        allowed = {d.upper().rstrip("\\/:") for d in allowed_drives}
-        library_paths = [p for p in library_paths if os.path.splitdrive(p)[0].upper().rstrip(":") in allowed]
+    # A path-prefix filter rather than the old drive-letter-equality one -- works identically on
+    # every OS (a POSIX path has no drive letter to match against at all, but a plain string
+    # prefix check needs no OS-specific concept), and is opt-in (empty/unset by default) either
+    # way. os.path.normcase lowercases on Windows (case-insensitive filesystem) and is a no-op on
+    # Linux (case-sensitive), matching each OS's own path-equality semantics.
+    allowed_roots = normalize_allowed_library_roots(steam_config.get("allowed_drives"))
+    if allowed_roots:
+        normalized_roots = [os.path.normcase(os.path.normpath(os.path.expanduser(root))) for root in allowed_roots]
+        library_paths = [
+            p for p in library_paths
+            if any(os.path.normcase(os.path.normpath(p)).startswith(root) for root in normalized_roots)
+        ]
 
     common_dirs = sorted({os.path.join(p, "steamapps", "common").lower() for p in library_paths})
     logging.info("Watching Steam library folders: %s", ", ".join(common_dirs))
@@ -252,7 +273,10 @@ def get_display_name_from_dirs(exe_path, common_dirs):
 
 
 def get_xbox_install_dirs(xbox_config):
-    if not xbox_config.get("enabled", True):
+    # The Xbox/PC Game Pass app is Windows-only (UWP-based) -- there's no Mac or Linux client at
+    # all to auto-detect, and the r"C:\XboxGames" default below is meaningless off Windows, so
+    # this is a deliberate no-op there rather than an oversight. See CROSS_PLATFORM_PLAN.md §2.5.
+    if sys.platform != "win32" or not xbox_config.get("enabled", True):
         return []
     configured = xbox_config.get("install_dirs") or [r"C:\XboxGames"]
     dirs = sorted({os.path.normpath(d).lower() for d in configured if os.path.isdir(d)})
@@ -273,7 +297,11 @@ def get_battlenet_install_dirs(battlenet_config):
 
 
 def get_gog_installed_games(gog_config):
-    if not gog_config.get("enabled", True):
+    # GOG Galaxy itself has never shipped a Mac or Linux client (GOG's DRM-free Mac/Linux
+    # installers for individual games are a separate, unrelated distribution path with no
+    # registry/manifest this could hook into) -- winreg doesn't even exist to import on those
+    # OSes, so this must return before ever touching it. See CROSS_PLATFORM_PLAN.md §2.5.
+    if sys.platform != "win32" or not gog_config.get("enabled", True):
         return []
 
     exclude_keywords = [k.lower() for k in gog_config.get("exclude_keywords", [])]
@@ -309,8 +337,11 @@ def get_gog_installed_games(gog_config):
 
 
 def get_epic_manifest_dir():
-    root = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
-    return os.path.join(root, "Epic", "EpicGamesLauncher", "Data", "Manifests")
+    """Directory Epic Games Launcher writes its .item install manifests to. Thin wrapper -- the
+    real per-OS path (Epic ships a native client on Windows and macOS, but not Linux -- see
+    CROSS_PLATFORM_PLAN.md §2.5) now lives in platform_common.epic_manifest_dir() /
+    platform_windows.py / platform_linux.py / platform_macos.py."""
+    return platform_common.epic_manifest_dir()
 
 
 def get_epic_installed_games(epic_config):
@@ -318,8 +349,8 @@ def get_epic_installed_games(epic_config):
         return []
 
     manifest_dir = get_epic_manifest_dir()
-    if not os.path.isdir(manifest_dir):
-        logging.info("No Epic Games manifests found at %s", manifest_dir)
+    if not manifest_dir or not os.path.isdir(manifest_dir):
+        logging.info("No Epic Games manifests found%s", f" at {manifest_dir}" if manifest_dir else " (Epic Games Launcher has no client on this OS)")
         return []
 
     exclude_keywords = [k.lower() for k in epic_config.get("exclude_keywords", [])]
@@ -4402,7 +4433,9 @@ def add_checkbox(parent, row, label_text, var, columnspan=2):
     ).grid(row=row, column=0, columnspan=columnspan, sticky="w", padx=10, pady=4)
 
 
-def add_browse_button(parent, row, var, mode="file", filetypes=(("Executable", "*.exe"), ("All files", "*.*"))):
+def add_browse_button(parent, row, var, mode="file", filetypes=None):
+    filetypes = platform_common.executable_filetypes() if filetypes is None else filetypes
+
     def browse():
         path = filedialog.askopenfilename(filetypes=filetypes) if mode == "file" else filedialog.askdirectory()
         if path:
@@ -4498,7 +4531,12 @@ def open_process_picker(parent, on_add, multiselect=True, already_selected=None)
 # just be clutter. A title with its own dedicated launcher (or a distribution platform this app
 # has no scanner for, like Riot Client or the EA app) stays, even if it's *also* on one of the
 # scanned platforms -- e.g. Warframe (Steam or its own launcher) and Apex Legends (Steam or EA).
-COMMON_GAMES = [
+#
+# Split per OS rather than one shared list: most of these titles have no real macOS/Linux client
+# at all (kernel-level anti-cheat, Windows-only engines, etc.) and would just be dead entries that
+# silently never match on those platforms. Only titles with a genuine native client elsewhere get
+# a platform-specific entry, with that platform's own process name.
+_COMMON_GAMES_WINDOWS = [
     {"name": "League of Legends", "process_name": "league of legends.exe"},
     {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
     {"name": "Valorant", "process_name": "VALORANT-Win64-Shipping.exe"},
@@ -4508,6 +4546,31 @@ COMMON_GAMES = [
     {"name": "Roblox", "process_name": "RobloxPlayerBeta.exe"},
     {"name": "Genshin Impact", "process_name": "GenshinImpact.exe"},
 ]
+
+# League of Legends and Roblox both ship real macOS clients; Valorant/Warframe/Apex/Genshin/
+# Wizard101 do not (no native Mac build, and several rely on kernel-level anti-cheat that
+# explicitly excludes macOS). Process names here are best-effort based on each game's typical
+# macOS bundle naming and haven't been confirmed against real hardware yet -- see
+# CROSS_PLATFORM_PLAN.md's open macOS unknowns. If one doesn't match, "Pick Running..." (while
+# the game is open) or typing the exact process name by hand still works.
+_COMMON_GAMES_MACOS = [
+    {"name": "League of Legends", "process_name": "LeagueofLegends"},
+    {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
+    {"name": "Roblox", "process_name": "RobloxPlayer"},
+]
+
+# Minecraft: Java Edition is the only one of these titles with a genuine native Linux client
+# (it's just a cross-platform Java app) -- none of the rest ship for Linux at all.
+_COMMON_GAMES_LINUX = [
+    {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
+]
+
+if sys.platform == "win32":
+    COMMON_GAMES = _COMMON_GAMES_WINDOWS
+elif sys.platform == "darwin":
+    COMMON_GAMES = _COMMON_GAMES_MACOS
+else:
+    COMMON_GAMES = _COMMON_GAMES_LINUX
 
 
 def open_common_games_picker(parent, insert_unique, current_watched_lower, add_window_row, current_window_keys):
@@ -4580,7 +4643,9 @@ def open_common_games_picker(parent, insert_unique, current_watched_lower, add_w
 
 def build_watched_games_editor(parent, initial_games, on_pick_common=None):
     tk.Label(
-        parent, text="Watched game processes (exact exe name, e.g. cs2.exe)", anchor="w",
+        parent,
+        text=f"Watched game processes (exact process name, e.g. {platform_common.example_executable_name()})",
+        anchor="w",
         bg=DARK_BG, fg=DARK_FG,
     ).pack(anchor="w", padx=10, pady=(10, 2))
     frame = tk.Frame(parent, bg=DARK_BG)
@@ -4646,7 +4711,12 @@ def build_watched_windows_editor(parent, initial_rows):
         )
 
     tk.Label(
-        parent, text="Window-title rules (for games sharing a generic process name, e.g. javaw.exe)", anchor="w",
+        parent,
+        text=(
+            "Window-title rules (for games sharing a generic process name, e.g. "
+            f"{'javaw.exe' if sys.platform == 'win32' else 'java'})"
+        ),
+        anchor="w",
         bg=DARK_BG, fg=DARK_FG,
     ).pack(anchor="w", padx=10, pady=(10, 2))
 
@@ -5341,7 +5411,14 @@ def _run_config_editor(master_root, restart_callback, on_close):
     row = 0
     row, steam_vars = build_launcher_section(launchers_tab, row, "Steam", config.get("steam", {}), False)
     steam_drives_var = tk.StringVar(value=format_csv_field(config.get("steam", {}).get("allowed_drives", [])))
-    add_labeled_entry(launchers_tab, row, "Allowed drives (comma-separated, e.g. C, D)", steam_drives_var)
+    # The filter itself is a plain path-prefix check (see normalize_allowed_library_roots), so it
+    # means the same thing on every OS -- just phrased with each OS's own example: bare drive
+    # letters on Windows, full folder paths (mount points) elsewhere.
+    allowed_roots_label = (
+        "Allowed drives (comma-separated, e.g. C, D)" if sys.platform == "win32"
+        else "Allowed library folders (comma-separated full paths, optional)"
+    )
+    add_labeled_entry(launchers_tab, row, allowed_roots_label, steam_drives_var)
     row += 1
     row, epic_vars = build_launcher_section(launchers_tab, row, "Epic Games", config.get("epic", {}), False)
     row, gog_vars = build_launcher_section(launchers_tab, row, "GOG Galaxy", config.get("gog", {}), False)
@@ -5957,7 +6034,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
     add_section_label(post_tab, row, "Notifications")
     row += 1
     notifications_enabled_var = tk.BooleanVar(value=config.get("notifications", {}).get("enabled", False))
-    add_checkbox(post_tab, row, "Show Windows toast notifications for key events", notifications_enabled_var)
+    add_checkbox(post_tab, row, "Show desktop notifications for key events", notifications_enabled_var)
     row += 1
 
     # --- Clip Editor ---

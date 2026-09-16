@@ -3,6 +3,7 @@ schedule.
 
 Minimum target: macOS 13 (Ventura) -- see CROSS_PLATFORM_PLAN.md §2.6."""
 import glob
+import logging
 import os
 import shutil
 
@@ -64,3 +65,63 @@ def find_vlc_directory():
                 return candidate
 
     return None
+
+
+def find_steam_install_path():
+    """Steam on macOS has no registry to ask -- its real, well-known install location under
+    Application Support."""
+    candidate = os.path.expanduser("~/Library/Application Support/Steam")
+    return candidate if os.path.isdir(candidate) else None
+
+
+def epic_manifest_dir():
+    """Epic Games Launcher ships a native macOS client (unlike Linux -- see
+    CROSS_PLATFORM_PLAN.md §2.5), writing its .item install manifests to the standard macOS
+    per-app Application Support convention -- the same manifest FORMAT as Windows, just a
+    different root. Not independently verified against a real Epic macOS install yet; confirm
+    this exact path during Phase 2's own testing against real hardware/CI, per the plan's own
+    note on this assumption."""
+    return os.path.expanduser("~/Library/Application Support/Epic/EpicGamesLauncher/Data/Manifests")
+
+
+def get_window_titles():
+    """Maps each visible top-level window's owning PID to its titles via Quartz's
+    CGWindowListCopyWindowInfo -- returns metadata (including title and owning PID) for every
+    window currently on screen; unlike some other macOS window-introspection APIs, this
+    particular call needs no special Accessibility/Screen-Recording permission grant from the
+    user. Returns {} (never raises) if pyobjc isn't installed, or for any other reason this can't
+    complete -- window-title-based game detection is one optional input to a bigger detection
+    pipeline (see autostart_script.py's find_target_process), not something worth this app
+    crashing over.
+
+    pyobjc is imported lazily, inside this function, rather than at module level --
+    deliberately, so this whole module stays importable (for the cross-OS backend-dispatch
+    testing CROSS_PLATFORM_PLAN.md §3.2 describes) even in an environment that doesn't have
+    pyobjc installed at all, which is every non-macOS CI runner given it's a macOS-only
+    requirements.txt dependency (see that file's own sys_platform marker)."""
+    try:
+        import Quartz
+    except ImportError:
+        logging.warning(
+            "pyobjc-framework-Quartz isn't installed -- window-title-based game detection rules "
+            "won't match."
+        )
+        return {}
+
+    try:
+        window_list = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        )
+    except Exception as exc:
+        logging.warning("Could not enumerate windows for window-title detection: %s", exc)
+        return {}
+
+    titles = {}
+    for window in window_list or []:
+        title = window.get("kCGWindowName")
+        pid = window.get("kCGWindowOwnerPID")
+        if not title or pid is None:
+            continue
+        titles.setdefault(pid, []).append(title)
+    return titles

@@ -10,6 +10,7 @@ to return this module's dispatch *from a test running on real Linux/macOS CI* (t
 platform-selection logic without needing real Windows) -- an unconditional `import winreg` here
 would defeat that by crashing at import time on those runners even before any function of this
 module's actually gets called. Guarded the same way for the same reason."""
+import ctypes
 import glob
 import os
 import shutil
@@ -17,6 +18,7 @@ import sys
 
 if sys.platform == "win32":
     import winreg
+    from ctypes import wintypes
 
 LIBVLC_FILENAME = "libvlc.dll"
 
@@ -96,3 +98,48 @@ def find_vlc_directory():
             return candidate
 
     return None
+
+
+def find_steam_install_path():
+    """Moved unchanged from autostart_script.py's old get_steam_install_path(): Steam writes its
+    real install root to the registry on every Windows install."""
+    for hive, subkey in (
+        (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+    ):
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value = winreg.QueryValueEx(key, "SteamPath")[0]
+                return os.path.normpath(value)
+        except OSError:
+            continue
+    return None
+
+
+def epic_manifest_dir():
+    """Moved unchanged from autostart_script.py's old get_epic_manifest_dir()."""
+    root = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+    return os.path.join(root, "Epic", "EpicGamesLauncher", "Data", "Manifests")
+
+
+def get_window_titles():
+    """Moved unchanged from autostart_script.py's old get_window_titles(): maps each visible
+    top-level window's owning PID to its titles via a raw EnumWindows callback."""
+    titles = {}
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+    def callback(hwnd, lparam):
+        if not ctypes.windll.user32.IsWindowVisible(hwnd):
+            return 1
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return 1
+        buf = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        titles.setdefault(pid.value, []).append(buf.value)
+        return 1
+
+    ctypes.windll.user32.EnumWindows(EnumWindowsProc(callback), 0)
+    return titles

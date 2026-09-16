@@ -76,5 +76,43 @@ class FindVlcDirectoryTests(unittest.TestCase):
                     self.assertIsNone(pmac.find_vlc_directory())
 
 
+class GetWindowTitlesTests(unittest.TestCase):
+    def test_missing_pyobjc_returns_empty_not_raises(self):
+        # pyobjc genuinely isn't installed in this test environment (it's a macOS-only
+        # requirements.txt dependency -- see that file's sys_platform marker), so this exercises
+        # the real ImportError path, not a simulated one.
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(pmac.get_window_titles(), {})
+
+    def test_parses_window_list_into_pid_keyed_titles(self):
+        # Injects a fake Quartz module into sys.modules -- lets this test exercise
+        # get_window_titles' real CGWindowListCopyWindowInfo-parsing logic end to end without
+        # pyobjc actually being installed, the same cross-OS-testability spirit as
+        # CROSS_PLATFORM_PLAN.md §3.2.
+        fake_quartz = unittest.mock.MagicMock()
+        fake_quartz.kCGWindowListOptionOnScreenOnly = 1
+        fake_quartz.kCGWindowListExcludeDesktopElements = 2
+        fake_quartz.kCGNullWindowID = 0
+        fake_quartz.CGWindowListCopyWindowInfo.return_value = [
+            {"kCGWindowName": "Balatro", "kCGWindowOwnerPID": 4321},
+            {"kCGWindowName": "Discord", "kCGWindowOwnerPID": 5555},
+            {"kCGWindowOwnerPID": 9999},  # no title -- should be skipped, not raise
+            {"kCGWindowName": "Dock"},  # no PID -- should be skipped, not raise
+        ]
+
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            result = pmac.get_window_titles()
+
+        self.assertEqual(result, {4321: ["Balatro"], 5555: ["Discord"]})
+
+    def test_enumeration_failure_returns_empty_not_raises(self):
+        fake_quartz = unittest.mock.MagicMock()
+        fake_quartz.CGWindowListCopyWindowInfo.side_effect = RuntimeError("boom")
+
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with self.assertLogs(level="WARNING"):
+                self.assertEqual(pmac.get_window_titles(), {})
+
+
 if __name__ == "__main__":
     unittest.main()

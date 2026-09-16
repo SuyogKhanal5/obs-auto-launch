@@ -5,3 +5,5 @@ pillow
 python-vlc
 numpy
 screeninfo
+python-xlib; sys_platform == "linux"
+pyobjc-framework-Quartz; sys_platform == "darwin"

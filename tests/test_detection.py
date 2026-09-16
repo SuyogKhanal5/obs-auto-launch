@@ -93,6 +93,53 @@ class FindTargetProcessTests(unittest.TestCase):
         self.assertEqual(result, (None, None, None, None))
 
 
+class NormalizeAllowedLibraryRootsTests(unittest.TestCase):
+    def test_full_path_entries_pass_through_unchanged(self):
+        self.assertEqual(
+            a.normalize_allowed_library_roots(["/mnt/data", "/Volumes/External"]),
+            ["/mnt/data", "/Volumes/External"],
+        )
+
+    def test_bare_drive_letter_expands_to_root_on_windows(self):
+        with patch.object(a.sys, "platform", "win32"):
+            self.assertEqual(a.normalize_allowed_library_roots(["C", "d:"]), ["C:\\", "D:\\"])
+
+    def test_bare_drive_letter_dropped_with_warning_on_non_windows(self):
+        with patch.object(a.sys, "platform", "linux"):
+            with self.assertLogs(level="WARNING"):
+                result = a.normalize_allowed_library_roots(["C"])
+        self.assertEqual(result, [])
+
+    def test_blank_entries_ignored(self):
+        self.assertEqual(a.normalize_allowed_library_roots(["", "   "]), [])
+
+    def test_none_input_returns_empty_list(self):
+        self.assertEqual(a.normalize_allowed_library_roots(None), [])
+
+
+class GetSteamCommonDirsAllowedRootsFilterTests(unittest.TestCase):
+    def test_filters_to_matching_root_prefix(self):
+        install_path = os.path.join("C:" + os.sep, "Steam") if os.name == "nt" else "/steam"
+        with patch.object(a, "get_steam_install_path", return_value=install_path):
+            with patch.object(a.os.path, "isfile", return_value=False):
+                dirs = a.get_steam_common_dirs({"allowed_drives": [install_path]})
+        self.assertEqual(dirs, [os.path.join(install_path, "steamapps", "common").lower()])
+
+    def test_excludes_non_matching_root(self):
+        install_path = os.path.join("C:" + os.sep, "Steam") if os.name == "nt" else "/steam"
+        with patch.object(a, "get_steam_install_path", return_value=install_path):
+            with patch.object(a.os.path, "isfile", return_value=False):
+                dirs = a.get_steam_common_dirs({"allowed_drives": ["/somewhere/else"]})
+        self.assertEqual(dirs, [])
+
+    def test_no_filter_when_allowed_drives_unset(self):
+        install_path = os.path.join("C:" + os.sep, "Steam") if os.name == "nt" else "/steam"
+        with patch.object(a, "get_steam_install_path", return_value=install_path):
+            with patch.object(a.os.path, "isfile", return_value=False):
+                dirs = a.get_steam_common_dirs({})
+        self.assertEqual(dirs, [os.path.join(install_path, "steamapps", "common").lower()])
+
+
 class SanitizeFilenamePartTests(unittest.TestCase):
     def test_strips_invalid_filename_characters(self):
         self.assertEqual(a.sanitize_filename_part('Game: Part <2>?'), "Game Part 2")

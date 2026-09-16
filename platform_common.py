@@ -12,6 +12,7 @@ inputs they need as plain parameters (a path, a config dict, a fake filesystem v
 unittest.mock.patch) rather than reaching for sys.platform or the real filesystem/registry
 themselves wherever a test might reasonably want to substitute something.
 """
+import logging
 import os
 import shutil
 import subprocess
@@ -105,6 +106,39 @@ def libvlc_filename(platform_name=None):
     return _select_backend(platform_name).LIBVLC_FILENAME
 
 
+def find_steam_install_path(platform_name=None):
+    """Best-effort search for Steam's install root on this machine -- the base directory
+    steamapps/libraryfolders.vdf (and steamapps/common for whatever's installed directly there)
+    lives under. Returns None if Steam isn't found anywhere. Steam ships a native client on every
+    target OS, so every backend implements this for real (unlike Epic/Battle.net, which are
+    Windows+macOS only, or GOG/Xbox, which are Windows only -- see CROSS_PLATFORM_PLAN.md §2.5)."""
+    return _select_backend(platform_name).find_steam_install_path()
+
+
+def epic_manifest_dir(platform_name=None):
+    """Directory Epic Games Launcher writes its .item install manifests to, or None on an OS Epic
+    has no native client for (Linux -- see CROSS_PLATFORM_PLAN.md §2.5). The manifest FORMAT
+    itself is identical cross-platform (the same .item JSON schema); only this directory differs,
+    which is why get_epic_installed_games's own manifest-parsing logic in autostart_script.py
+    needs no OS-specific changes beyond calling this instead of a hardcoded Windows path."""
+    return _select_backend(platform_name).epic_manifest_dir()
+
+
+def get_window_titles(platform_name=None):
+    """Maps each visible top-level window's owning PID to a list of that window's titles -- used
+    for "window title contains X" game-detection rules (e.g. Minecraft's javaw.exe, whose process
+    name alone is too generic to watch for on its own). Returns {} (not an error) when this isn't
+    supported at all in the current session -- e.g. a Wayland desktop, which has no unprivileged
+    cross-compositor API for this; see CROSS_PLATFORM_PLAN.md §2.3. Never raises: a backend
+    failing for any other reason (a missing optional dependency, an X server that's unreachable
+    for some other reason) should degrade the same way -- one logged warning, not a crash."""
+    try:
+        return _select_backend(platform_name).get_window_titles()
+    except Exception:
+        logging.exception("get_window_titles() failed -- window-title-based game detection rules won't match this run.")
+        return {}
+
+
 def find_vlc_directory(configured_path=None, platform_name=None):
     """Resolves a VLC install: an explicit configured directory that still contains this OS's own
     libvlc file wins as-is; otherwise falls back to this OS's own discovery. Returns None if VLC
@@ -118,3 +152,23 @@ def find_vlc_directory(configured_path=None, platform_name=None):
     if configured_path and os.path.isfile(os.path.join(configured_path, libvlc_filename(platform_name))):
         return configured_path
     return _select_backend(platform_name).find_vlc_directory()
+
+
+def example_executable_name(base_name="cs2", platform_name=None):
+    """A single example process/executable name in this OS's own convention -- "cs2.exe" on
+    Windows, plain "cs2" on Linux/macOS (no extension, since neither OS uses one for a native
+    binary) -- for Settings UI copy that used to hardcode a Windows-style example regardless of
+    the OS actually running it."""
+    platform_name = sys.platform if platform_name is None else platform_name
+    return f"{base_name}.exe" if platform_name == "win32" else base_name
+
+
+def executable_filetypes(platform_name=None):
+    """The (label, pattern) filetypes tuple to hand a file-browse dialog when picking an
+    executable -- an ("Executable", "*.exe") filter is meaningful on Windows but actively
+    misleading on Linux/macOS, where native binaries have no extension at all and that filter
+    would just hide every real match. Non-Windows gets an unfiltered "All files" list instead."""
+    platform_name = sys.platform if platform_name is None else platform_name
+    if platform_name == "win32":
+        return (("Executable", "*.exe"), ("All files", "*.*"))
+    return (("All files", "*.*"),)

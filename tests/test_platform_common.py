@@ -171,6 +171,51 @@ class FindVlcDirectoryTests(unittest.TestCase):
         self.assertEqual(result, "/backend/vlc")
 
 
+class GetWindowTitlesTests(unittest.TestCase):
+    def test_returns_backends_result(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.get_window_titles.return_value = {123: ["Balatro"]}
+            result = pc.get_window_titles(platform_name="win32")
+        mock_select.assert_called_once_with("win32")
+        self.assertEqual(result, {123: ["Balatro"]})
+
+    def test_backend_exception_is_logged_and_returns_empty_dict_not_raised(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.get_window_titles.side_effect = RuntimeError("boom")
+            with self.assertLogs(level="ERROR"):
+                result = pc.get_window_titles(platform_name="linux")
+        self.assertEqual(result, {})
+
+
+class ExampleExecutableNameTests(unittest.TestCase):
+    def test_windows_adds_exe_suffix(self):
+        self.assertEqual(pc.example_executable_name(platform_name="win32"), "cs2.exe")
+
+    def test_linux_has_no_suffix(self):
+        self.assertEqual(pc.example_executable_name(platform_name="linux"), "cs2")
+
+    def test_macos_has_no_suffix(self):
+        self.assertEqual(pc.example_executable_name(platform_name="darwin"), "cs2")
+
+    def test_custom_base_name(self):
+        self.assertEqual(pc.example_executable_name("java", platform_name="win32"), "java.exe")
+        self.assertEqual(pc.example_executable_name("java", platform_name="linux"), "java")
+
+
+class ExecutableFiletypesTests(unittest.TestCase):
+    def test_windows_filters_to_exe_by_default(self):
+        filetypes = pc.executable_filetypes(platform_name="win32")
+        self.assertEqual(filetypes, (("Executable", "*.exe"), ("All files", "*.*")))
+
+    def test_linux_has_no_exe_filter(self):
+        filetypes = pc.executable_filetypes(platform_name="linux")
+        self.assertEqual(filetypes, (("All files", "*.*"),))
+
+    def test_macos_has_no_exe_filter(self):
+        filetypes = pc.executable_filetypes(platform_name="darwin")
+        self.assertEqual(filetypes, (("All files", "*.*"),))
+
+
 class BackendModulesAreSafelyImportableFromAnyOsTests(unittest.TestCase):
     """CROSS_PLATFORM_PLAN.md §3.2's whole premise: a test on ANY one real OS can still exercise
     what another OS's backend module would do, via mocking -- which requires every backend module
