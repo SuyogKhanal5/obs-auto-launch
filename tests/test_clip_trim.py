@@ -857,8 +857,13 @@ class IsFileBeingRecordedTests(unittest.TestCase):
         self.assertTrue(a.is_file_being_recorded(r"C:\Recordings\Game - clip.mkv", recording_state))
 
     def test_true_regardless_of_path_normalization(self):
-        recording_state = {"current_path": r"C:\Recordings\Game - clip.mkv"}
-        self.assertTrue(a.is_file_being_recorded(r"C:\Recordings\.\Game - clip.mkv", recording_state))
+        # Built with os.path.join/a literal "." component rather than a hardcoded backslash
+        # literal -- os.path.normpath only collapses "." segments it recognizes as such via the
+        # ambient separator (ntpath on Windows, posixpath elsewhere), so a Windows-style literal
+        # wouldn't actually exercise normalization at all on a POSIX os.path.
+        recording_state = {"current_path": os.path.join("Recordings", "Game - clip.mkv")}
+        unnormalized = os.path.join("Recordings", ".", "Game - clip.mkv")
+        self.assertTrue(a.is_file_being_recorded(unnormalized, recording_state))
 
     def test_false_for_a_different_file(self):
         recording_state = {"current_path": r"C:\Recordings\Game - clip.mkv"}

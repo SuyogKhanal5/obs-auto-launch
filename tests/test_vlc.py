@@ -6,75 +6,19 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
+import platform_common
 
-
-class FindVlcTests(unittest.TestCase):
-    def test_finds_via_hklm_registry(self):
-        mock_key = MagicMock()
-        with patch.object(a.winreg, "OpenKey") as mock_open_key:
-            mock_open_key.return_value.__enter__.return_value = mock_key
-            with patch.object(a.winreg, "QueryValueEx", return_value=(r"C:\VLC", 1)):
-                with patch("os.path.isfile", return_value=True):
-                    self.assertEqual(a.find_vlc(), r"C:\VLC")
-
-    def test_falls_back_to_hkcu_when_hklm_fails(self):
-        def open_key(hive, subkey):
-            if hive == a.winreg.HKEY_LOCAL_MACHINE:
-                raise OSError("not found")
-            return MagicMock().__enter__()
-
-        with patch.object(a.winreg, "OpenKey", side_effect=open_key):
-            with patch.object(a.winreg, "QueryValueEx", return_value=(r"C:\VLC (user)", 1)):
-                with patch("os.path.isfile", return_value=True):
-                    self.assertEqual(a.find_vlc(), r"C:\VLC (user)")
-
-    def test_stale_registry_entry_without_libvlc_dll_is_rejected(self):
-        # The registry key can outlive an uninstall/move -- don't trust it blindly, verify
-        # libvlc.dll actually still exists there before reporting it as found.
-        mock_key = MagicMock()
-        with patch.object(a.winreg, "OpenKey") as mock_open_key:
-            mock_open_key.return_value.__enter__.return_value = mock_key
-            with patch.object(a.winreg, "QueryValueEx", return_value=(r"C:\Stale\VLC", 1)):
-                with patch("os.path.isfile", return_value=False):
-                    with patch.dict(os.environ, {}, clear=True):
-                        with patch("shutil.which", return_value=None):
-                            self.assertIsNone(a.find_vlc())
-
-    def test_falls_back_to_program_files(self):
-        program_files = r"C:\Program Files"
-
-        def isfile(path):
-            return path == os.path.join(program_files, "VideoLAN", "VLC", "libvlc.dll")
-
-        with patch.object(a.winreg, "OpenKey", side_effect=OSError("not found")):
-            with patch.dict(os.environ, {"ProgramFiles": program_files}, clear=True):
-                with patch("os.path.isfile", side_effect=isfile):
-                    self.assertEqual(a.find_vlc(), os.path.join(program_files, "VideoLAN", "VLC"))
-
-    def test_falls_back_to_path_lookup(self):
-        vlc_dir = r"D:\Apps\VLC"
-
-        def isfile(path):
-            return path == os.path.join(vlc_dir, "libvlc.dll")
-
-        with patch.object(a.winreg, "OpenKey", side_effect=OSError("not found")):
-            with patch.dict(os.environ, {}, clear=True):
-                with patch("os.path.isfile", side_effect=isfile):
-                    with patch("shutil.which", return_value=os.path.join(vlc_dir, "vlc.exe")):
-                        self.assertEqual(a.find_vlc(), vlc_dir)
-
-    def test_returns_none_when_nothing_found(self):
-        with patch.object(a.winreg, "OpenKey", side_effect=OSError("not found")):
-            with patch.dict(os.environ, {}, clear=True):
-                with patch("os.path.isfile", return_value=False):
-                    with patch("shutil.which", return_value=None):
-                        self.assertIsNone(a.find_vlc())
+# a.find_vlc() is now a thin wrapper around platform_common.find_vlc_directory() (see
+# CROSS_PLATFORM_PLAN.md Phase 1) -- the real per-OS registry/PATH-lookup logic these tests used
+# to exercise directly via a.winreg now lives in platform_windows.py, covered by
+# test_platform_windows.py::FindVlcDirectoryTests (which can run on any OS via patch.object(...,
+# create=True), unlike a direct a.winreg patch here that only works for real on Windows).
 
 
 class ResolveVlcPathTests(unittest.TestCase):
     def test_existing_configured_dir_is_used_as_is(self):
         with tempfile.TemporaryDirectory() as tmp:
-            open(os.path.join(tmp, "libvlc.dll"), "w").close()
+            open(os.path.join(tmp, platform_common.libvlc_filename()), "w").close()
             with patch.object(a, "find_vlc") as mock_find_vlc:
                 self.assertEqual(a.resolve_vlc_path(tmp), tmp)
             mock_find_vlc.assert_not_called()

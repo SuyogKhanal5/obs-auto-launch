@@ -2968,14 +2968,19 @@ def create_vlc_instance_with_logging(vlc_module, args=None):
         })
 
     try:
-        msvcrt = ctypes.CDLL("msvcrt")
-        msvcrt.vsnprintf.restype = ctypes.c_int
-        msvcrt.vsnprintf.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_void_p]
+        # vsnprintf is what actually expands libvlc's C-style varargs log message -- it lives in
+        # msvcrt on Windows, but msvcrt itself doesn't exist at all on Linux/macOS. A NULL handle
+        # to ctypes.CDLL on POSIX resolves against the process's own already-loaded symbols
+        # (which always includes libc, dlopen(NULL, ...) under the hood), so this needs an
+        # explicit per-OS load rather than one hardcoded library name.
+        libc = ctypes.CDLL("msvcrt") if sys.platform == "win32" else ctypes.CDLL(None)
+        libc.vsnprintf.restype = ctypes.c_int
+        libc.vsnprintf.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_void_p]
 
         @vlc_module.CallbackDecorators.LogCb
         def on_vlc_log(_data, level, _ctx, fmt, log_args):
             buf = ctypes.create_string_buffer(2048)
-            n = msvcrt.vsnprintf(buf, len(buf), fmt, log_args)
+            n = libc.vsnprintf(buf, len(buf), fmt, log_args)
             text = buf.raw[:n].decode("utf-8", errors="replace") if n and n > 0 else "<unreadable log message>"
             logging.log(_VLC_LOG_LEVEL_MAP.get(level, logging.DEBUG), "libvlc: %s", text)
 

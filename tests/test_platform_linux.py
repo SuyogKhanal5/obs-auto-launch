@@ -70,12 +70,15 @@ class GetWindowTitlesTests(unittest.TestCase):
             self.assertEqual(pl.get_window_titles(), {})
 
     def test_missing_python_xlib_returns_empty_not_raises(self):
-        # python-xlib genuinely isn't installed in this test environment (it's a Linux-only
-        # requirements.txt dependency -- see that file's sys_platform marker), so this exercises
-        # the real ImportError path, not a simulated one.
+        # A None entry in sys.modules makes any `import Xlib...` raise ImportError immediately,
+        # regardless of whether python-xlib is actually installed in the environment running this
+        # test -- needed because it genuinely IS installed on real Linux CI (a requirements.txt
+        # dependency for sys_platform == "linux"), so this can't rely on a real absence to
+        # exercise the ImportError path the way it could when the dependency wasn't installed yet.
         with unittest.mock.patch.object(pl, "is_wayland_session", return_value=False):
-            with self.assertLogs(level="WARNING"):
-                self.assertEqual(pl.get_window_titles(), {})
+            with unittest.mock.patch.dict(sys.modules, {"Xlib": None, "Xlib.X": None, "Xlib.display": None, "Xlib.error": None}):
+                with self.assertLogs(level="WARNING"):
+                    self.assertEqual(pl.get_window_titles(), {})
 
     def test_parses_client_list_into_pid_keyed_titles(self):
         # Builds a minimal fake Xlib module tree and injects it into sys.modules -- lets this

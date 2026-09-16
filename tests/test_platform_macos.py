@@ -78,11 +78,14 @@ class FindVlcDirectoryTests(unittest.TestCase):
 
 class GetWindowTitlesTests(unittest.TestCase):
     def test_missing_pyobjc_returns_empty_not_raises(self):
-        # pyobjc genuinely isn't installed in this test environment (it's a macOS-only
-        # requirements.txt dependency -- see that file's sys_platform marker), so this exercises
-        # the real ImportError path, not a simulated one.
-        with self.assertLogs(level="WARNING"):
-            self.assertEqual(pmac.get_window_titles(), {})
+        # A None entry in sys.modules makes `import Quartz` raise ImportError immediately,
+        # regardless of whether pyobjc is actually installed in the environment running this test
+        # -- needed because it genuinely IS installed on real macOS CI (a requirements.txt
+        # dependency for sys_platform == "darwin"), so this can't rely on a real absence to
+        # exercise the ImportError path the way it could when the dependency wasn't installed yet.
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": None}):
+            with self.assertLogs(level="WARNING"):
+                self.assertEqual(pmac.get_window_titles(), {})
 
     def test_parses_window_list_into_pid_keyed_titles(self):
         # Injects a fake Quartz module into sys.modules -- lets this test exercise

@@ -104,10 +104,16 @@ class FireCustomKeybindTests(unittest.TestCase):
         self.assertIn(("save_replay_buffer",), client.calls)
 
 
+@unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hotkey API")
 class RunCustomKeybindListenerRegistrationRetryTests(unittest.TestCase):
     # A self-restart doesn't guarantee the previous process's hotkey registrations are released
     # by the time this thread starts -- confirmed live as a real bug: a keybind that lost this
     # race on one restart stayed dead for the rest of that session with only one WARNING logged.
+    #
+    # run_custom_keybind_listener/run_clip_editor_space_bar_listener (below) are still the
+    # Windows-only ctypes.windll implementation -- global hotkeys get an X11/Quartz port in
+    # CROSS_PLATFORM_PLAN.md Phase 3, at which point these move to platform_windows.py and this
+    # guard gets replaced with real per-OS coverage rather than a skip.
     def setUp(self):
         self.mock_user32 = unittest.mock.Mock()
         self.mock_user32.GetMessageW.return_value = 0  # exit the message loop immediately
@@ -175,6 +181,7 @@ class IsSpaceBarToggleEventTests(unittest.TestCase):
         ))
 
 
+@unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hotkey API")
 class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
     def setUp(self):
         self.mock_user32 = unittest.mock.Mock()

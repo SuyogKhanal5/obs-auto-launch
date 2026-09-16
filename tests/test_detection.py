@@ -7,19 +7,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
 
 
+# These fixtures build paths with os.path.join rather than hardcoded backslash literals -- the
+# functions under test use the ambient os.sep/os.path (ntpath on Windows, posixpath elsewhere),
+# so a literal r"D:\..." string is only a realistic exe path on Windows; on Linux/macOS it's just
+# an opaque string with no path separators posixpath recognizes at all, which would silently test
+# the wrong thing rather than the real cross-platform prefix-matching logic. Building fixtures the
+# same way the real code builds paths keeps these tests meaningful on every OS the suite runs on
+# (per CROSS_PLATFORM_PLAN.md §3.2/§5.11), instead of being Windows-only assertions.
 class IsExeUnderDirsTests(unittest.TestCase):
     def setUp(self):
-        self.dirs = [r"d:\steamlibrary\steamapps\common"]
+        self.dirs = [os.path.join("steamlibrary", "steamapps", "common")]
 
     def test_matches_under_common_dir(self):
-        self.assertTrue(a.is_exe_under_dirs(r"D:\SteamLibrary\steamapps\common\Balatro\Balatro.exe", self.dirs, []))
+        exe = os.path.join("SteamLibrary", "steamapps", "common", "Balatro", "Balatro.exe")
+        self.assertTrue(a.is_exe_under_dirs(exe, self.dirs, []))
 
     def test_excluded_keyword_blocks_match(self):
-        exe = r"D:\SteamLibrary\steamapps\common\SomeGame\_CommonRedist\vcredist.exe"
+        exe = os.path.join("SteamLibrary", "steamapps", "common", "SomeGame", "_CommonRedist", "vcredist.exe")
         self.assertFalse(a.is_exe_under_dirs(exe, self.dirs, ["_commonredist"]))
 
     def test_outside_common_dirs_does_not_match(self):
-        self.assertFalse(a.is_exe_under_dirs(r"C:\Windows\System32\notepad.exe", self.dirs, []))
+        exe = os.path.join("System", "System32", "notepad.exe")
+        self.assertFalse(a.is_exe_under_dirs(exe, self.dirs, []))
 
     def test_empty_exe_path_does_not_match(self):
         self.assertFalse(a.is_exe_under_dirs("", self.dirs, []))
@@ -28,23 +37,28 @@ class IsExeUnderDirsTests(unittest.TestCase):
 
 class GetDisplayNameFromDirsTests(unittest.TestCase):
     def test_extracts_top_level_folder(self):
-        dirs = [r"d:\steamlibrary\steamapps\common"]
-        name = a.get_display_name_from_dirs(r"D:\SteamLibrary\steamapps\common\Balatro\Balatro.exe", dirs)
+        dirs = [os.path.join("steamlibrary", "steamapps", "common")]
+        exe = os.path.join("SteamLibrary", "steamapps", "common", "Balatro", "Balatro.exe")
+        name = a.get_display_name_from_dirs(exe, dirs)
         self.assertEqual(name, "Balatro")
 
     def test_no_match_returns_none(self):
-        dirs = [r"d:\steamlibrary\steamapps\common"]
-        self.assertIsNone(a.get_display_name_from_dirs(r"C:\Games\Foo\Foo.exe", dirs))
+        dirs = [os.path.join("steamlibrary", "steamapps", "common")]
+        exe = os.path.join("Games", "Foo", "Foo.exe")
+        self.assertIsNone(a.get_display_name_from_dirs(exe, dirs))
 
 
 class FindGameByInstallDirTests(unittest.TestCase):
     def test_matches_manifest_install_dir(self):
-        manifest_games = [{"install_dir": r"c:\games\hitman 3", "display_name": "HITMAN 3"}]
-        result = a.find_game_by_install_dir(r"C:\Games\HITMAN 3\Retail\HITMAN3.exe", manifest_games)
+        install_dir = os.path.join("games", "hitman 3")
+        manifest_games = [{"install_dir": install_dir, "display_name": "HITMAN 3"}]
+        exe = os.path.join("Games", "HITMAN 3", "Retail", "HITMAN3.exe")
+        result = a.find_game_by_install_dir(exe, manifest_games)
         self.assertEqual(result, "HITMAN 3")
 
     def test_no_manifest_match_returns_none(self):
-        self.assertIsNone(a.find_game_by_install_dir(r"C:\Games\Other\other.exe", []))
+        exe = os.path.join("Games", "Other", "other.exe")
+        self.assertIsNone(a.find_game_by_install_dir(exe, []))
 
 
 class FindTargetProcessTests(unittest.TestCase):
@@ -54,22 +68,24 @@ class FindTargetProcessTests(unittest.TestCase):
     more expensive one when multiple could match the same process list."""
 
     def test_watched_games_takes_priority(self):
-        processes = [("cs2.exe", r"D:\Steam\steamapps\common\cs2\cs2.exe", 111)]
-        name, exe, pid, display = a.find_target_process(
-            {"cs2.exe"}, [r"d:\steam\steamapps\common"], [], [], [], processes
-        )
+        exe = os.path.join("Steam", "steamapps", "common", "cs2", "cs2.exe")
+        processes = [("cs2.exe", exe, 111)]
+        common_dirs = [os.path.join("steam", "steamapps", "common")]
+        name, exe, pid, display = a.find_target_process({"cs2.exe"}, common_dirs, [], [], [], processes)
         self.assertEqual((name, pid, display), ("cs2.exe", 111, None))
 
     def test_falls_back_to_common_dirs(self):
-        processes = [("Balatro.exe", r"D:\SteamLibrary\steamapps\common\Balatro\Balatro.exe", 222)]
-        name, exe, pid, display = a.find_target_process(
-            set(), [r"d:\steamlibrary\steamapps\common"], [], [], [], processes
-        )
+        exe = os.path.join("SteamLibrary", "steamapps", "common", "Balatro", "Balatro.exe")
+        processes = [("Balatro.exe", exe, 222)]
+        common_dirs = [os.path.join("steamlibrary", "steamapps", "common")]
+        name, exe, pid, display = a.find_target_process(set(), common_dirs, [], [], [], processes)
         self.assertEqual((name, pid, display), ("Balatro.exe", 222, None))
 
     def test_falls_back_to_manifest_games(self):
-        processes = [("HITMAN3.exe", r"C:\Games\HITMAN 3\HITMAN3.exe", 333)]
-        manifest_games = [{"install_dir": r"c:\games\hitman 3", "display_name": "HITMAN 3"}]
+        exe = os.path.join("Games", "HITMAN 3", "HITMAN3.exe")
+        processes = [("HITMAN3.exe", exe, 333)]
+        install_dir = os.path.join("games", "hitman 3")
+        manifest_games = [{"install_dir": install_dir, "display_name": "HITMAN 3"}]
         name, exe, pid, display = a.find_target_process(set(), [], [], manifest_games, [], processes)
         self.assertEqual((name, pid, display), ("HITMAN3.exe", 333, "HITMAN 3"))
 
