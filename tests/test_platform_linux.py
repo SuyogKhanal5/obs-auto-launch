@@ -1,5 +1,6 @@
 import os
 import sys
+import types
 import unittest
 import unittest.mock
 
@@ -128,6 +129,265 @@ class GetWindowTitlesTests(unittest.TestCase):
 
         self.assertEqual(result, {4321: ["Balatro"], 5555: ["Discord"]})
         fake_display.close.assert_called_once()
+
+
+class KeysymForKeyTests(unittest.TestCase):
+    def test_letter_keys(self):
+        self.assertEqual(pl.keysym_for_key("a"), 0x41)
+        self.assertEqual(pl.keysym_for_key("Z"), 0x5A)
+
+    def test_digit_keys(self):
+        self.assertEqual(pl.keysym_for_key("5"), 0x35)
+
+    def test_function_keys(self):
+        self.assertEqual(pl.keysym_for_key("F1"), 0xFFBE)
+        self.assertEqual(pl.keysym_for_key("F12"), 0xFFC9)
+
+    def test_invalid_key_returns_none(self):
+        self.assertIsNone(pl.keysym_for_key("F13"))
+        self.assertIsNone(pl.keysym_for_key("Enter"))
+        self.assertIsNone(pl.keysym_for_key(""))
+        self.assertIsNone(pl.keysym_for_key(None))
+
+
+class X11ModMaskForTests(unittest.TestCase):
+    FAKE_X = types.SimpleNamespace(ControlMask=0x4, Mod1Mask=0x8, ShiftMask=0x1, Mod4Mask=0x40)
+
+    def test_combines_flags(self):
+        self.assertEqual(pl._x11_mod_mask_for(["ctrl", "alt"], self.FAKE_X), 0x4 | 0x8)
+
+    def test_empty_or_none_is_zero(self):
+        self.assertEqual(pl._x11_mod_mask_for([], self.FAKE_X), 0)
+        self.assertEqual(pl._x11_mod_mask_for(None, self.FAKE_X), 0)
+
+    def test_unknown_modifier_is_ignored(self):
+        self.assertEqual(pl._x11_mod_mask_for(["ctrl", "bogus"], self.FAKE_X), 0x4)
+
+
+class IgnorableModifierTests(unittest.TestCase):
+    def make_fake_display(self, numlock_keycode=77, capslock_keycode=66, scrolllock_keycode=None):
+        # 8 modifier slots in X's own defined order (Shift, Lock, Control, Mod1..Mod5) -- CapsLock
+        # lands in the "Lock" slot (index 1) and NumLock in "Mod2" (index 4), the near-universal
+        # real-world mapping, without hardcoding that assumption into the function under test
+        # itself (it reads get_modifier_mapping() directly, not these indices).
+        display = unittest.mock.MagicMock()
+        mapping = [[] for _ in range(8)]
+        mapping[1] = [capslock_keycode]
+        mapping[4] = [numlock_keycode]
+        display.get_modifier_mapping.return_value = mapping
+
+        def keysym_to_keycode(keysym):
+            return {
+                pl._XK_CAPS_LOCK: capslock_keycode,
+                pl._XK_NUM_LOCK: numlock_keycode,
+                pl._XK_SCROLL_LOCK: scrolllock_keycode or 0,
+            }.get(keysym, 0)
+
+        display.keysym_to_keycode.side_effect = keysym_to_keycode
+        return display
+
+    def test_bits_found_for_capslock_and_numlock(self):
+        display = self.make_fake_display()
+        self.assertEqual(sorted(pl._ignorable_modifier_bits(display)), sorted([1 << 1, 1 << 4]))
+
+    def test_combinations_cover_every_subset(self):
+        display = self.make_fake_display()
+        combos = pl._ignorable_modifier_combinations(display)
+        self.assertEqual(sorted(combos), sorted([0, 1 << 1, 1 << 4, (1 << 1) | (1 << 4)]))
+
+    def test_missing_lock_key_on_this_keyboard_is_skipped(self):
+        # keysym_to_keycode returning 0 for a keysym this keyboard doesn't have (ScrollLock here)
+        # must not add a bogus 0-keycode entry -- 0 isn't a valid keycode, and "in []" against an
+        # empty modifier slot would silently misattribute it to slot 0 (Shift) otherwise.
+        display = self.make_fake_display(scrolllock_keycode=None)
+        self.assertEqual(len(pl._ignorable_modifier_bits(display)), 2)
+
+
+class RegisterGlobalHotkeyTests(unittest.TestCase):
+    FAKE_X = types.SimpleNamespace(ControlMask=0x4, Mod1Mask=0x8, ShiftMask=0x1, Mod4Mask=0x40, GrabModeAsync=0x1)
+
+    def make_no_lock_keys_display(self, keycode=39):
+        display = unittest.mock.MagicMock()
+        display.keysym_to_keycode.return_value = keycode
+        display.get_modifier_mapping.return_value = [[] for _ in range(8)]
+        return display
+
+    def test_registers_and_returns_a_handle(self):
+        display = self.make_no_lock_keys_display()
+        root = unittest.mock.MagicMock()
+        with unittest.mock.patch.dict(sys.modules, {"Xlib": unittest.mock.MagicMock(X=self.FAKE_X), "Xlib.X": self.FAKE_X}):
+            handle = pl.register_global_hotkey(display, root, ["ctrl"], "S")
+        self.assertEqual(handle, (39, 0x4))
+        root.grab_key.assert_called_once_with(39, 0x4, True, 0x1, 0x1)
+
+    def test_invalid_key_returns_none_without_grabbing(self):
+        display = self.make_no_lock_keys_display()
+        root = unittest.mock.MagicMock()
+        with unittest.mock.patch.dict(sys.modules, {"Xlib": unittest.mock.MagicMock(X=self.FAKE_X), "Xlib.X": self.FAKE_X}):
+            handle = pl.register_global_hotkey(display, root, [], "NotAKey")
+        self.assertIsNone(handle)
+        root.grab_key.assert_not_called()
+
+    def test_unresolvable_keycode_returns_none(self):
+        display = self.make_no_lock_keys_display(keycode=0)
+        root = unittest.mock.MagicMock()
+        with unittest.mock.patch.dict(sys.modules, {"Xlib": unittest.mock.MagicMock(X=self.FAKE_X), "Xlib.X": self.FAKE_X}):
+            handle = pl.register_global_hotkey(display, root, [], "S")
+        self.assertIsNone(handle)
+        root.grab_key.assert_not_called()
+
+
+class UnregisterGlobalHotkeyTests(unittest.TestCase):
+    def test_ungrabs_every_ignorable_combination(self):
+        display = unittest.mock.MagicMock()
+        display.get_modifier_mapping.return_value = [[] for _ in range(8)]
+        root = unittest.mock.MagicMock()
+        pl.unregister_global_hotkey(display, root, (39, 0x4))
+        root.ungrab_key.assert_called_once_with(39, 0x4)
+
+    def test_none_handle_is_a_no_op(self):
+        root = unittest.mock.MagicMock()
+        pl.unregister_global_hotkey(unittest.mock.MagicMock(), root, None)
+        root.ungrab_key.assert_not_called()
+
+    def test_ungrab_failure_is_swallowed(self):
+        display = unittest.mock.MagicMock()
+        display.get_modifier_mapping.return_value = [[] for _ in range(8)]
+        root = unittest.mock.MagicMock()
+        root.ungrab_key.side_effect = Exception("boom")
+        pl.unregister_global_hotkey(display, root, (39, 0x4))  # must not raise
+
+
+class RunCustomKeybindListenerTests(unittest.TestCase):
+    def make_fake_xlib(self, next_event_side_effect, keycode=39):
+        fake_x = types.SimpleNamespace(
+            ControlMask=0x4, Mod1Mask=0x8, ShiftMask=0x1, Mod4Mask=0x40, GrabModeAsync=0x1,
+            KeyPressMask=0x1, KeyPress=2,
+        )
+        fake_root = unittest.mock.MagicMock()
+        fake_screen = unittest.mock.MagicMock()
+        fake_screen.root = fake_root
+
+        fake_display = unittest.mock.MagicMock()
+        fake_display.screen.return_value = fake_screen
+        fake_display.keysym_to_keycode.return_value = keycode
+        fake_display.get_modifier_mapping.return_value = [[] for _ in range(8)]
+        fake_display.next_event.side_effect = next_event_side_effect
+
+        fake_display_module = unittest.mock.MagicMock()
+        fake_display_module.Display.return_value = fake_display
+
+        fake_error_module = unittest.mock.MagicMock()
+        fake_error_module.DisplayError = type("DisplayError", (Exception,), {})
+
+        fake_xlib = unittest.mock.MagicMock()
+        fake_xlib.X = fake_x
+        fake_xlib.display = fake_display_module
+        fake_xlib.error = fake_error_module
+
+        modules = {
+            "Xlib": fake_xlib, "Xlib.X": fake_x, "Xlib.display": fake_display_module, "Xlib.error": fake_error_module,
+        }
+        return modules, fake_root, fake_display
+
+    def test_fires_matching_binding_on_a_dedicated_thread(self):
+        key_event = unittest.mock.MagicMock(type=2, detail=39, state=0x4)
+        modules, fake_root, fake_display = self.make_fake_xlib(
+            next_event_side_effect=[key_event, RuntimeError("stop the test loop")],
+        )
+        binding = {"enabled": True, "modifiers": ["ctrl"], "key": "S", "action": "save_replay_buffer"}
+        fire_keybind = unittest.mock.Mock()
+        describe_keybind = unittest.mock.Mock(return_value="Ctrl+S")
+        notify = unittest.mock.Mock()
+        fake_thread = unittest.mock.MagicMock()
+
+        with unittest.mock.patch.object(pl, "is_wayland_session", return_value=False):
+            with unittest.mock.patch.object(pl.threading, "Thread", return_value=fake_thread) as mock_thread_cls:
+                with unittest.mock.patch.dict(sys.modules, modules):
+                    with self.assertLogs(level="ERROR"):  # the injected RuntimeError gets logged, not raised
+                        pl.run_custom_keybind_listener(
+                            [binding], get_client="get_client", get_manual_split_buffer_seconds="get_seconds",
+                            fire_keybind=fire_keybind, describe_keybind=describe_keybind, notify=notify,
+                            icon="icon", notifications_config="notif_cfg", status="status",
+                        )
+
+        fake_root.grab_key.assert_called_once_with(39, 0x4, True, 0x1, 0x1)
+        mock_thread_cls.assert_called_once_with(
+            target=fire_keybind,
+            args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status"),
+            daemon=True,
+        )
+        fake_thread.start.assert_called_once()
+        fake_root.ungrab_key.assert_called_once_with(39, 0x4)
+        fake_display.close.assert_called_once()
+
+    def test_non_matching_key_press_does_not_fire(self):
+        other_key_event = unittest.mock.MagicMock(type=2, detail=999, state=0x4)
+        modules, fake_root, fake_display = self.make_fake_xlib(
+            next_event_side_effect=[other_key_event, RuntimeError("stop the test loop")],
+        )
+        binding = {"enabled": True, "modifiers": ["ctrl"], "key": "S", "action": "save_replay_buffer"}
+        fire_keybind = unittest.mock.Mock()
+
+        with unittest.mock.patch.object(pl, "is_wayland_session", return_value=False):
+            with unittest.mock.patch.object(pl.threading, "Thread") as mock_thread_cls:
+                with unittest.mock.patch.dict(sys.modules, modules):
+                    with self.assertLogs(level="ERROR"):
+                        pl.run_custom_keybind_listener(
+                            [binding], get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
+                            fire_keybind=fire_keybind, describe_keybind=unittest.mock.Mock(), notify=unittest.mock.Mock(),
+                        )
+
+        mock_thread_cls.assert_not_called()
+
+    def test_disabled_binding_is_not_registered(self):
+        modules, fake_root, fake_display = self.make_fake_xlib(next_event_side_effect=[])
+        binding = {"enabled": False, "modifiers": [], "key": "S", "action": "save_replay_buffer"}
+
+        with unittest.mock.patch.object(pl, "is_wayland_session", return_value=False):
+            with unittest.mock.patch.dict(sys.modules, modules):
+                pl.run_custom_keybind_listener(
+                    [binding], get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
+                    fire_keybind=unittest.mock.Mock(), describe_keybind=unittest.mock.Mock(), notify=unittest.mock.Mock(),
+                )
+
+        fake_root.grab_key.assert_not_called()
+        fake_display.next_event.assert_not_called()  # nothing registered -> returns before the event loop
+
+    def test_invalid_key_is_logged_and_skipped(self):
+        modules, fake_root, fake_display = self.make_fake_xlib(next_event_side_effect=[])
+        binding = {"enabled": True, "modifiers": [], "key": "NotAKey", "action": "save_replay_buffer"}
+
+        with unittest.mock.patch.object(pl, "is_wayland_session", return_value=False):
+            with unittest.mock.patch.dict(sys.modules, modules):
+                with self.assertLogs(level="WARNING"):
+                    pl.run_custom_keybind_listener(
+                        [binding], get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
+                        fire_keybind=unittest.mock.Mock(), describe_keybind=unittest.mock.Mock(), notify=unittest.mock.Mock(),
+                    )
+
+        fake_root.grab_key.assert_not_called()
+
+    def test_wayland_session_returns_without_opening_display(self):
+        with unittest.mock.patch.object(pl, "is_wayland_session", return_value=True):
+            with self.assertLogs(level="WARNING"):
+                pl.run_custom_keybind_listener(
+                    [{"enabled": True, "modifiers": [], "key": "S"}], get_client=lambda: None,
+                    get_manual_split_buffer_seconds=lambda: 0, fire_keybind=unittest.mock.Mock(),
+                    describe_keybind=unittest.mock.Mock(), notify=unittest.mock.Mock(),
+                )  # must not raise, and must never touch Xlib at all
+
+    def test_missing_python_xlib_is_logged_not_raised(self):
+        with unittest.mock.patch.object(pl, "is_wayland_session", return_value=False):
+            with unittest.mock.patch.dict(
+                sys.modules, {"Xlib": None, "Xlib.X": None, "Xlib.display": None, "Xlib.error": None},
+            ):
+                with self.assertLogs(level="WARNING"):
+                    pl.run_custom_keybind_listener(
+                        [{"enabled": True, "modifiers": [], "key": "S"}], get_client=lambda: None,
+                        get_manual_split_buffer_seconds=lambda: 0, fire_keybind=unittest.mock.Mock(),
+                        describe_keybind=unittest.mock.Mock(), notify=unittest.mock.Mock(),
+                    )  # must not raise
 
 
 if __name__ == "__main__":

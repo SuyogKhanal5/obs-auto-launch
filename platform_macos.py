@@ -6,6 +6,7 @@ import glob
 import logging
 import os
 import shutil
+import threading
 
 # The canonical libvlc shared-library name on macOS. Only used as a presence signal by
 # platform_common.find_vlc_directory() -- see that function's own docstring for why the exact
@@ -125,3 +126,268 @@ def get_window_titles():
             continue
         titles.setdefault(pid, []).append(title)
     return titles
+
+
+# --- Global hotkeys (Quartz CGEventTap) ---
+# macOS has no API for a true exclusive OS-level hotkey reservation the way Win32's RegisterHotKey
+# or X11's XGrabKey have -- the standard approach (used by essentially every third-party macOS
+# hotkey utility) is a session-level CGEventTap: a passive, non-consuming observer of every
+# keystroke system-wide, matched against the configured bindings in the callback itself. This is
+# actually the SAME shape Windows' WH_KEYBOARD_LL space-bar hook already uses in this app (see
+# platform_windows.py's run_clip_editor_space_bar_listener) -- here it does double duty for BOTH
+# custom keybinds and the space bar, unlike Windows/X11 which use two different mechanisms
+# (RegisterHotKey/XGrabKey for custom keybinds, a separate passive hook for the space bar) because
+# neither of those OSes' exclusive-grab APIs can be scoped to "only while my own window is
+# focused" the way a plain window-local grab can.
+#
+# Requires the user to grant this app Accessibility permission (System Settings > Privacy &
+# Security > Accessibility) -- CGEventTapCreate returns None without it. CI cannot grant real
+# Accessibility permission (there's no interactive user session on macos-latest runners), so only
+# the permission-NOT-granted path is exercised for real there; the "happy path" (a tap that
+# actually receives events) needs real-hardware verification, flagged per
+# CROSS_PLATFORM_PLAN.md Phase 3's own exit criteria.
+
+# Carbon/HIToolbox's stable kVK_* virtual keycodes (from the public Events.h enum, unchanged
+# across macOS versions) for the CUSTOM_KEYBIND_KEY_OPTIONS key space -- unlike X11 keysyms,
+# these are physical ANSI-US key positions, not derived from the key's ASCII value, so (unlike
+# platform_linux.keysym_for_key) this has to be a literal lookup table rather than an arithmetic
+# offset. Not independently verified against real Mac hardware in this session -- flag any
+# mismatch found during real-hardware testing per CROSS_PLATFORM_PLAN.md's open macOS unknowns.
+_MACOS_KEYCODES = {
+    "A": 0x00, "S": 0x01, "D": 0x02, "F": 0x03, "H": 0x04, "G": 0x05, "Z": 0x06, "X": 0x07,
+    "C": 0x08, "V": 0x09, "B": 0x0B, "Q": 0x0C, "W": 0x0D, "E": 0x0E, "R": 0x0F, "Y": 0x10,
+    "T": 0x11, "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15, "6": 0x16, "5": 0x17, "9": 0x19,
+    "7": 0x1A, "8": 0x1C, "0": 0x1D, "O": 0x1F, "U": 0x20, "I": 0x22, "P": 0x23, "L": 0x25,
+    "J": 0x26, "K": 0x28, "N": 0x2D, "M": 0x2E,
+    "F1": 0x7A, "F2": 0x78, "F3": 0x63, "F4": 0x76, "F5": 0x60, "F6": 0x61, "F7": 0x62,
+    "F8": 0x64, "F9": 0x65, "F10": 0x6D, "F11": 0x67, "F12": 0x6F,
+}
+MACOS_SPACE_KEYCODE = 0x31  # kVK_Space
+
+
+def macos_keycode_for_key(key):
+    """macOS counterpart of autostart_script.py's vk_code_for_key -- maps a
+    CUSTOM_KEYBIND_KEY_OPTIONS entry to its ANSI-US virtual keycode."""
+    return _MACOS_KEYCODES.get((key or "").strip().upper())
+
+
+def accessibility_permission_granted():
+    """True if this process currently holds Accessibility permission -- required before
+    CGEventTapCreate will do anything at all (it returns None silently otherwise, which is why
+    this is checked and reported explicitly up front rather than left to look like an unexplained
+    dead hotkey)."""
+    try:
+        import Quartz
+    except ImportError:
+        return False
+    try:
+        return bool(Quartz.AXIsProcessTrusted())
+    except Exception:
+        logging.exception("Could not check macOS Accessibility permission status.")
+        return False
+
+
+def request_accessibility_permission():
+    """Shows macOS's own native "<App> would like to control this computer using accessibility
+    features" prompt, which deep-links to the right System Settings pane. Safe to call more than
+    once -- macOS only actually shows the dialog the first time it's asked for a given app; after
+    a decision has been recorded, granting it later requires the user to do so manually in System
+    Settings (there's no way for this app to re-trigger the dialog itself)."""
+    try:
+        import Quartz
+    except ImportError:
+        return
+    try:
+        Quartz.AXIsProcessTrustedWithOptions({Quartz.kAXTrustedCheckOptionPrompt: True})
+    except Exception:
+        logging.exception("Could not show the macOS Accessibility permission prompt.")
+
+
+def _macos_mod_flags_for(modifiers, Quartz):
+    flags = {
+        "ctrl": Quartz.kCGEventFlagMaskControl, "alt": Quartz.kCGEventFlagMaskAlternate,
+        "shift": Quartz.kCGEventFlagMaskShift, "win": Quartz.kCGEventFlagMaskCommand,
+    }
+    mask = 0
+    for m in modifiers or []:
+        mask |= flags.get(m, 0)
+    return mask
+
+
+def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_event=None):
+    """Shared by run_custom_keybind_listener and run_clip_editor_space_bar_listener below --
+    both need the exact same CGEventTapCreate/CFRunLoop wiring, differing only in which keydowns
+    the callback itself cares about. Blocks in CFRunLoopRun() for this thread's whole lifetime (or
+    until stop_event fires, if given), the same "thread-affinity-bound, blocks until told to stop"
+    shape the Windows/X11 backends' own message loops have. Returns without ever calling
+    tap_callback if Accessibility permission isn't granted (after requesting it and calling
+    on_permission_denied so the caller can surface that to the user its own way) or if tap
+    creation fails for any other reason.
+
+    CFRunLoopRun() has no built-in "stop after this event" polling hook the way Win32's
+    GetMessageW or X11's pending_events() do -- stopping it early needs an explicit
+    CFRunLoopStop(run_loop) call, which IS safe to make from another thread (that's its documented
+    purpose). When stop_event is given, a small watcher daemon thread blocks on stop_event.wait()
+    and stops this run loop the moment it fires, so a stop_event.set() from elsewhere (e.g. the
+    clip editor window closing) actually tears this listener down instead of leaking a
+    permanently-running tap thread until process exit."""
+    if not accessibility_permission_granted():
+        logging.warning(
+            "This feature needs Accessibility permission, which hasn't been granted yet -- "
+            "requesting it now. Grant it in System Settings > Privacy & Security > Accessibility, "
+            "then restart the app."
+        )
+        request_accessibility_permission()
+        on_permission_denied()
+        return
+
+    try:
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap, Quartz.kCGEventTapOptionListenOnly,
+            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown), tap_callback, None,
+        )
+        if not tap:
+            logging.warning(
+                "Could not create the macOS event tap -- Accessibility permission may not have "
+                "taken effect yet; try restarting the app."
+            )
+            return
+        run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        run_loop = Quartz.CFRunLoopGetCurrent()
+        Quartz.CFRunLoopAddSource(run_loop, run_loop_source, Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(tap, True)
+
+        if stop_event is not None:
+            def watch_for_stop():
+                stop_event.wait()
+                Quartz.CFRunLoopStop(run_loop)
+
+            threading.Thread(target=watch_for_stop, daemon=True).start()
+
+        Quartz.CFRunLoopRun()
+    except Exception:
+        logging.exception("macOS event tap failed unexpectedly.")
+
+
+def run_custom_keybind_listener(
+    bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
+    icon=None, notifications_config=None, status=None,
+):
+    """macOS counterpart of platform_windows.run_custom_keybind_listener -- see the module
+    comment above for why this uses a passive CGEventTap rather than an exclusive-grab API.
+    fire_keybind/describe_keybind/notify are passed in rather than imported from
+    autostart_script.py to avoid backend modules depending on it (the dependency only ever goes
+    the other way -- see CROSS_PLATFORM_PLAN.md §3)."""
+    try:
+        import Quartz
+    except ImportError:
+        logging.warning("Custom keybinds need pyobjc-framework-Quartz, which isn't installed -- see requirements.txt.")
+        return
+
+    enabled_bindings = [b for b in bindings if b.get("enabled", True)]
+    lookup = {}
+    for binding in enabled_bindings:
+        keycode = macos_keycode_for_key(binding.get("key", ""))
+        if keycode is None:
+            logging.warning("Custom keybind has an invalid key %r; skipping.", binding.get("key"))
+            continue
+        mask = _macos_mod_flags_for(binding.get("modifiers"), Quartz)
+        lookup[(keycode, mask)] = binding
+        logging.info("Registered custom keybind %s -> %s", describe_keybind(binding), binding.get("action"))
+
+    if not lookup:
+        return
+
+    relevant_flags_mask = (
+        Quartz.kCGEventFlagMaskControl | Quartz.kCGEventFlagMaskAlternate
+        | Quartz.kCGEventFlagMaskShift | Quartz.kCGEventFlagMaskCommand
+    )
+
+    def tap_callback(proxy, event_type, event, refcon):
+        try:
+            if event_type == Quartz.kCGEventKeyDown:
+                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                mask = Quartz.CGEventGetFlags(event) & relevant_flags_mask
+                binding = lookup.get((keycode, mask))
+                if binding:
+                    threading.Thread(
+                        target=fire_keybind,
+                        args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                        daemon=True,
+                    ).start()
+        except Exception:
+            logging.exception("Custom keybind macOS event tap callback failed.")
+        return event
+
+    def on_permission_denied():
+        notify(
+            icon, notifications_config, "Accessibility permission needed",
+            "Custom keybinds need Accessibility permission. Grant it in System Settings > Privacy "
+            "& Security > Accessibility, then restart the app.",
+        )
+
+    _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied)
+
+
+def resolve_editor_top_level_window(tk_window_id):
+    """Unused on macOS -- run_clip_editor_space_bar_listener below scopes by frontmost process,
+    not a specific window handle (see that function's own docstring for why). Identity function
+    only so the call site (autostart_script.py's start_space_bar_listener) doesn't need an
+    OS-specific branch of its own."""
+    return tk_window_id
+
+
+def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_event):
+    """macOS counterpart of platform_windows.run_clip_editor_space_bar_listener -- same
+    CGEventTap mechanism as run_custom_keybind_listener above (see the module comment for why
+    macOS uses one passive tap for both, unlike Windows/X11's two separate mechanisms), filtered
+    to the space bar and gated on this app's own process currently being frontmost.
+
+    That frontmost-PROCESS check (rather than "is the clip editor's specific NSWindow key",
+    Windows' precise per-HWND scoping) is a real, deliberate simplification: getting a specific
+    NSWindow's identity from Tkinter's own separate event loop needs deeper AppKit bridging this
+    phase doesn't attempt yet, so if this app has more than one top-level window open at once
+    (e.g. the clip editor AND the main Settings window), space bar toggles play/pause while
+    EITHER is frontmost, not only the clip editor specifically -- flagged as a known gap to
+    tighten during real-hardware follow-up, not the precise Windows-equivalent behavior.
+
+    editor_window_handle is accepted (for a uniform cross-backend call signature -- see
+    platform_common.run_clip_editor_space_bar_listener) but unused: there's nothing to resolve
+    here since the frontmost check works process-wide, not per-window, unlike Windows/X11's
+    HWND-/X11-window-id-scoped equivalents."""
+    del editor_window_handle
+    try:
+        import Quartz
+    except ImportError:
+        logging.warning(
+            "Clip editor: space bar needs pyobjc-framework-Quartz, which isn't installed -- use "
+            "the on-screen play/pause button instead."
+        )
+        return
+
+    this_pid = os.getpid()
+
+    def is_this_app_frontmost():
+        try:
+            frontmost = Quartz.NSWorkspace.sharedWorkspace().frontmostApplication()
+            return frontmost is not None and frontmost.processIdentifier() == this_pid
+        except Exception:
+            return False
+
+    def tap_callback(proxy, event_type, event, refcon):
+        try:
+            if event_type == Quartz.kCGEventKeyDown:
+                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                if keycode == MACOS_SPACE_KEYCODE and is_this_app_frontmost():
+                    on_toggle()
+        except Exception:
+            logging.exception("Clip editor: space bar event tap callback failed.")
+        return event
+
+    def on_permission_denied():
+        logging.warning(
+            "Clip editor: space bar needs Accessibility permission -- use the on-screen "
+            "play/pause button instead until it's granted."
+        )
+
+    _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_event=stop_event)

@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import unittest
 import unittest.mock
 
@@ -115,6 +116,271 @@ class GetWindowTitlesTests(unittest.TestCase):
         with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
             with self.assertLogs(level="WARNING"):
                 self.assertEqual(pmac.get_window_titles(), {})
+
+
+def make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=True):
+    fake = unittest.mock.MagicMock()
+    fake.kCGEventFlagMaskControl = 0x40000
+    fake.kCGEventFlagMaskAlternate = 0x80000
+    fake.kCGEventFlagMaskShift = 0x20000
+    fake.kCGEventFlagMaskCommand = 0x100000
+    fake.kCGSessionEventTap = 1
+    fake.kCGHeadInsertEventTap = 0
+    fake.kCGEventTapOptionListenOnly = 1
+    fake.kCGEventKeyDown = 10
+    fake.kCGKeyboardEventKeycode = 9
+    fake.kCFRunLoopCommonModes = "kCFRunLoopCommonModes"
+    fake.kAXTrustedCheckOptionPrompt = "AXTrustedCheckOptionPrompt"
+    fake.AXIsProcessTrusted.return_value = accessibility_trusted
+    fake.CGEventMaskBit.side_effect = lambda event_type: 1 << event_type
+    fake.CGEventTapCreate.return_value = object() if tap_creation_succeeds else None
+    fake.CFRunLoopGetCurrent.return_value = "run_loop"
+    return fake
+
+
+class MacosKeycodeForKeyTests(unittest.TestCase):
+    def test_letter_and_digit_keys(self):
+        self.assertEqual(pmac.macos_keycode_for_key("a"), 0x00)
+        self.assertEqual(pmac.macos_keycode_for_key("S"), 0x01)
+        self.assertEqual(pmac.macos_keycode_for_key("5"), 0x17)
+
+    def test_function_keys(self):
+        self.assertEqual(pmac.macos_keycode_for_key("F1"), 0x7A)
+        self.assertEqual(pmac.macos_keycode_for_key("F12"), 0x6F)
+
+    def test_invalid_key_returns_none(self):
+        self.assertIsNone(pmac.macos_keycode_for_key("F13"))
+        self.assertIsNone(pmac.macos_keycode_for_key("Enter"))
+        self.assertIsNone(pmac.macos_keycode_for_key(""))
+        self.assertIsNone(pmac.macos_keycode_for_key(None))
+
+
+class AccessibilityPermissionGrantedTests(unittest.TestCase):
+    def test_missing_pyobjc_returns_false(self):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": None}):
+            self.assertFalse(pmac.accessibility_permission_granted())
+
+    def test_granted(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            self.assertTrue(pmac.accessibility_permission_granted())
+
+    def test_not_granted(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=False)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            self.assertFalse(pmac.accessibility_permission_granted())
+
+    def test_exception_returns_false_not_raised(self):
+        fake_quartz = make_fake_quartz()
+        fake_quartz.AXIsProcessTrusted.side_effect = RuntimeError("boom")
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with self.assertLogs(level="ERROR"):
+                self.assertFalse(pmac.accessibility_permission_granted())
+
+
+class RequestAccessibilityPermissionTests(unittest.TestCase):
+    def test_missing_pyobjc_is_a_no_op(self):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": None}):
+            pmac.request_accessibility_permission()  # must not raise
+
+    def test_prompts_via_ax_is_process_trusted_with_options(self):
+        fake_quartz = make_fake_quartz()
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            pmac.request_accessibility_permission()
+        fake_quartz.AXIsProcessTrustedWithOptions.assert_called_once_with(
+            {fake_quartz.kAXTrustedCheckOptionPrompt: True}
+        )
+
+    def test_exception_is_swallowed(self):
+        fake_quartz = make_fake_quartz()
+        fake_quartz.AXIsProcessTrustedWithOptions.side_effect = RuntimeError("boom")
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with self.assertLogs(level="ERROR"):
+                pmac.request_accessibility_permission()  # must not raise
+
+
+class RunCustomKeybindListenerTests(unittest.TestCase):
+    def test_missing_pyobjc_is_logged_not_raised(self):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": None}):
+            with self.assertLogs(level="WARNING"):
+                pmac.run_custom_keybind_listener(
+                    [{"enabled": True, "key": "S", "modifiers": []}], get_client=lambda: None,
+                    get_manual_split_buffer_seconds=lambda: 0, fire_keybind=unittest.mock.Mock(),
+                    describe_keybind=unittest.mock.Mock(), notify=unittest.mock.Mock(),
+                )  # must not raise
+
+    def test_permission_not_granted_requests_and_notifies(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=False)
+        notify = unittest.mock.Mock()
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with self.assertLogs(level="WARNING"):
+                pmac.run_custom_keybind_listener(
+                    [{"enabled": True, "key": "S", "modifiers": []}], get_client=lambda: None,
+                    get_manual_split_buffer_seconds=lambda: 0, fire_keybind=unittest.mock.Mock(),
+                    describe_keybind=unittest.mock.Mock(), notify=notify,
+                )
+        fake_quartz.AXIsProcessTrustedWithOptions.assert_called_once()
+        notify.assert_called_once()
+        fake_quartz.CGEventTapCreate.assert_not_called()
+
+    def test_invalid_key_is_skipped_and_no_tap_is_created(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with self.assertLogs(level="WARNING"):
+                pmac.run_custom_keybind_listener(
+                    [{"enabled": True, "key": "NotAKey", "modifiers": []}], get_client=lambda: None,
+                    get_manual_split_buffer_seconds=lambda: 0, fire_keybind=unittest.mock.Mock(),
+                    describe_keybind=unittest.mock.Mock(), notify=unittest.mock.Mock(),
+                )
+        fake_quartz.CGEventTapCreate.assert_not_called()
+
+    def test_fires_matching_binding_on_a_dedicated_thread(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        binding = {"enabled": True, "key": "S", "modifiers": ["ctrl"], "action": "save_replay_buffer"}
+        fire_keybind = unittest.mock.Mock()
+        fake_thread = unittest.mock.MagicMock()
+
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with unittest.mock.patch.object(pmac.threading, "Thread", return_value=fake_thread) as mock_thread_cls:
+                pmac.run_custom_keybind_listener(
+                    [binding], get_client="get_client", get_manual_split_buffer_seconds="get_seconds",
+                    fire_keybind=fire_keybind, describe_keybind=unittest.mock.Mock(return_value="Ctrl+S"),
+                    notify=unittest.mock.Mock(), icon="icon", notifications_config="notif_cfg", status="status",
+                )
+
+                fake_quartz.CGEventTapCreate.assert_called_once()
+                tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
+
+                # threading.Thread must still be the patched mock (not the real class) when this
+                # fires -- both patches need to stay active across the callback invocation, not
+                # just across run_custom_keybind_listener's own setup.
+                fake_event = unittest.mock.Mock()
+                fake_quartz.CGEventGetIntegerValueField.return_value = pmac.macos_keycode_for_key("S")
+                fake_quartz.CGEventGetFlags.return_value = fake_quartz.kCGEventFlagMaskControl
+                result = tap_callback(None, fake_quartz.kCGEventKeyDown, fake_event, None)
+
+                self.assertIs(result, fake_event)
+                mock_thread_cls.assert_called_once_with(
+                    target=fire_keybind,
+                    args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status"),
+                    daemon=True,
+                )
+                fake_thread.start.assert_called_once()
+        fake_quartz.CFRunLoopRun.assert_called_once()
+
+    def test_non_matching_key_press_does_not_fire(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        binding = {"enabled": True, "key": "S", "modifiers": ["ctrl"], "action": "save_replay_buffer"}
+        fire_keybind = unittest.mock.Mock()
+
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with unittest.mock.patch.object(pmac.threading, "Thread") as mock_thread_cls:
+                pmac.run_custom_keybind_listener(
+                    [binding], get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
+                    fire_keybind=fire_keybind, describe_keybind=unittest.mock.Mock(), notify=unittest.mock.Mock(),
+                )
+
+                tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
+                fake_quartz.CGEventGetIntegerValueField.return_value = pmac.macos_keycode_for_key("Q")
+                fake_quartz.CGEventGetFlags.return_value = fake_quartz.kCGEventFlagMaskControl
+                tap_callback(None, fake_quartz.kCGEventKeyDown, unittest.mock.Mock(), None)
+
+                mock_thread_cls.assert_not_called()
+
+    def test_tap_creation_failure_is_logged_not_raised(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=False)
+        binding = {"enabled": True, "key": "S", "modifiers": []}
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with self.assertLogs(level="WARNING"):
+                pmac.run_custom_keybind_listener(
+                    [binding], get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
+                    fire_keybind=unittest.mock.Mock(), describe_keybind=unittest.mock.Mock(),
+                    notify=unittest.mock.Mock(),
+                )  # must not raise
+        fake_quartz.CFRunLoopRun.assert_not_called()
+
+
+class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
+    def test_missing_pyobjc_is_logged_not_raised(self):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": None}):
+            with self.assertLogs(level="WARNING"):
+                pmac.run_clip_editor_space_bar_listener(
+                    None, unittest.mock.Mock(), unittest.mock.Mock(),
+                )  # must not raise
+
+    def test_permission_not_granted_is_logged_not_raised(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=False)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with self.assertLogs(level="WARNING"):
+                pmac.run_clip_editor_space_bar_listener(
+                    None, unittest.mock.Mock(), unittest.mock.Mock(),
+                )
+        fake_quartz.CGEventTapCreate.assert_not_called()
+
+    def test_toggles_when_this_process_is_frontmost(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_frontmost_app = unittest.mock.Mock()
+        fake_frontmost_app.processIdentifier.return_value = os.getpid()
+        fake_quartz.NSWorkspace.sharedWorkspace.return_value.frontmostApplication.return_value = fake_frontmost_app
+        on_toggle = unittest.mock.Mock()
+
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            pmac.run_clip_editor_space_bar_listener(None, on_toggle, unittest.mock.Mock())
+
+        tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
+        fake_quartz.CGEventGetIntegerValueField.return_value = pmac.MACOS_SPACE_KEYCODE
+        tap_callback(None, fake_quartz.kCGEventKeyDown, unittest.mock.Mock(), None)
+
+        on_toggle.assert_called_once()
+
+    def test_does_not_toggle_when_a_different_process_is_frontmost(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_frontmost_app = unittest.mock.Mock()
+        fake_frontmost_app.processIdentifier.return_value = os.getpid() + 1
+        fake_quartz.NSWorkspace.sharedWorkspace.return_value.frontmostApplication.return_value = fake_frontmost_app
+        on_toggle = unittest.mock.Mock()
+
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            pmac.run_clip_editor_space_bar_listener(None, on_toggle, unittest.mock.Mock())
+
+        tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
+        fake_quartz.CGEventGetIntegerValueField.return_value = pmac.MACOS_SPACE_KEYCODE
+        tap_callback(None, fake_quartz.kCGEventKeyDown, unittest.mock.Mock(), None)
+
+        on_toggle.assert_not_called()
+
+    def test_non_space_key_does_not_toggle(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        on_toggle = unittest.mock.Mock()
+
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            pmac.run_clip_editor_space_bar_listener(None, on_toggle, unittest.mock.Mock())
+
+        tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
+        fake_quartz.CGEventGetIntegerValueField.return_value = pmac.macos_keycode_for_key("A")
+        tap_callback(None, fake_quartz.kCGEventKeyDown, unittest.mock.Mock(), None)
+
+        on_toggle.assert_not_called()
+
+    def test_stop_event_stops_the_run_loop(self):
+        # The real watcher thread run_clip_editor_space_bar_listener spawns to call
+        # CFRunLoopStop runs asynchronously on a real background thread -- racy to assert on
+        # directly, so threading.Thread is replaced with something that runs its target
+        # synchronously instead, making the effect of stop_event already being set deterministic
+        # to observe here.
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        stop_event = threading.Event()
+        stop_event.set()
+
+        def run_target_synchronously(target=None, daemon=None):
+            target()
+            return unittest.mock.MagicMock()
+
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            with unittest.mock.patch.object(pmac.threading, "Thread", side_effect=run_target_synchronously):
+                pmac.run_clip_editor_space_bar_listener(None, unittest.mock.Mock(), stop_event)
+
+        fake_quartz.CFRunLoopStop.assert_called_once_with("run_loop")
 
 
 if __name__ == "__main__":

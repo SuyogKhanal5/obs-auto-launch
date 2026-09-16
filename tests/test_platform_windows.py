@@ -1,5 +1,7 @@
+import ctypes
 import os
 import sys
+import threading
 import unittest
 import unittest.mock
 
@@ -127,6 +129,212 @@ class GetWindowTitlesTests(unittest.TestCase):
         for pid, titles in result.items():
             self.assertIsInstance(pid, int)
             self.assertIsInstance(titles, list)
+
+
+class VkCodeForKeyTests(unittest.TestCase):
+    def test_letter_keys(self):
+        self.assertEqual(pw.vk_code_for_key("s"), ord("S"))
+        self.assertEqual(pw.vk_code_for_key("Z"), ord("Z"))
+
+    def test_digit_keys(self):
+        self.assertEqual(pw.vk_code_for_key("5"), ord("5"))
+
+    def test_function_keys(self):
+        self.assertEqual(pw.vk_code_for_key("F1"), 0x70)
+        self.assertEqual(pw.vk_code_for_key("F12"), 0x7B)
+
+    def test_invalid_key_returns_none(self):
+        self.assertIsNone(pw.vk_code_for_key("F13"))
+        self.assertIsNone(pw.vk_code_for_key("Enter"))
+        self.assertIsNone(pw.vk_code_for_key(""))
+        self.assertIsNone(pw.vk_code_for_key(None))
+
+
+class ModFlagsForTests(unittest.TestCase):
+    def test_combines_flags(self):
+        self.assertEqual(pw.mod_flags_for(["ctrl", "alt"]), pw.MOD_CONTROL | pw.MOD_ALT)
+
+    def test_empty_or_none_is_zero(self):
+        self.assertEqual(pw.mod_flags_for([]), 0)
+        self.assertEqual(pw.mod_flags_for(None), 0)
+
+    def test_unknown_modifier_is_ignored(self):
+        self.assertEqual(pw.mod_flags_for(["ctrl", "bogus"]), pw.MOD_CONTROL)
+
+
+class IsSpaceBarToggleEventTests(unittest.TestCase):
+    EDITOR_HWND = 12345
+    OTHER_HWND = 99999
+
+    def test_matching_keydown_on_editor_window_toggles(self):
+        self.assertTrue(pw.is_space_bar_toggle_event(
+            pw.HC_ACTION, pw.WM_KEYDOWN, pw.VK_SPACE, self.EDITOR_HWND, self.EDITOR_HWND,
+        ))
+
+    def test_matching_syskeydown_on_editor_window_toggles(self):
+        self.assertTrue(pw.is_space_bar_toggle_event(
+            pw.HC_ACTION, pw.WM_SYSKEYDOWN, pw.VK_SPACE, self.EDITOR_HWND, self.EDITOR_HWND,
+        ))
+
+    def test_wrong_ncode_is_ignored(self):
+        self.assertFalse(pw.is_space_bar_toggle_event(
+            pw.HC_ACTION + 1, pw.WM_KEYDOWN, pw.VK_SPACE, self.EDITOR_HWND, self.EDITOR_HWND,
+        ))
+
+    def test_key_up_is_ignored(self):
+        self.assertFalse(pw.is_space_bar_toggle_event(
+            pw.HC_ACTION, 0x0101, pw.VK_SPACE, self.EDITOR_HWND, self.EDITOR_HWND,  # WM_KEYUP
+        ))
+
+    def test_other_keys_are_ignored(self):
+        self.assertFalse(pw.is_space_bar_toggle_event(
+            pw.HC_ACTION, pw.WM_KEYDOWN, 0x41, self.EDITOR_HWND, self.EDITOR_HWND,  # 'A'
+        ))
+
+    def test_space_pressed_while_a_different_window_is_foreground_is_ignored(self):
+        self.assertFalse(pw.is_space_bar_toggle_event(
+            pw.HC_ACTION, pw.WM_KEYDOWN, pw.VK_SPACE, self.OTHER_HWND, self.EDITOR_HWND,
+        ))
+
+
+@unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hotkey API")
+class RunCustomKeybindListenerRegistrationRetryTests(unittest.TestCase):
+    # A self-restart doesn't guarantee the previous process's hotkey registrations are released
+    # by the time this thread starts -- confirmed live as a real bug: a keybind that lost this
+    # race on one restart stayed dead for the rest of that session with only one WARNING logged.
+    def setUp(self):
+        self.mock_user32 = unittest.mock.Mock()
+        self.mock_user32.GetMessageW.return_value = 0  # exit the message loop immediately
+        self.bindings = [{"enabled": True, "action": "add_marker", "modifiers": ["ctrl"], "key": "F3"}]
+        self.fire_keybind = unittest.mock.Mock()
+        self.describe_keybind = unittest.mock.Mock(return_value="Ctrl+F3")
+        self.notify = unittest.mock.Mock()
+        self.patchers = [
+            unittest.mock.patch.object(pw.ctypes.windll, "user32", self.mock_user32),
+            unittest.mock.patch.object(pw.time, "sleep"),
+        ]
+        for p in self.patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_retries_and_succeeds_after_transient_failures(self):
+        self.mock_user32.RegisterHotKey.side_effect = [False, False, True]
+        pw.run_custom_keybind_listener(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+        )
+        self.assertEqual(self.mock_user32.RegisterHotKey.call_count, 3)
+
+    def test_gives_up_after_max_retries_and_notifies(self):
+        self.mock_user32.RegisterHotKey.return_value = False
+        icon = unittest.mock.Mock()
+        with self.assertLogs(level="WARNING"):
+            pw.run_custom_keybind_listener(
+                self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+                icon=icon, notifications_config={"enabled": True},
+            )
+        self.assertEqual(self.mock_user32.RegisterHotKey.call_count, 5)
+        self.notify.assert_called_once()
+
+
+@unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hotkey API")
+class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
+    def setUp(self):
+        self.mock_user32 = unittest.mock.Mock()
+        # Every SetWindowsHookExW/UnhookWindowsHookEx/CallNextHookEx/GetForegroundWindow call
+        # sets its own .restype/.argtypes as a real ctypes function pointer would let it -- a
+        # bare Mock attribute happily accepts that assignment and ignores it, which is exactly
+        # what's wanted here (these tests care about call counts/args, not real marshaling).
+        self.mock_user32.SetWindowsHookExW.return_value = 777  # a fake, truthy hook handle
+        self.mock_user32.PeekMessageW.return_value = 0  # no messages waiting
+        # The real hook_proc's WINFUNCTYPE restype (c_ssize_t) enforces an actual integer return
+        # value even when the callback is invoked directly like this (not through a real OS
+        # callback) -- a bare Mock() default here fails that conversion inside ctypes itself.
+        self.mock_user32.CallNextHookEx.return_value = 0
+        self.patcher = unittest.mock.patch.object(pw.ctypes.windll, "user32", self.mock_user32)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def test_install_failure_logs_and_returns_without_looping(self):
+        self.mock_user32.SetWindowsHookExW.return_value = 0
+        stop_event = threading.Event()
+        with self.assertLogs(level="WARNING"):
+            pw.run_clip_editor_space_bar_listener(12345, lambda: None, stop_event)
+        self.mock_user32.PeekMessageW.assert_not_called()
+        self.mock_user32.UnhookWindowsHookEx.assert_not_called()
+
+    def test_pre_set_stop_event_still_unhooks_before_returning(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw.run_clip_editor_space_bar_listener(12345, lambda: None, stop_event)
+        self.mock_user32.UnhookWindowsHookEx.assert_called_once_with(777)
+
+    def test_callback_toggles_only_for_editor_window_space_keydown(self):
+        editor_hwnd = 12345
+        stop_event = threading.Event()
+        stop_event.set()  # exits the message loop immediately; only installing the hook matters
+        calls = []
+        pw.run_clip_editor_space_bar_listener(editor_hwnd, lambda: calls.append(1), stop_event)
+
+        # The real ctypes-wrapped callback passed to SetWindowsHookExW -- calling it directly
+        # here exercises the SAME code path a real keystroke would, without needing an actual OS
+        # hook installed (there's no physical keyboard in a test environment).
+        callback = self.mock_user32.SetWindowsHookExW.call_args[0][1]
+
+        self.mock_user32.GetForegroundWindow.return_value = editor_hwnd
+        info = pw.KBDLLHOOKSTRUCT(vkCode=pw.VK_SPACE)
+        result = callback(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
+        self.assertEqual(calls, [1])
+        # ctypes round-trips lparam through a fresh POINTER(KBDLLHOOKSTRUCT) wrapper object on
+        # its way into this callback, so it's never the SAME Python object as what was passed in
+        # above -- comparing the args it was actually forwarded to CallNextHookEx with by their
+        # dereferenced value (not object identity/equality) is what actually verifies pass-through.
+        next_hook_args = self.mock_user32.CallNextHookEx.call_args[0]
+        self.assertEqual(next_hook_args[:3], (None, pw.HC_ACTION, pw.WM_KEYDOWN))
+        self.assertEqual(next_hook_args[3].contents.vkCode, pw.VK_SPACE)
+        self.assertEqual(result, 0)
+
+    def test_callback_does_not_toggle_for_other_window_or_other_keys(self):
+        editor_hwnd = 12345
+        stop_event = threading.Event()
+        stop_event.set()
+        calls = []
+        pw.run_clip_editor_space_bar_listener(editor_hwnd, lambda: calls.append(1), stop_event)
+        callback = self.mock_user32.SetWindowsHookExW.call_args[0][1]
+
+        self.mock_user32.GetForegroundWindow.return_value = 99999  # a different window
+        info = pw.KBDLLHOOKSTRUCT(vkCode=pw.VK_SPACE)
+        callback(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
+        self.assertEqual(calls, [])
+
+        self.mock_user32.GetForegroundWindow.return_value = editor_hwnd
+        info_other_key = pw.KBDLLHOOKSTRUCT(vkCode=0x41)  # 'A'
+        callback(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info_other_key))
+        self.assertEqual(calls, [])
+
+    def test_callback_exception_is_swallowed_and_still_calls_next_hook(self):
+        editor_hwnd = 12345
+        stop_event = threading.Event()
+        stop_event.set()
+        pw.run_clip_editor_space_bar_listener(
+            editor_hwnd, lambda: (_ for _ in ()).throw(RuntimeError("boom")), stop_event,
+        )
+        callback = self.mock_user32.SetWindowsHookExW.call_args[0][1]
+
+        self.mock_user32.GetForegroundWindow.return_value = editor_hwnd
+        info = pw.KBDLLHOOKSTRUCT(vkCode=pw.VK_SPACE)
+        with self.assertLogs(level="ERROR"):
+            callback(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
+        self.mock_user32.CallNextHookEx.assert_called_once()
+
+
+@unittest.skipUnless(sys.platform == "win32", "constructs a real ctypes.wintypes.HWND")
+class ResolveEditorTopLevelWindowTests(unittest.TestCase):
+    def test_resolves_via_get_ancestor(self):
+        mock_user32 = unittest.mock.Mock()
+        mock_user32.GetAncestor.return_value = 999
+        with unittest.mock.patch.object(pw.ctypes, "windll", unittest.mock.Mock(user32=mock_user32)):
+            result = pw.resolve_editor_top_level_window(12345)
+        self.assertEqual(result, 999)
 
 
 if __name__ == "__main__":

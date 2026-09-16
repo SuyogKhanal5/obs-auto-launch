@@ -172,3 +172,49 @@ def executable_filetypes(platform_name=None):
     if platform_name == "win32":
         return (("Executable", "*.exe"), ("All files", "*.*"))
     return (("All files", "*.*"),)
+
+
+def global_hotkeys_supported(platform_name=None):
+    """False only for a Linux/Wayland session, which has no unprivileged API for a global hotkey
+    at all (see CROSS_PLATFORM_PLAN.md §2.3) -- True on Windows and macOS unconditionally, and on
+    Linux/X11. Meant for calling UI code (the custom-keybind Settings tab, the clip editor) to
+    show a clear "not supported this session" message up front, rather than only finding out when
+    run_custom_keybind_listener's own listener thread logs a warning and quietly does nothing."""
+    backend = _select_backend(platform_name)
+    is_wayland_session = getattr(backend, "is_wayland_session", None)
+    return not (is_wayland_session and is_wayland_session())
+
+
+def run_custom_keybind_listener(
+    bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
+    icon=None, notifications_config=None, status=None, platform_name=None,
+):
+    """Dispatches to this OS's own full custom-keybind listener implementation -- unlike most of
+    this module's other functions, the entire mechanism (registration AND its event loop) differs
+    enough per OS (RegisterHotKey/GetMessageW vs. XGrabKey/XNextEvent vs. a CGEventTap/CFRunLoop)
+    that each backend owns its whole implementation rather than sharing one generic shape here;
+    see CROSS_PLATFORM_PLAN.md Phase 3. fire_keybind/describe_keybind/notify are passed through
+    rather than imported by the backend modules themselves, so backends never depend on
+    autostart_script.py (the dependency only ever goes the other way -- see this module's own
+    docstring)."""
+    return _select_backend(platform_name).run_custom_keybind_listener(
+        bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
+        icon=icon, notifications_config=notifications_config, status=status,
+    )
+
+
+def resolve_editor_top_level_window(tk_window_id, platform_name=None):
+    """Resolves whatever handle this OS's run_clip_editor_space_bar_listener backend needs to
+    scope its check to the clip editor's own window, starting from the Tk root widget's own
+    winfo_id() -- an ancestor walk up to the true top-level HWND on Windows, the identity
+    function on Linux/macOS (see each backend's own resolve_editor_top_level_window)."""
+    return _select_backend(platform_name).resolve_editor_top_level_window(tk_window_id)
+
+
+def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_event, platform_name=None):
+    """Dispatches to this OS's own clip editor space-bar play/pause listener. editor_window_handle
+    is whatever this OS's backend needs to scope the check to the editor window specifically -- an
+    HWND on Windows, an X11 window id on Linux; accepted but unused on macOS, which scopes by
+    frontmost process instead (see platform_macos.run_clip_editor_space_bar_listener's own
+    docstring for why)."""
+    return _select_backend(platform_name).run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_event)
