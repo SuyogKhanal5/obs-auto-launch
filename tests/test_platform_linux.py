@@ -131,6 +131,15 @@ class GetWindowTitlesTests(unittest.TestCase):
         fake_display.close.assert_called_once()
 
 
+class EmbedVideoPlayerTests(unittest.TestCase):
+    def test_calls_set_xwindow_with_widgets_winfo_id(self):
+        player = unittest.mock.Mock()
+        widget = unittest.mock.Mock()
+        widget.winfo_id.return_value = 4242
+        pl.embed_video_player(player, widget)
+        player.set_xwindow.assert_called_once_with(4242)
+
+
 class KeysymForKeyTests(unittest.TestCase):
     def test_letter_keys(self):
         self.assertEqual(pl.keysym_for_key("a"), 0x41)

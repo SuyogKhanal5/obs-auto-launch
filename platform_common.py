@@ -203,6 +203,14 @@ def run_custom_keybind_listener(
     )
 
 
+def embed_video_player(player, tk_widget, platform_name=None):
+    """Embeds a python-vlc player's video output into tk_widget -- set_hwnd on Windows,
+    set_xwindow on Linux/X11 (both take the plain numeric id tk_widget.winfo_id() already
+    returns), set_nsobject on macOS (needs a real NSView object -- see
+    platform_macos.embed_video_player for how that's bridged from Tk's own winfo_id())."""
+    return _select_backend(platform_name).embed_video_player(player, tk_widget)
+
+
 def resolve_editor_top_level_window(tk_window_id, platform_name=None):
     """Resolves whatever handle this OS's run_clip_editor_space_bar_listener backend needs to
     scope its check to the clip editor's own window, starting from the Tk root widget's own

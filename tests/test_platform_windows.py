@@ -131,6 +131,15 @@ class GetWindowTitlesTests(unittest.TestCase):
             self.assertIsInstance(titles, list)
 
 
+class EmbedVideoPlayerTests(unittest.TestCase):
+    def test_calls_set_hwnd_with_widgets_winfo_id(self):
+        player = unittest.mock.Mock()
+        widget = unittest.mock.Mock()
+        widget.winfo_id.return_value = 4242
+        pw.embed_video_player(player, widget)
+        player.set_hwnd.assert_called_once_with(4242)
+
+
 class VkCodeForKeyTests(unittest.TestCase):
     def test_letter_keys(self):
         self.assertEqual(pw.vk_code_for_key("s"), ord("S"))

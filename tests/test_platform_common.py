@@ -187,6 +187,16 @@ class GetWindowTitlesTests(unittest.TestCase):
         self.assertEqual(result, {})
 
 
+class EmbedVideoPlayerTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        player = unittest.mock.Mock()
+        widget = unittest.mock.Mock()
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.embed_video_player(player, widget, platform_name="linux")
+        mock_select.assert_called_once_with("linux")
+        mock_select.return_value.embed_video_player.assert_called_once_with(player, widget)
+
+
 class ExampleExecutableNameTests(unittest.TestCase):
     def test_windows_adds_exe_suffix(self):
         self.assertEqual(pc.example_executable_name(platform_name="win32"), "cs2.exe")

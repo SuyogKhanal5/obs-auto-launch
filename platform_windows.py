@@ -277,6 +277,13 @@ VK_SPACE = 0x20
 GA_ROOT = 2
 
 
+def embed_video_player(player, tk_widget):
+    """Embeds a python-vlc player's output into tk_widget -- Windows takes a raw HWND, the same
+    integer Tk's own winfo_id() already returns. Moved unchanged from the clip editor's old
+    direct player.set_hwnd(video_frame.winfo_id()) call site."""
+    player.set_hwnd(tk_widget.winfo_id())
+
+
 def resolve_editor_top_level_window(tk_window_id):
     """Walks from a Tk widget's own HWND up to its true top-level ancestor HWND -- a Tk widget's
     own winfo_id() isn't necessarily the top-level window itself on Windows (unlike X11, where Tk

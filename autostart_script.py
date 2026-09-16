@@ -6816,7 +6816,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     video_frame = tk.Frame(root, bg="black")
     video_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
     root.update_idletasks()
-    player.set_hwnd(video_frame.winfo_id())
+    platform_common.embed_video_player(player, video_frame)
 
     # --- Timeline (click/drag anywhere to seek; start/end markers drawn in their own colors so
     # they're never confused with the playback seeker; scroll to zoom, right-drag to pan once

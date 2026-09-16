@@ -373,6 +373,13 @@ def run_custom_keybind_listener(
 # rule already scopes it that way.
 
 
+def embed_video_player(player, tk_widget):
+    """Embeds a python-vlc player's output into tk_widget -- X11 takes the plain numeric X window
+    id, the same integer Tk's own winfo_id() already returns (unlike macOS, where python-vlc's
+    set_nsobject needs an actual NSView object -- see platform_macos.embed_video_player)."""
+    player.set_xwindow(tk_widget.winfo_id())
+
+
 def resolve_editor_top_level_window(tk_window_id):
     """Tk creates its root widget's window directly as a real, window-manager-visible top-level
     X window as soon as it exists -- unlike Windows, where a Tk widget's own HWND isn't

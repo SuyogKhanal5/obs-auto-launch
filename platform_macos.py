@@ -329,6 +329,28 @@ def run_custom_keybind_listener(
     _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied)
 
 
+def embed_video_player(player, tk_widget):
+    """Embeds a python-vlc player's output into tk_widget -- unlike Windows/Linux (which both
+    hand set_hwnd/set_xwindow the plain numeric id winfo_id() already returns), python-vlc's
+    macOS set_nsobject() needs a real NSView Objective-C object, not a raw integer.
+
+    Modern Tk/Aqua (Cocoa-based -- what every current Tcl/Tk build uses; the old Carbon-based Tk
+    port is long deprecated) returns the NSView*'s own pointer value directly from winfo_id(), so
+    this wraps that raw pointer as a real PyObjC object via objc.objc_object(...) rather than
+    trying to locate/match an NSWindow through some other, less direct path (e.g. searching
+    NSApp's window list). This is the single least-confident piece of code in this phase (see
+    CROSS_PLATFORM_PLAN.md §5.5) -- not verified against real macOS hardware in this session; if
+    the pointer-cast assumption above turns out wrong for some Tk/macOS version combination, the
+    most likely real symptom is a blank/black video surface (set_nsobject's own argument
+    validation is lenient) rather than a crash, so this needs real-hardware confirmation, not
+    just "did it raise" CI coverage."""
+    import objc
+
+    view_ptr = tk_widget.winfo_id()
+    ns_view = objc.objc_object(c_void_p=view_ptr)
+    player.set_nsobject(ns_view)
+
+
 def resolve_editor_top_level_window(tk_window_id):
     """Unused on macOS -- run_clip_editor_space_bar_listener below scopes by frontmost process,
     not a specific window handle (see that function's own docstring for why). Identity function

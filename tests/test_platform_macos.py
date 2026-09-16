@@ -118,6 +118,23 @@ class GetWindowTitlesTests(unittest.TestCase):
                 self.assertEqual(pmac.get_window_titles(), {})
 
 
+class EmbedVideoPlayerTests(unittest.TestCase):
+    def test_wraps_winfo_id_as_ns_view_and_calls_set_nsobject(self):
+        fake_objc = unittest.mock.MagicMock()
+        fake_ns_view = object()
+        fake_objc.objc_object.return_value = fake_ns_view
+
+        player = unittest.mock.Mock()
+        widget = unittest.mock.Mock()
+        widget.winfo_id.return_value = 4242
+
+        with unittest.mock.patch.dict(sys.modules, {"objc": fake_objc}):
+            pmac.embed_video_player(player, widget)
+
+        fake_objc.objc_object.assert_called_once_with(c_void_p=4242)
+        player.set_nsobject.assert_called_once_with(fake_ns_view)
+
+
 def make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=True):
     fake = unittest.mock.MagicMock()
     fake.kCGEventFlagMaskControl = 0x40000
