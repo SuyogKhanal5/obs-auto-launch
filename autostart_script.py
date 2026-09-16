@@ -2791,31 +2791,14 @@ MKV_TO_MP4_PRESERVE_TRACKS_EXTENSION = ".mp4"
 
 def find_ffmpeg():
     """Best-effort search for an ffmpeg install already on this PC, so most users never have to
-    know or set an ffmpeg path themselves. Checks PATH first, then the install locations of the
-    package managers people actually use to get ffmpeg on Windows (winget, Chocolatey, Scoop)
-    plus a couple of common manual-install folders. Returns None if nothing turns up anywhere --
-    the feature is still opt-in and requires an actual ffmpeg somewhere on the machine."""
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-
-    candidates = [
-        r"C:\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
-        os.path.expandvars(r"%USERPROFILE%\scoop\shims\ffmpeg.exe"),
-    ]
-    try:
-        candidates += glob.glob(
-            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\*FFmpeg*\**\ffmpeg.exe"),
-            recursive=True,
-        )
-    except OSError:
-        pass
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return None
+    know or set an ffmpeg path themselves. Thin wrapper kept under this name since many call
+    sites throughout this file already use it -- the actual per-OS search logic (PATH lookup
+    first, then each OS's own common non-PATH install locations) now lives in
+    platform_common.find_ffmpeg_executable() / platform_windows.py / platform_linux.py /
+    platform_macos.py, see CROSS_PLATFORM_PLAN.md Phase 1. Returns None if nothing turns up
+    anywhere -- the feature is still opt-in and requires an actual ffmpeg somewhere on the
+    machine."""
+    return platform_common.find_ffmpeg_executable()
 
 
 def resolve_ffmpeg_path(configured_path):
@@ -2867,42 +2850,24 @@ VLC_WINGET_ID = "VideoLAN.VLC"
 
 
 def find_vlc():
-    """Best-effort search for a VLC install on this PC, mirroring find_ffmpeg()'s approach but
-    checking for libvlc.dll (what python-vlc actually loads) via the registry key VLC itself
-    writes on install, rather than a bare exe on PATH. Deliberately does NOT import the `vlc`
-    module -- see import_vlc_module()'s docstring for why that has to stay separate. Returns the
-    install directory, or None."""
-    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-        try:
-            with winreg.OpenKey(hive, r"Software\VideoLAN\VLC") as key:
-                install_dir = winreg.QueryValueEx(key, "InstallDir")[0]
-        except OSError:
-            continue
-        if install_dir and os.path.isfile(os.path.join(install_dir, "libvlc.dll")):
-            return install_dir
-
-    for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
-        base = os.environ.get(env_var)
-        if not base:
-            continue
-        candidate = os.path.join(base, "VideoLAN", "VLC")
-        if os.path.isfile(os.path.join(candidate, "libvlc.dll")):
-            return candidate
-
-    vlc_exe = shutil.which("vlc")
-    if vlc_exe:
-        candidate = os.path.dirname(vlc_exe)
-        if os.path.isfile(os.path.join(candidate, "libvlc.dll")):
-            return candidate
-
-    return None
+    """Best-effort search for a VLC install on this PC. Deliberately does NOT import the `vlc`
+    module -- see import_vlc_module()'s docstring for why that has to stay separate. Thin wrapper
+    kept under this name since many call sites throughout this file already use it -- the actual
+    per-OS search logic now lives in platform_common.find_vlc_directory() /
+    platform_windows.py / platform_linux.py / platform_macos.py, see
+    CROSS_PLATFORM_PLAN.md Phase 1. Returns the install directory, or None."""
+    return platform_common.find_vlc_directory()
 
 
 def resolve_vlc_path(configured_path):
     """Resolves clip_editor.vlc_path to an actual VLC install directory: an explicit configured
-    directory that still contains libvlc.dll wins as-is (mirrors resolve_ffmpeg_path's
-    precedence), otherwise falls back to find_vlc()'s auto-detection."""
-    if configured_path and os.path.isfile(os.path.join(configured_path, "libvlc.dll")):
+    directory that still contains this OS's own libvlc file wins as-is (mirrors
+    resolve_ffmpeg_path's precedence -- previously hardcoded "libvlc.dll" here specifically,
+    which was actually a latent bug on any OS but Windows, now fixed by asking
+    platform_common for the right filename), otherwise falls back to find_vlc()'s
+    auto-detection."""
+    libvlc_filename = platform_common.libvlc_filename()
+    if configured_path and os.path.isfile(os.path.join(configured_path, libvlc_filename)):
         return configured_path
     return find_vlc()
 
@@ -3397,8 +3362,8 @@ def probe_audio_stream_count(ffmpeg_path, input_path):
     count to correctly re-map every track when only some of them are being shifted or muted;
     returns None (rather than guessing) if ffprobe can't be found or the probe fails, since a
     caller can't safely build a filter graph without knowing it."""
-    ffprobe_path = os.path.join(os.path.dirname(ffmpeg_path), "ffprobe.exe")
-    if not os.path.isfile(ffprobe_path):
+    ffprobe_path = platform_common.find_ffprobe_executable(ffmpeg_path)
+    if not ffprobe_path:
         return None
     try:
         result = subprocess.run(

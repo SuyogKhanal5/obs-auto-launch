@@ -102,7 +102,7 @@ class TranscodeRecordingTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def _fake_run(self, returncode=0, stderr=""):
-        def run(cmd, capture_output, text, creationflags):
+        def run(cmd, capture_output, text, creationflags=0):
             self.last_cmd = cmd
             return type("Result", (), {"returncode": returncode, "stderr": stderr})()
         return run
@@ -174,7 +174,7 @@ class ApplyAudioSyncShiftTests(unittest.TestCase):
         self.addCleanup(probe_patcher.stop)
 
     def _fake_run(self, returncode=0, stderr="", write_output=True, output_bytes=b"data"):
-        def run(cmd, capture_output, text, creationflags):
+        def run(cmd, capture_output, text, creationflags=0):
             self.last_cmd = cmd
             if write_output:
                 output_path = cmd[-1]

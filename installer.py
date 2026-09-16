@@ -11,7 +11,6 @@ Kept intentionally separate from autostart_script.py: it only needs a
 handful of stdlib modules plus psutil, not the full app's dependency set.
 """
 
-import glob
 import json
 import os
 import secrets
@@ -23,11 +22,6 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
-# Windows-only stdlib module -- guarded the same way and for the same reason as
-# autostart_script.py's own winreg import; see CROSS_PLATFORM_PLAN.md.
-if sys.platform == "win32":
-    import winreg
-
 import psutil
 
 import platform_common
@@ -37,10 +31,6 @@ EXE_NAME = "OBSAutoRecorder.exe"
 APP_FOLDER_NAME = "OBSAutoRecorder"  # onedir build folder embedded in this installer's data
 APP_INTERNAL_DIR_NAME = "_internal"  # PyInstaller onedir's support-files subfolder
 DEFAULT_INSTALL_DIR = r"C:\Program Files\OBSAutoRecorder"
-DEFAULT_OBS_PATHS = [
-    r"C:\Program Files\obs-studio\bin\64bit\obs64.exe",
-    r"C:\Program Files (x86)\obs-studio\bin\64bit\obs64.exe",
-]
 OBS_DOWNLOAD_URL = "https://obsproject.com/download"
 OBS_WINGET_ID = "OBSProject.OBSStudio"
 FFMPEG_WINGET_ID = "Gyan.FFmpeg"
@@ -68,25 +58,10 @@ def has_winget():
 
 
 def is_ffmpeg_installed():
-    """Minimal presence check mirroring autostart_script.py's find_ffmpeg(), duplicated rather
-    than imported since this installer deliberately stays independent of the main app's
-    dependency set (see the module docstring)."""
-    if shutil.which("ffmpeg"):
-        return True
-    candidates = [
-        r"C:\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
-        os.path.expandvars(r"%USERPROFILE%\scoop\shims\ffmpeg.exe"),
-    ]
-    try:
-        candidates += glob.glob(
-            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\*FFmpeg*\**\ffmpeg.exe"),
-            recursive=True,
-        )
-    except OSError:
-        pass
-    return any(path and os.path.isfile(path) for path in candidates)
+    """Presence check backed by platform_common.find_ffmpeg_executable() -- the same per-OS
+    search autostart_script.py itself uses, no longer duplicated here (previously this had its
+    own separate copy of the Windows candidate list; see CROSS_PLATFORM_PLAN.md Phase 1)."""
+    return platform_common.find_ffmpeg_executable() is not None
 
 
 def winget_install(package_id, timeout=600):
@@ -168,23 +143,11 @@ def get_startup_shortcut_path():
 
 
 def find_obs_exe():
-    for path in DEFAULT_OBS_PATHS:
-        if os.path.isfile(path):
-            return path
-
-    for hive, subkey in (
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio"),
-    ):
-        try:
-            with winreg.OpenKey(hive, subkey) as key:
-                install_location = winreg.QueryValueEx(key, "InstallLocation")[0]
-        except OSError:
-            continue
-        candidate = os.path.join(install_location, "bin", "64bit", "obs64.exe")
-        if os.path.isfile(candidate):
-            return candidate
-    return None
+    """Backed by platform_common.find_obs_executable() -- the per-OS search (registry lookup on
+    Windows, .app bundle / Flatpak on macOS / Linux) now lives there, see
+    CROSS_PLATFORM_PLAN.md Phase 1. Kept under this name since it's called from a couple of
+    places in this file already."""
+    return platform_common.find_obs_executable()
 
 
 def is_obs_running():

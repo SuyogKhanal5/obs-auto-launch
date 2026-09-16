@@ -262,7 +262,7 @@ class ExtractAudioTrackWavTests(unittest.TestCase):
         self.out_wav = os.path.join(self.tmp, "out.wav")
 
     def _fake_run(self, returncode=0, write_output=True, stderr=""):
-        def run(cmd, capture_output, text, creationflags, timeout, **kwargs):
+        def run(cmd, capture_output, text, creationflags=0, timeout=None, **kwargs):
             self.last_cmd = cmd
             if write_output:
                 with open(cmd[-1], "wb") as f:

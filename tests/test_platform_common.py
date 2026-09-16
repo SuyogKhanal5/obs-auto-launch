@@ -47,5 +47,147 @@ class SelectBackendTests(unittest.TestCase):
         self.assertEqual(backend.__name__, expected)
 
 
+class FindObsExecutableTests(unittest.TestCase):
+    def test_configured_path_that_exists_wins(self):
+        with unittest.mock.patch("os.path.isfile", return_value=True):
+            self.assertEqual(pc.find_obs_executable(configured_path="/some/obs"), "/some/obs")
+
+    def test_configured_path_that_does_not_exist_falls_back_to_backend(self):
+        with unittest.mock.patch("os.path.isfile", return_value=False):
+            with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+                mock_select.return_value.find_obs_executable.return_value = "/backend/obs"
+                result = pc.find_obs_executable(configured_path="/missing", platform_name="linux")
+        mock_select.assert_called_once_with("linux")
+        self.assertEqual(result, "/backend/obs")
+
+    def test_no_configured_path_goes_straight_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.find_obs_executable.return_value = "/backend/obs"
+            result = pc.find_obs_executable(platform_name="darwin")
+        self.assertEqual(result, "/backend/obs")
+
+
+class FindFfmpegExecutableTests(unittest.TestCase):
+    def test_absolute_configured_path_that_exists_wins(self):
+        with unittest.mock.patch("os.path.isabs", return_value=True), \
+             unittest.mock.patch("os.path.isfile", return_value=True):
+            self.assertEqual(pc.find_ffmpeg_executable("/abs/ffmpeg"), "/abs/ffmpeg")
+
+    def test_configured_path_found_via_which_wins(self):
+        with unittest.mock.patch("os.path.isabs", return_value=False), \
+             unittest.mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+            self.assertEqual(pc.find_ffmpeg_executable("ffmpeg"), "/usr/bin/ffmpeg")
+
+    def test_falls_back_to_backend_candidates_first_existing_wins(self):
+        with unittest.mock.patch("shutil.which", return_value=None):
+            with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+                mock_select.return_value.ffmpeg_candidates.return_value = ["/opt/a/ffmpeg", "/opt/b/ffmpeg"]
+                with unittest.mock.patch("os.path.isfile", side_effect=lambda p: p == "/opt/b/ffmpeg"):
+                    result = pc.find_ffmpeg_executable(platform_name="linux")
+        self.assertEqual(result, "/opt/b/ffmpeg")
+
+    def test_returns_none_when_nothing_resolves(self):
+        with unittest.mock.patch("shutil.which", return_value=None):
+            with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+                mock_select.return_value.ffmpeg_candidates.return_value = []
+                self.assertIsNone(pc.find_ffmpeg_executable(platform_name="linux"))
+
+    def test_blank_configured_path_defaults_to_bare_ffmpeg(self):
+        with unittest.mock.patch("shutil.which") as mock_which:
+            mock_which.return_value = "/usr/bin/ffmpeg"
+            pc.find_ffmpeg_executable(configured_path="")
+        mock_which.assert_called_once_with("ffmpeg")
+
+
+class FindFfprobeExecutableTests(unittest.TestCase):
+    # find_ffprobe_executable uses the ambient os.path (ntpath on Windows, posixpath elsewhere)
+    # to split/join the given ffmpeg_path -- correct for real production paths (always native to
+    # whatever OS is actually running), but it genuinely means a backslash-separated Windows-style
+    # path can't be parsed correctly by posixpath (backslash isn't a separator there at all) --
+    # this one test is inherently Windows-real-path-semantics-dependent, not a portability bug in
+    # the function itself, so it's skipped rather than faked on non-Windows CI.
+    @unittest.skipUnless(os.name == "nt", "exercises real Windows (ntpath) path-splitting semantics")
+    def test_windows_style_exe_suffix_preserved(self):
+        with unittest.mock.patch("os.path.isfile", return_value=True):
+            result = pc.find_ffprobe_executable(r"C:\ffmpeg\bin\ffmpeg.exe")
+        self.assertEqual(result, r"C:\ffmpeg\bin\ffprobe.exe")
+
+    def test_no_extension_preserved(self):
+        # os.path.join uses this OS's own separator regardless of the input path's own slash
+        # style (e.g. joins with a backslash even for a "/usr/bin/..."-style input when this
+        # particular test happens to run on Windows) -- building the expected value the same way
+        # keeps this assertion correct on every OS the suite actually runs on, not just POSIX.
+        with unittest.mock.patch("os.path.isfile", return_value=True):
+            result = pc.find_ffprobe_executable("/usr/bin/ffmpeg")
+        self.assertEqual(result, os.path.join("/usr/bin", "ffprobe"))
+
+    def test_returns_none_when_ffprobe_missing(self):
+        with unittest.mock.patch("os.path.isfile", return_value=False):
+            self.assertIsNone(pc.find_ffprobe_executable("/usr/bin/ffmpeg"))
+
+    def test_unusual_ffmpeg_name_falls_back_to_os_default_on_linux(self):
+        with unittest.mock.patch.object(pc.sys, "platform", "linux"):
+            with unittest.mock.patch("os.path.isfile", return_value=True):
+                result = pc.find_ffprobe_executable("/usr/bin/my-custom-build")
+        self.assertEqual(result, os.path.join("/usr/bin", "ffprobe"))
+
+    @unittest.skipUnless(os.name == "nt", "exercises real Windows (ntpath) path-splitting semantics")
+    def test_unusual_ffmpeg_name_falls_back_to_os_default_on_windows(self):
+        with unittest.mock.patch.object(pc.sys, "platform", "win32"):
+            with unittest.mock.patch("os.path.isfile", return_value=True):
+                result = pc.find_ffprobe_executable(r"C:\tools\my-custom-build.exe")
+        self.assertEqual(result, r"C:\tools\ffprobe.exe")
+
+
+class LibvlcFilenameTests(unittest.TestCase):
+    def test_windows(self):
+        self.assertEqual(pc.libvlc_filename(platform_name="win32"), "libvlc.dll")
+
+    def test_linux(self):
+        self.assertEqual(pc.libvlc_filename(platform_name="linux"), "libvlc.so.5")
+
+    def test_macos(self):
+        self.assertEqual(pc.libvlc_filename(platform_name="darwin"), "libvlc.dylib")
+
+
+class FindVlcDirectoryTests(unittest.TestCase):
+    def test_configured_dir_with_correct_libvlc_file_wins(self):
+        with unittest.mock.patch("os.path.isfile", return_value=True):
+            result = pc.find_vlc_directory(configured_path="/some/vlc", platform_name="linux")
+        self.assertEqual(result, "/some/vlc")
+
+    def test_configured_dir_without_libvlc_falls_back_to_backend(self):
+        with unittest.mock.patch("os.path.isfile", return_value=False):
+            with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+                mock_select.return_value.LIBVLC_FILENAME = "libvlc.so.5"
+                mock_select.return_value.find_vlc_directory.return_value = "/backend/vlc"
+                result = pc.find_vlc_directory(configured_path="/some/vlc", platform_name="linux")
+        self.assertEqual(result, "/backend/vlc")
+
+    def test_no_configured_path_goes_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.find_vlc_directory.return_value = "/backend/vlc"
+            result = pc.find_vlc_directory(platform_name="darwin")
+        self.assertEqual(result, "/backend/vlc")
+
+
+class BackendModulesAreSafelyImportableFromAnyOsTests(unittest.TestCase):
+    """CROSS_PLATFORM_PLAN.md §3.2's whole premise: a test on ANY one real OS can still exercise
+    what another OS's backend module would do, via mocking -- which requires every backend module
+    to at least be IMPORTABLE regardless of which real OS is running the test (individual
+    functions inside a "foreign" backend may still fail if actually CALLED without the right
+    mocks, e.g. platform_windows's real winreg-touching code on real Linux -- that's expected and
+    fine, only the import itself must never crash)."""
+
+    def test_all_three_backends_import_cleanly_regardless_of_real_platform(self):
+        for platform_name in ("win32", "darwin", "linux"):
+            with self.subTest(platform_name=platform_name):
+                backend = pc._select_backend(platform_name=platform_name)
+                self.assertTrue(hasattr(backend, "find_obs_executable"))
+                self.assertTrue(hasattr(backend, "find_vlc_directory"))
+                self.assertTrue(hasattr(backend, "ffmpeg_candidates"))
+                self.assertTrue(hasattr(backend, "LIBVLC_FILENAME"))
+
+
 if __name__ == "__main__":
     unittest.main()

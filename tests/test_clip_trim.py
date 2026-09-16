@@ -247,7 +247,7 @@ class ProbeAudioStreamCountTests(unittest.TestCase):
             fake_ffprobe = os.path.join(tmp, "ffprobe.exe")
             open(fake_ffprobe, "w").close()
 
-            def run(cmd, capture_output, text, creationflags, timeout):
+            def run(cmd, capture_output, text, creationflags=0, timeout=None):
                 return type("Result", (), {"returncode": 0, "stdout": "1\n2\n3\n"})()
 
             with patch.object(a.subprocess, "run", side_effect=run):
@@ -260,7 +260,7 @@ class ProbeAudioStreamCountTests(unittest.TestCase):
             fake_ffprobe = os.path.join(tmp, "ffprobe.exe")
             open(fake_ffprobe, "w").close()
 
-            def run(cmd, capture_output, text, creationflags, timeout):
+            def run(cmd, capture_output, text, creationflags=0, timeout=None):
                 return type("Result", (), {"returncode": 1, "stdout": ""})()
 
             with patch.object(a.subprocess, "run", side_effect=run):
@@ -607,7 +607,7 @@ class ComputeTrimOutputPathTests(unittest.TestCase):
 
 class TrimClipTests(unittest.TestCase):
     def _fake_run(self, returncode=0, stderr="", write_output=True, output_bytes=b"data"):
-        def run(cmd, capture_output, text, creationflags):
+        def run(cmd, capture_output, text, creationflags=0):
             self.last_cmd = cmd
             if write_output:
                 output_path = cmd[-1]
@@ -697,7 +697,7 @@ class TrimClipTests(unittest.TestCase):
             out = os.path.join(tmp, "out.mp4")
             calls = []
 
-            def run(cmd, capture_output, text, creationflags):
+            def run(cmd, capture_output, text, creationflags=0):
                 calls.append(cmd)
                 if cmd[-1] != "NUL":
                     with open(cmd[-1], "wb") as f:
@@ -720,7 +720,7 @@ class TrimClipTests(unittest.TestCase):
             out = os.path.join(tmp, "out.mp4")
             calls = []
 
-            def run(cmd, capture_output, text, creationflags):
+            def run(cmd, capture_output, text, creationflags=0):
                 calls.append(cmd)
                 return type("Result", (), {"returncode": 1, "stderr": "boom"})()
 
@@ -772,7 +772,7 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def run(cmd, capture_output, text, creationflags):
+            def run(cmd, capture_output, text, creationflags=0):
                 if cmd[-1] != "NUL":
                     with open(cmd[-1], "wb") as f:
                         f.write(b"data")
@@ -815,7 +815,7 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def run(cmd, capture_output, text, creationflags):
+            def run(cmd, capture_output, text, creationflags=0):
                 if cmd[-1] != "NUL":
                     with open(cmd[-1], "wb") as f:
                         f.write(b"data")
@@ -1013,7 +1013,7 @@ class TrimClipProgressCallbackTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def fake_run(cmd, capture_output, text, creationflags):
+            def fake_run(cmd, capture_output, text, creationflags=0):
                 # pass 1 (analysis, discarded to NUL) still goes through plain subprocess.run
                 self.assertEqual(cmd[-1], "NUL")
                 return type("Result", (), {"returncode": 0, "stderr": ""})()
@@ -1040,7 +1040,7 @@ class TrimClipProgressCallbackTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def fake_run(cmd, capture_output, text, creationflags):
+            def fake_run(cmd, capture_output, text, creationflags=0):
                 with open(cmd[-1], "wb") as f:
                     f.write(b"data")
                 return type("Result", (), {"returncode": 0, "stderr": ""})()
