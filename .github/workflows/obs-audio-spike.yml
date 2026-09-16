@@ -30,6 +30,29 @@ jobs:
           sudo add-apt-repository -y ppa:obsproject/obs-studio
           sudo apt-get update
           sudo apt-get install -y obs-studio xvfb
+      # The GitHub-hosted ubuntu-latest image is a minimal server install with no audio server
+      # running at all by default -- installing PipeWire alone isn't enough to see whether OBS's
+      # PipeWire-specific per-app-audio-capture module loads at all; per CROSS_PLATFORM_PLAN.md §6,
+      # this only means anything if PipeWire is actually running as a real session (dbus-launch
+      # gives it the persistent D-Bus session bus a systemd --user service would normally get from
+      # a real login), not just installed.
+      - name: Install and start PipeWire
+        run: |
+          sudo apt-get install -y pipewire pipewire-pulse wireplumber dbus-x11
+          # dbus-launch starts a real, persistent D-Bus session daemon and prints env vars for
+          # it -- needed because pipewire/wireplumber (unlike a plain CLI tool) expect a real
+          # session bus to register on, the same one a systemd --user service would normally get
+          # from an actual login session. `disown` on each background job keeps it alive past
+          # this step's own shell exiting (bash otherwise SIGHUPs background jobs on exit).
+          eval "$(dbus-launch --sh-syntax)"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          pipewire & disown
+          sleep 2
+          wireplumber & disown
+          sleep 2
+          pipewire-pulse & disown
+          sleep 2
+          pactl info || true
       # Pre-seeding this file (server enabled, no password, fixed port) avoids any GUI-based
       # first-run configuration of the websocket server itself.
       - name: Pre-seed obs-websocket config
@@ -45,6 +68,10 @@ jobs:
             "alerts_enabled": false
           }
           EOF
+      - name: Confirm PipeWire is actually running
+        run: |
+          pactl info || true
+          pactl list short sources || true
       - name: Launch OBS under Xvfb
         run: |
           xvfb-run -a --server-args="-screen 0 1280x720x24" \
@@ -89,9 +116,14 @@ jobs:
           EOF
       - name: Launch OBS
         run: |
-          "/Applications/OBS.app/Contents/MacOS/OBS" --minimize-to-tray --disable-shutdown-check > obs_stdout.log 2>&1 &
+          "/Applications/OBS.app/Contents/MacOS/OBS" --verbose --minimize-to-tray --disable-shutdown-check > obs_stdout.log 2>&1 &
           echo "OBS launched with PID $!"
+          sleep 10
+          echo "--- process check after 10s ---"
+          ps aux | grep -i obs || true
           sleep 20
+          echo "--- process check after 30s ---"
+          ps aux | grep -i obs || true
       - name: Run the capability spike
         continue-on-error: true
         run: python ci/obs_audio_capability_spike.py localhost 4455 ""
@@ -101,4 +133,6 @@ jobs:
           echo "--- obs_stdout.log ---"
           cat obs_stdout.log || true
           echo "--- OBS's own log directory ---"
-          find ~/Library/Application\ Support/obs-studio/logs -type f -exec echo {} \; -exec cat {} \; 2>/dev/null | tail -200 || true
+          find ~/Library/Application\ Support/obs-studio/logs -type f -exec echo {} \; -exec cat {} \; 2>/dev/null | tail -300 || true
+          echo "--- crash reports, if any ---"
+          find ~/Library/Logs/DiagnosticReports -iname "*obs*" -exec echo {} \; -exec cat {} \; 2>/dev/null | head -200 || true
