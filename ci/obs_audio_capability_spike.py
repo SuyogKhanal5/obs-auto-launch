@@ -54,7 +54,10 @@ def main():
         print(f"SPIKE: get_version failed (continuing anyway): {exc}", file=sys.stderr)
 
     try:
-        kinds = client.get_input_kind_list().input_kinds
+        # unversioned=False -- the normal, "as shown in OBS's own Add Source menu" kind names;
+        # obsws-python makes this parameter required even though it's optional in the raw
+        # OBS WebSocket v5 protocol (defaulting to false there).
+        kinds = client.get_input_kind_list(False).input_kinds
     except Exception as exc:
         print(f"SPIKE: FAILED get_input_kind_list: {exc}", file=sys.stderr)
         sys.exit(1)

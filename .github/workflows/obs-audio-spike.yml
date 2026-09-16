@@ -89,7 +89,8 @@ jobs:
           EOF
       - name: Launch OBS
         run: |
-          open -a OBS --args --minimize-to-tray --disable-shutdown-check
+          "/Applications/OBS.app/Contents/MacOS/OBS" --minimize-to-tray --disable-shutdown-check > obs_stdout.log 2>&1 &
+          echo "OBS launched with PID $!"
           sleep 20
       - name: Run the capability spike
         continue-on-error: true
@@ -97,5 +98,7 @@ jobs:
       - name: Show OBS's own log output
         if: always()
         run: |
+          echo "--- obs_stdout.log ---"
+          cat obs_stdout.log || true
           echo "--- OBS's own log directory ---"
           find ~/Library/Application\ Support/obs-studio/logs -type f -exec echo {} \; -exec cat {} \; 2>/dev/null | tail -200 || true
