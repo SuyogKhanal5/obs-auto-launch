@@ -21,10 +21,16 @@ import sys
 import threading
 import tkinter as tk
 import webbrowser
-import winreg
 from tkinter import filedialog, messagebox, ttk
 
+# Windows-only stdlib module -- guarded the same way and for the same reason as
+# autostart_script.py's own winreg import; see CROSS_PLATFORM_PLAN.md.
+if sys.platform == "win32":
+    import winreg
+
 import psutil
+
+import platform_common
 
 APP_NAME = "OBS Auto Recorder"
 EXE_NAME = "OBSAutoRecorder.exe"
@@ -93,7 +99,7 @@ def winget_install(package_id, timeout=600):
                 "--accept-source-agreements", "--accept-package-agreements",
             ],
             capture_output=True, text=True, timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            **platform_common.hide_console_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
@@ -142,7 +148,7 @@ def create_shortcut(link_path, target, working_dir):
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
             capture_output=True, text=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            **platform_common.hide_console_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False

@@ -1,0 +1,42 @@
+name: Test (Windows / Linux / macOS)
+
+# Runs the test suite on all 3 target OSes -- see CROSS_PLATFORM_PLAN.md. This is the concrete
+# "simulate other OSes" mechanism for anything CI *can* verify (imports, platform-dispatch logic
+# via mocking, filesystem-based backends); it can't cover real GUI rendering, real global
+# hotkeys, or macOS Accessibility-permission flows -- those need a human on real hardware
+# eventually, per the plan's own §7.5.
+
+on:
+  push:
+    branches: [main, os-independent]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Xvfb (Linux only, for headless Tkinter GUI tests)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Run tests (Linux, under Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m unittest discover -s tests -v
+
+      - name: Run tests (Windows / macOS)
+        if: runner.os != 'Linux'
+        run: python -m unittest discover -s tests -v

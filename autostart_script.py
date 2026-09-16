@@ -13,14 +13,25 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
-import winreg
-from ctypes import wintypes
 from tkinter import filedialog, messagebox, ttk
+
+# winreg/ctypes.wintypes are Windows-only stdlib modules (ModuleNotFoundError on Linux/macOS) --
+# guarded here so the module can be imported (and the test suite can collect) on every OS. The
+# functions that actually use winreg/wintypes are being migrated into platform_windows.py phase
+# by phase (see CROSS_PLATFORM_PLAN.md); until a given function's move lands, calling it on a
+# non-Windows OS raises NameError at call time rather than crashing the whole process at import
+# time -- an intentional, temporary state, not a bug.
+if sys.platform == "win32":
+    import winreg
+    from ctypes import wintypes
 
 import obsws_python as obsws
 import psutil
 import pystray
+import screeninfo
 from PIL import Image, ImageDraw
+
+import platform_common
 
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
@@ -89,18 +100,18 @@ def build_tray_image(color):
 
 
 def get_monitor_rects():
+    """Cross-platform monitor enumeration via the `screeninfo` package -- this used to be a
+    Windows-only ctypes EnumDisplayMonitors call (see CROSS_PLATFORM_PLAN.md Phase 0); screeninfo
+    already supports Windows/Linux/macOS itself, so there's no per-OS branch needed here at all.
+    Returns [] rather than raising if screeninfo can't detect any display (e.g. a genuinely
+    headless CI runner) -- callers already treat an empty monitor list as "no overlay available."
+    """
     monitors = []
-
-    MonitorEnumProc = ctypes.WINFUNCTYPE(
-        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.RECT), ctypes.c_void_p
-    )
-
-    def callback(hmonitor, hdc, rect_ptr, data):
-        r = rect_ptr.contents
-        monitors.append({"left": r.left, "top": r.top, "right": r.right, "bottom": r.bottom})
-        return 1
-
-    ctypes.windll.user32.EnumDisplayMonitors(0, 0, MonitorEnumProc(callback), 0)
+    try:
+        for m in screeninfo.get_monitors():
+            monitors.append({"left": m.x, "top": m.y, "right": m.x + m.width, "bottom": m.y + m.height})
+    except screeninfo.ScreenInfoError:
+        return []
 
     monitors.sort(key=lambda m: (m["left"], m["top"]))
     for m in monitors:
@@ -524,7 +535,7 @@ def set_startup_shortcut_enabled(enabled):
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
             capture_output=True, text=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            **platform_common.hide_console_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logging.error("Failed to create startup shortcut: %s", exc)
@@ -1416,7 +1427,7 @@ def extract_audio_track_wav(ffmpeg_path, input_path, track_number, output_wav_pa
         # function, indistinguishable from the measurement having simply found nothing.
         result = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            **platform_common.hide_console_subprocess_kwargs(),
             timeout=AUDIO_SYNC_MEASUREMENT_EXTRACTION_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -1644,7 +1655,7 @@ def run_audio_sync_calibration(client, ffmpeg_path, target_input_name, reference
                         "-map", f"0:a:{ref_track - 1}", "-c:a", "pcm_s16le", ref_wav,
                         "-map", f"0:a:{CALIBRATION_TARGET_TRACK - 1}", "-c:a", "pcm_s16le", target_wav,
                     ],
-                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=30,
+                    capture_output=True, **platform_common.hide_console_subprocess_kwargs(), timeout=30,
                 )
                 measured_ms = measure_audio_lag_ms(ref_wav, target_wav)
             except Exception as exc:
@@ -2837,7 +2848,7 @@ def winget_install_ffmpeg(timeout=600):
                 "--accept-source-agreements", "--accept-package-agreements",
             ],
             capture_output=True, text=True, timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            **platform_common.hide_console_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
@@ -2901,7 +2912,7 @@ def winget_install_vlc(timeout=600):
                 "--accept-source-agreements", "--accept-package-agreements",
             ],
             capture_output=True, text=True, timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            **platform_common.hide_console_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
@@ -3008,7 +3019,7 @@ def transcode_recording(input_path, transcode_config, icon=None, notifications_c
     logging.info("Transcoding %s with ffmpeg: %s", os.path.basename(input_path), " ".join(cmd))
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs()
         )
     except OSError as exc:
         logging.error(
@@ -3102,7 +3113,7 @@ def apply_audio_sync_shift(input_path, audio_sync_shift_config, icon=None, notif
     ]
     logging.info("Applying audio sync shift to %s: %s", basename, " ".join(cmd))
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        result = subprocess.run(cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs())
     except OSError as exc:
         logging.error("Could not run ffmpeg at '%s' to shift audio for %s: %s", ffmpeg_path, basename, exc)
         notify(icon, notifications_config, "Audio sync shift failed", f"Could not shift {basename}: ffmpeg failed to run.")
@@ -3390,7 +3401,7 @@ def probe_audio_stream_count(ffmpeg_path, input_path):
                 ffprobe_path, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
                 "-of", "csv=p=0", input_path,
             ],
-            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=15,
+            capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs(), timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -3583,7 +3594,7 @@ def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress):
     progress_cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
     proc = subprocess.Popen(
         progress_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW,
+        encoding="utf-8", errors="replace", **platform_common.hide_console_subprocess_kwargs(),
     )
     stderr_chunks = []
 
@@ -3665,7 +3676,7 @@ def trim_clip(
                 logging.exception("Trim progress callback failed.")
         try:
             result1 = subprocess.run(
-                pass1_cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+                pass1_cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs()
             )
         except OSError as exc:
             logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
@@ -3710,7 +3721,7 @@ def trim_clip(
             )
         else:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+                cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs()
             )
             returncode, stderr_text = result.returncode, result.stderr
     except OSError as exc:

@@ -4,3 +4,4 @@ pystray
 pillow
 python-vlc
 numpy
+screeninfo
