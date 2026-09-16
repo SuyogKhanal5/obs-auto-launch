@@ -1,0 +1,101 @@
+name: OBS audio capability spike (Phase 6 research)
+
+# CROSS_PLATFORM_PLAN.md Phase 6 -- a research spike, not a gate: installs a real OBS on Linux and
+# macOS, launches it with obs-websocket pre-configured (no GUI interaction), and dumps its real
+# GetInputKindList/GetInputDefaultSettings output so the per-app-audio-capture source-type name for
+# each OS is confirmed empirically instead of guessed from docs. Exploratory by design -- failures
+# here are findings to read and act on (see ci/obs_audio_capability_spike.py), not a merge blocker,
+# so this workflow never fails the build.
+
+on:
+  push:
+    branches: [main, os-independent]
+  workflow_dispatch:
+
+jobs:
+  spike-linux:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install obsws-python
+        run: pip install obsws-python
+      # Ubuntu's own repo build of obs-studio is often too old to have obs-websocket v5 built in
+      # (that needs OBS 28+) -- the official PPA gives a current version instead.
+      - name: Install OBS Studio
+        run: |
+          sudo add-apt-repository -y ppa:obsproject/obs-studio
+          sudo apt-get update
+          sudo apt-get install -y obs-studio xvfb
+      # Pre-seeding this file (server enabled, no password, fixed port) avoids any GUI-based
+      # first-run configuration of the websocket server itself.
+      - name: Pre-seed obs-websocket config
+        run: |
+          mkdir -p ~/.config/obs-studio/plugin_config/obs-websocket
+          cat > ~/.config/obs-studio/plugin_config/obs-websocket/config.json <<'EOF'
+          {
+            "first_load": false,
+            "server_enabled": true,
+            "server_port": 4455,
+            "server_password": "",
+            "auth_required": false,
+            "alerts_enabled": false
+          }
+          EOF
+      - name: Launch OBS under Xvfb
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x720x24" \
+            obs --minimize-to-tray --disable-shutdown-check > obs_stdout.log 2>&1 &
+          echo "OBS launched with PID $!"
+          sleep 15
+      - name: Run the capability spike
+        continue-on-error: true
+        run: python ci/obs_audio_capability_spike.py localhost 4455 ""
+      - name: Show OBS's own log output (for diagnosing a failed connection/first-run-wizard block)
+        if: always()
+        run: |
+          echo "--- obs_stdout.log ---"
+          cat obs_stdout.log || true
+          echo "--- OBS's own log directory ---"
+          find ~/.config/obs-studio/logs -type f -exec echo {} \; -exec cat {} \; 2>/dev/null | tail -200 || true
+
+  spike-macos:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install obsws-python
+        run: pip install obsws-python
+      - name: Install OBS Studio
+        run: brew install --cask obs
+      - name: Pre-seed obs-websocket config
+        run: |
+          mkdir -p ~/Library/Application\ Support/obs-studio/plugin_config/obs-websocket
+          cat > ~/Library/Application\ Support/obs-studio/plugin_config/obs-websocket/config.json <<'EOF'
+          {
+            "first_load": false,
+            "server_enabled": true,
+            "server_port": 4455,
+            "server_password": "",
+            "auth_required": false,
+            "alerts_enabled": false
+          }
+          EOF
+      - name: Launch OBS
+        run: |
+          open -a OBS --args --minimize-to-tray --disable-shutdown-check
+          sleep 20
+      - name: Run the capability spike
+        continue-on-error: true
+        run: python ci/obs_audio_capability_spike.py localhost 4455 ""
+      - name: Show OBS's own log output
+        if: always()
+        run: |
+          echo "--- OBS's own log directory ---"
+          find ~/Library/Application\ Support/obs-studio/logs -type f -exec echo {} \; -exec cat {} \; 2>/dev/null | tail -200 || true
