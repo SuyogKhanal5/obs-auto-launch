@@ -2597,19 +2597,24 @@ VK_SPACE = 0x20
 GA_ROOT = 2
 
 
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("vkCode", wintypes.DWORD),
-        ("scanCode", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_void_p),
-    ]
+# Guarded the same way as the winreg/wintypes imports at the top of this file -- these two
+# ctypes definitions reference wintypes at class-definition time (module load, not call time), so
+# they'd raise NameError on import on Linux/macOS just like an unguarded winreg usage would. Both
+# are only ever consumed by run_clip_editor_space_bar_listener below, which platform_windows.py
+# will take over in full once Phase 3 (global hotkeys) lands -- see CROSS_PLATFORM_PLAN.md.
+if sys.platform == "win32":
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", wintypes.DWORD),
+            ("scanCode", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_void_p),
+        ]
 
-
-LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
-    ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, ctypes.POINTER(KBDLLHOOKSTRUCT)
-)
+    LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, ctypes.POINTER(KBDLLHOOKSTRUCT)
+    )
 
 
 def is_space_bar_toggle_event(n_code, wparam, vk_code, foreground_hwnd, editor_hwnd):
