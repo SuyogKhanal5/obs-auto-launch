@@ -105,17 +105,34 @@ jobs:
         run: pyinstaller --onefile --name OBSAutoRecorderInstaller-linux --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder:OBSAutoRecorder" --add-data "${{ github.workspace }}/config.example.json:." installer.py
 
       # ---------------- macOS ----------------
+      - name: Prefer universal2 wheels for compiled dependencies (macOS)
+        if: runner.os == 'macOS'
+        # A plain `pip install` on an Apple Silicon runner picks the arm64-only wheel for a
+        # compiled package even when a universal2 (fat binary) wheel is also published, since
+        # pip prefers the more specific platform tag -- confirmed live: PIL._imaging.cpython-
+        # 312-darwin.so (Pillow's own core C extension, not an optional one) came back
+        # arm64-only, breaking --target-arch universal2 below entirely regardless of the
+        # PIL._avif exclusion. Explicitly downloading the universal2-tagged wheel and
+        # force-installing it is the standard fix; if PyPI doesn't actually publish one for a
+        # given package, this step fails here with a clear "no matching distribution" error
+        # instead of a confusing PyInstaller-side failure later.
+        run: |
+          mkdir -p /tmp/universal2-wheels
+          pip download --no-deps --only-binary=:all: --python-version 3.12 --platform macosx_11_0_universal2 --dest /tmp/universal2-wheels numpy Pillow psutil
+          pip install --force-reinstall /tmp/universal2-wheels/*.whl
+
       - name: Build app (.app bundle, universal2)
         if: runner.os == 'macOS'
         # --target-arch universal2 needs every dependency to actually ship a universal2 (or both
         # arm64 and x86_64) wheel -- not yet independently confirmed for this project's full
-        # dependency set (numpy, Pillow, python-vlc, psutil, pystray, obsws-python); this build
-        # step is itself the confirmation per CROSS_PLATFORM_PLAN.md §7.4's own note. A failure
-        # here means falling back to separate Intel/ARM builds instead of one universal binary.
+        # dependency set (numpy, Pillow, python-vlc, psutil, pystray, obsws-python) before the
+        # step above; this build step is itself the confirmation per
+        # CROSS_PLATFORM_PLAN.md §7.4's own note. A failure here means falling back to separate
+        # Intel/ARM builds instead of one universal binary.
         # PIL._avif (an optional AVIF-codec extension Pillow bundles, unrelated to anything this
         # app actually uses -- it only needs PIL.Image/ImageDraw for the tray icon) ships as an
-        # arm64-only .so on this runner, not a universal2 fat binary; excluded rather than
-        # abandoning the universal2 build over an unused optional codec.
+        # arm64-only .so even in the universal2 wheel; excluded rather than abandoning the
+        # universal2 build over an unused optional codec.
         run: pyinstaller --windowed --name OBSAutoRecorder --target-arch universal2 --exclude-module PIL._avif --distpath dist --workpath build --specpath build autostart_script.py
 
       - name: Package DMG (macOS)
