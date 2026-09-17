@@ -3,11 +3,11 @@ name: Build and release
 # CROSS_PLATFORM_PLAN.md Phase 7 -- builds all 3 OSes' native artifacts in one run: Windows
 # (onedir zip + a UAC-elevated onefile installer exe, unchanged from before this phase), Linux
 # (onedir tar.gz + an AppImage, plus a onefile installer binary), macOS (a native-arch .app
-# wrapped in a .dmg, plus a matching installer binary -- universal2 turned out not to be possible
-# at all, see the macOS build step's own comment for why). Manual-trigger only
-# (workflow_dispatch); release creation itself only fires on a tag push or main, same as before --
-# triggering this on any other branch just builds and uploads artifacts for inspection, no public
-# release involved.
+# wrapped in a .dmg, plus a matching installer binary, built separately for Apple Silicon and
+# Intel -- universal2 turned out not to be possible at all, see the macOS build step's own comment
+# for why). Manual-trigger only (workflow_dispatch); release creation itself only fires on a tag
+# push or main, same as before -- triggering this on any other branch just builds and uploads
+# artifacts for inspection, no public release involved.
 
 on:
   workflow_dispatch:
@@ -19,8 +19,14 @@ jobs:
   build:
     strategy:
       fail-fast: false
+      # macos-latest (Apple Silicon/arm64) and macos-13 (Intel/x86_64 -- the last Intel-based
+      # GitHub-hosted macOS image) both build the macOS steps below natively on their own real
+      # architecture -- this sidesteps the wheel-availability problems a cross-compiled
+      # --target-arch build would hit entirely (see the macOS build step's own comment on why
+      # universal2 itself isn't possible), since a plain `pip install` on each runner already
+      # gets the right per-arch wheel for numpy/Pillow/psutil with no special-casing needed.
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest, macos-13]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -107,23 +113,26 @@ jobs:
         run: pyinstaller --onefile --name OBSAutoRecorderInstaller-linux --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder:OBSAutoRecorder" --add-data "${{ github.workspace }}/config.example.json:." installer.py
 
       # ---------------- macOS ----------------
-      # universal2 was attempted first per CROSS_PLATFORM_PLAN.md §7.4 and is NOT currently
-      # possible: numpy doesn't publish a universal2 wheel on PyPI at all (confirmed live -- `pip
-      # download --platform macosx_11_0_universal2 numpy` itself fails with "no matching
-      # distribution", not a PyInstaller-side error), so there's no way to get a fat binary for
-      # it without building numpy from source for both architectures and merging them by hand.
-      # This is exactly the fallback §7.4 named as an acceptable outcome: a native-arch build
-      # instead of one universal binary. GitHub's macos-latest runner is Apple Silicon (arm64),
-      # so this currently ships an Apple Silicon-only build; real Intel Mac support would need
-      # either an x86_64 runner/cross-build (e.g. via Rosetta 2, not attempted here) or someone
-      # building on real Intel hardware -- tracked as follow-up, not blocking this phase.
+      # universal2 (one fat binary for both architectures) was attempted first per
+      # CROSS_PLATFORM_PLAN.md §7.4 and is NOT possible: numpy doesn't publish a universal2 wheel
+      # on PyPI at all (confirmed live -- `pip download --platform macosx_11_0_universal2 numpy`
+      # itself fails with "no matching distribution", not a PyInstaller-side error), so there's no
+      # way to get a fat binary for it without building numpy from source for both architectures
+      # and merging them by hand. Building separately on each architecture's own native runner
+      # (macos-latest for Apple Silicon, macos-13 for Intel -- the last Intel-based GitHub-hosted
+      # macOS image) sidesteps that entirely: each gets a plain, correct, real per-arch wheel via
+      # ordinary `pip install`, no cross-compilation or wheel-forcing needed.
+      - name: Detect macOS architecture
+        if: runner.os == 'macOS'
+        run: echo "MACOS_ARCH=$(uname -m)" >> "$GITHUB_ENV"
+
       - name: Build app (.app bundle, native arch)
         if: runner.os == 'macOS'
         run: pyinstaller --windowed --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
 
       - name: Package DMG (macOS)
         if: runner.os == 'macOS'
-        run: hdiutil create -volname "OBS Auto Recorder" -srcfolder dist/OBSAutoRecorder.app -ov -format UDZO dist/OBSAutoRecorder-macos-arm64.dmg
+        run: hdiutil create -volname "OBS Auto Recorder" -srcfolder dist/OBSAutoRecorder.app -ov -format UDZO "dist/OBSAutoRecorder-macos-${MACOS_ARCH}.dmg"
 
       - name: Zip the .app bundle for installer embedding (macOS)
         if: runner.os == 'macOS'
@@ -137,7 +146,7 @@ jobs:
 
       - name: Build installer binary (macOS)
         if: runner.os == 'macOS'
-        run: pyinstaller --onefile --name OBSAutoRecorderInstaller-macos-arm64 --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder-app.zip:." --add-data "${{ github.workspace }}/config.example.json:." installer.py
+        run: pyinstaller --onefile --name "OBSAutoRecorderInstaller-macos-${MACOS_ARCH}" --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder-app.zip:." --add-data "${{ github.workspace }}/config.example.json:." installer.py
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -150,8 +159,8 @@ jobs:
             dist/OBSAutoRecorder-linux.tar.gz
             dist/OBSAutoRecorder-x86_64.AppImage
             dist/OBSAutoRecorderInstaller-linux
-            dist/OBSAutoRecorder-macos-arm64.dmg
-            dist/OBSAutoRecorderInstaller-macos-arm64
+            dist/OBSAutoRecorder-macos-*.dmg
+            dist/OBSAutoRecorderInstaller-macos-*
             config.example.json
 
   release:
@@ -169,7 +178,7 @@ jobs:
       - name: Flatten artifacts into one release-assets folder
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name "*.zip" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.dmg" -o -name "OBSAutoRecorderInstaller-linux" -o -name "OBSAutoRecorderInstaller-macos-arm64" \) -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name "*.zip" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.dmg" -o -name "OBSAutoRecorderInstaller-linux" -o -name "OBSAutoRecorderInstaller-macos-*" \) -exec cp {} release-assets/ \;
           ls -la release-assets
 
       - name: Create versioned GitHub release
