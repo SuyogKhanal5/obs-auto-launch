@@ -28,13 +28,24 @@ import platform_common
 import platform_windows
 
 APP_NAME = "OBS Auto Recorder"
-EXE_NAME = "OBSAutoRecorder.exe"
 APP_FOLDER_NAME = "OBSAutoRecorder"  # onedir build folder embedded in this installer's data
 APP_INTERNAL_DIR_NAME = "_internal"  # PyInstaller onedir's support-files subfolder
-DEFAULT_INSTALL_DIR = r"C:\Program Files\OBSAutoRecorder"
+# PyInstaller's own --name OBSAutoRecorder produces a different real binary name/layout per OS:
+# OBSAutoRecorder.exe (Windows), a bare OBSAutoRecorder binary (Linux), or an OBSAutoRecorder.app
+# bundle whose real executable lives at Contents/MacOS/OBSAutoRecorder (macOS) -- see
+# CROSS_PLATFORM_PLAN.md Phase 7 / .github/workflows/build-release.yml for how each is built.
+EXE_NAME = platform_common.example_executable_name("OBSAutoRecorder")
+# Per-user install locations (CROSS_PLATFORM_PLAN.md §2.8) -- none of the 3 need elevation for
+# the app install itself (a separate concern from installing system packages like ffmpeg/OBS via
+# platform_common.install_optional_dependency/run_linux_install_command, which does need root on
+# Linux and admin on Windows for THAT, regardless of where this app itself lives).
+if sys.platform == "win32":
+    DEFAULT_INSTALL_DIR = r"C:\Program Files\OBSAutoRecorder"
+elif sys.platform == "darwin":
+    DEFAULT_INSTALL_DIR = os.path.expanduser("~/Applications/OBSAutoRecorder")
+else:
+    DEFAULT_INSTALL_DIR = os.path.expanduser("~/.local/share/OBSAutoRecorder")
 OBS_DOWNLOAD_URL = "https://obsproject.com/download"
-OBS_WINGET_ID = "OBSProject.OBSStudio"
-FFMPEG_WINGET_ID = "Gyan.FFmpeg"
 FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
 
 # Duplicated from autostart_script.py's COMMON_GAMES rather than imported (see the module
@@ -54,10 +65,6 @@ COMMON_GAMES = [
 ]
 
 
-def has_winget():
-    return shutil.which("winget") is not None
-
-
 def is_ffmpeg_installed():
     """Presence check backed by platform_common.find_ffmpeg_executable() -- the same per-OS
     search autostart_script.py itself uses, no longer duplicated here (previously this had its
@@ -65,38 +72,32 @@ def is_ffmpeg_installed():
     return platform_common.find_ffmpeg_executable() is not None
 
 
-def winget_install(package_id, timeout=600):
-    """Best-effort winget install. Returns (True, None) on success, (False, reason) otherwise --
-    never raises, so a failed/missing winget never blocks the rest of setup."""
-    try:
-        result = subprocess.run(
-            [
-                "winget", "install", "--id", package_id, "-e", "--silent",
-                "--accept-source-agreements", "--accept-package-agreements",
-            ],
-            capture_output=True, text=True, timeout=timeout,
-            **platform_common.hide_console_subprocess_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
-    if result.returncode == 0:
-        return True, None
-    return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
-
-
 def ensure_ffmpeg(on_progress):
     """Best-effort, non-blocking: ffmpeg powers the app's optional MKV-to-MP4 post-record
-    conversion, but most people don't have it and don't know where to get it, so this installs
-    it automatically via winget when available instead of leaving it as a manual step. Returns
-    one of "already_present", "installed", "winget_failed", "no_winget" -- callers decide what
-    (if anything) to tell the user based on that, this never raises or fails setup itself."""
+    conversion, but most people don't have it and don't know where to get it. Windows/macOS
+    install it automatically via platform_common.install_optional_dependency (winget/Homebrew)
+    when available; Linux never does a silent background install at all (see
+    CROSS_PLATFORM_PLAN.md §2.7) -- the finish page shows the exact install command instead (see
+    build_linux_ffmpeg_command below), left for the user to run explicitly. Returns one of
+    "already_present", "installed", "no_package_manager", "install_failed", "manual_only" --
+    callers decide what (if anything) to tell the user based on that; this never raises or fails
+    setup itself."""
     if is_ffmpeg_installed():
         return "already_present"
-    if not has_winget():
-        return "no_winget"
+    if sys.platform not in ("win32", "darwin"):
+        return "manual_only"
+    if not platform_common.has_package_manager():
+        return "no_package_manager"
     on_progress("Installing ffmpeg (for optional MKV to MP4 conversion)...")
-    success, _reason = winget_install(FFMPEG_WINGET_ID)
-    return "installed" if success else "winget_failed"
+    success, _reason = platform_common.install_optional_dependency("ffmpeg")
+    return "installed" if success else "install_failed"
+
+
+def build_linux_ffmpeg_command():
+    """The exact command to install ffmpeg on this Linux system, for the finish page to show
+    verbatim when ensure_ffmpeg above returned "manual_only" -- or None if no supported package
+    manager was detected, in which case the finish page falls back to the plain download link."""
+    return platform_common.build_linux_install_command("ffmpeg")
 
 
 def resource_path(name):
@@ -403,7 +404,7 @@ def main():
     tk.Entry(dir_row, textvariable=dir_var, width=48).pack(side="left", fill="x", expand=True)
 
     def browse_install_dir():
-        chosen = filedialog.askdirectory(initialdir=dir_var.get() or "C:\\")
+        chosen = filedialog.askdirectory(initialdir=dir_var.get() or os.path.expanduser("~"))
         if chosen:
             dir_var.set(os.path.normpath(os.path.join(chosen, "OBSAutoRecorder")))
 
@@ -415,14 +416,18 @@ def main():
     )
     location_notice.pack(fill="x", pady=(2, 12))
 
-    desktop_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(
-        location, text="Create a shortcut on my Desktop", variable=desktop_var, bg=PAGE_BG
-    ).pack(anchor="w", pady=4)
+    # The desktop-icon feature itself is still Windows-only (see platform_windows.py's own
+    # "Shortcuts / autostart" section) -- unlike autostart below, no Linux/macOS equivalent is
+    # implemented yet, so this option doesn't exist to show on those OSes at all.
+    desktop_var = tk.BooleanVar(value=sys.platform == "win32")
+    if sys.platform == "win32":
+        tk.Checkbutton(
+            location, text="Create a shortcut on my Desktop", variable=desktop_var, bg=PAGE_BG
+        ).pack(anchor="w", pady=4)
 
     startup_var = tk.BooleanVar(value=True)
     tk.Checkbutton(
-        location, text="Start automatically when Windows starts", variable=startup_var, bg=PAGE_BG
+        location, text="Start automatically at login", variable=startup_var, bg=PAGE_BG
     ).pack(anchor="w", pady=4)
 
     # ---------- Find OBS ----------
@@ -454,20 +459,29 @@ def main():
             download_link.pack(side="left", padx=(16, 0))
 
     def browse_obs():
+        example = platform_common.example_executable_name("obs64")
         chosen = filedialog.askopenfilename(
-            title="Locate obs64.exe", filetypes=[("OBS Studio", "obs64.exe"), ("All files", "*.*")]
+            title=f"Locate {example}", filetypes=platform_common.executable_filetypes()
         )
         if chosen:
             obs_var.set(chosen)
             refresh_obs_status()
 
     def on_easy_install_obs():
+        # Windows/macOS: a silent, fire-and-forget background install (winget/Homebrew) --
+        # nothing to confirm first, same philosophy as today. Linux never does this silently
+        # (CROSS_PLATFORM_PLAN.md §2.7); this button only exists there once
+        # linux_install_command has already been shown as read-only text below, and running it
+        # goes through run_linux_install_command (pkexec) instead of install_optional_dependency.
         easy_install_btn.config(state="disabled")
-        obs_status.config(text="Installing OBS Studio via winget... this can take a few minutes.", fg="#555555")
+        install_verb = "Installing" if sys.platform in ("win32", "darwin") else "Running the install command for"
+        obs_status.config(text=f"{install_verb} OBS Studio... this can take a few minutes.", fg="#555555")
         download_link.pack_forget()
 
         def worker():
-            return winget_install(OBS_WINGET_ID, timeout=900)
+            if sys.platform in ("win32", "darwin"):
+                return platform_common.install_optional_dependency("obs", timeout=900)
+            return platform_common.run_linux_install_command(linux_install_command, timeout=900)
 
         def done(result, error):
             easy_install_btn.config(state="normal")
@@ -491,17 +505,38 @@ def main():
 
     obs_buttons_row = tk.Frame(obs_page, bg=PAGE_BG)
     obs_buttons_row.pack(anchor="w", pady=(0, 8))
-    tk.Button(obs_buttons_row, text="Browse for obs64.exe...", command=browse_obs).pack(side="left")
-    # "Easy Install" only makes sense (and only appears) when winget is actually available to run
-    # it -- otherwise the existing manual download link below is the only path, same as before.
-    if has_winget():
-        easy_install_btn = tk.Button(obs_buttons_row, text="Easy Install", command=on_easy_install_obs)
+    tk.Button(
+        obs_buttons_row, text=f"Browse for {platform_common.example_executable_name('obs64')}...", command=browse_obs,
+    ).pack(side="left")
+    linux_install_command = platform_common.build_linux_install_command("obs") if sys.platform not in ("win32", "darwin") else None
+    if sys.platform in ("win32", "darwin"):
+        # "Easy Install" only makes sense (and only appears) when a silent-install mechanism is
+        # actually available to run it -- otherwise the manual download link below is the only
+        # path, same as before.
+        if platform_common.has_package_manager():
+            easy_install_btn = tk.Button(obs_buttons_row, text="Easy Install", command=on_easy_install_obs)
+            easy_install_btn.pack(side="left", padx=(8, 0))
+    elif linux_install_command:
+        easy_install_btn = tk.Button(obs_buttons_row, text="Run this command", command=on_easy_install_obs)
         easy_install_btn.pack(side="left", padx=(8, 0))
     download_link = tk.Label(
         obs_buttons_row, text="Don't have OBS? Download it here ↗", bg=PAGE_BG, fg="#2563eb",
         font=("Segoe UI", 10, "underline"), cursor="hand2",
     )
     download_link.bind("<Button-1>", lambda _event: webbrowser.open(OBS_DOWNLOAD_URL))
+
+    # Linux: the exact command shown as read-only text before the "Run this command" button above
+    # can ever be clicked -- transparent, nothing hidden, per CROSS_PLATFORM_PLAN.md §2.7. Falls
+    # back to the plain download link (already handled above) if no package manager/Flatpak was
+    # detected at all.
+    if sys.platform not in ("win32", "darwin") and linux_install_command:
+        command_row = tk.Frame(obs_page, bg=PAGE_BG)
+        command_row.pack(anchor="w", fill="x", pady=(0, 8))
+        tk.Label(command_row, text="This will run:", bg=PAGE_BG, font=("Segoe UI", 9)).pack(anchor="w")
+        command_entry = tk.Entry(command_row, font=("Consolas", 9))
+        command_entry.insert(0, linux_install_command)
+        command_entry.config(state="readonly")
+        command_entry.pack(fill="x", pady=(2, 0))
 
     refresh_obs_status()
 
@@ -632,7 +667,7 @@ def main():
     tk.Entry(output_folder_row, textvariable=output_folder_var, width=44).pack(side="left", fill="x", expand=True)
 
     def browse_output_folder():
-        chosen = filedialog.askdirectory(initialdir=output_folder_var.get() or "C:\\")
+        chosen = filedialog.askdirectory(initialdir=output_folder_var.get() or os.path.expanduser("~"))
         if chosen:
             output_folder_var.set(os.path.normpath(chosen))
 
@@ -890,7 +925,24 @@ def main():
                 "\nffmpeg was also installed automatically, so you're ready to convert MKV "
                 "recordings to MP4 later from Settings → Post-Processing, if you ever want to."
             )
-        elif ffmpeg_status in ("no_winget", "winget_failed"):
+        elif ffmpeg_status == "manual_only":
+            command = build_linux_ffmpeg_command()
+            if command:
+                lines.append(
+                    "\nffmpeg isn't installed -- it's only needed if you want to convert MKV "
+                    f"recordings to MP4 later. Run this command to install it:\n\n    {command}\n\n"
+                    "and this app will find it on its own, or point Settings → Post-Processing at "
+                    "it directly."
+                )
+            else:
+                lines.append(
+                    "\nffmpeg wasn't found and no supported package manager was detected to "
+                    "install it automatically -- it's only needed if you want to convert MKV "
+                    "recordings to MP4 later. Install it via your distro's package manager, then "
+                    "this app will find it on its own, or point Settings → Post-Processing at it "
+                    "directly."
+                )
+        elif ffmpeg_status in ("no_package_manager", "install_failed"):
             lines.append(
                 "\nffmpeg wasn't found and couldn't be installed automatically -- it's only needed "
                 f"if you want to convert MKV recordings to MP4 later. Install it from {FFMPEG_DOWNLOAD_URL} "

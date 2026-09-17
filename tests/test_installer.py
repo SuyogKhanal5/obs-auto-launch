@@ -106,60 +106,54 @@ class BuildConfigTests(unittest.TestCase):
 
 class EnsureFfmpegTests(unittest.TestCase):
     """ensure_ffmpeg must never block or fail setup regardless of what's on the machine -- these
-    pin its four possible outcomes against mocked presence/winget checks."""
+    pin its possible outcomes against mocked presence/package-manager checks. The real per-OS
+    install mechanism now lives in platform_common.install_optional_dependency() (winget/
+    Homebrew) -- see test_platform_windows.py/test_platform_macos.py for that -- and this only
+    covers ensure_ffmpeg's own dispatch logic, pinned to win32 so its behavior doesn't vary
+    depending on which real OS happens to run this test (Linux takes a different, "manual_only"
+    branch entirely -- covered separately below)."""
 
     def test_already_present_skips_install_entirely(self):
         with patch.object(installer, "is_ffmpeg_installed", return_value=True):
-            with patch.object(installer, "winget_install") as mock_install:
+            with patch.object(installer.platform_common, "install_optional_dependency") as mock_install:
                 status = installer.ensure_ffmpeg(lambda _msg: None)
         self.assertEqual(status, "already_present")
         mock_install.assert_not_called()
 
-    def test_no_winget_reports_no_winget_without_attempting_install(self):
-        with patch.object(installer, "is_ffmpeg_installed", return_value=False):
-            with patch.object(installer, "has_winget", return_value=False):
-                with patch.object(installer, "winget_install") as mock_install:
-                    status = installer.ensure_ffmpeg(lambda _msg: None)
-        self.assertEqual(status, "no_winget")
+    def test_no_package_manager_reports_without_attempting_install(self):
+        with patch.object(installer.sys, "platform", "win32"):
+            with patch.object(installer, "is_ffmpeg_installed", return_value=False):
+                with patch.object(installer.platform_common, "has_package_manager", return_value=False):
+                    with patch.object(installer.platform_common, "install_optional_dependency") as mock_install:
+                        status = installer.ensure_ffmpeg(lambda _msg: None)
+        self.assertEqual(status, "no_package_manager")
         mock_install.assert_not_called()
 
-    def test_successful_winget_install_reports_installed(self):
-        with patch.object(installer, "is_ffmpeg_installed", return_value=False):
-            with patch.object(installer, "has_winget", return_value=True):
-                with patch.object(installer, "winget_install", return_value=(True, None)):
-                    status = installer.ensure_ffmpeg(lambda _msg: None)
+    def test_successful_install_reports_installed(self):
+        with patch.object(installer.sys, "platform", "win32"):
+            with patch.object(installer, "is_ffmpeg_installed", return_value=False):
+                with patch.object(installer.platform_common, "has_package_manager", return_value=True):
+                    with patch.object(installer.platform_common, "install_optional_dependency", return_value=(True, None)):
+                        status = installer.ensure_ffmpeg(lambda _msg: None)
         self.assertEqual(status, "installed")
 
-    def test_failed_winget_install_reports_winget_failed_not_raise(self):
-        with patch.object(installer, "is_ffmpeg_installed", return_value=False):
-            with patch.object(installer, "has_winget", return_value=True):
-                with patch.object(installer, "winget_install", return_value=(False, "network error")):
-                    status = installer.ensure_ffmpeg(lambda _msg: None)  # must not raise
-        self.assertEqual(status, "winget_failed")
+    def test_failed_install_reports_install_failed_not_raise(self):
+        with patch.object(installer.sys, "platform", "win32"):
+            with patch.object(installer, "is_ffmpeg_installed", return_value=False):
+                with patch.object(installer.platform_common, "has_package_manager", return_value=True):
+                    with patch.object(
+                        installer.platform_common, "install_optional_dependency", return_value=(False, "network error"),
+                    ):
+                        status = installer.ensure_ffmpeg(lambda _msg: None)  # must not raise
+        self.assertEqual(status, "install_failed")
 
-
-class WingetInstallTests(unittest.TestCase):
-    def test_success_exit_code_reports_success(self):
-        with patch.object(installer.subprocess, "run") as mock_run:
-            mock_run.return_value = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-            success, reason = installer.winget_install("Some.Package")
-        self.assertTrue(success)
-        self.assertIsNone(reason)
-
-    def test_nonzero_exit_code_reports_failure_with_reason(self):
-        with patch.object(installer.subprocess, "run") as mock_run:
-            mock_run.return_value = type(
-                "Result", (), {"returncode": 1, "stdout": "", "stderr": "no package found"}
-            )()
-            success, reason = installer.winget_install("Some.Package")
-        self.assertFalse(success)
-        self.assertIn("no package found", reason)
-
-    def test_missing_winget_binary_reports_failure_not_raise(self):
-        with patch.object(installer.subprocess, "run", side_effect=OSError("not found")):
-            success, reason = installer.winget_install("Some.Package")  # must not raise
-        self.assertFalse(success)
-        self.assertIsNotNone(reason)
+    def test_linux_never_attempts_a_silent_install(self):
+        with patch.object(installer.sys, "platform", "linux"):
+            with patch.object(installer, "is_ffmpeg_installed", return_value=False):
+                with patch.object(installer.platform_common, "install_optional_dependency") as mock_install:
+                    status = installer.ensure_ffmpeg(lambda _msg: None)
+        self.assertEqual(status, "manual_only")
+        mock_install.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -131,6 +131,46 @@ class GetWindowTitlesTests(unittest.TestCase):
             self.assertIsInstance(titles, list)
 
 
+class InstallOptionalDependencyTests(unittest.TestCase):
+    def test_has_package_manager_true_when_winget_present(self):
+        with unittest.mock.patch.object(pw.shutil, "which", return_value=r"C:\winget.exe"):
+            self.assertTrue(pw.has_package_manager())
+
+    def test_has_package_manager_false_when_winget_missing(self):
+        with unittest.mock.patch.object(pw.shutil, "which", return_value=None):
+            self.assertFalse(pw.has_package_manager())
+
+    def test_unknown_package_returns_false_without_running_anything(self):
+        with unittest.mock.patch.object(pw.subprocess, "run") as mock_run:
+            success, reason = pw.install_optional_dependency("notarealpackage")
+        self.assertFalse(success)
+        self.assertIn("notarealpackage", reason)
+        mock_run.assert_not_called()
+
+    def test_success_runs_winget_with_the_right_package_id(self):
+        with unittest.mock.patch.object(pw.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0, stdout="", stderr="")
+            success, reason = pw.install_optional_dependency("ffmpeg")
+        self.assertTrue(success)
+        self.assertIsNone(reason)
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args[:3], ["winget", "install", "--id"])
+        self.assertIn("Gyan.FFmpeg", args)
+
+    def test_nonzero_exit_code_reports_failure_with_reason(self):
+        with unittest.mock.patch.object(pw.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=1, stdout="", stderr="no package found")
+            success, reason = pw.install_optional_dependency("obs")
+        self.assertFalse(success)
+        self.assertIn("no package found", reason)
+
+    def test_missing_winget_binary_reports_failure_not_raise(self):
+        with unittest.mock.patch.object(pw.subprocess, "run", side_effect=OSError("not found")):
+            success, reason = pw.install_optional_dependency("vlc")  # must not raise
+        self.assertFalse(success)
+        self.assertIsNotNone(reason)
+
+
 class AutostartTests(unittest.TestCase):
     def test_disabled_when_no_shortcut_file(self):
         with unittest.mock.patch.dict(pw.os.environ, {"APPDATA": r"C:\Users\Test\AppData\Roaming"}, clear=False):

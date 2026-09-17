@@ -229,6 +229,38 @@ def disable_autostart(platform_name=None):
     return _select_backend(platform_name).disable_autostart()
 
 
+def has_package_manager(platform_name=None):
+    """True if this OS's silent-install mechanism (winget on Windows, Homebrew on macOS) is
+    available to run at all. Meaningless on Linux, which never does a silent install -- see
+    build_linux_install_command/run_linux_install_command instead."""
+    return _select_backend(platform_name).has_package_manager()
+
+
+def install_optional_dependency(package, timeout=600, platform_name=None):
+    """Best-effort, silent install of an optional dependency ("ffmpeg", "obs", or "vlc") --
+    winget on Windows, Homebrew on macOS. Returns (True, None) on success, (False, reason)
+    otherwise; never raises, so a failed/missing package manager never blocks setup. Not
+    meaningful on Linux, which never does a silent background install by design (see
+    CROSS_PLATFORM_PLAN.md §2.7) -- build_linux_install_command/run_linux_install_command are the
+    Linux equivalent, requiring an explicit user click before anything runs."""
+    return _select_backend(platform_name).install_optional_dependency(package, timeout=timeout)
+
+
+def build_linux_install_command(package, platform_name=None):
+    """The exact command to install `package` ("ffmpeg" or "obs") on this Linux system, for a
+    caller to show verbatim before the user decides whether to run it -- see
+    platform_linux.build_linux_install_command's own docstring for the full rationale. Linux-only;
+    not defined on the Windows/macOS backends, which use install_optional_dependency instead."""
+    return _select_backend(platform_name).build_linux_install_command(package)
+
+
+def run_linux_install_command(command, timeout=600, platform_name=None):
+    """Executes a command build_linux_install_command returned, via pkexec (or directly, for a
+    --user-scoped Flatpak install that needs no elevation) -- see
+    platform_linux.run_linux_install_command's own docstring. Linux-only."""
+    return _select_backend(platform_name).run_linux_install_command(command, timeout=timeout)
+
+
 def embed_video_player(player, tk_widget, platform_name=None):
     """Embeds a python-vlc player's video output into tk_widget -- set_hwnd on Windows,
     set_xwindow on Linux/X11 (both take the plain numeric id tk_widget.winfo_id() already

@@ -393,6 +393,37 @@ def disable_autostart():
     return True
 
 
+# --- Optional dependency install (Homebrew) ---
+# macOS counterpart of platform_windows.install_optional_dependency -- same silent, best-effort
+# philosophy as Windows' winget, via Homebrew instead. CROSS_PLATFORM_PLAN.md Phase 7 / §3.3.
+_BREW_PACKAGES = {
+    "ffmpeg": {"formula": "ffmpeg"},
+    "obs": {"cask": "obs"},
+    "vlc": {"cask": "vlc"},
+}
+
+
+def has_package_manager():
+    return shutil.which("brew") is not None
+
+
+def install_optional_dependency(package, timeout=600):
+    """Best-effort silent install via Homebrew. Returns (True, None) on success, (False, reason)
+    otherwise -- never raises, so a missing/failed brew never blocks the rest of setup."""
+    spec = _BREW_PACKAGES.get(package)
+    if not spec:
+        return False, f"No Homebrew package known for '{package}'."
+    cmd = ["brew", "install"]
+    cmd += ["--cask", spec["cask"]] if "cask" in spec else [spec["formula"]]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, None
+    return False, (result.stdout or result.stderr or f"brew exited with code {result.returncode}")[-500:].strip()
+
+
 def embed_video_player(player, tk_widget):
     """Embeds a python-vlc player's output into tk_widget -- unlike Windows/Linux (which both
     hand set_hwnd/set_xwindow the plain numeric id winfo_id() already returns), python-vlc's

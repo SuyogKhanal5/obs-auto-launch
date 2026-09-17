@@ -2543,36 +2543,28 @@ def resolve_ffmpeg_path(configured_path):
 
 
 FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
-FFMPEG_WINGET_ID = "Gyan.FFmpeg"
 
 
 def has_winget():
-    return shutil.which("winget") is not None
+    """Thin dispatcher -- True if this OS's silent-install mechanism is available (winget on
+    Windows, Homebrew on macOS) -- see platform_common.has_package_manager() /
+    platform_windows.py / platform_macos.py, CROSS_PLATFORM_PLAN.md Phase 7. Always False on
+    Linux, which never does a silent background install at all (§2.7) -- every call site below
+    hides its "Easy Install"-style button in that case, same as it always did for "no winget"."""
+    if sys.platform not in ("win32", "darwin"):
+        return False
+    return platform_common.has_package_manager()
 
 
 def winget_install_ffmpeg(timeout=600):
-    """Best-effort silent ffmpeg install via winget, mirroring installer.py's winget_install()
-    (duplicated rather than imported -- this module and installer.py are intentionally
-    independent, and installer.py isn't bundled into this app's own build). Returns (True, None)
-    on success, (False, reason) otherwise; never raises."""
-    try:
-        result = subprocess.run(
-            [
-                "winget", "install", "--id", FFMPEG_WINGET_ID, "-e", "--silent",
-                "--accept-source-agreements", "--accept-package-agreements",
-            ],
-            capture_output=True, text=True, timeout=timeout,
-            **platform_common.hide_console_subprocess_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
-    if result.returncode == 0:
-        return True, None
-    return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
+    """Best-effort silent ffmpeg install -- winget on Windows, Homebrew on macOS. Returns
+    (True, None) on success, (False, reason) otherwise; never raises. Kept under this name since
+    call sites throughout this file already use it; the real per-OS mechanism now lives in
+    platform_common.install_optional_dependency()."""
+    return platform_common.install_optional_dependency("ffmpeg", timeout=timeout)
 
 
 VLC_DOWNLOAD_URL = "https://www.videolan.org/vlc/"
-VLC_WINGET_ID = "VideoLAN.VLC"
 
 
 def find_vlc():
@@ -2599,22 +2591,10 @@ def resolve_vlc_path(configured_path):
 
 
 def winget_install_vlc(timeout=600):
-    """Best-effort silent VLC install via winget, mirroring winget_install_ffmpeg(). Returns
-    (True, None) on success, (False, reason) otherwise; never raises."""
-    try:
-        result = subprocess.run(
-            [
-                "winget", "install", "--id", VLC_WINGET_ID, "-e", "--silent",
-                "--accept-source-agreements", "--accept-package-agreements",
-            ],
-            capture_output=True, text=True, timeout=timeout,
-            **platform_common.hide_console_subprocess_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
-    if result.returncode == 0:
-        return True, None
-    return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
+    """Best-effort silent VLC install -- winget on Windows, Homebrew on macOS. Returns
+    (True, None) on success, (False, reason) otherwise; never raises. Mirrors
+    winget_install_ffmpeg()'s own dispatch to platform_common.install_optional_dependency()."""
+    return platform_common.install_optional_dependency("vlc", timeout=timeout)
 
 
 def import_vlc_module():

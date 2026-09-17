@@ -133,6 +133,72 @@ class GetWindowTitlesTests(unittest.TestCase):
         fake_display.close.assert_called_once()
 
 
+class BuildLinuxInstallCommandTests(unittest.TestCase):
+    def test_prefers_user_scoped_flatpak_for_obs(self):
+        with unittest.mock.patch.object(pl.shutil, "which", side_effect=lambda name: "/usr/bin/flatpak" if name == "flatpak" else None):
+            command = pl.build_linux_install_command("obs")
+        self.assertEqual(command, "flatpak install --user -y flathub com.obsproject.Studio")
+
+    def test_falls_back_to_apt_for_obs_when_no_flatpak(self):
+        with unittest.mock.patch.object(pl.shutil, "which", side_effect=lambda name: "/usr/bin/apt-get" if name == "apt-get" else None):
+            command = pl.build_linux_install_command("obs")
+        self.assertEqual(command, "apt-get install -y obs-studio")
+
+    def test_ffmpeg_never_prefers_flatpak_even_when_available(self):
+        with unittest.mock.patch.object(pl.shutil, "which", side_effect=lambda name: "/usr/bin/" + name if name in ("flatpak", "apt-get") else None):
+            command = pl.build_linux_install_command("ffmpeg")
+        self.assertEqual(command, "apt-get install -y ffmpeg")
+
+    def test_dnf_command(self):
+        with unittest.mock.patch.object(pl.shutil, "which", side_effect=lambda name: "/usr/bin/dnf" if name == "dnf" else None):
+            self.assertEqual(pl.build_linux_install_command("ffmpeg"), "dnf install -y ffmpeg")
+
+    def test_pacman_command(self):
+        with unittest.mock.patch.object(pl.shutil, "which", side_effect=lambda name: "/usr/bin/pacman" if name == "pacman" else None):
+            self.assertEqual(pl.build_linux_install_command("ffmpeg"), "pacman -S --noconfirm ffmpeg")
+
+    def test_zypper_command(self):
+        with unittest.mock.patch.object(pl.shutil, "which", side_effect=lambda name: "/usr/bin/zypper" if name == "zypper" else None):
+            self.assertEqual(pl.build_linux_install_command("ffmpeg"), "zypper install -y ffmpeg")
+
+    def test_returns_none_when_nothing_detected(self):
+        with unittest.mock.patch.object(pl.shutil, "which", return_value=None):
+            self.assertIsNone(pl.build_linux_install_command("ffmpeg"))
+            self.assertIsNone(pl.build_linux_install_command("obs"))
+
+
+class RunLinuxInstallCommandTests(unittest.TestCase):
+    def test_user_scoped_flatpak_runs_directly_without_pkexec(self):
+        with unittest.mock.patch.object(pl.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0, stdout="", stderr="")
+            success, reason = pl.run_linux_install_command("flatpak install --user -y flathub com.obsproject.Studio")
+        self.assertTrue(success)
+        self.assertIsNone(reason)
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args[0], "flatpak")
+
+    def test_package_manager_command_runs_via_pkexec(self):
+        with unittest.mock.patch.object(pl.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0, stdout="", stderr="")
+            success, reason = pl.run_linux_install_command("apt-get install -y ffmpeg")
+        self.assertTrue(success)
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args, ["pkexec", "apt-get", "install", "-y", "ffmpeg"])
+
+    def test_nonzero_exit_code_reports_failure_with_reason(self):
+        with unittest.mock.patch.object(pl.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=1, stdout="", stderr="permission denied")
+            success, reason = pl.run_linux_install_command("apt-get install -y ffmpeg")
+        self.assertFalse(success)
+        self.assertIn("permission denied", reason)
+
+    def test_missing_pkexec_reports_failure_not_raise(self):
+        with unittest.mock.patch.object(pl.subprocess, "run", side_effect=OSError("not found")):
+            success, reason = pl.run_linux_install_command("apt-get install -y ffmpeg")  # must not raise
+        self.assertFalse(success)
+        self.assertIsNotNone(reason)
+
+
 class AutostartTests(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="obsautorec_test_xdg_config_")

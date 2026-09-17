@@ -120,6 +120,52 @@ class GetWindowTitlesTests(unittest.TestCase):
                 self.assertEqual(pmac.get_window_titles(), {})
 
 
+class InstallOptionalDependencyTests(unittest.TestCase):
+    def test_has_package_manager_true_when_brew_present(self):
+        with unittest.mock.patch.object(pmac.shutil, "which", return_value="/opt/homebrew/bin/brew"):
+            self.assertTrue(pmac.has_package_manager())
+
+    def test_has_package_manager_false_when_brew_missing(self):
+        with unittest.mock.patch.object(pmac.shutil, "which", return_value=None):
+            self.assertFalse(pmac.has_package_manager())
+
+    def test_unknown_package_returns_false_without_running_anything(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            success, reason = pmac.install_optional_dependency("notarealpackage")
+        self.assertFalse(success)
+        self.assertIn("notarealpackage", reason)
+        mock_run.assert_not_called()
+
+    def test_formula_package_installs_without_cask_flag(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0, stdout="", stderr="")
+            success, reason = pmac.install_optional_dependency("ffmpeg")
+        self.assertTrue(success)
+        self.assertIsNone(reason)
+        mock_run.assert_called_once_with(["brew", "install", "ffmpeg"], capture_output=True, text=True, timeout=600)
+
+    def test_cask_package_installs_with_cask_flag(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0, stdout="", stderr="")
+            pmac.install_optional_dependency("obs")
+        mock_run.assert_called_once_with(
+            ["brew", "install", "--cask", "obs"], capture_output=True, text=True, timeout=600
+        )
+
+    def test_nonzero_exit_code_reports_failure_with_reason(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=1, stdout="", stderr="no formula found")
+            success, reason = pmac.install_optional_dependency("vlc")
+        self.assertFalse(success)
+        self.assertIn("no formula found", reason)
+
+    def test_missing_brew_binary_reports_failure_not_raise(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run", side_effect=OSError("not found")):
+            success, reason = pmac.install_optional_dependency("obs")  # must not raise
+        self.assertFalse(success)
+        self.assertIsNotNone(reason)
+
+
 class AutostartTests(unittest.TestCase):
     def setUp(self):
         self.tmp_home = tempfile.mkdtemp(prefix="obsautorec_test_home_")

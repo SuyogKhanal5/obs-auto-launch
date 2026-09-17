@@ -39,27 +39,20 @@ class ResolveVlcPathTests(unittest.TestCase):
 
 
 class WingetInstallVlcTests(unittest.TestCase):
+    # winget_install_vlc() now dispatches to platform_common.install_optional_dependency("vlc")
+    # -- see test_platform_windows.py/test_platform_macos.py for the real winget/Homebrew logic.
     def test_success_exit_code_reports_success(self):
-        with patch.object(a.subprocess, "run") as mock_run:
-            mock_run.return_value = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        with patch.object(a.platform_common, "install_optional_dependency", return_value=(True, None)) as mock_install:
             success, reason = a.winget_install_vlc()
         self.assertTrue(success)
         self.assertIsNone(reason)
+        mock_install.assert_called_once_with("vlc", timeout=600)
 
-    def test_nonzero_exit_code_reports_failure_with_reason(self):
-        with patch.object(a.subprocess, "run") as mock_run:
-            mock_run.return_value = type(
-                "Result", (), {"returncode": 1, "stdout": "", "stderr": "no package found"}
-            )()
+    def test_failure_reports_failure_with_reason(self):
+        with patch.object(a.platform_common, "install_optional_dependency", return_value=(False, "no package found")):
             success, reason = a.winget_install_vlc()
         self.assertFalse(success)
         self.assertIn("no package found", reason)
-
-    def test_missing_winget_binary_reports_failure_not_raise(self):
-        with patch.object(a.subprocess, "run", side_effect=OSError("not found")):
-            success, reason = a.winget_install_vlc()  # must not raise
-        self.assertFalse(success)
-        self.assertIsNotNone(reason)
 
 
 class ImportVlcModuleTests(unittest.TestCase):

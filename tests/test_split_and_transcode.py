@@ -308,37 +308,42 @@ class ResolveFfmpegPathTests(unittest.TestCase):
 
 
 class HasWingetTests(unittest.TestCase):
-    def test_true_when_winget_on_path(self):
-        with patch.object(a.shutil, "which", return_value=r"C:\Windows\winget.exe"):
-            self.assertTrue(a.has_winget())
+    # has_winget() is now a thin dispatcher to platform_common.has_package_manager() (winget on
+    # Windows, Homebrew on macOS) -- see test_platform_windows.py/test_platform_macos.py for the
+    # real per-OS logic. Pinned to win32 here so this test's outcome doesn't depend on which real
+    # OS happens to run it (has_winget() is unconditionally False on Linux -- see its own
+    # docstring).
+    def test_true_when_package_manager_available(self):
+        with patch.object(a.sys, "platform", "win32"):
+            with patch.object(a.platform_common, "has_package_manager", return_value=True):
+                self.assertTrue(a.has_winget())
 
-    def test_false_when_winget_not_on_path(self):
-        with patch.object(a.shutil, "which", return_value=None):
-            self.assertFalse(a.has_winget())
+    def test_false_when_package_manager_unavailable(self):
+        with patch.object(a.sys, "platform", "win32"):
+            with patch.object(a.platform_common, "has_package_manager", return_value=False):
+                self.assertFalse(a.has_winget())
+
+    def test_false_on_linux_regardless_of_package_manager(self):
+        with patch.object(a.sys, "platform", "linux"):
+            with patch.object(a.platform_common, "has_package_manager", return_value=True):
+                self.assertFalse(a.has_winget())
 
 
 class WingetInstallFfmpegTests(unittest.TestCase):
+    # winget_install_ffmpeg() now dispatches to platform_common.install_optional_dependency("ffmpeg")
+    # -- see test_platform_windows.py/test_platform_macos.py for the real winget/Homebrew logic.
     def test_success_exit_code_reports_success(self):
-        with patch.object(a.subprocess, "run") as mock_run:
-            mock_run.return_value = type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        with patch.object(a.platform_common, "install_optional_dependency", return_value=(True, None)) as mock_install:
             success, reason = a.winget_install_ffmpeg()
         self.assertTrue(success)
         self.assertIsNone(reason)
+        mock_install.assert_called_once_with("ffmpeg", timeout=600)
 
-    def test_nonzero_exit_code_reports_failure_with_reason(self):
-        with patch.object(a.subprocess, "run") as mock_run:
-            mock_run.return_value = type(
-                "Result", (), {"returncode": 1, "stdout": "", "stderr": "no package found"}
-            )()
+    def test_failure_reports_failure_with_reason(self):
+        with patch.object(a.platform_common, "install_optional_dependency", return_value=(False, "no package found")):
             success, reason = a.winget_install_ffmpeg()
         self.assertFalse(success)
         self.assertIn("no package found", reason)
-
-    def test_missing_winget_binary_reports_failure_not_raise(self):
-        with patch.object(a.subprocess, "run", side_effect=OSError("not found")):
-            success, reason = a.winget_install_ffmpeg()  # must not raise
-        self.assertFalse(success)
-        self.assertIsNotNone(reason)
 
 
 if __name__ == "__main__":

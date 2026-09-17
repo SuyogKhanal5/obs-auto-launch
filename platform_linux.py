@@ -8,7 +8,9 @@ relevant functions once they land, not a silent no-op or a crash."""
 import logging
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import threading
 
 # The canonical libvlc shared-object name on Linux (SONAME-versioned, unlike Windows/macOS).
@@ -424,6 +426,73 @@ def disable_autostart():
             logging.error("Failed to remove autostart entry: %s", exc)
             return False
     return True
+
+
+# --- Optional dependency install (transparent command + pkexec) ---
+# Unlike Windows (winget) / macOS (Homebrew), Linux never does a silent background install --
+# per CROSS_PLATFORM_PLAN.md §2.7, the exact command is built and shown to the user as read-only
+# text first, only running (via pkexec, the standard mechanism for a GUI app to request a
+# graphical privilege-escalation prompt) on explicit click. build_linux_install_command and
+# run_linux_install_command are deliberately two separate functions for exactly that reason: the
+# UI needs to display the former's result before ever calling the latter.
+_LINUX_PACKAGE_NAMES = {
+    "ffmpeg": {"apt-get": "ffmpeg", "dnf": "ffmpeg", "pacman": "ffmpeg", "zypper": "ffmpeg"},
+    "obs": {"apt-get": "obs-studio", "dnf": "obs-studio", "pacman": "obs-studio", "zypper": "obs-studio"},
+}
+_PACKAGE_MANAGER_INSTALL_ARGS = {
+    "apt-get": "install -y",
+    "dnf": "install -y",
+    "pacman": "-S --noconfirm",
+    "zypper": "install -y",
+}
+_OBS_FLATPAK_APP_ID = "com.obsproject.Studio"
+
+
+def _detected_package_manager():
+    for pm in ("apt-get", "dnf", "pacman", "zypper"):
+        if shutil.which(pm):
+            return pm
+    return None
+
+
+def build_linux_install_command(package):
+    """Returns the exact command string to install `package` ("ffmpeg" or "obs") on this Linux
+    system, for the UI to show verbatim before the user decides whether to run it -- never
+    executes anything itself (see run_linux_install_command for that). Prefers a --user-scoped
+    Flatpak install for OBS specifically when Flatpak is available: OBS is frequently missing
+    from a distro's own default repos (e.g. Fedora needs RPM Fusion enabled first), and Flatpak is
+    the most reliably up-to-date, distro-agnostic path -- plus a --user install needs no
+    elevation at all, unlike every native-package-manager command below. Returns None if no
+    supported mechanism is detected at all -- callers fall back to manual per-distro instructions
+    in that case."""
+    if package == "obs" and shutil.which("flatpak"):
+        return f"flatpak install --user -y flathub {_OBS_FLATPAK_APP_ID}"
+    pm = _detected_package_manager()
+    if pm is None:
+        return None
+    pkg_name = _LINUX_PACKAGE_NAMES.get(package, {}).get(pm)
+    if not pkg_name:
+        return None
+    return f"{pm} {_PACKAGE_MANAGER_INSTALL_ARGS[pm]} {pkg_name}"
+
+
+def run_linux_install_command(command, timeout=600):
+    """Executes a command build_linux_install_command returned. A --user-scoped Flatpak install
+    needs no elevation and is run directly; everything else (a native package manager command)
+    needs root, requested via pkexec -- the standard mechanism for a GUI app to show a graphical
+    privilege-escalation prompt, the Linux equivalent of Windows' UAC or macOS's "with
+    administrator privileges". Returns (True, None) on success, (False, reason) otherwise --
+    never raises."""
+    args = shlex.split(command)
+    is_user_scoped_flatpak = args[:1] == ["flatpak"] and "--user" in args
+    full_args = args if is_user_scoped_flatpak else ["pkexec"] + args
+    try:
+        result = subprocess.run(full_args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, None
+    return False, (result.stdout or result.stderr or f"exited with code {result.returncode}")[-500:].strip()
 
 
 def embed_video_player(player, tk_widget):

@@ -1,4 +1,11 @@
-name: Build and release exe
+name: Build and release
+
+# CROSS_PLATFORM_PLAN.md Phase 7 -- builds all 3 OSes' native artifacts in one run: Windows
+# (onedir zip + a UAC-elevated onefile installer exe, unchanged from before this phase), Linux
+# (onedir tar.gz + an AppImage, plus a onefile installer binary), macOS (a universal2 .app wrapped
+# in a .dmg, plus a universal2 onefile installer binary). Manual-trigger only (workflow_dispatch);
+# release creation itself only fires on a tag push or main, same as before -- triggering this on
+# any other branch just builds and uploads artifacts for inspection, no public release involved.
 
 on:
   workflow_dispatch:
@@ -8,7 +15,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -19,10 +30,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 
-      - name: Run tests
+      - name: Install Xvfb (Linux only, for the test run below)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Run tests (Linux, under Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m unittest discover -s tests -v
+
+      - name: Run tests (Windows / macOS)
+        if: runner.os != 'Linux'
         run: python -m unittest discover -s tests -v
 
-      - name: Build app (onedir)
+      # ---------------- Windows ----------------
+      - name: Build app (onedir, Windows)
+        if: runner.os == 'Windows'
         # onedir, not onefile: onefile re-extracts itself to a fresh %TEMP% folder on every
         # single launch, which antivirus real-time scanning can intermittently fail to clean up
         # (a widely-reported PyInstaller/Defender interaction -- shows up as OBS Auto Recorder
@@ -31,50 +53,132 @@ jobs:
         # plus an _internal/ support-files folder), not a single exe.
         run: pyinstaller --onedir --noconsole --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
 
-      - name: Zip the app folder for direct/portable download
-        run: Compress-Archive -Path dist/OBSAutoRecorder/* -DestinationPath dist/OBSAutoRecorder.zip
+      - name: Zip the app folder for direct/portable download (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/OBSAutoRecorder/* -DestinationPath dist/OBSAutoRecorder-windows.zip
 
-      - name: Build installer exe
+      - name: Build installer exe (Windows)
+        if: runner.os == 'Windows'
         # --add-data source paths are resolved relative to --specpath, not the working
         # directory, so they must be absolute here. The installer itself stays onefile (it's a
         # single short-lived download-and-run, not something that relaunches itself repeatedly)
-        # and embeds the whole onedir app folder as one data resource.
+        # and embeds the whole onedir app folder as one data resource. --uac-admin is needed here
+        # specifically because the default install location (Program Files) requires elevation to
+        # write to -- unrelated to Phase 7's per-user Linux/macOS install locations, which need no
+        # such prompt at all.
         run: pyinstaller --onefile --noconsole --uac-admin --name OBSAutoRecorderInstaller --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}\dist\OBSAutoRecorder;OBSAutoRecorder" --add-data "${{ github.workspace }}\config.example.json;." installer.py
+
+      # ---------------- Linux ----------------
+      - name: Build app (onedir, Linux)
+        if: runner.os == 'Linux'
+        run: pyinstaller --onedir --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
+
+      - name: Tar the app folder for direct/portable download (Linux)
+        if: runner.os == 'Linux'
+        run: tar -C dist -czf dist/OBSAutoRecorder-linux.tar.gz OBSAutoRecorder
+
+      - name: Package AppImage (Linux)
+        if: runner.os == 'Linux'
+        # AppImage is the primary Linux distribution format per CROSS_PLATFORM_PLAN.md §2 --
+        # self-contained, no install step needed, runs on essentially any distro. appimagetool
+        # itself ships as its own AppImage from the project's GitHub releases (there's no distro
+        # package for it). The icon is a plain solid-color placeholder -- a real app icon asset
+        # doesn't exist in this repo yet (see Phase 9 / follow-up work); appimagetool refuses to
+        # build without one at all.
+        run: |
+          wget -q -O appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          mkdir -p AppDir/usr/bin
+          cp -r dist/OBSAutoRecorder/. AppDir/usr/bin/
+          printf '#!/bin/bash\nHERE="$(dirname "$(readlink -f "${0}")")"\nexec "$HERE/usr/bin/OBSAutoRecorder" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          printf '[Desktop Entry]\nType=Application\nName=OBS Auto Recorder\nExec=OBSAutoRecorder\nIcon=OBSAutoRecorder\nCategories=Utility;\n' > AppDir/OBSAutoRecorder.desktop
+          python -c "from PIL import Image; Image.new('RGBA', (256, 256), (30, 30, 30, 255)).save('AppDir/OBSAutoRecorder.png')"
+          cp AppDir/OBSAutoRecorder.png AppDir/.DirIcon
+          ARCH=x86_64 ./appimagetool AppDir dist/OBSAutoRecorder-x86_64.AppImage
+
+      - name: Build installer binary (Linux)
+        if: runner.os == 'Linux'
+        # Named distinctly from macOS's own installer binary below -- PyInstaller only appends
+        # .exe on Windows, so an identically-named Linux/macOS onefile binary would collide once
+        # both land in the same flat release-assets folder.
+        run: pyinstaller --onefile --name OBSAutoRecorderInstaller-linux --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder:OBSAutoRecorder" --add-data "${{ github.workspace }}/config.example.json:." installer.py
+
+      # ---------------- macOS ----------------
+      - name: Build app (.app bundle, universal2)
+        if: runner.os == 'macOS'
+        # --target-arch universal2 needs every dependency to actually ship a universal2 (or both
+        # arm64 and x86_64) wheel -- not yet independently confirmed for this project's full
+        # dependency set (numpy, Pillow, python-vlc, psutil, pystray, obsws-python); this build
+        # step is itself the confirmation per CROSS_PLATFORM_PLAN.md §7.4's own note. A failure
+        # here means falling back to separate Intel/ARM builds instead of one universal binary.
+        run: pyinstaller --windowed --name OBSAutoRecorder --target-arch universal2 --distpath dist --workpath build --specpath build autostart_script.py
+
+      - name: Package DMG (macOS)
+        if: runner.os == 'macOS'
+        run: hdiutil create -volname "OBS Auto Recorder" -srcfolder dist/OBSAutoRecorder.app -ov -format UDZO dist/OBSAutoRecorder-macos.dmg
+
+      - name: Build installer binary (macOS universal2)
+        if: runner.os == 'macOS'
+        run: pyinstaller --onefile --name OBSAutoRecorderInstaller-macos --target-arch universal2 --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder.app:OBSAutoRecorder.app" --add-data "${{ github.workspace }}/config.example.json:." installer.py
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OBSAutoRecorder
+          name: OBSAutoRecorder-${{ matrix.os }}
+          if-no-files-found: ignore
           path: |
-            dist/OBSAutoRecorder.zip
+            dist/OBSAutoRecorder-windows.zip
             dist/OBSAutoRecorderInstaller.exe
+            dist/OBSAutoRecorder-linux.tar.gz
+            dist/OBSAutoRecorder-x86_64.AppImage
+            dist/OBSAutoRecorderInstaller-linux
+            dist/OBSAutoRecorder-macos.dmg
+            dist/OBSAutoRecorderInstaller-macos
+            config.example.json
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts into one release-assets folder
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name "*.zip" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.dmg" -o -name "OBSAutoRecorderInstaller-linux" -o -name "OBSAutoRecorderInstaller-macos" \) -exec cp {} release-assets/ \;
+          ls -la release-assets
 
       - name: Create versioned GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
         # RELEASE_NOTES.md is an optional, hand-written description for whatever tag is currently
         # being cut -- checked in only when a release needs specific text (e.g. "VERIFIED STABLE"
         # plus a curated changelist) instead of GitHub's auto-generated commit list. It's meant to
         # be overwritten (or removed) before the next tag, not accumulated release-over-release.
         run: |
           if [ -f RELEASE_NOTES.md ]; then
-            gh release create "${{ github.ref_name }}" dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.zip config.example.json --title "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
+            gh release create "${{ github.ref_name }}" release-assets/* config.example.json --title "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
           else
-            gh release create "${{ github.ref_name }}" dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.zip config.example.json --title "${{ github.ref_name }}" --generate-notes
+            gh release create "${{ github.ref_name }}" release-assets/* config.example.json --title "${{ github.ref_name }}" --generate-notes
           fi
 
       - name: Publish rolling "latest" build (main branch)
         if: github.ref == 'refs/heads/main'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
         run: |
           git tag -f latest
           git push origin latest --force
           gh release delete latest --yes || true
-          gh release create latest dist/OBSAutoRecorderInstaller.exe dist/OBSAutoRecorder.zip config.example.json \
+          gh release create latest release-assets/* config.example.json \
             --title "Latest build (main)" \
             --notes "Automatically built from the latest commit on main (${{ github.sha }}). May be less stable than a tagged release." \
             --prerelease

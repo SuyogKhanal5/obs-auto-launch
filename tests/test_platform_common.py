@@ -223,6 +223,44 @@ class DisableAutostartTests(unittest.TestCase):
         self.assertTrue(result)
 
 
+class HasPackageManagerTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.has_package_manager.return_value = True
+            self.assertTrue(pc.has_package_manager(platform_name="win32"))
+        mock_select.assert_called_once_with("win32")
+
+
+class InstallOptionalDependencyDispatchTests(unittest.TestCase):
+    def test_dispatches_with_package_and_timeout(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.install_optional_dependency.return_value = (True, None)
+            result = pc.install_optional_dependency("ffmpeg", timeout=30, platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        mock_select.return_value.install_optional_dependency.assert_called_once_with("ffmpeg", timeout=30)
+        self.assertEqual(result, (True, None))
+
+
+class BuildLinuxInstallCommandDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.build_linux_install_command.return_value = "apt-get install -y ffmpeg"
+            result = pc.build_linux_install_command("ffmpeg", platform_name="linux")
+        mock_select.assert_called_once_with("linux")
+        self.assertEqual(result, "apt-get install -y ffmpeg")
+
+
+class RunLinuxInstallCommandDispatchTests(unittest.TestCase):
+    def test_dispatches_with_command_and_timeout(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.run_linux_install_command.return_value = (True, None)
+            result = pc.run_linux_install_command("apt-get install -y ffmpeg", timeout=30, platform_name="linux")
+        mock_select.return_value.run_linux_install_command.assert_called_once_with(
+            "apt-get install -y ffmpeg", timeout=30
+        )
+        self.assertEqual(result, (True, None))
+
+
 class EmbedVideoPlayerTests(unittest.TestCase):
     def test_dispatches_to_backend(self):
         player = unittest.mock.Mock()

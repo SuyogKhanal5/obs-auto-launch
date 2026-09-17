@@ -360,6 +360,44 @@ def disable_autostart():
     return True
 
 
+# --- Optional dependency install (winget) ---
+# Generalizes installer.py's old winget_install(package_id)/has_winget() and
+# autostart_script.py's own duplicate winget_install_ffmpeg()/winget_install_vlc() into one
+# shared function, reached through platform_common.install_optional_dependency() --
+# CROSS_PLATFORM_PLAN.md Phase 7 / §3.3's interface table.
+_WINGET_PACKAGE_IDS = {
+    "ffmpeg": "Gyan.FFmpeg",
+    "obs": "OBSProject.OBSStudio",
+    "vlc": "VideoLAN.VLC",
+}
+
+
+def has_package_manager():
+    return shutil.which("winget") is not None
+
+
+def install_optional_dependency(package, timeout=600):
+    """Best-effort silent install via winget. Returns (True, None) on success, (False, reason)
+    otherwise -- never raises, so a failed/missing winget never blocks the rest of setup."""
+    package_id = _WINGET_PACKAGE_IDS.get(package)
+    if not package_id:
+        return False, f"No winget package id known for '{package}'."
+    try:
+        result = subprocess.run(
+            [
+                "winget", "install", "--id", package_id, "-e", "--silent",
+                "--accept-source-agreements", "--accept-package-agreements",
+            ],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, None
+    return False, (result.stdout or result.stderr or f"winget exited with code {result.returncode}")[-500:].strip()
+
+
 def embed_video_player(player, tk_widget):
     """Embeds a python-vlc player's output into tk_widget -- Windows takes a raw HWND, the same
     integer Tk's own winfo_id() already returns. Moved unchanged from the clip editor's old
