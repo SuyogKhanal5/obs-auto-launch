@@ -166,6 +166,24 @@ def is_app_running():
     return False
 
 
+def close_obs_for_setup():
+    """Force-closes any running OBS process so its WebSocket server can be configured
+    automatically instead of leaving that to the user -- mirrors autostart_script.py's own
+    kill_process_by_name, which already force-kills OBS during its normal hang-recovery flow, so
+    this isn't a new risk profile for this app to introduce. Best-effort: never raises, and
+    returns whether OBS was actually found running to close in the first place."""
+    was_running = False
+    for proc in psutil.process_iter(["name"]):
+        try:
+            if (proc.info.get("name") or "").lower() in _OBS_PROCESS_NAMES:
+                was_running = True
+                proc.kill()
+                proc.wait(timeout=5)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+            pass
+    return was_running
+
+
 def get_obs_websocket_config_path():
     obs_config_dir = platform_common.obs_config_dir()
     if not obs_config_dir:
@@ -281,6 +299,10 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
         config_path = os.path.join(install_dir, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
+
+        if is_obs_running():
+            on_progress("Closing OBS so its WebSocket server can be configured automatically...")
+            close_obs_for_setup()
 
         on_progress("Configuring OBS's WebSocket server...")
         obs_ws_configured, obs_ws_reason = try_configure_obs_websocket(password)
@@ -662,8 +684,8 @@ def main():
     ).pack(anchor="w", pady=(10, 4))
     tk.Label(
         advanced_page,
-        text="    Requires an Application Audio Capture source named \"Game Audio\" in OBS — add "
-        "one now or later; this just tells the app to use it once it's there.",
+        text="    Creates an Application Audio Capture source named \"Game Audio\" in OBS "
+        "automatically the first time it's needed — nothing to add yourself.",
         bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w", justify="left", wraplength=490,
     ).pack(anchor="w")
 
@@ -676,8 +698,7 @@ def main():
         advanced_page,
         text=(
             "    Defaults to a 30-second buffer -- change the length, or switch to replay-buffer-"
-            "only mode (skips full recordings entirely), later from this app's Settings \u2192 OBS. "
-            "OBS needs one restart after this is turned on before the buffer actually works."
+            "only mode (skips full recordings entirely), later from this app's Settings \u2192 OBS."
         ),
         bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w", justify="left", wraplength=490,
     ).pack(anchor="w")
@@ -708,7 +729,7 @@ def main():
     tk.Button(output_folder_row, text="Browse...", command=browse_output_folder).pack(side="left", padx=(8, 0))
     tk.Label(
         advanced_page, text="    Leave blank to use OBS's own recording folder setting.",
-        bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w",
+        bg=PAGE_BG, font=("Segoe UI", 9), fg="#555555", anchor="w", justify="left", wraplength=490,
     ).pack(anchor="w")
 
     # ---------- Ready / progress ----------
@@ -867,10 +888,9 @@ def main():
             if is_obs_running():
                 obs_running_notice.config(
                     text=(
-                        "⚠  OBS is currently running -- its WebSocket server can't be configured "
-                        "automatically while it's open. Close OBS first if you'd like that done for "
-                        "you, or continue and set the password manually afterward (shown on the "
-                        "finish page)."
+                        "⚠  OBS is currently running -- it'll be closed automatically during install "
+                        "so its WebSocket server can be configured for you. Save anything important "
+                        "in OBS first if you have unsaved changes there."
                     )
                 )
             else:
