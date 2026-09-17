@@ -127,6 +127,39 @@ def epic_manifest_dir():
     return os.path.join(root, "Epic", "EpicGamesLauncher", "Data", "Manifests")
 
 
+def find_gog_installed_games(exclude_keywords):
+    """Moved from autostart_script.py's old get_gog_installed_games() -- GOG Galaxy itself has
+    never shipped a Mac or Linux client (GOG's DRM-free Mac/Linux installers for individual games
+    are a separate, unrelated distribution path with no registry/manifest this could hook into),
+    so this only ever needs a real implementation here; see CROSS_PLATFORM_PLAN.md §2.5. Only
+    ever reached (via platform_common.find_gog_installed_games) after the caller's own
+    sys.platform == "win32" check, so Linux/macOS never need their own version of this at all."""
+    games = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\GOG.com\Games") as games_key:
+            index = 0
+            while True:
+                try:
+                    subkey_name = winreg.EnumKey(games_key, index)
+                except OSError:
+                    break
+                index += 1
+                try:
+                    with winreg.OpenKey(games_key, subkey_name) as subkey:
+                        install_dir = winreg.QueryValueEx(subkey, "path")[0]
+                        display_name = winreg.QueryValueEx(subkey, "gameName")[0]
+                except OSError:
+                    continue
+                if not install_dir or not display_name:
+                    continue
+                if any(kw in display_name.lower() for kw in exclude_keywords):
+                    continue
+                games.append({"install_dir": os.path.normpath(install_dir).lower(), "display_name": display_name})
+    except OSError:
+        return []
+    return games
+
+
 def get_window_titles():
     """Moved unchanged from autostart_script.py's old get_window_titles(): maps each visible
     top-level window's owning PID to its titles via a raw EnumWindows callback."""

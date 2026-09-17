@@ -261,6 +261,35 @@ class RunLinuxInstallCommandDispatchTests(unittest.TestCase):
         self.assertEqual(result, (True, None))
 
 
+class ObsConfigDirTests(unittest.TestCase):
+    def test_windows_uses_appdata(self):
+        with unittest.mock.patch.dict(os.environ, {"APPDATA": r"C:\Users\Test\AppData\Roaming"}, clear=False):
+            result = pc.obs_config_dir(platform_name="win32")
+        self.assertEqual(result, r"C:\Users\Test\AppData\Roaming\obs-studio")
+
+    def test_windows_returns_none_when_appdata_unset(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(pc.obs_config_dir(platform_name="win32"))
+
+    def test_macos_uses_application_support(self):
+        result = pc.obs_config_dir(platform_name="darwin")
+        self.assertEqual(result, os.path.expanduser("~/Library/Application Support/obs-studio"))
+
+    def test_linux_uses_dot_config(self):
+        result = pc.obs_config_dir(platform_name="linux")
+        self.assertEqual(result, os.path.expanduser("~/.config/obs-studio"))
+
+
+class FindGogInstalledGamesDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.find_gog_installed_games.return_value = [{"display_name": "HITMAN 3"}]
+            result = pc.find_gog_installed_games(["demo"], platform_name="win32")
+        mock_select.assert_called_once_with("win32")
+        mock_select.return_value.find_gog_installed_games.assert_called_once_with(["demo"])
+        self.assertEqual(result, [{"display_name": "HITMAN 3"}])
+
+
 class EmbedVideoPlayerTests(unittest.TestCase):
     def test_dispatches_to_backend(self):
         player = unittest.mock.Mock()

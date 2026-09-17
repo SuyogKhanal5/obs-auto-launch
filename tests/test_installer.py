@@ -104,6 +104,38 @@ class BuildConfigTests(unittest.TestCase):
         self.assertEqual(config["obs"]["websocket"]["password"], "generated-pw")
 
 
+class IsObsRunningTests(unittest.TestCase):
+    def make_fake_proc(self, name):
+        proc = unittest.mock.Mock()
+        proc.info = {"name": name}
+        return proc
+
+    def test_true_for_windows_process_names(self):
+        for name in ("obs64.exe", "OBS32.EXE"):
+            with patch.object(installer.psutil, "process_iter", return_value=[self.make_fake_proc(name)]):
+                self.assertTrue(installer.is_obs_running())
+
+    def test_true_for_linux_and_macos_process_name(self):
+        for name in ("obs", "OBS"):
+            with patch.object(installer.psutil, "process_iter", return_value=[self.make_fake_proc(name)]):
+                self.assertTrue(installer.is_obs_running())
+
+    def test_false_when_not_running(self):
+        with patch.object(installer.psutil, "process_iter", return_value=[self.make_fake_proc("explorer.exe")]):
+            self.assertFalse(installer.is_obs_running())
+
+
+class GetObsWebsocketConfigPathTests(unittest.TestCase):
+    def test_dispatches_to_platform_common_obs_config_dir(self):
+        with patch.object(installer.platform_common, "obs_config_dir", return_value=r"C:\AppData\obs-studio"):
+            path = installer.get_obs_websocket_config_path()
+        self.assertEqual(path, os.path.join(r"C:\AppData\obs-studio", "plugin_config", "obs-websocket", "config.json"))
+
+    def test_returns_none_when_obs_config_dir_unresolvable(self):
+        with patch.object(installer.platform_common, "obs_config_dir", return_value=None):
+            self.assertIsNone(installer.get_obs_websocket_config_path())
+
+
 class EnsureFfmpegTests(unittest.TestCase):
     """ensure_ffmpeg must never block or fail setup regardless of what's on the machine -- these
     pin its possible outcomes against mocked presence/package-manager checks. The real per-OS

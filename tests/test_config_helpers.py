@@ -212,11 +212,39 @@ class EnforceStorageBudgetTests(unittest.TestCase):
         self.assertFalse(os.path.isfile(path))
 
 
-class CleanupOrphanedPyinstallerTempDirsTests(unittest.TestCase):
+class ClearObsCrashSentinelTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
-        patcher = patch.dict(os.environ, {"TEMP": self.tmpdir.name, "TMP": self.tmpdir.name})
+
+    def test_removes_sentinel_files(self):
+        sentinel_dir = os.path.join(self.tmpdir.name, ".sentinel")
+        os.mkdir(sentinel_dir)
+        sentinel_file = os.path.join(sentinel_dir, "some-sentinel")
+        open(sentinel_file, "w").close()
+        with patch.object(a.platform_common, "obs_config_dir", return_value=self.tmpdir.name):
+            a.clear_obs_crash_sentinel()
+        self.assertFalse(os.path.isfile(sentinel_file))
+
+    def test_missing_sentinel_dir_does_not_raise(self):
+        with patch.object(a.platform_common, "obs_config_dir", return_value=self.tmpdir.name):
+            a.clear_obs_crash_sentinel()  # must not raise
+
+    def test_unresolvable_obs_config_dir_does_not_raise(self):
+        with patch.object(a.platform_common, "obs_config_dir", return_value=None):
+            a.clear_obs_crash_sentinel()  # must not raise
+
+
+class CleanupOrphanedPyinstallerTempDirsTests(unittest.TestCase):
+    # a.tempfile.gettempdir() (not raw TEMP/TMP env vars, which the function used to read
+    # directly -- see CROSS_PLATFORM_PLAN.md Phase 8's dead-code sweep) is patched directly here
+    # rather than via os.environ: gettempdir() caches its result the first time anything in the
+    # process calls it, so patching the env vars alone wouldn't reliably take effect if something
+    # else already triggered that cache earlier in the test run.
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        patcher = patch.object(a.tempfile, "gettempdir", return_value=self.tmpdir.name)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -243,8 +271,8 @@ class CleanupOrphanedPyinstallerTempDirsTests(unittest.TestCase):
             a.cleanup_orphaned_pyinstaller_temp_dirs()
         self.assertTrue(os.path.isdir(other))
 
-    def test_missing_temp_env_var_does_not_raise(self):
-        with patch.dict(os.environ, {}, clear=True):
+    def test_nonexistent_tempdir_does_not_raise(self):
+        with patch.object(a.tempfile, "gettempdir", return_value=os.path.join(self.tmpdir.name, "does-not-exist")):
             a.cleanup_orphaned_pyinstaller_temp_dirs()  # must not raise
 
 

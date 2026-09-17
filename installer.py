@@ -141,13 +141,16 @@ def find_obs_exe():
     return platform_common.find_obs_executable()
 
 
+_OBS_PROCESS_NAMES = {"obs64.exe", "obs32.exe", "obs"}  # Windows / Windows / Linux+macOS
+
+
 def is_obs_running():
     for proc in psutil.process_iter(["name"]):
         try:
             name = (proc.info.get("name") or "").lower()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-        if name in ("obs64.exe", "obs32.exe"):
+        if name in _OBS_PROCESS_NAMES:
             return True
     return False
 
@@ -164,10 +167,10 @@ def is_app_running():
 
 
 def get_obs_websocket_config_path():
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
+    obs_config_dir = platform_common.obs_config_dir()
+    if not obs_config_dir:
         return None
-    return os.path.join(appdata, "obs-studio", "plugin_config", "obs-websocket", "config.json")
+    return os.path.join(obs_config_dir, "plugin_config", "obs-websocket", "config.json")
 
 
 def try_configure_obs_websocket(password):

@@ -102,7 +102,7 @@ Edit `config.json`:
 | `poll_interval_seconds` | How often to check running processes |
 | `organize_into_game_subfolders` | If `true`, finished recordings are filed into a `<Game Name>\` subfolder instead of being prefixed with the game name in-place (see [Optional: game subfolders](#optional-game-subfolders)) |
 | `steam.enabled` | Auto-detect any game running from a Steam library folder |
-| `steam.allowed_drives` | Only scan Steam libraries on these drive letters |
+| `steam.allowed_drives` | Only scan Steam libraries under these path prefixes (a full folder path, e.g. `D:\\` or `/mnt/games` — the field name is kept from when this only understood bare Windows drive letters like `"C"`, `"D"`; those old values still work unchanged on Windows, expanded to that drive's root, and are ignored with a logged warning on Linux/macOS, where a drive letter isn't a meaningful concept) |
 | `steam.exclude_keywords` | Substrings in an exe's path that disqualify it from being treated as a game (anti-cheat installers, redistributables, background apps like Wallpaper Engine, etc.) |
 | `epic.enabled` | Auto-detect any game installed via the Epic Games Launcher |
 | `epic.exclude_keywords` | Substrings in an installed title's display name that disqualify it from being treated as a game (e.g. Unreal Engine editor installs) |

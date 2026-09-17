@@ -15,15 +15,6 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
-# winreg/ctypes.wintypes are Windows-only stdlib modules (ModuleNotFoundError on Linux/macOS) --
-# guarded here so the module can be imported (and the test suite can collect) on every OS. The
-# functions that actually use winreg/wintypes are being migrated into platform_windows.py phase
-# by phase (see CROSS_PLATFORM_PLAN.md); until a given function's move lands, calling it on a
-# non-Windows OS raises NameError at call time rather than crashing the whole process at import
-# time -- an intentional, temporary state, not a bug.
-if sys.platform == "win32":
-    import winreg
-
 import obsws_python as obsws
 import psutil
 import pystray
@@ -298,37 +289,14 @@ def get_battlenet_install_dirs(battlenet_config):
 def get_gog_installed_games(gog_config):
     # GOG Galaxy itself has never shipped a Mac or Linux client (GOG's DRM-free Mac/Linux
     # installers for individual games are a separate, unrelated distribution path with no
-    # registry/manifest this could hook into) -- winreg doesn't even exist to import on those
-    # OSes, so this must return before ever touching it. See CROSS_PLATFORM_PLAN.md §2.5.
+    # registry/manifest this could hook into), so this is a deliberate no-op there rather than an
+    # oversight. See CROSS_PLATFORM_PLAN.md §2.5. The real registry-reading logic now lives in
+    # platform_common.find_gog_installed_games() / platform_windows.py, Phase 8.
     if sys.platform != "win32" or not gog_config.get("enabled", True):
         return []
 
     exclude_keywords = [k.lower() for k in gog_config.get("exclude_keywords", [])]
-    games = []
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\GOG.com\Games") as games_key:
-            index = 0
-            while True:
-                try:
-                    subkey_name = winreg.EnumKey(games_key, index)
-                except OSError:
-                    break
-                index += 1
-                try:
-                    with winreg.OpenKey(games_key, subkey_name) as subkey:
-                        install_dir = winreg.QueryValueEx(subkey, "path")[0]
-                        display_name = winreg.QueryValueEx(subkey, "gameName")[0]
-                except OSError:
-                    continue
-                if not install_dir or not display_name:
-                    continue
-                if any(kw in display_name.lower() for kw in exclude_keywords):
-                    continue
-                games.append({"install_dir": os.path.normpath(install_dir).lower(), "display_name": display_name})
-    except OSError:
-        logging.info("No GOG Galaxy installs found in registry.")
-        return []
-
+    games = platform_common.find_gog_installed_games(exclude_keywords)
     logging.info(
         "Watching GOG Galaxy installs: %s", ", ".join(g["display_name"] for g in games) if games else "none found"
     )
@@ -467,10 +435,10 @@ def kill_process_by_name(process_name):
 
 
 def clear_obs_crash_sentinel():
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
+    obs_config_dir = platform_common.obs_config_dir()
+    if not obs_config_dir:
         return
-    sentinel_dir = os.path.join(appdata, "obs-studio", ".sentinel")
+    sentinel_dir = os.path.join(obs_config_dir, ".sentinel")
     if not os.path.isdir(sentinel_dir):
         return
     for entry in os.listdir(sentinel_dir):
@@ -481,14 +449,20 @@ def clear_obs_crash_sentinel():
 
 
 def cleanup_orphaned_pyinstaller_temp_dirs():
-    """A frozen onefile build extracts to a fresh %TEMP%\\_MEI<pid> folder every launch and
-    normally deletes it again on clean exit. That delete can fail -- most commonly because
-    antivirus real-time scanning still has a newly-extracted DLL open for scanning at that exact
-    moment (a widely-reported PyInstaller/Windows Defender interaction, not specific to this
-    app) -- leaving the folder orphaned. Left unchecked these just accumulate indefinitely.
-    Only removes a folder whose PID no longer belongs to any running process (regardless of
-    which app it came from), so a still-running process's own folder is never touched."""
-    temp_dir = os.environ.get("TEMP") or os.environ.get("TMP")
+    """A frozen onefile build extracts to a fresh <tempdir>/_MEI<pid> folder every launch (the
+    same _MEI<pid> naming convention on every OS a onefile PyInstaller build runs on, not just
+    Windows) and normally deletes it again on clean exit. That delete can fail -- most commonly
+    on Windows, where antivirus real-time scanning can still have a newly-extracted DLL open for
+    scanning at that exact moment (a widely-reported PyInstaller/Windows Defender interaction,
+    not specific to this app) -- leaving the folder orphaned. Left unchecked these just
+    accumulate indefinitely. Only removes a folder whose PID no longer belongs to any running
+    process (regardless of which app it came from), so a still-running process's own folder is
+    never touched.
+
+    tempfile.gettempdir() (not raw TEMP/TMP env var lookups, which only Windows commonly sets)
+    finds the right base directory on every OS -- it already checks TMPDIR/TEMP/TMP in that
+    order before falling back to each OS's own platform default (e.g. /tmp on Linux/macOS)."""
+    temp_dir = tempfile.gettempdir()
     if not temp_dir or not os.path.isdir(temp_dir):
         return
     removed = 0

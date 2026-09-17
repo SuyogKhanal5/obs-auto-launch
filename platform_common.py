@@ -261,6 +261,31 @@ def run_linux_install_command(command, timeout=600, platform_name=None):
     return _select_backend(platform_name).run_linux_install_command(command, timeout=timeout)
 
 
+def obs_config_dir(platform_name=None):
+    """OBS's own per-user config root -- same formula on every OS regardless of where THIS app
+    (or its installer) itself lives, since it's just where OBS always stores its own config/
+    logs/crash-sentinel files/obs-websocket plugin settings. A plain path-selection helper, not
+    dispatched per-backend, since no OS API call is involved -- callers include
+    autostart_script.py's clear_obs_crash_sentinel() and installer.py's
+    get_obs_websocket_config_path(), which independently need the exact same directory. Returns
+    None only for the (unusual) case of APPDATA being unset on Windows."""
+    platform_name = sys.platform if platform_name is None else platform_name
+    if platform_name == "win32":
+        appdata = os.environ.get("APPDATA")
+        return os.path.join(appdata, "obs-studio") if appdata else None
+    if platform_name == "darwin":
+        return os.path.expanduser("~/Library/Application Support/obs-studio")
+    return os.path.expanduser("~/.config/obs-studio")
+
+
+def find_gog_installed_games(exclude_keywords, platform_name=None):
+    """GOG Galaxy has never shipped a native Linux/macOS client (CROSS_PLATFORM_PLAN.md §2.5) --
+    only platform_windows.py implements this for real. Linux/macOS-only in practice: the caller
+    (autostart_script.py's own get_gog_installed_games) already checks sys.platform == "win32"
+    before ever reaching this, so this is never actually invoked on the wrong OS."""
+    return _select_backend(platform_name).find_gog_installed_games(exclude_keywords)
+
+
 def embed_video_player(player, tk_widget, platform_name=None):
     """Embeds a python-vlc player's video output into tk_widget -- set_hwnd on Windows,
     set_xwindow on Linux/X11 (both take the plain numeric id tk_widget.winfo_id() already

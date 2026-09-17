@@ -219,6 +219,59 @@ class AutostartTests(unittest.TestCase):
                     self.assertFalse(pw.disable_autostart())
 
 
+class FindGogInstalledGamesTests(unittest.TestCase):
+    def make_fake_winreg(self, entries):
+        """entries: list of (subkey_name, install_dir, display_name), in enumeration order."""
+        fake_winreg = unittest.mock.MagicMock()
+        fake_winreg.HKEY_LOCAL_MACHINE = "HKLM"
+        games_key = "games_key_sentinel"
+        by_subkey = {name: (install_dir, display_name) for name, install_dir, display_name in entries}
+        names_in_order = [name for name, _, _ in entries]
+
+        def open_key(hive_or_parent, subkey_path):
+            cm = unittest.mock.MagicMock()
+            # Two distinct calls share this mock: OpenKey(HKLM, "SOFTWARE\\...") for the
+            # top-level GOG.com\Games key, then OpenKey(games_key, subkey_name) once per game --
+            # told apart by which "parent" was passed.
+            cm.__enter__.return_value = games_key if hive_or_parent == "HKLM" else subkey_path
+            return cm
+
+        fake_winreg.OpenKey.side_effect = open_key
+
+        def enum_key(key, index):
+            if key != games_key or index >= len(names_in_order):
+                raise OSError("no more subkeys")
+            return names_in_order[index]
+
+        fake_winreg.EnumKey.side_effect = enum_key
+
+        def query_value_ex(subkey_name, value_name):
+            install_dir, display_name = by_subkey[subkey_name]
+            return (install_dir, 1) if value_name == "path" else (display_name, 1)
+
+        fake_winreg.QueryValueEx.side_effect = query_value_ex
+        return fake_winreg
+
+    def test_returns_games_from_registry(self):
+        fake_winreg = self.make_fake_winreg([("1", r"C:\Games\HITMAN 3", "HITMAN 3")])
+        with unittest.mock.patch.object(pw, "winreg", fake_winreg, create=True):
+            games = pw.find_gog_installed_games([])
+        self.assertEqual(games, [{"install_dir": r"c:\games\hitman 3", "display_name": "HITMAN 3"}])
+
+    def test_excludes_keyword_matches(self):
+        fake_winreg = self.make_fake_winreg([("1", r"C:\Games\Demo Game", "Some Demo")])
+        with unittest.mock.patch.object(pw, "winreg", fake_winreg, create=True):
+            games = pw.find_gog_installed_games(["demo"])
+        self.assertEqual(games, [])
+
+    def test_returns_empty_list_when_top_level_key_missing(self):
+        fake_winreg = unittest.mock.MagicMock()
+        fake_winreg.HKEY_LOCAL_MACHINE = "HKLM"
+        fake_winreg.OpenKey.side_effect = OSError("not found")
+        with unittest.mock.patch.object(pw, "winreg", fake_winreg, create=True):
+            self.assertEqual(pw.find_gog_installed_games([]), [])
+
+
 class EmbedVideoPlayerTests(unittest.TestCase):
     def test_calls_set_hwnd_with_widgets_winfo_id(self):
         player = unittest.mock.Mock()
