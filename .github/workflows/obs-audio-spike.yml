@@ -72,6 +72,16 @@ jobs:
         run: |
           pactl info || true
           pactl list short sources || true
+      # A real, continuously-playing audio stream to test against -- GetInputDefaultSettings
+      # alone can't reveal whether PipeWire exposes per-application streams as selectable capture
+      # targets at runtime, since that list is only populated once something is actually
+      # producing audio (see CROSS_PLATFORM_PLAN.md §6.1). speaker-test runs for its own fixed
+      # duration then exits; run in the background for long enough to outlive the spike script.
+      - name: Start a real audio-producing test process
+        run: |
+          sudo apt-get install -y alsa-utils
+          timeout 90 speaker-test -t sine -f 440 & disown
+          sleep 2
       - name: Launch OBS under Xvfb
         run: |
           xvfb-run -a --server-args="-screen 0 1280x720x24" \

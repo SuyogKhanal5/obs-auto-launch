@@ -84,6 +84,30 @@ def main():
             file=sys.stderr,
         )
 
+    # GetInputDefaultSettings only ever returns a STATIC default ({"device_id": "default"}) --
+    # it can't reveal whether PipeWire's pulse-compatibility layer exposes individual application
+    # audio streams as selectable "devices" at runtime, since that list only exists once
+    # something is actually producing audio. Creating a real input and querying its live property
+    # list (while a test tone plays via the "speaker-test" process this script's caller starts
+    # before invoking this) is the only way to actually see that.
+    for kind in ("pulse_output_capture", "pulse_input_capture"):
+        if kind not in kinds:
+            continue
+        probe_input_name = f"obsautorec-spike-{kind}"
+        try:
+            scene_name = client.get_current_program_scene().current_program_scene_name
+            client.create_input(scene_name, probe_input_name, kind, {}, True)
+            items = client.get_input_properties_list_property_items(probe_input_name, "device_id").property_items
+            print(f"SPIKE: live 'device_id' property items for a real '{kind}' input (scene={scene_name}):")
+            print(json.dumps(items, indent=2))
+        except Exception as exc:
+            print(f"SPIKE: probing '{kind}' failed: {exc}", file=sys.stderr)
+        finally:
+            try:
+                client.remove_input(probe_input_name)
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     main()
