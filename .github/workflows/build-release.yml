@@ -112,7 +112,11 @@ jobs:
         # dependency set (numpy, Pillow, python-vlc, psutil, pystray, obsws-python); this build
         # step is itself the confirmation per CROSS_PLATFORM_PLAN.md §7.4's own note. A failure
         # here means falling back to separate Intel/ARM builds instead of one universal binary.
-        run: pyinstaller --windowed --name OBSAutoRecorder --target-arch universal2 --distpath dist --workpath build --specpath build autostart_script.py
+        # PIL._avif (an optional AVIF-codec extension Pillow bundles, unrelated to anything this
+        # app actually uses -- it only needs PIL.Image/ImageDraw for the tray icon) ships as an
+        # arm64-only .so on this runner, not a universal2 fat binary; excluded rather than
+        # abandoning the universal2 build over an unused optional codec.
+        run: pyinstaller --windowed --name OBSAutoRecorder --target-arch universal2 --exclude-module PIL._avif --distpath dist --workpath build --specpath build autostart_script.py
 
       - name: Package DMG (macOS)
         if: runner.os == 'macOS'
