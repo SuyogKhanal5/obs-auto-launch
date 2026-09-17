@@ -1,6 +1,8 @@
 # OBS Auto Recorder
 
-A lightweight Windows background watcher that automatically starts and stops OBS recording when you launch or close a game. Runs from the system tray, launches OBS if it isn't already open, and renames finished recordings with the game's name.
+A lightweight background watcher — for Windows, Linux, and macOS — that automatically starts and stops OBS recording when you launch or close a game. Runs from the system tray, launches OBS if it isn't already open, and renames finished recordings with the game's name.
+
+Windows has the fullest feature set (it's where this app started); Linux and macOS are fully supported for game detection, recording, and the clip editor, with a few gaps noted throughout this README and summarized in [Known limitations](#known-limitations) — global custom keybinds and Minecraft-style window-title rules need a real X11 session on Linux (no Wayland support yet) and Accessibility permission on macOS, and per-app game-audio isolation isn't available on either yet.
 
 ## Features
 
@@ -16,8 +18,8 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - Optional replay buffer support: starts/stops OBS's replay buffer alongside recording, with a "Save Replay Buffer" tray action (see [Optional: replay buffer](#optional-replay-buffer))
 - Optional post-record transcode: runs a finished recording through `ffmpeg` in the background (e.g. to compress it, or remux MKV to MP4 while preserving every audio track) once it's done (see [Optional: post-record transcode](#optional-post-record-transcode))
 - Optional manual split with a delay: adds a "Split Recording File" tray item that splits the current recording after a configurable buffer, independent of any OBS hotkey (see [Optional: split recording files](#optional-split-recording-files))
-- Optional custom keybinds: set your own system-wide key combos (e.g. `Ctrl+Alt+S`) that call OBS actions like Split Recording File, Save Replay Buffer, or Pause Recording directly over the WebSocket, independent of OBS's own Hotkeys settings (see [Optional: custom keybinds](#optional-custom-keybinds))
-- Optional Windows toast notifications for key events (recording started/stopped, OBS restarted, low disk space, no audio detected) via the tray icon (see [Optional: notifications](#optional-notifications))
+- Optional custom keybinds: set your own system-wide key combos (e.g. `Ctrl+Alt+S`) that call OBS actions like Split Recording File, Save Replay Buffer, or Pause Recording directly over the WebSocket, independent of OBS's own Hotkeys settings — Windows and macOS (Accessibility permission required) fully, Linux needs a real X11 session, no Wayland support yet (see [Optional: custom keybinds](#optional-custom-keybinds))
+- Optional desktop notifications for key events (recording started/stopped, OBS restarted, low disk space, no audio detected) via the tray icon (see [Optional: notifications](#optional-notifications))
 - Optional built-in clip editor (tray icon → **Edit Clips...**): preview a recording with real playback (play/pause/seek/rewind), pick a start and end point, and trim it with one click — lossless by default, with an optional frame-accurate mode — without opening a separate video editor (see [Optional: clip editor](#optional-clip-editor))
 - Clears OBS's "unclean shutdown" crash-recovery sentinel before launching, so a prior forced close (e.g. Task Manager, crash, power loss) doesn't pop OBS's crash dialog and stall automation
 - Detects a hung OBS (process running but its WebSocket stops responding) or a memory-bloated idle OBS, and automatically kills and relaunches it instead of silently failing to record
@@ -26,33 +28,37 @@ A lightweight Windows background watcher that automatically starts and stops OBS
 - System tray icon showing live status (gray = watching, red = recording, green = recording file just split, orange = internal error or OBS recovery in progress — check the log), plus shortcuts to open the recordings folder and log file
 - Built-in GUI settings editor (tray icon → **Edit Settings...**) for every `config.json` option — no manual JSON editing required (see [Optional: settings editor](#optional-settings-editor))
 - Optional floating always-on-top overlay, pinned to any monitor of your choice via the tray icon's right-click menu, showing the same status color
-- Packaged as a single standalone `OBSAutoRecorder.exe` so it's easy to identify and kill in Task Manager (not a generic `python.exe`/`pythonw.exe` process)
-- A plain-language installer (`OBSAutoRecorderInstaller.exe`) for non-technical users: picks an install folder, finds (or lets you browse to) OBS, offers a few simple preferences, optionally creates a desktop icon and/or sets up auto-start, and even tries to configure OBS's WebSocket server for you automatically — see [Quick install](#quick-install-recommended)
+- Packaged as a standalone app per OS so it's easy to identify and kill in your process manager (not a generic `python`/`pythonw` process): `OBSAutoRecorder.exe` on Windows, an AppImage or plain tarball on Linux, an `.app` bundle on macOS (Apple Silicon only for now — see [Known limitations](#known-limitations))
+- A plain-language installer for non-technical users, one per OS, sharing the same wizard: picks an install folder, finds (or lets you browse to) OBS, offers a few simple preferences, optionally sets up auto-start, and even tries to configure OBS's WebSocket server for you automatically — see [Quick install](#quick-install-recommended)
 
 ## Requirements
 
-- Windows 10/11
-- [OBS Studio](https://obsproject.com/) with the built-in WebSocket server (OBS 28+) — doesn't need to be installed before you run the installer, just before you actually want to record
+- **Windows 10/11**, **Linux** (any distro — X11 session recommended, see the Wayland note below), or **macOS 13 (Ventura) or newer, Apple Silicon** (Intel Mac builds aren't available yet — see [Known limitations](#known-limitations))
+- [OBS Studio](https://obsproject.com/) with the built-in WebSocket server (OBS 28+) — doesn't need to be installed before you run the installer, just before you actually want to record. On Linux, a Flatpak install (`flatpak install flathub com.obsproject.Studio`) is recommended over your distro's own repo package, which is often outdated or missing WebSocket support entirely
 - [VLC media player](https://www.videolan.org/vlc/) — only needed for the optional [clip editor](#optional-clip-editor)'s video preview; nothing else in this app uses it. Not required to record at all
-- Python 3.10+ (only needed if you want to run from source or build the exes yourself — not needed to use the [prebuilt releases](../../releases/latest))
+- **Linux only:** a real **X11** session for [custom keybinds](#optional-custom-keybinds) and Minecraft-style [window-title rules](#manual-setup) to work — Wayland has no unprivileged API for either, so both degrade to "not available" (logged once, not a crash) under Wayland. Everything else (game detection by process, recording, the clip editor) works the same under either.
+- **macOS only:** [custom keybinds](#optional-custom-keybinds) need Accessibility permission (System Settings → Privacy & Security → Accessibility) — the app prompts for it and tells you if it's missing rather than silently doing nothing.
+- Python 3.10+ (only needed if you want to run from source or build the app yourself — not needed to use the [prebuilt releases](../../releases/latest))
 
 ## Quick install (recommended)
 
-This is the whole setup for most people — five minutes, no file editing, nothing to type by hand:
+This is the whole setup for most people — five minutes, no file editing, nothing to type by hand. The wizard itself is the same on every OS; only where things land and how OBS/ffmpeg get installed differ, called out below.
 
 1. **Install OBS Studio first**, if you haven't already — [obsproject.com](https://obsproject.com/), or let the installer do it for you in step 3 below. You don't need to configure anything inside it yet.
-2. Download **`OBSAutoRecorderInstaller.exe`** from the [Releases page](../../releases/latest) and run it.
+2. Download the installer for your OS from the [Releases page](../../releases/latest) and run it: `OBSAutoRecorderInstaller.exe` (Windows), `OBSAutoRecorderInstaller-linux` (Linux — mark it executable first, `chmod +x OBSAutoRecorderInstaller-linux`), or `OBSAutoRecorderInstaller-macos-arm64` (macOS, Apple Silicon).
 3. Click through the wizard:
-   - **Choose where to install** — the default (Program Files) is fine for almost everyone.
-   - **Locate OBS Studio** — it finds this automatically in the common install locations; if it can't and you have `winget` (most Windows 10/11 PCs do), an **Easy Install** button installs OBS Studio for you right there — otherwise, click **Browse...** if it's already installed elsewhere, or use the download link on that page.
+   - **Choose where to install** — the default (Program Files on Windows, `~/.local/share/OBSAutoRecorder` on Linux, `~/Applications/OBSAutoRecorder` on macOS) is fine for almost everyone; none of these need admin/root access for the app install itself.
+   - **Locate OBS Studio** — it finds this automatically in the common install locations. If it can't:
+     - **Windows/macOS**: an **Easy Install** button installs OBS Studio for you right there via `winget`/Homebrew, if available — otherwise click **Browse...** if it's already installed elsewhere, or use the download link on that page.
+     - **Linux**: instead of a silent install, you get the exact command this app would run (preferring a Flatpak install of OBS, since many distros' own repo packages are outdated or missing WebSocket support) shown as read-only text, plus a **Run this command** button — nothing runs without you seeing it first and clicking that button, which prompts for your password via your desktop's normal graphical `pkexec` prompt.
    - **A few quick preferences** — plain yes/no toggles (split long recordings, delete accidental short clips, notifications, per-game folders). All changeable later.
-   - **Advanced options** — multi-track audio, game audio isolation, the replay buffer, the disk space guard, a custom recording folder. Everything here is off by default and safe to skip entirely with the **Skip this page** link — come back to it later from **Edit Settings...** once you know you want one of these.
+   - **Advanced options** — multi-track audio, game audio isolation (Windows only for now — see [Known limitations](#known-limitations)), the replay buffer, the disk space guard, a custom recording folder. Everything here is off by default and safe to skip entirely with the **Skip this page** link — come back to it later from **Edit Settings...** once you know you want one of these.
 4. Click **Install**, then **Finish** (leave "Launch OBS Auto Recorder now" checked).
-5. **Check it worked**: launch any game installed via Steam, Epic, GOG, or the Xbox app — these are auto-detected, nothing to configure first. The tray icon should turn red within a couple of seconds, and OBS should start recording. Close the game and confirm a new recording file appears, renamed with the game's name, in OBS's recording folder. (A game from somewhere else, e.g. Riot's client or a standalone installer? Add it via **Edit Settings... → Watched Games → Common Games...** or **Pick Running...** first — see [Optional: settings editor](#optional-settings-editor).)
+5. **Check it worked**: launch any game installed via Steam (or, on Windows/macOS, Epic Games; Windows also gets GOG and the Xbox app — see [Optional: more launchers](#optional-more-launchers) for which launcher auto-detection exists on which OS) — these are auto-detected, nothing to configure first. The tray icon should turn red within a couple of seconds, and OBS should start recording. Close the game and confirm a new recording file appears, renamed with the game's name, in OBS's recording folder. (A game from somewhere else, e.g. Riot's client or a standalone installer? Add it via **Edit Settings... → Watched Games → Common Games...** or **Pick Running...** first — see [Optional: settings editor](#optional-settings-editor).)
 
 The installer also tries to configure OBS's WebSocket server for you automatically (needs OBS to have been run at least once already, and to not be running during install). If it can't, it tells you the one manual step left — see the [Steps to take inside OBS](#steps-to-take-inside-obs) table below for exactly what to click.
 
-It also installs `ffmpeg` for you automatically via `winget` if it isn't already on your PC — this only matters if you later turn on [post-record transcode](#optional-post-record-transcode) (e.g. to convert MKV recordings to MP4), so most people can ignore it entirely. No `winget`? The Finish page just tells you where to grab it manually instead; nothing about the rest of setup depends on it.
+It also installs `ffmpeg` for you automatically if it isn't already on your PC — via `winget` on Windows, Homebrew on macOS, or (on Linux) by showing you the exact command for your distro's package manager, the same transparent "show it, then click to run it" flow as OBS above — this only matters if you later turn on [post-record transcode](#optional-post-record-transcode) (e.g. to convert MKV recordings to MP4), so most people can ignore it entirely. Nothing found or nothing to run automatically? The Finish page just tells you where to grab it manually instead; nothing about the rest of setup depends on it.
 
 Running the installer again later lets you update or uninstall — it detects an existing install and asks which you want, and an update never touches your existing settings.
 
@@ -87,10 +93,11 @@ In OBS: **Tools → WebSocket Server Settings**
 
 ### 2. Configure
 
-Get `config.example.json` — it's attached to each [Release](../../releases/latest) alongside the exe, or you can grab it from this repo. Put it next to `OBSAutoRecorder.exe` and rename your copy to `config.json`:
+Get `config.example.json` — it's attached to each [Release](../../releases/latest) alongside the app, or you can grab it from this repo. Put it next to the app and rename your copy to `config.json`:
 
 ```
-copy config.example.json config.json
+copy config.example.json config.json      # Windows
+cp config.example.json config.json        # Linux/macOS
 ```
 
 Edit `config.json`:
@@ -101,17 +108,17 @@ Edit `config.json`:
 | `watched_windows` | For games that share a generic process name (e.g. Java Edition Minecraft runs as `javaw.exe`, same as any Java app) — matches by process name **and** a substring of its window title. See below. |
 | `poll_interval_seconds` | How often to check running processes |
 | `organize_into_game_subfolders` | If `true`, finished recordings are filed into a `<Game Name>\` subfolder instead of being prefixed with the game name in-place (see [Optional: game subfolders](#optional-game-subfolders)) |
-| `steam.enabled` | Auto-detect any game running from a Steam library folder |
+| `steam.enabled` | Auto-detect any game running from a Steam library folder — Steam ships a native client on all 3 OSes, so this works everywhere |
 | `steam.allowed_drives` | Only scan Steam libraries under these path prefixes (a full folder path, e.g. `D:\\` or `/mnt/games` — the field name is kept from when this only understood bare Windows drive letters like `"C"`, `"D"`; those old values still work unchanged on Windows, expanded to that drive's root, and are ignored with a logged warning on Linux/macOS, where a drive letter isn't a meaningful concept) |
 | `steam.exclude_keywords` | Substrings in an exe's path that disqualify it from being treated as a game (anti-cheat installers, redistributables, background apps like Wallpaper Engine, etc.) |
-| `epic.enabled` | Auto-detect any game installed via the Epic Games Launcher |
+| `epic.enabled` | Auto-detect any game installed via the Epic Games Launcher — **Windows and macOS only**; Epic has never shipped a native Linux client |
 | `epic.exclude_keywords` | Substrings in an installed title's display name that disqualify it from being treated as a game (e.g. Unreal Engine editor installs) |
-| `gog.enabled` | Auto-detect any game installed via GOG Galaxy (read from the registry, no setup needed) |
+| `gog.enabled` | Auto-detect any game installed via GOG Galaxy (read from the registry, no setup needed) — **Windows only**; the Galaxy client itself has never shipped for Linux or macOS |
 | `gog.exclude_keywords` | Substrings in an installed title's display name that disqualify it from being treated as a game |
-| `xbox.enabled` | Auto-detect any game installed via the Xbox app / PC Game Pass |
+| `xbox.enabled` | Auto-detect any game installed via the Xbox app / PC Game Pass — **Windows only** (it's a UWP app with no Linux/macOS client at all) |
 | `xbox.install_dirs` | Folders to scan, one subfolder per game (defaults to `["C:\\XboxGames"]`, the default Xbox app install location) |
 | `xbox.exclude_keywords` | Substrings in an exe's path that disqualify it from being treated as a game |
-| `battlenet.enabled` | Auto-detect any game under the configured Battle.net folders |
+| `battlenet.enabled` | Auto-detect any game under the configured Battle.net folders — **Windows and macOS only**; Battle.net has no native Linux client |
 | `battlenet.install_dirs` | Folders to scan, one subfolder per game. Battle.net has no shared install root or manifest to read automatically, so this only detects anything once you list where your Battle.net games live |
 | `battlenet.exclude_keywords` | Substrings in an exe's path that disqualify it from being treated as a game |
 | `disk_space_guard.enabled` | Skip starting a recording (and show an error) if free disk space is below `minimum_free_gb` (see [Optional: disk space guard](#optional-disk-space-guard)) |
@@ -122,7 +129,7 @@ Edit `config.json`:
 | `cleanup.flag_silent_recordings.enabled` | Watch OBS's live audio meters while recording; if no input ever crosses `peak_threshold`, warn after `warn_after_seconds` and tag the finished file with a `[NO AUDIO]` prefix |
 | `cleanup.flag_silent_recordings.peak_threshold` | Minimum audio peak (0.0-1.0) that counts as "audio detected". Defaults to `0.02` if omitted |
 | `cleanup.flag_silent_recordings.warn_after_seconds` | How long with no audio before logging/notifying. Defaults to `30` if omitted |
-| `notifications.enabled` | Show Windows toast notifications (via the tray icon) for recording start/stop, OBS restarts, low disk space, and no-audio warnings (see [Optional: notifications](#optional-notifications)) |
+| `notifications.enabled` | Show desktop notifications (via the tray icon) for recording start/stop, OBS restarts, low disk space, and no-audio warnings (see [Optional: notifications](#optional-notifications)) |
 | `post_record_transcode.enabled` | Run each finished recording through `ffmpeg` in the background once it's done (see [Optional: post-record transcode](#optional-post-record-transcode)) |
 | `post_record_transcode.ffmpeg_path` | Path to `ffmpeg`, or just `"ffmpeg"` if it's on your `PATH` (the default). If it can't be resolved, the app automatically falls back to searching common install locations (winget/Chocolatey/Scoop) — see **Auto-detect ffmpeg** in [Optional: post-record transcode](#optional-post-record-transcode) |
 | `post_record_transcode.args` | Extra `ffmpeg` arguments between the input and output file, e.g. codec/quality settings. Include `-map 0` (as the default args do) if you want every track carried over — without it, `ffmpeg` only keeps one "best" audio track and silently drops the rest, which matters if you're using [multi-track audio](#optional-multi-track-audio) |
@@ -132,8 +139,8 @@ Edit `config.json`:
 | `clip_editor.output_folder` | Where trimmed clips are saved (see [Optional: clip editor](#optional-clip-editor)). Leave blank to save next to the source recording |
 | `clip_editor.delete_original_after_trim` | Delete the source recording once a trim succeeds. Never deletes on a failed trim |
 | `clip_editor.vlc_path` | Override which VLC install the clip editor uses, if you have more than one. Leave blank to auto-detect |
-| `obs.process_name` | Process name to watch for/kill when managing OBS, e.g. `"obs64.exe"` (the default) — only needs changing for a non-standard OBS build |
-| `obs.path` | Full path to `obs64.exe` |
+| `obs.process_name` | Process name to watch for/kill when managing OBS, e.g. `"obs64.exe"` on Windows (`"obs"` on Linux, `"OBS"` on macOS — whichever your install actually uses) — only needs changing for a non-standard OBS build |
+| `obs.path` | Full path to the OBS executable (`obs64.exe` on Windows; the `obs` binary on Linux; `OBS.app/Contents/MacOS/OBS` on macOS) |
 | `obs.launch_args` | Extra command-line args OBS is launched with |
 | `obs.startup_wait_seconds` | How long to wait after launching OBS before trying to connect |
 | `obs.output_folder` | Recording output folder to enforce in OBS (created automatically if missing). Leave unset/blank to leave OBS's own recording folder setting alone |
@@ -177,30 +184,38 @@ Editing `config.json` never requires rebuilding `OBSAutoRecorder.exe` — it's a
 
 ### 3. Get the app running
 
-**Option A — use the prebuilt build directly** (no installer, e.g. for a portable/USB setup): download `OBSAutoRecorder.zip` from the [Releases page](../../releases/latest), extract it (an `OBSAutoRecorder.exe` alongside an `_internal/` folder — both need to stay together, in their own folder), add a `config.json` next to the exe (see step 2), and run it. No Python needed.
+**Option A — use the prebuilt build directly** (no installer, e.g. for a portable/USB setup):
+
+- **Windows**: download `OBSAutoRecorder-windows.zip` from the [Releases page](../../releases/latest), extract it (an `OBSAutoRecorder.exe` alongside an `_internal/` folder — both need to stay together, in their own folder), add a `config.json` next to the exe (see step 2), and run it.
+- **Linux**: download `OBSAutoRecorder-x86_64.AppImage`, `chmod +x` it, and run it directly — self-contained, no extraction needed. Or download `OBSAutoRecorder-linux.tar.gz` for the plain extracted-folder equivalent of Windows' zip. Either way, add a `config.json` next to it (see step 2).
+- **macOS**: download `OBSAutoRecorder-macos-arm64.dmg` (Apple Silicon only — see [Known limitations](#known-limitations)), open it, and drag `OBSAutoRecorder.app` to Applications. Add a `config.json` inside the app bundle's `Contents/MacOS/` folder (see step 2) — or just use the installer instead, which handles this for you.
+
+No Python needed for any of these.
 
 **Option B — build it yourself**:
 
 ```
 pip install -r requirements.txt
-pyinstaller --onedir --noconsole --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py
+pyinstaller --onedir --noconsole --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py   # Windows
+pyinstaller --onedir --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py               # Linux
+pyinstaller --windowed --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py             # macOS (produces OBSAutoRecorder.app)
 ```
 
-This produces an `OBSAutoRecorder/` folder in the project folder (an exe plus an `_internal/` support-files folder — both required, don't separate them), with `config.json` read from that same folder. Rebuild any time you change `autostart_script.py`.
+On Windows/Linux this produces an `OBSAutoRecorder/` folder (an exe/binary plus an `_internal/` support-files folder — both required, don't separate them); on macOS, an `OBSAutoRecorder.app` bundle. `config.json` is read from that same folder (or `OBSAutoRecorder.app/Contents/MacOS/` on macOS). Rebuild any time you change `autostart_script.py`.
 
-Built as onedir rather than onefile deliberately: a onefile exe re-extracts itself to a fresh `%TEMP%` folder on *every single launch*, and antivirus real-time scanning can intermittently fail to release a newly-extracted file in time for that folder to be cleaned up afterward — a widely-reported PyInstaller/Windows Defender interaction, not a bug specific to this app, but one this app hits particularly often since it relaunches itself on every settings save (the Settings editor's "Save and Restart", and "Restart App" from the tray menu). Onedir runs directly from wherever it's installed, so that whole failure mode doesn't exist. The tradeoff is a folder instead of a single file — the installer hides that from end users by embedding and installing the whole folder, so downloading and running `OBSAutoRecorderInstaller.exe` is still a one-file experience.
+Built as onedir/`.app` rather than onefile deliberately: a onefile build re-extracts itself to a fresh temp folder on *every single launch*, and on Windows, antivirus real-time scanning can intermittently fail to release a newly-extracted file in time for that folder to be cleaned up afterward — a widely-reported PyInstaller/Windows Defender interaction, not a bug specific to this app, but one this app hits particularly often since it relaunches itself on every settings save (the Settings editor's "Save and Restart", and "Restart App" from the tray menu). Onedir/`.app` runs directly from wherever it's installed, so that whole failure mode doesn't exist. The tradeoff is a folder instead of a single file — the installer hides that from end users by embedding and installing the whole thing, so downloading and running the installer is still a one-file experience.
 
-To also build the installer (`OBSAutoRecorderInstaller.exe`), build the app as above, then:
+To also build the installer, build the app as above, then (paths shown for Windows; see [.github/workflows/build-release.yml](.github/workflows/build-release.yml) for the exact Linux/macOS equivalents, including macOS's extra step of zipping the `.app` bundle first to work around a PyInstaller codesigning quirk):
 
 ```
 pyinstaller --onefile --noconsole --uac-admin --name OBSAutoRecorderInstaller --distpath . --workpath build --specpath build --add-data "<full path to the OBSAutoRecorder folder>;OBSAutoRecorder" --add-data "<full path to config.example.json>;." installer.py
 ```
 
-The `--add-data` source paths must be absolute (PyInstaller resolves relative ones against `--specpath`, not your working directory). `--uac-admin` makes the installer prompt for admin rights on launch, needed for its default install location (Program Files).
+The `--add-data` source paths must be absolute (PyInstaller resolves relative ones against `--specpath`, not your working directory). `--uac-admin` makes the Windows installer prompt for admin rights on launch, needed for its default install location (Program Files) — Linux/macOS installers need no elevation at all for the app install itself, since they default to a per-user location.
 
-A GitHub Actions workflow ([.github/workflows/build-release.yml](.github/workflows/build-release.yml)) does all of this automatically:
-- Pushing a `vX.Y.Z` tag builds both exes and publishes them, alongside `config.example.json`, as a new versioned GitHub Release.
-- Every push to `main` builds both exes and republishes them to a rolling [`latest`](../../releases/tag/latest) pre-release, so the newest code is always available even between tagged versions. The [Releases page](../../releases/latest) itself still points at the newest *tagged* release, since the rolling build is marked as a pre-release.
+A GitHub Actions workflow ([.github/workflows/build-release.yml](.github/workflows/build-release.yml)) does all of this automatically, for all 3 OSes in one run:
+- Pushing a `vX.Y.Z` tag builds every OS's artifacts and publishes them all, alongside `config.example.json`, as a new versioned GitHub Release.
+- Every push to `main` does the same, republishing to a rolling [`latest`](../../releases/tag/latest) pre-release, so the newest code is always available even between tagged versions. The [Releases page](../../releases/latest) itself still points at the newest *tagged* release, since the rolling build is marked as a pre-release.
 
 You can also run either one directly without building, for testing:
 
@@ -221,14 +236,13 @@ These intentionally don't cover the tray icon, the settings editor GUI, or anyth
 
 ### 4. Run automatically at login
 
-If you used the installer, you already chose this on the Install location page. To change it later: right-click the tray icon → **Edit Settings...** → General tab → check/uncheck **Launch automatically when Windows starts**, then **Save**. This adds/removes a shortcut in your Startup folder for you (only available when running the built `.exe`, not `python autostart_script.py`).
+If you used the installer, you already chose this on the Install location page. To change it later: right-click the tray icon → **Edit Settings...** → General tab → check/uncheck **Launch automatically at login**, then **Save**. This only works from the built app, not `python autostart_script.py`, and sets up the right mechanism for your OS automatically:
 
-To do it by hand instead:
+- **Windows**: a shortcut in your Startup folder (`shell:startup`)
+- **Linux**: a `~/.config/autostart/OBSAutoRecorder.desktop` entry, per the XDG autostart spec every mainstream desktop environment supports
+- **macOS**: a per-user LaunchAgent (`~/Library/LaunchAgents/com.obsautorecorder.autostart.plist`), loaded via `launchctl`
 
-1. Press `Win+R`, enter `shell:startup`, hit Enter
-2. Create a shortcut there pointing to `OBSAutoRecorder.exe`
-
-Either way, it will launch silently (no console window) every time you log in.
+None of these need admin/root access. Either way, it launches silently (no console window) every time you log in.
 
 ## Using the tray icon
 
@@ -264,7 +278,7 @@ Both cases flash the tray icon orange and log a warning. To avoid restart loops,
 
 ## Optional: settings editor
 
-Instead of hand-editing `config.json`, right-click the tray icon → **Edit Settings...** for a tabbed GUI covering every option in this README's config table: General (including "launch at Windows startup" — see [Run automatically at login](#4-run-automatically-at-login)), Watched Games (including the window-title rules), Launchers, OBS (path, output folder, recording format, WebSocket, auto-split, manual split, health recovery, game audio, multi-track audio, replay buffer), a **Custom Keybinds** tab (see [Optional: custom keybinds](#optional-custom-keybinds)), Cleanup & Guards, Post-Processing/Notifications, and a **Clip Editor** tab (the trimmed-clip output folder and VLC location — see [Optional: clip editor](#optional-clip-editor)).
+Instead of hand-editing `config.json`, right-click the tray icon → **Edit Settings...** for a tabbed GUI covering every option in this README's config table: General (including "launch automatically at login" — see [Run automatically at login](#4-run-automatically-at-login)), Watched Games (including the window-title rules), Launchers, OBS (path, output folder, recording format, WebSocket, auto-split, manual split, health recovery, game audio, multi-track audio, replay buffer), a **Custom Keybinds** tab (see [Optional: custom keybinds](#optional-custom-keybinds)), Cleanup & Guards, Post-Processing/Notifications, and a **Clip Editor** tab (the trimmed-clip output folder and VLC location — see [Optional: clip editor](#optional-clip-editor)).
 
 - **Save** writes `config.json` and closes the window, with a reminder that a restart may be necessary for some settings to take effect (config is only read at startup, so changes don't apply to the already-running watcher).
 - **Save and Restart** writes `config.json` and immediately relaunches the whole app (stops any active recording first, same as a normal Quit) so every setting takes effect right away.
@@ -278,6 +292,8 @@ Instead of hand-editing `config.json`, right-click the tray icon → **Edit Sett
 The editor always reloads `config.json` fresh when opened and only overwrites the fields shown in the form, so any advanced/unlisted key you've hand-added is left untouched.
 
 ## Optional: isolate game audio
+
+**Windows only** for now — see [Known limitations](#known-limitations) for why Linux/macOS don't have this yet.
 
 If your recordings pick up Discord, Spotify, or other background app audio alongside the game, OBS's **Application Audio Capture** source can isolate just the game's audio — it captures a chosen process's audio output directly, regardless of what else is playing. This script can optionally point that source at whichever game it just detected, so you don't have to re-target it by hand every time you switch games. Just set `obs.game_audio_capture.enabled` to `true` in `config.json` (or **Edit Settings... → OBS tab → Game Audio Isolation**) — the app creates the `Game Audio` **Application Audio Capture** source in OBS for you automatically the first time it's needed, nothing to add by hand. Set `obs.game_audio_capture.input_name` if you'd rather it use a different name (e.g. because you already have a similarly-purposed source under a different one).
 
@@ -360,11 +376,12 @@ OBS's WebSocket API doesn't report *why* a file split happened, so the script ca
 
 **Edit Settings... → Custom Keybinds** lets you set your own system-wide key combos (e.g. `Ctrl+Alt+S`) that call an OBS action directly over the WebSocket the instant they're pressed — Split Recording File, Save/Start/Stop/Toggle Replay Buffer, Start/Stop/Toggle Recording, or Pause/Resume/Toggle Recording Pause. Each row has an on/off checkbox, an action dropdown, Ctrl/Alt/Shift/Win modifier checkboxes, and a key (0-9, A-Z, or F1-F12).
 
-This is *not* OBS hotkey rebinding, and doesn't touch OBS's own Hotkeys settings at all: obs-websocket (the protocol this app talks to OBS with) has no API to read or change what physical key OBS itself has a hotkey bound to. Instead, this app registers its own keybinds directly with Windows and calls the matching WebSocket request when one fires — completely independent of, and in addition to, whatever's set in OBS's own **Settings → Hotkeys** dialog. That means:
+This is *not* OBS hotkey rebinding, and doesn't touch OBS's own Hotkeys settings at all: obs-websocket (the protocol this app talks to OBS with) has no API to read or change what physical key OBS itself has a hotkey bound to. Instead, this app registers its own keybinds directly with the OS (Win32 `RegisterHotKey` on Windows, `XGrabKey` on Linux/X11, a Quartz event tap on macOS) and calls the matching WebSocket request when one fires — completely independent of, and in addition to, whatever's set in OBS's own **Settings → Hotkeys** dialog. That means:
 
 - They work even if you've never opened OBS's Hotkeys page.
 - They only fire while this app is running, and only actually do anything while OBS is running and connected (a keybind pressed with OBS closed just logs a warning).
-- A key combo already claimed by another running app (or by OBS itself, or Windows) may fail to register — check `autostart_script.log` at startup for "Could not register custom keybind..." if one doesn't seem to work, and try a different combo.
+- **Linux**: needs a real X11 session — there's no unprivileged global-hotkey API under Wayland at all, so this feature is unavailable there (logged once, not a crash). **macOS**: needs Accessibility permission (System Settings → Privacy & Security → Accessibility) — the app requests it and tells you clearly if it's still missing.
+- A key combo already claimed by another running app (or by OBS itself, or the OS) may fail to register — check `autostart_script.log` at startup for "Could not register custom keybind..." if one doesn't seem to work, and try a different combo. On Linux/X11, an already-claimed combination can't be detected as a registration failure at all (X11 has no way to report that back) — it just silently never fires, which looks the same as not being registered yet.
 - Changes here take effect on the next app restart (**Save and Restart**, or **Restart App** from the tray), same as other settings.
 - **Split Recording File** automatically ticks OBS's own **Automatically split file** option in Settings → Output the moment it's used, if it isn't already on — see [Optional: split recording files](#optional-split-recording-files) for why OBS requires that even for a manual split.
 
@@ -372,11 +389,11 @@ This is *not* OBS hotkey rebinding, and doesn't touch OBS's own Hotkeys settings
 
 ## Optional: more launchers
 
-Beyond the process/window list, Steam, and Epic, three more launchers can be auto-detected:
+Beyond the process/window list, Steam, and Epic, three more launchers can be auto-detected — each only on the OSes that launcher itself actually ships a native client for; a launcher with no client on your OS at all simply has nothing to detect, not a bug:
 
-- **GOG Galaxy** — fully automatic, no setup needed. Reads installed games straight from the registry (`HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\GOG.com\Games`), the same place GOG Galaxy itself keeps track of them.
-- **Xbox app / PC Game Pass** — automatic if you used the default install location. PC Game Pass installs each game as its own top-level folder (e.g. `C:\XboxGames\Halo Infinite\...`); set `xbox.install_dirs` if you chose a different install location.
-- **Battle.net** — Blizzard doesn't expose a shared manifest or install root the way the others do, so this only works once you tell it where to look. Set `battlenet.install_dirs` to the parent folder(s) containing your Battle.net games (e.g. `["D:\\Games\\Battle.net"]`) and `battlenet.enabled` to `true`; each immediate subfolder is treated as a game, the same way Steam/Xbox detection works.
+- **GOG Galaxy** (**Windows only**) — fully automatic, no setup needed. Reads installed games straight from the registry (`HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\GOG.com\Games`), the same place GOG Galaxy itself keeps track of them. The Galaxy client has never shipped for Linux or macOS at all (GOG's separate DRM-free Linux/Mac installers for individual games aren't something this can hook into).
+- **Xbox app / PC Game Pass** (**Windows only** — it's a UWP app, no Linux/macOS client exists) — automatic if you used the default install location. PC Game Pass installs each game as its own top-level folder (e.g. `C:\XboxGames\Halo Infinite\...`); set `xbox.install_dirs` if you chose a different install location.
+- **Battle.net** (**Windows and macOS**; no native Linux client) — Blizzard doesn't expose a shared manifest or install root the way the others do, so this only works once you tell it where to look. Set `battlenet.install_dirs` to the parent folder(s) containing your Battle.net games (e.g. `["D:\\Games\\Battle.net"]` on Windows, `["/Applications/Battle.net/Games"]`-style paths on macOS) and `battlenet.enabled` to `true`; each immediate subfolder is treated as a game, the same way Steam/Xbox detection works.
 
 ## Optional: game subfolders
 
@@ -405,7 +422,7 @@ Setting `obs.replay_buffer.enabled` to `true` starts OBS's replay buffer wheneve
 
 Setting `post_record_transcode.enabled` to `true` runs each finished recording through `ffmpeg` in the background right after it's renamed. `post_record_transcode.args` are passed to `ffmpeg` between the input and output file — customize these for whatever codec/quality/size tradeoff you want (the default re-encodes to H.264/AAC at a moderate quality, mainly to shrink OBS's typically larger native output, and includes `-map 0` so every audio track survives the re-encode rather than just the first one). The output filename gets `post_record_transcode.suffix` appended; set `post_record_transcode.delete_original` to `true` to remove the original once the transcode succeeds. By default the output keeps the original file's extension — set `post_record_transcode.output_extension` (e.g. `.mp4`) to convert it to a different container.
 
-**No ffmpeg installed yet?** **Edit Settings... → Post-Processing** shows an **Install ffmpeg via winget** button and a manual download link instead of the usual options, since there's nothing useful to configure until ffmpeg actually exists somewhere on the PC. Installing it (either way) switches the panel over to the full options automatically, no need to reopen Settings. Any value already saved in `config.json` from before ffmpeg went missing (or before it's installed yet) is preserved either way, even while its controls are hidden.
+**No ffmpeg installed yet?** **Edit Settings... → Post-Processing** shows an **Install ffmpeg** button (via `winget` on Windows, Homebrew on macOS) and a manual download link instead of the usual options, since there's nothing useful to configure until ffmpeg actually exists somewhere on the PC. Installing it (either way) switches the panel over to the full options automatically, no need to reopen Settings. Any value already saved in `config.json` from before ffmpeg went missing (or before it's installed yet) is preserved either way, even while its controls are hidden.
 
 **Finding ffmpeg:** this feature needs `ffmpeg` actually installed somewhere on the PC — most users don't have it by default, which is why the [installer](#quick-install-recommended) already tries to install it for you automatically via `winget`. If you skipped that or it couldn't find `winget`, leave `post_record_transcode.ffmpeg_path` as `"ffmpeg"` (the default) and the app will look for it on your `PATH` automatically; if that fails, **Edit Settings... → Post-Processing → Auto-detect ffmpeg** searches the install locations of common Windows package managers (winget, Chocolatey, Scoop) and a few common manual-install folders, and fills in the exact path if it finds one. If nothing's found anywhere, install ffmpeg first (e.g. `winget install ffmpeg`, or download from ffmpeg.org), then auto-detect again, or use **Browse...** to point the field at `ffmpeg.exe` by hand. The same auto-detect fallback also runs automatically at transcode time if the configured path stops resolving (e.g. ffmpeg got reinstalled elsewhere).
 
@@ -426,24 +443,41 @@ Right-click the tray icon → **Edit Clips...** for a simple built-in editor: pr
 - **Fast vs. Precise** — by default, trimming is a lossless, near-instant stream copy (no re-encoding), but the actual cut snaps to the nearest keyframe at or before your chosen start point, which can land a couple of seconds off depending on the recording's keyframe interval. Tick **Precise (slower, frame-accurate)** for an exact cut instead — it re-encodes across the cut, so it takes longer and isn't lossless.
 - **Deleting the original** — set `clip_editor.delete_original_after_trim` to `true` to remove the source recording once a trim succeeds. Exactly like [post-record transcode](#optional-post-record-transcode), the source is *never* deleted unless the trim actually verifiably succeeded (the output file exists and isn't empty) — a failed trim always leaves the original untouched.
 
-**Needs VLC** for the preview (nothing else in this app uses it — recording itself never requires VLC). If VLC isn't found, **Edit Clips...** opens a small install prompt instead of a broken editor: an **Install VLC via winget** button (when `winget` is available) plus a manual download link, the same pattern as ffmpeg's install prompt in Post-Processing. Installing switches straight to the real editor, no need to try **Edit Clips...** a second time. To point at a specific install (e.g. you have more than one), set `clip_editor.vlc_path` to its folder in **Edit Settings... → Clip Editor**, otherwise it's auto-detected via the registry key VLC itself writes on install.
+**Needs VLC** for the preview (nothing else in this app uses it — recording itself never requires VLC). If VLC isn't found, **Edit Clips...** opens a small install prompt instead of a broken editor: an **Install VLC** button (`winget` on Windows, Homebrew on macOS, when available) plus a manual download link, the same pattern as ffmpeg's install prompt in Post-Processing. Installing switches straight to the real editor, no need to try **Edit Clips...** a second time. To point at a specific install (e.g. you have more than one), set `clip_editor.vlc_path` to its folder in **Edit Settings... → Clip Editor**, otherwise it's auto-detected (via the registry key VLC itself writes on install, on Windows; via its usual install locations on Linux/macOS).
 
 ## Optional: notifications
 
-Setting `notifications.enabled` to `true` shows a Windows toast notification (via the tray icon, so no extra permissions or setup needed) for: recording started/stopped, OBS restarted (hung or memory-bloated), OBS unreachable, low disk space, a short clip deleted, and no-audio detected. These mirror the corresponding log messages, so nothing shown as a notification is exclusive to it — check the log if you missed one.
+Setting `notifications.enabled` to `true` shows a desktop notification (via the tray icon, so no extra permissions or setup needed on Windows/macOS) for: recording started/stopped, OBS restarted (hung or memory-bloated), OBS unreachable, low disk space, a short clip deleted, and no-audio detected. These mirror the corresponding log messages, so nothing shown as a notification is exclusive to it — check the log if you missed one.
+
+On Linux, this depends on your desktop environment actually having a notification daemon running (true for essentially every mainstream desktop) — if notifications silently don't appear there, check the log for the corresponding message instead; the app never fails or blocks on a missing notification backend either way.
 
 ## Known limitations
 
-- Windows has one system tray total — it isn't per-monitor. Use the floating overlay if you need status visible on a specific monitor.
+**Cross-platform gaps** (Windows has full parity; these are Linux/macOS-specific):
+
+- **Game audio isolation** ([Optional: isolate game audio](#optional-isolate-game-audio)) is **Windows only** for now. It's built on OBS's WASAPI-specific process-audio-capture source, which has no drop-in equivalent on Linux (PipeWire) or macOS (CoreAudio) yet — an investigation into the real per-OS OBS source-type schema found that OBS's own Linux build doesn't currently expose a distinct per-application audio-capture source at all under its own generic PulseAudio-compatible capture kinds, at least in the configuration tested; this needs more real-hardware investigation before it can be built. `obs.multi_track_audio.app_captures`-based routing has the same Windows-only dependency.
+- **Custom keybinds** and **Minecraft-style window-title rules** need a real **X11** session on Linux — Wayland has no unprivileged API for either a global hotkey or reading another window's title, so both quietly do nothing (logged once) under Wayland rather than crashing. On macOS, custom keybinds need **Accessibility permission** (System Settings → Privacy & Security → Accessibility); the app requests it and tells you clearly if it's still missing.
+- **macOS is Apple Silicon (arm64) only** for now — the build couldn't be made universal (Intel + Apple Silicon in one binary) because `numpy` doesn't publish a universal2 wheel at all. Real Intel Mac support would need a separate Intel build, not currently produced.
+- **Desktop shortcut** (an icon you double-click, separate from auto-start) is a **Windows-only** installer option right now; Linux/macOS don't get an equivalent yet. Auto-start-at-login itself (see [Run automatically at login](#4-run-automatically-at-login)) works on all 3 OSes.
+- The clip editor's video embedding on macOS uses a PyObjC bridge to get a real NSView from Tk's own window handle, which is the least-confidently-verified piece of this app's macOS port (not verified against real Mac hardware as of this writing) — if the video preview shows up blank on macOS, this is the most likely cause; the rest of the clip editor (trimming, file handling) is unaffected either way.
+- GOG Galaxy, the Xbox app/PC Game Pass, and Battle.net auto-detection are scoped to whichever OSes those launchers actually ship a native client for — see the config table above and [Optional: more launchers](#optional-more-launchers) for exactly which OS each one works on.
+
+**Everything else** (applies equally on every OS):
+
+- One system tray total per OS — it isn't per-monitor. Use the floating overlay if you need status visible on a specific monitor.
 - Steam-game auto-detection matches by folder location, not a games database, so a handful of non-game Steam apps may need adding to `steam.exclude_keywords` if they cause false positives (Wallpaper Engine is excluded by default). The same applies to `xbox.exclude_keywords` and `battlenet.exclude_keywords`.
-- Epic-game auto-detection reads the Epic Games Launcher's local install manifests (`%PROGRAMDATA%\Epic\EpicGamesLauncher\Data\Manifests`), so a game only shows up once it's been installed at least once through the launcher.
+- Epic-game auto-detection reads the Epic Games Launcher's local install manifests (`%PROGRAMDATA%\Epic\EpicGamesLauncher\Data\Manifests` on Windows, `~/Library/Application Support/Epic/EpicGamesLauncher/Data/Manifests` on macOS), so a game only shows up once it's been installed at least once through the launcher.
 - GOG Galaxy auto-detection reads from the registry, so a game only shows up once it's been installed at least once through GOG Galaxy.
 - Battle.net auto-detection requires manually configuring `battlenet.install_dirs` — there's no manifest or shared install root to read automatically.
 - The silent-recording check only looks at OBS's own input audio meters; if a source is capturing audio but OBS itself reports zero level (e.g. a genuinely misconfigured capture), it'll correctly flag as silent, but it can't detect audio that's present but wrong (e.g. a completely different application's audio).
 - The installer's automatic OBS WebSocket configuration only works if OBS has been run at least once already (so its settings folder exists) and isn't currently running at install time; otherwise the installer falls back to showing you the password to paste in manually. It also only writes to OBS's *default* settings profile.
 - Multi-track audio's recording-folder handoff (`obs.multi_track_audio`) and `obs.output_folder` both need obs-websocket 5.3+ (bundled with OBS 29+); on older OBS versions the dedicated multi-track profile is still created but its recording folder isn't cloned from your original profile, and `obs.output_folder` silently has no effect (check the log). Track routing and Advanced-mode/track-count setup work on any OBS 28+ install.
-- The installer's **Easy Install** button for OBS and its automatic `ffmpeg` install both need `winget` (present by default on current Windows 10/11, via the App Installer). Without it, both fall back to their manual alternatives (a download link, or installing `ffmpeg` yourself later) rather than failing setup.
-- [Custom keybinds](#optional-custom-keybinds) are system-wide, so a combo already claimed by another running app, or reserved by OBS/Windows itself, may fail to register — try a different combo if one doesn't seem to fire.
+- The installer's **Easy Install** button for OBS and its automatic `ffmpeg` install need `winget` on Windows (present by default on current Windows 10/11, via the App Installer) or Homebrew on macOS. Without one, both fall back to their manual alternatives (a download link, or installing `ffmpeg` yourself later) rather than failing setup. Linux never does a silent install at all by design — see [Quick install](#quick-install-recommended).
+- [Custom keybinds](#optional-custom-keybinds) are system-wide, so a combo already claimed by another running app, or reserved by OBS/the OS itself, may fail to register — try a different combo if one doesn't seem to fire. On Linux/X11 specifically, an already-claimed combination can't even be detected as a failure (no error is reported back) — it just silently never fires; there's no in-app way to tell that apart from a combo that isn't registered at all yet.
 - The [clip editor](#optional-clip-editor)'s default (fast) trim mode always snaps to the nearest keyframe at or before your chosen start point — expected behavior, not a bug, and the tradeoff for it being lossless and near-instant. Use **Precise** mode if you need an exact cut.
 - The clip editor's fast trim mode is a pure stream copy (no re-encoding) into whatever container the output file extension implies, so trimming into a different container than the source (e.g. an MKV recording trimmed to a `.mp4` output) inherits the same audio-codec-compatibility caveat as [post-record transcode](#optional-post-record-transcode)'s remux preset — in practice this is a non-issue for OBS's own default recording codecs, but an unusual codec combination could produce a file some players won't open. Precise mode re-encodes, avoiding this entirely.
 - The clip editor has no cancel button once a trim is running (only Precise/re-encoding trims of a large clip take long enough for this to matter) and only one instance of the editor can be open at a time, same as the Settings editor.
+
+## For contributors: how the cross-platform port works
+
+This app was originally Windows-only; Linux and macOS support was added via a platform-abstraction layer described in detail in [CROSS_PLATFORM_PLAN.md](CROSS_PLATFORM_PLAN.md) — the OS-specific backends (`platform_windows.py`/`platform_linux.py`/`platform_macos.py`, dispatched through `platform_common.py`), what's verified to actually work (including real findings from CI, like the game-audio-isolation and macOS-universal2 investigations above), and what's still flagged as needing real hardware to confirm. Worth reading before touching any OS-specific code path.

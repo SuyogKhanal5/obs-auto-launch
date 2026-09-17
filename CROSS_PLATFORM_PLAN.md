@@ -1,8 +1,10 @@
 # Cross-Platform (Linux/macOS) Migration Plan
 
-Branch: `os-independent`. This document is the working plan for porting OBS Auto Recorder from Windows-only to Windows + Linux + macOS, maximizing shared code between all three so a bug fixed on one platform is fixed (or trivially portable) on the others.
+**Status: Phases 0-8 complete and CI-verified; this document is kept as the technical record of *why* the architecture looks the way it does and *what was actually confirmed working* (vs. guessed), not archived — read it before touching any OS-specific code path.** Phase 6 (game audio isolation) is the one open exception: it concluded at the research-spike stage with a real, documented negative/blocked finding rather than shipped code (§6.1) — see that section before assuming this feature exists on Linux/macOS. For user-facing setup/usage docs, see [README.md](README.md), which now also has OS-specific instructions throughout (Phase 9).
 
-This is a planning document, not a changelog — update it as work proceeds (check off phases, correct wrong assumptions, add discovered issues) rather than treating it as frozen.
+Branch: `os-independent`. This document was the working plan for porting OBS Auto Recorder from Windows-only to Windows + Linux + macOS, maximizing shared code between all three so a bug fixed on one platform is fixed (or trivially portable) on the others.
+
+This was a planning document, not a changelog, while the migration was in progress — updated as work proceeded (phases checked off, wrong assumptions corrected, discovered issues added) rather than treated as frozen. It's kept in that same updated-in-place form now that the migration itself is done, since the reasoning and real findings throughout remain the most complete explanation of this codebase's cross-platform design.
 
 ---
 
