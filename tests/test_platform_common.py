@@ -263,9 +263,15 @@ class RunLinuxInstallCommandDispatchTests(unittest.TestCase):
 
 class ObsConfigDirTests(unittest.TestCase):
     def test_windows_uses_appdata(self):
-        with unittest.mock.patch.dict(os.environ, {"APPDATA": r"C:\Users\Test\AppData\Roaming"}, clear=False):
+        # Built with os.path.join, the same way the real function does -- os.path.join on a
+        # backslash-containing *input* string behaves differently depending on which real OS
+        # runs the test (ntpath treats "\" as a separator, posixpath treats it as a literal
+        # character), so only a same-mechanism comparison is correct on every OS this suite
+        # actually runs on, per CROSS_PLATFORM_PLAN.md §3.2.
+        appdata = r"C:\Users\Test\AppData\Roaming"
+        with unittest.mock.patch.dict(os.environ, {"APPDATA": appdata}, clear=False):
             result = pc.obs_config_dir(platform_name="win32")
-        self.assertEqual(result, r"C:\Users\Test\AppData\Roaming\obs-studio")
+        self.assertEqual(result, os.path.join(appdata, "obs-studio"))
 
     def test_windows_returns_none_when_appdata_unset(self):
         with unittest.mock.patch.dict(os.environ, {}, clear=True):
