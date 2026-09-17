@@ -125,9 +125,19 @@ jobs:
         if: runner.os == 'macOS'
         run: hdiutil create -volname "OBS Auto Recorder" -srcfolder dist/OBSAutoRecorder.app -ov -format UDZO dist/OBSAutoRecorder-macos-arm64.dmg
 
+      - name: Zip the .app bundle for installer embedding (macOS)
+        if: runner.os == 'macOS'
+        # A plain --add-data of the .app bundle directory made PyInstaller's own macOS
+        # codesigning pass choke on the Mach-O binary it found nested inside (confirmed live:
+        # `codesign` failed with exit code 1 trying to re-sign OBSAutoRecorder.app/Contents/MacOS/
+        # OBSAutoRecorder as if it were one of the INSTALLER's own binaries). A zip has no binary
+        # for PyInstaller's Analysis step to find at all -- installer.py extracts it back out at
+        # install time instead of a plain directory copy (see its own app_relative_path()).
+        run: (cd dist && zip -r -y OBSAutoRecorder-app.zip OBSAutoRecorder.app)
+
       - name: Build installer binary (macOS)
         if: runner.os == 'macOS'
-        run: pyinstaller --onefile --name OBSAutoRecorderInstaller-macos-arm64 --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder.app:OBSAutoRecorder.app" --add-data "${{ github.workspace }}/config.example.json:." installer.py
+        run: pyinstaller --onefile --name OBSAutoRecorderInstaller-macos-arm64 --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder-app.zip:." --add-data "${{ github.workspace }}/config.example.json:." installer.py
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

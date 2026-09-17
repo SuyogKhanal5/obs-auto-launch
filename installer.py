@@ -20,6 +20,7 @@ import sys
 import threading
 import tkinter as tk
 import webbrowser
+import zipfile
 from tkinter import filedialog, messagebox, ttk
 
 import psutil
@@ -35,6 +36,23 @@ APP_INTERNAL_DIR_NAME = "_internal"  # PyInstaller onedir's support-files subfol
 # bundle whose real executable lives at Contents/MacOS/OBSAutoRecorder (macOS) -- see
 # CROSS_PLATFORM_PLAN.md Phase 7 / .github/workflows/build-release.yml for how each is built.
 EXE_NAME = platform_common.example_executable_name("OBSAutoRecorder")
+APP_BUNDLE_NAME = f"{APP_FOLDER_NAME}.app"  # macOS only
+# macOS embeds the .app bundle as a zip (see build-release.yml) rather than a plain data
+# directory -- PyInstaller's own macOS codesigning pass tries to re-sign a Mach-O binary it finds
+# nested inside embedded *data*, which fails; a zip has no binary for it to find at all. Not used
+# on Windows/Linux, which embed the onedir folder directly.
+APP_BUNDLE_ZIP_NAME = "OBSAutoRecorder-app.zip"
+
+
+def app_relative_path():
+    """Path to the real launchable executable, relative to install_dir. Just EXE_NAME everywhere
+    except macOS, where the app ships as a .app bundle (a directory), not a bare executable, so
+    the actual Mach-O binary lives nested inside it."""
+    if sys.platform == "darwin":
+        return os.path.join(APP_BUNDLE_NAME, "Contents", "MacOS", EXE_NAME)
+    return EXE_NAME
+
+
 # Per-user install locations (CROSS_PLATFORM_PLAN.md §2.8) -- none of the 3 need elevation for
 # the app install itself (a separate concern from installing system packages like ffmpeg/OBS via
 # platform_common.install_optional_dependency/run_linux_install_command, which does need root on
@@ -224,7 +242,7 @@ def build_config(template, obs_path, password, options):
 
 
 def is_existing_install(install_dir):
-    return os.path.isfile(os.path.join(install_dir, EXE_NAME))
+    return os.path.isfile(os.path.join(install_dir, app_relative_path()))
 
 
 def do_install(install_dir, obs_path, options, on_progress, write_config=True):
@@ -232,14 +250,21 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
     os.makedirs(install_dir, exist_ok=True)
 
     on_progress("Copying application files...")
-    # The app ships as a PyInstaller onedir build (an exe plus an _internal/ folder of support
-    # files) rather than onefile -- deliberately, since onefile re-extracts itself to a fresh
-    # %TEMP% folder on every single launch, which antivirus real-time scanning can intermittently
-    # fail to clean up (a widely-reported PyInstaller/Defender interaction). Onedir runs directly
-    # from where it's installed, so that whole failure mode doesn't exist. Embedded here as a
-    # whole folder (APP_FOLDER_NAME) rather than a single file; dirs_exist_ok=True lets Update
-    # overwrite an existing install in place.
-    shutil.copytree(resource_path(APP_FOLDER_NAME), install_dir, dirs_exist_ok=True)
+    if sys.platform == "darwin":
+        # The .app bundle is embedded as a zip, not a plain data directory -- see
+        # APP_BUNDLE_ZIP_NAME's own docstring for why. Extracting overwrites an existing install
+        # in place, same as copytree's dirs_exist_ok=True does for the other two OSes below.
+        with zipfile.ZipFile(resource_path(APP_BUNDLE_ZIP_NAME)) as zf:
+            zf.extractall(install_dir)
+    else:
+        # The app ships as a PyInstaller onedir build (an exe plus an _internal/ folder of
+        # support files) rather than onefile -- deliberately, since onefile re-extracts itself to
+        # a fresh %TEMP% folder on every single launch, which antivirus real-time scanning can
+        # intermittently fail to clean up (a widely-reported PyInstaller/Defender interaction).
+        # Onedir runs directly from where it's installed, so that whole failure mode doesn't
+        # exist. Embedded here as a whole folder (APP_FOLDER_NAME) rather than a single file;
+        # dirs_exist_ok=True lets Update overwrite an existing install in place.
+        shutil.copytree(resource_path(APP_FOLDER_NAME), install_dir, dirs_exist_ok=True)
 
     password = None
     obs_ws_configured = None
@@ -260,7 +285,7 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
     on_progress("Checking for ffmpeg...")
     ffmpeg_status = ensure_ffmpeg(on_progress)
 
-    exe_path = os.path.join(install_dir, EXE_NAME)
+    exe_path = os.path.join(install_dir, app_relative_path())
 
     if options.get("desktop_shortcut"):
         on_progress("Creating desktop shortcut...")
@@ -298,7 +323,13 @@ def do_uninstall(install_dir, keep_config, on_progress):
     internal_dir = os.path.join(install_dir, APP_INTERNAL_DIR_NAME)
     if os.path.isdir(internal_dir):
         shutil.rmtree(internal_dir, ignore_errors=True)
-    for name in (EXE_NAME, "autostart_script.log"):
+    if sys.platform == "darwin":
+        # The .app bundle is a directory, not a file -- os.remove would just raise on it (caught
+        # below, but silently leaving the whole bundle behind instead of actually uninstalling).
+        bundle_path = os.path.join(install_dir, APP_BUNDLE_NAME)
+        if os.path.isdir(bundle_path):
+            shutil.rmtree(bundle_path, ignore_errors=True)
+    for name in ((EXE_NAME,) if sys.platform != "darwin" else ()) + ("autostart_script.log",):
         try:
             path = os.path.join(install_dir, name)
             if os.path.isfile(path):
@@ -1048,7 +1079,7 @@ def main():
     def finish():
         if launch_var.get() and current["install_dir"]:
             try:
-                subprocess.Popen([os.path.join(current["install_dir"], EXE_NAME)], cwd=current["install_dir"])
+                subprocess.Popen([os.path.join(current["install_dir"], app_relative_path())], cwd=current["install_dir"])
             except OSError:
                 pass
         root.destroy()
