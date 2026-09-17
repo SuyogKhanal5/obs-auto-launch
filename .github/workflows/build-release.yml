@@ -2,10 +2,12 @@ name: Build and release
 
 # CROSS_PLATFORM_PLAN.md Phase 7 -- builds all 3 OSes' native artifacts in one run: Windows
 # (onedir zip + a UAC-elevated onefile installer exe, unchanged from before this phase), Linux
-# (onedir tar.gz + an AppImage, plus a onefile installer binary), macOS (a universal2 .app wrapped
-# in a .dmg, plus a universal2 onefile installer binary). Manual-trigger only (workflow_dispatch);
-# release creation itself only fires on a tag push or main, same as before -- triggering this on
-# any other branch just builds and uploads artifacts for inspection, no public release involved.
+# (onedir tar.gz + an AppImage, plus a onefile installer binary), macOS (a native-arch .app
+# wrapped in a .dmg, plus a matching installer binary -- universal2 turned out not to be possible
+# at all, see the macOS build step's own comment for why). Manual-trigger only
+# (workflow_dispatch); release creation itself only fires on a tag push or main, same as before --
+# triggering this on any other branch just builds and uploads artifacts for inspection, no public
+# release involved.
 
 on:
   workflow_dispatch:
@@ -105,43 +107,27 @@ jobs:
         run: pyinstaller --onefile --name OBSAutoRecorderInstaller-linux --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder:OBSAutoRecorder" --add-data "${{ github.workspace }}/config.example.json:." installer.py
 
       # ---------------- macOS ----------------
-      - name: Prefer universal2 wheels for compiled dependencies (macOS)
+      # universal2 was attempted first per CROSS_PLATFORM_PLAN.md §7.4 and is NOT currently
+      # possible: numpy doesn't publish a universal2 wheel on PyPI at all (confirmed live -- `pip
+      # download --platform macosx_11_0_universal2 numpy` itself fails with "no matching
+      # distribution", not a PyInstaller-side error), so there's no way to get a fat binary for
+      # it without building numpy from source for both architectures and merging them by hand.
+      # This is exactly the fallback §7.4 named as an acceptable outcome: a native-arch build
+      # instead of one universal binary. GitHub's macos-latest runner is Apple Silicon (arm64),
+      # so this currently ships an Apple Silicon-only build; real Intel Mac support would need
+      # either an x86_64 runner/cross-build (e.g. via Rosetta 2, not attempted here) or someone
+      # building on real Intel hardware -- tracked as follow-up, not blocking this phase.
+      - name: Build app (.app bundle, native arch)
         if: runner.os == 'macOS'
-        # A plain `pip install` on an Apple Silicon runner picks the arm64-only wheel for a
-        # compiled package even when a universal2 (fat binary) wheel is also published, since
-        # pip prefers the more specific platform tag -- confirmed live: PIL._imaging.cpython-
-        # 312-darwin.so (Pillow's own core C extension, not an optional one) came back
-        # arm64-only, breaking --target-arch universal2 below entirely regardless of the
-        # PIL._avif exclusion. Explicitly downloading the universal2-tagged wheel and
-        # force-installing it is the standard fix; if PyPI doesn't actually publish one for a
-        # given package, this step fails here with a clear "no matching distribution" error
-        # instead of a confusing PyInstaller-side failure later.
-        run: |
-          mkdir -p /tmp/universal2-wheels
-          pip download --no-deps --only-binary=:all: --python-version 3.12 --platform macosx_11_0_universal2 --dest /tmp/universal2-wheels numpy Pillow psutil
-          pip install --force-reinstall /tmp/universal2-wheels/*.whl
-
-      - name: Build app (.app bundle, universal2)
-        if: runner.os == 'macOS'
-        # --target-arch universal2 needs every dependency to actually ship a universal2 (or both
-        # arm64 and x86_64) wheel -- not yet independently confirmed for this project's full
-        # dependency set (numpy, Pillow, python-vlc, psutil, pystray, obsws-python) before the
-        # step above; this build step is itself the confirmation per
-        # CROSS_PLATFORM_PLAN.md §7.4's own note. A failure here means falling back to separate
-        # Intel/ARM builds instead of one universal binary.
-        # PIL._avif (an optional AVIF-codec extension Pillow bundles, unrelated to anything this
-        # app actually uses -- it only needs PIL.Image/ImageDraw for the tray icon) ships as an
-        # arm64-only .so even in the universal2 wheel; excluded rather than abandoning the
-        # universal2 build over an unused optional codec.
-        run: pyinstaller --windowed --name OBSAutoRecorder --target-arch universal2 --exclude-module PIL._avif --distpath dist --workpath build --specpath build autostart_script.py
+        run: pyinstaller --windowed --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
 
       - name: Package DMG (macOS)
         if: runner.os == 'macOS'
-        run: hdiutil create -volname "OBS Auto Recorder" -srcfolder dist/OBSAutoRecorder.app -ov -format UDZO dist/OBSAutoRecorder-macos.dmg
+        run: hdiutil create -volname "OBS Auto Recorder" -srcfolder dist/OBSAutoRecorder.app -ov -format UDZO dist/OBSAutoRecorder-macos-arm64.dmg
 
-      - name: Build installer binary (macOS universal2)
+      - name: Build installer binary (macOS)
         if: runner.os == 'macOS'
-        run: pyinstaller --onefile --name OBSAutoRecorderInstaller-macos --target-arch universal2 --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder.app:OBSAutoRecorder.app" --add-data "${{ github.workspace }}/config.example.json:." installer.py
+        run: pyinstaller --onefile --name OBSAutoRecorderInstaller-macos-arm64 --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder.app:OBSAutoRecorder.app" --add-data "${{ github.workspace }}/config.example.json:." installer.py
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -154,8 +140,8 @@ jobs:
             dist/OBSAutoRecorder-linux.tar.gz
             dist/OBSAutoRecorder-x86_64.AppImage
             dist/OBSAutoRecorderInstaller-linux
-            dist/OBSAutoRecorder-macos.dmg
-            dist/OBSAutoRecorderInstaller-macos
+            dist/OBSAutoRecorder-macos-arm64.dmg
+            dist/OBSAutoRecorderInstaller-macos-arm64
             config.example.json
 
   release:
@@ -173,7 +159,7 @@ jobs:
       - name: Flatten artifacts into one release-assets folder
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name "*.zip" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.dmg" -o -name "OBSAutoRecorderInstaller-linux" -o -name "OBSAutoRecorderInstaller-macos" \) -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name "*.zip" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.dmg" -o -name "OBSAutoRecorderInstaller-linux" -o -name "OBSAutoRecorderInstaller-macos-arm64" \) -exec cp {} release-assets/ \;
           ls -la release-assets
 
       - name: Create versioned GitHub release
