@@ -1,7 +1,7 @@
 """macOS backend for platform_common.py -- see CROSS_PLATFORM_PLAN.md for the full migration
 schedule.
 
-Minimum target: macOS 13 (Ventura) -- see CROSS_PLATFORM_PLAN.md §2.6."""
+Minimum target: macOS 14.4 (Sonoma) -- see CROSS_PLATFORM_PLAN.md §2.6."""
 import glob
 import logging
 import os

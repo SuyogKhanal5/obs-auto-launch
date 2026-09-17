@@ -19,14 +19,17 @@ jobs:
   build:
     strategy:
       fail-fast: false
-      # macos-latest (Apple Silicon/arm64) and macos-13 (Intel/x86_64 -- the last Intel-based
-      # GitHub-hosted macOS image) both build the macOS steps below natively on their own real
-      # architecture -- this sidesteps the wheel-availability problems a cross-compiled
-      # --target-arch build would hit entirely (see the macOS build step's own comment on why
-      # universal2 itself isn't possible), since a plain `pip install` on each runner already
-      # gets the right per-arch wheel for numpy/Pillow/psutil with no special-casing needed.
+      # macos-latest (Apple Silicon/arm64) and macos-15-intel (Intel/x86_64) both build the macOS
+      # steps below natively on their own real architecture -- this sidesteps the
+      # wheel-availability problems a cross-compiled --target-arch build would hit entirely (see
+      # the macOS build step's own comment on why universal2 itself isn't possible), since a plain
+      # `pip install` on each runner already gets the right per-arch wheel for
+      # numpy/Pillow/psutil with no special-casing needed. macos-13 (the original Intel label
+      # used here) was retired by GitHub in Dec 2025; macos-15-intel is its replacement and is
+      # itself only guaranteed through Aug 2027, since Apple no longer ships Intel Macs at all --
+      # there will eventually be no Intel image left to build on.
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest, macos-13]
+        os: [windows-latest, ubuntu-latest, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -119,9 +122,9 @@ jobs:
       # itself fails with "no matching distribution", not a PyInstaller-side error), so there's no
       # way to get a fat binary for it without building numpy from source for both architectures
       # and merging them by hand. Building separately on each architecture's own native runner
-      # (macos-latest for Apple Silicon, macos-13 for Intel -- the last Intel-based GitHub-hosted
-      # macOS image) sidesteps that entirely: each gets a plain, correct, real per-arch wheel via
-      # ordinary `pip install`, no cross-compilation or wheel-forcing needed.
+      # (macos-latest for Apple Silicon, macos-15-intel for Intel) sidesteps that entirely: each
+      # gets a plain, correct, real per-arch wheel via ordinary `pip install`, no cross-compilation
+      # or wheel-forcing needed.
       - name: Detect macOS architecture
         if: runner.os == 'macOS'
         run: echo "MACOS_ARCH=$(uname -m)" >> "$GITHUB_ENV"
