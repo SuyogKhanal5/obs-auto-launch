@@ -335,6 +335,22 @@ class ExecutableFiletypesTests(unittest.TestCase):
         self.assertEqual(filetypes, (("All files", "*.*"),))
 
 
+class GuiRequiresMainThreadTests(unittest.TestCase):
+    # Confirmed live: running Tk off the real process main thread while pystray's tray icon pumps
+    # it (this app's default architecture, fine on Windows/Linux) crashes the whole process
+    # outright on macOS -- AppKit's hard main-thread-only requirement. See main()'s own use of
+    # this in autostart_script.py for the actual fix (icon.run_detached() + running the overlay's
+    # Tk mainloop directly on the real main thread, macOS only).
+    def test_true_on_macos(self):
+        self.assertTrue(pc.gui_requires_main_thread(platform_name="darwin"))
+
+    def test_false_on_windows(self):
+        self.assertFalse(pc.gui_requires_main_thread(platform_name="win32"))
+
+    def test_false_on_linux(self):
+        self.assertFalse(pc.gui_requires_main_thread(platform_name="linux"))
+
+
 class BackendModulesAreSafelyImportableFromAnyOsTests(unittest.TestCase):
     """CROSS_PLATFORM_PLAN.md §3.2's whole premise: a test on ANY one real OS can still exercise
     what another OS's backend module would do, via mocking -- which requires every backend module

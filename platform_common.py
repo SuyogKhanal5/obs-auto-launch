@@ -331,3 +331,16 @@ def process_audio_capture_settings(process_name, exe_path, platform_name=None):
     needs (e.g. exe_path is None because the process isn't running right now, or -- macOS only --
     it isn't inside a normal .app bundle at all)."""
     return _select_backend(platform_name).process_audio_capture_settings(process_name, exe_path)
+
+
+def gui_requires_main_thread(platform_name=None):
+    """True if this OS's GUI toolkit must run only on the real process main thread -- AppKit's
+    hard requirement on macOS. Confirmed live: this app's Tk GUI (the overlay, and everything
+    built as a Toplevel of its one tk.Tk() -- Settings, the clip editor) running on a background
+    thread while pystray's tray icon pumps the real main thread's Cocoa run loop (this app's
+    default architecture, fine on Windows/Linux) crashes the whole process outright the moment
+    anything actually triggers that run loop to spin -- an uncaught NSInvalidArgumentException
+    deep inside Tk's own color-handling code (GetRGBA/TkpGetColor), not a graceful failure or a
+    Python-catchable exception. False on Windows/Linux, where no such constraint exists."""
+    platform_name = sys.platform if platform_name is None else platform_name
+    return platform_name == "darwin"

@@ -8138,6 +8138,19 @@ def main():
     ]
     menu = pystray.Menu(*menu_items)
 
+    if platform_common.gui_requires_main_thread():
+        # A second, independent macOS constraint from the one gui_requires_main_thread's own
+        # docstring covers (confirmed live with a separate, minimal repro): Tk's own Cocoa
+        # integration must finish registering itself on the shared NSApplication *before*
+        # anything else (pystray.Icon() below, via PyObjC) touches it -- otherwise Tk's later
+        # widget creation calls an NSApplication method (added by Tk's own registration) that
+        # doesn't exist yet, crashing the whole process with an uncaught
+        # NSInvalidArgumentException. A throwaway Tk() that's never mapped to a real window (no
+        # mainloop, destroyed immediately) is enough to trigger that registration harmlessly.
+        primer = tk.Tk()
+        tk.Frame(primer)
+        primer.destroy()
+
     icon = pystray.Icon(
         "OBSAutoRecorder",
         icon=build_tray_image(IDLE_COLOR),
@@ -8169,22 +8182,44 @@ def main():
     def setup(icon):
         icon.visible = True
         watcher_thread.start()
-        overlay_thread.start()
+        # On macOS the overlay's Tk GUI runs directly on the real main thread instead (see
+        # platform_common.gui_requires_main_thread) -- started below, after icon.run_detached()
+        # returns, not here.
+        if not platform_common.gui_requires_main_thread():
+            overlay_thread.start()
         if keybind_thread:
             keybind_thread.start()
 
-    icon.run(setup=setup)
+    if platform_common.gui_requires_main_thread():
+        # AppKit requires all GUI work -- both pystray's own tray icon AND Tk's Aqua backend --
+        # to run on the real process main thread; confirmed live that the normal arrangement
+        # below (pystray owns the main thread via icon.run(), Tk runs on overlay_thread) crashes
+        # the whole process the instant anything actually pumps the main thread's Cocoa run
+        # loop. icon.run_detached() hands pystray's own event handling off to a background
+        # thread instead and returns immediately, freeing this (real main) thread to run the
+        # overlay's own Tk mainloop directly -- the same call overlay_thread would otherwise
+        # have made, just synchronous here instead of threaded.
+        icon.run_detached(setup=setup)
+        run_overlay(monitors, overlay_state, audio_state, status, stop_event)
+    else:
+        icon.run(setup=setup)
 
-    # icon.run() returns as soon as icon.stop() fires (from watcher_loop's finally, once
-    # stop_event is set), which can happen before the overlay thread's Tk mainloop -- polling
-    # stop_event only every 120ms -- has actually destroyed its root and released Tcl/Tk. Onefile
-    # PyInstaller builds extract their DLLs (including Tcl/Tk) to a temp dir and try to remove it
-    # right after the interpreter shuts down; if that thread (and its Tcl interpreter) is still
-    # winding down when the process exits, that removal can fail. Give both threads a moment to
-    # actually finish instead of leaving them to be hard-killed mid-shutdown.
+    # On Windows/Linux, icon.run() returns as soon as icon.stop() fires (from watcher_loop's
+    # finally, once stop_event is set), which can happen before overlay_thread's Tk mainloop --
+    # polling stop_event only every 120ms -- has actually destroyed its root and released
+    # Tcl/Tk. On macOS, run_overlay() above already blocked (on this same thread) until its own
+    # root.destroy() happened, so it's already fully wound down by this point -- this join is a
+    # no-op there, not a race. Onefile PyInstaller builds extract their DLLs (including Tcl/Tk)
+    # to a temp dir and try to remove it right after the interpreter shuts down; if a thread (and
+    # its Tcl interpreter) is still winding down when the process exits, that removal can fail --
+    # give watcher_thread a moment to actually finish instead of leaving it hard-killed mid-
+    # shutdown.
     stop_event.set()
     watcher_thread.join(timeout=5)
-    overlay_thread.join(timeout=5)
+    # On macOS, run_overlay() above already ran (and returned) directly on this thread instead
+    # of on overlay_thread, which was never started there -- nothing left to join.
+    if not platform_common.gui_requires_main_thread():
+        overlay_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
