@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
@@ -288,6 +289,23 @@ class SyncMultiTrackAudioAppCapturesTests(unittest.TestCase):
     used to only get that treatment once, at creation -- meaning the exact same OBS-side drift
     would leave them silently broken until someone noticed and fixed it by hand. This checks
     sync_multi_track_audio now re-asserts every configured app_captures entry on every call."""
+
+    def setUp(self):
+        # set_game_audio_capture_target's own orchestration is OS-agnostic -- mocking
+        # platform_common's two dispatch functions with Windows-shaped return values keeps these
+        # tests exercising that orchestration regardless of which real OS runs them, per
+        # platform_common.py's own testing philosophy (CROSS_PLATFORM_PLAN.md §3.2).
+        patcher1 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_kind", return_value="wasapi_process_output_capture",
+        )
+        patcher2 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_settings",
+            side_effect=lambda process_name, exe_path: {"window": f"::{process_name}", "priority": 2},
+        )
+        patcher1.start()
+        patcher2.start()
+        self.addCleanup(patcher1.stop)
+        self.addCleanup(patcher2.stop)
 
     def test_repoints_existing_app_capture_every_time(self):
         client = FakeObsClient(

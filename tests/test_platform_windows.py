@@ -477,14 +477,22 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
         self.mock_user32.CallNextHookEx.assert_called_once()
 
 
-@unittest.skipUnless(sys.platform == "win32", "constructs a real ctypes.wintypes.HWND")
-class ResolveEditorTopLevelWindowTests(unittest.TestCase):
-    def test_resolves_via_get_ancestor(self):
-        mock_user32 = unittest.mock.Mock()
-        mock_user32.GetAncestor.return_value = 999
-        with unittest.mock.patch.object(pw.ctypes, "windll", unittest.mock.Mock(user32=mock_user32)):
-            result = pw.resolve_editor_top_level_window(12345)
-        self.assertEqual(result, 999)
+class ProcessAudioCaptureSettingsTests(unittest.TestCase):
+    def test_kind_is_wasapi_process_output_capture(self):
+        self.assertEqual(pw.PROCESS_AUDIO_CAPTURE_KIND, "wasapi_process_output_capture")
+
+    def test_builds_exe_only_window_match(self):
+        settings = pw.process_audio_capture_settings("Balatro.exe", "C:\\Games\\Balatro.exe")
+        self.assertEqual(
+            settings, {"window": "::Balatro.exe", "priority": pw.WINDOW_MATCH_PRIORITY_EXE_FALLBACK},
+        )
+
+    def test_exe_path_is_accepted_but_unused(self):
+        # Windows resolves purely by process name -- exe_path only exists for signature parity
+        # with the macOS backend, which actually needs it to resolve a bundle identifier.
+        with_path = pw.process_audio_capture_settings("Balatro.exe", "C:\\Games\\Balatro.exe")
+        without_path = pw.process_audio_capture_settings("Balatro.exe", None)
+        self.assertEqual(with_path, without_path)
 
 
 if __name__ == "__main__":

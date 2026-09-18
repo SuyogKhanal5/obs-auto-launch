@@ -500,5 +500,16 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
                     )  # must not raise
 
 
+class ProcessAudioCaptureSettingsTests(unittest.TestCase):
+    # Confirmed negative finding, not an unimplemented feature -- CROSS_PLATFORM_PLAN.md §6.1: a
+    # real CI spike found no per-application audio capture kind exists under PulseAudio.
+    def test_kind_is_none(self):
+        self.assertIsNone(pl.PROCESS_AUDIO_CAPTURE_KIND)
+
+    def test_settings_is_always_none(self):
+        self.assertIsNone(pl.process_audio_capture_settings("Balatro", "/usr/bin/balatro"))
+        self.assertIsNone(pl.process_audio_capture_settings("Balatro", None))
+
+
 if __name__ == "__main__":
     unittest.main()

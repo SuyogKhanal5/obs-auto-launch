@@ -351,6 +351,35 @@ class BackendModulesAreSafelyImportableFromAnyOsTests(unittest.TestCase):
                 self.assertTrue(hasattr(backend, "find_vlc_directory"))
                 self.assertTrue(hasattr(backend, "ffmpeg_candidates"))
                 self.assertTrue(hasattr(backend, "LIBVLC_FILENAME"))
+                self.assertTrue(hasattr(backend, "PROCESS_AUDIO_CAPTURE_KIND"))
+                self.assertTrue(hasattr(backend, "process_audio_capture_settings"))
+
+
+class ProcessAudioCaptureKindDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.PROCESS_AUDIO_CAPTURE_KIND = "sck_audio_capture"
+            result = pc.process_audio_capture_kind(platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        self.assertEqual(result, "sck_audio_capture")
+
+    def test_none_on_linux_is_a_confirmed_negative_finding_not_a_dispatch_bug(self):
+        result = pc.process_audio_capture_kind(platform_name="linux")
+        self.assertIsNone(result)
+
+
+class ProcessAudioCaptureSettingsDispatchTests(unittest.TestCase):
+    def test_dispatches_with_process_name_and_exe_path(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.process_audio_capture_settings.return_value = {"window": "::Balatro.exe"}
+            result = pc.process_audio_capture_settings(
+                "Balatro.exe", "C:\\Games\\Balatro.exe", platform_name="win32",
+            )
+        mock_select.assert_called_once_with("win32")
+        mock_select.return_value.process_audio_capture_settings.assert_called_once_with(
+            "Balatro.exe", "C:\\Games\\Balatro.exe",
+        )
+        self.assertEqual(result, {"window": "::Balatro.exe"})
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import os
+import plistlib
 import shutil
 import sys
 import tempfile
@@ -496,6 +497,95 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
                 pmac.run_clip_editor_space_bar_listener(None, unittest.mock.Mock(), stop_event)
 
         fake_quartz.CFRunLoopStop.assert_called_once_with("run_loop")
+
+
+class ResolveBundleIdentifierTests(unittest.TestCase):
+    # Fake .app bundles built with real tempfile dirs and a real plistlib-written Info.plist --
+    # this is pure file I/O with no macOS-specific API involved, so it's exercisable (and
+    # confirmed correct) on any real OS running the test, not just macOS.
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+
+    def make_app_bundle(self, app_name, bundle_id):
+        app_dir = os.path.join(self.tmp_dir, f"{app_name}.app")
+        contents_dir = os.path.join(app_dir, "Contents")
+        macos_dir = os.path.join(contents_dir, "MacOS")
+        os.makedirs(macos_dir)
+        exe_path = os.path.join(macos_dir, app_name)
+        with open(exe_path, "w") as f:
+            f.write("")
+        with open(os.path.join(contents_dir, "Info.plist"), "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
+        return exe_path
+
+    def test_resolves_a_real_looking_app_bundle(self):
+        exe_path = self.make_app_bundle("Balatro", "com.playstack.balatro")
+        self.assertEqual(pmac.resolve_bundle_identifier(exe_path), "com.playstack.balatro")
+
+    def test_none_when_exe_path_is_none(self):
+        self.assertIsNone(pmac.resolve_bundle_identifier(None))
+
+    def test_none_when_exe_path_is_not_inside_an_app_bundle(self):
+        bare_exe = os.path.join(self.tmp_dir, "bare-binary")
+        with open(bare_exe, "w") as f:
+            f.write("")
+        self.assertIsNone(pmac.resolve_bundle_identifier(bare_exe))
+
+    def test_none_when_info_plist_is_missing(self):
+        macos_dir = os.path.join(self.tmp_dir, "Broken.app", "Contents", "MacOS")
+        os.makedirs(macos_dir)
+        exe_path = os.path.join(macos_dir, "Broken")
+        with open(exe_path, "w") as f:
+            f.write("")
+        self.assertIsNone(pmac.resolve_bundle_identifier(exe_path))
+
+    def test_none_when_info_plist_is_corrupt(self):
+        app_dir = os.path.join(self.tmp_dir, "Corrupt.app")
+        os.makedirs(os.path.join(app_dir, "Contents", "MacOS"))
+        exe_path = os.path.join(app_dir, "Contents", "MacOS", "Corrupt")
+        with open(exe_path, "w") as f:
+            f.write("")
+        with open(os.path.join(app_dir, "Contents", "Info.plist"), "w") as f:
+            f.write("not a real plist")
+        self.assertIsNone(pmac.resolve_bundle_identifier(exe_path))
+
+    def test_none_when_plist_has_no_bundle_identifier_key(self):
+        app_dir = os.path.join(self.tmp_dir, "NoId.app")
+        os.makedirs(os.path.join(app_dir, "Contents", "MacOS"))
+        exe_path = os.path.join(app_dir, "Contents", "MacOS", "NoId")
+        with open(exe_path, "w") as f:
+            f.write("")
+        with open(os.path.join(app_dir, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump({"SomeOtherKey": "value"}, f)
+        self.assertIsNone(pmac.resolve_bundle_identifier(exe_path))
+
+
+class ProcessAudioCaptureSettingsTests(unittest.TestCase):
+    # Confirmed live against a real OBS 30.2.3 instance on macOS 15.5 -- see
+    # platform_macos.py's own PROCESS_AUDIO_CAPTURE_KIND comment for the full empirical findings
+    # (GetInputKindList, GetInputDefaultSettings, and GetInputPropertiesListPropertyItems output).
+    def test_kind_is_sck_audio_capture(self):
+        self.assertEqual(pmac.PROCESS_AUDIO_CAPTURE_KIND, "sck_audio_capture")
+
+    def test_builds_application_mode_settings_when_bundle_id_resolves(self):
+        with unittest.mock.patch.object(pmac, "resolve_bundle_identifier", return_value="com.hnc.Discord"):
+            settings = pmac.process_audio_capture_settings("Discord", "/Applications/Discord.app/Contents/MacOS/Discord")
+        self.assertEqual(settings, {"type": 1, "application": "com.hnc.Discord"})
+        self.assertEqual(settings["type"], pmac.SCK_AUDIO_CAPTURE_TYPE_APPLICATION)
+
+    def test_none_when_bundle_id_cannot_be_resolved(self):
+        with unittest.mock.patch.object(pmac, "resolve_bundle_identifier", return_value=None):
+            settings = pmac.process_audio_capture_settings("Balatro", None)
+        self.assertIsNone(settings)
+
+    def test_process_name_is_accepted_but_unused(self):
+        # macOS's "application" field needs a bundle identifier, which only exe_path can
+        # resolve -- process_name exists purely for signature parity with the Windows backend.
+        with unittest.mock.patch.object(pmac, "resolve_bundle_identifier", return_value="com.hnc.Discord"):
+            settings_a = pmac.process_audio_capture_settings("Discord", "/some/path")
+            settings_b = pmac.process_audio_capture_settings("SomethingElseEntirely", "/some/path")
+        self.assertEqual(settings_a, settings_b)
 
 
 if __name__ == "__main__":

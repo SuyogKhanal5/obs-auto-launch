@@ -270,6 +270,26 @@ class IsEventClientConnectedTests(unittest.TestCase):
 
 
 class SetGameAudioCaptureTargetTests(unittest.TestCase):
+    # set_game_audio_capture_target's own orchestration (repoint-vs-create, error handling) is
+    # OS-agnostic -- mocking platform_common's two dispatch functions with Windows-shaped return
+    # values makes these tests exercise that same orchestration regardless of which real OS runs
+    # them, per platform_common.py's own testing philosophy (CROSS_PLATFORM_PLAN.md §3.2). The
+    # platform backends themselves (Windows/macOS/Linux) have their own dedicated tests.
+    def setUp(self):
+        patcher1 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_kind", return_value="wasapi_process_output_capture",
+        )
+        patcher2 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_settings",
+            side_effect=lambda process_name, exe_path: {
+                "window": f"::{process_name}", "priority": a.WINDOW_MATCH_PRIORITY_EXE_FALLBACK,
+            },
+        )
+        patcher1.start()
+        patcher2.start()
+        self.addCleanup(patcher1.stop)
+        self.addCleanup(patcher2.stop)
+
     def test_repoints_an_existing_input(self):
         client = FakeObsClient(inputs={
             "Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}, "settings": {}},
@@ -310,6 +330,69 @@ class SetGameAudioCaptureTargetTests(unittest.TestCase):
         with self.assertLogs(level="WARNING"):
             a.set_game_audio_capture_target(client, "Game Audio", "Balatro.exe")  # must not raise
         self.assertNotIn("Game Audio", client.inputs)
+
+
+class ResolveProcessAudioCaptureTests(unittest.TestCase):
+    def test_returns_none_kind_when_os_has_no_capture_kind(self):
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value=None):
+            kind, settings = a.resolve_process_audio_capture("Balatro.exe")
+        self.assertIsNone(kind)
+        self.assertIsNone(settings)
+
+    def test_returns_none_settings_when_process_cannot_be_resolved(self):
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", return_value=None):
+            kind, settings = a.resolve_process_audio_capture("Balatro")
+        self.assertEqual(kind, "sck_audio_capture")
+        self.assertIsNone(settings)
+
+    def test_looks_up_the_live_exe_path_for_a_running_process(self):
+        # Only macOS's real backend actually uses exe_path (to resolve a bundle identifier), but
+        # this orchestration function should always try to find it regardless of OS, rather than
+        # assuming it's never needed.
+        fake_processes = [("Balatro", "/Applications/Balatro.app/Contents/MacOS/Balatro", 123)]
+        captured = {}
+
+        def fake_settings(process_name, exe_path):
+            captured["process_name"] = process_name
+            captured["exe_path"] = exe_path
+            return {"type": 1, "application": "com.playstack.balatro"}
+
+        with unittest.mock.patch.object(a, "get_running_processes", return_value=fake_processes), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", side_effect=fake_settings):
+            kind, settings = a.resolve_process_audio_capture("Balatro")
+        self.assertEqual(kind, "sck_audio_capture")
+        self.assertEqual(settings, {"type": 1, "application": "com.playstack.balatro"})
+        self.assertEqual(captured["exe_path"], "/Applications/Balatro.app/Contents/MacOS/Balatro")
+
+    def test_exe_path_is_none_when_process_is_not_running(self):
+        captured = {}
+
+        def fake_settings(process_name, exe_path):
+            captured["exe_path"] = exe_path
+            return None
+
+        with unittest.mock.patch.object(a, "get_running_processes", return_value=[]), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", side_effect=fake_settings):
+            a.resolve_process_audio_capture("Balatro")
+        self.assertIsNone(captured["exe_path"])
+
+    def test_logs_and_leaves_input_unchanged_when_os_has_no_capture_kind(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value=None):
+            with self.assertLogs(level="WARNING"):
+                a.set_game_audio_capture_target(client, "Game Audio", "Balatro")  # must not raise
+        self.assertEqual(client.calls, [])
+
+    def test_logs_and_leaves_input_unchanged_when_process_cannot_be_resolved(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", return_value=None):
+            with self.assertLogs(level="WARNING"):
+                a.set_game_audio_capture_target(client, "Game Audio", "Balatro")  # must not raise
+        self.assertEqual(client.calls, [])
 
 
 class ActiveSessionMarkerTests(unittest.TestCase):

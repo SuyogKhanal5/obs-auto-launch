@@ -309,3 +309,25 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
     frontmost process instead (see platform_macos.run_clip_editor_space_bar_listener's own
     docstring for why)."""
     return _select_backend(platform_name).run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_event)
+
+
+def process_audio_capture_kind(platform_name=None):
+    """Returns the OBS input kind used for per-process/per-application audio capture on this OS
+    (e.g. isolating one game's audio onto its own recording track), or None if this OS has no
+    confirmed capability of that kind at all -- Linux is a confirmed negative finding, not an
+    unimplemented one (CROSS_PLATFORM_PLAN.md §6.1: a real CI spike against PulseAudio found no
+    per-app capture kind exists there). Never guessed from documentation -- every non-None value
+    here was confirmed empirically against a real, running OBS instance."""
+    return _select_backend(platform_name).PROCESS_AUDIO_CAPTURE_KIND
+
+
+def process_audio_capture_settings(process_name, exe_path, platform_name=None):
+    """Builds the OBS input-settings dict that points process_audio_capture_kind()'s input at
+    process_name/exe_path on this OS -- a Windows "window" field formatted "::process_name" (an
+    exe-only match, no title/class needed), a macOS sck_audio_capture "application" field (a
+    bundle identifier resolved from exe_path -- see platform_macos.resolve_bundle_identifier).
+    Returns None if this OS has no such kind at all (process_audio_capture_kind() is None), or if
+    process_name/exe_path can't be resolved to whatever that kind's target identifier actually
+    needs (e.g. exe_path is None because the process isn't running right now, or -- macOS only --
+    it isn't inside a normal .app bundle at all)."""
+    return _select_backend(platform_name).process_audio_capture_settings(process_name, exe_path)

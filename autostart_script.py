@@ -877,12 +877,44 @@ WINDOW_MATCH_PRIORITY_EXE_FALLBACK = 2
 OBS_RESOURCE_NOT_FOUND_CODE = 600
 
 
+def resolve_process_audio_capture(process_name):
+    """Resolves the OBS input kind + settings dict needed to capture process_name's own audio on
+    this OS, via platform_common.process_audio_capture_kind()/process_audio_capture_settings()
+    -- see CROSS_PLATFORM_PLAN.md §6.1 for how each OS's values were confirmed (Windows and macOS
+    empirically against a real OBS instance, Linux a confirmed negative finding). Looks up
+    process_name's own live executable path itself (only macOS's backend actually needs it, to
+    resolve an app bundle identifier) so callers never have to supply one.
+
+    Returns (kind, settings). kind is None if this OS has no confirmed per-app audio capture kind
+    at all (Linux); settings is None if kind exists but process_name couldn't be resolved to
+    whatever it needs (e.g. it isn't currently running) -- callers should distinguish the two,
+    since they call for different log messages."""
+    kind = platform_common.process_audio_capture_kind()
+    if not kind:
+        return None, None
+    exe_path = next((exe for name, exe, _pid in get_running_processes() if name == process_name), None)
+    settings = platform_common.process_audio_capture_settings(process_name, exe_path)
+    return kind, settings
+
+
 def set_game_audio_capture_target(client, input_name, process_name):
     """Points the game-audio-isolation input at the detected game's process, creating that
     Application Audio Capture input in OBS first if it doesn't exist yet -- so obs.game_audio_capture
     works without needing to add the OBS source by hand first, the same way the multi-track
     quick-setup wizard self-creates sources for common apps."""
-    settings = {"window": f"::{process_name}", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}
+    kind, settings = resolve_process_audio_capture(process_name)
+    if not kind:
+        logging.warning(
+            "Per-app audio capture has no confirmed OBS source kind on this OS yet; '%s' was "
+            "left unchanged.", input_name,
+        )
+        return
+    if settings is None:
+        logging.warning(
+            "Could not resolve an audio-capture target for %s (not currently running, or its "
+            "app isn't in a normal bundle); '%s' was left unchanged.", process_name, input_name,
+        )
+        return
     try:
         client.set_input_settings(input_name, settings, True)
         logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
@@ -899,7 +931,7 @@ def set_game_audio_capture_target(client, input_name, process_name):
     # be added by hand in OBS first.
     try:
         scene = client.get_current_program_scene().current_program_scene_name
-        client.create_input(scene, input_name, "wasapi_process_output_capture", settings, True)
+        client.create_input(scene, input_name, kind, settings, True)
         logging.info(
             "Created Application Audio Capture input '%s' in OBS and pointed it at %s.",
             input_name, process_name,
@@ -1983,7 +2015,8 @@ def sync_multi_track_output_settings(client, entries, profile_name):
 AUDIO_TRACK_MANAGED_KINDS = {
     "wasapi_output_capture",  # Desktop Audio
     "wasapi_input_capture",  # Mic/Aux and other microphone devices
-    "wasapi_process_output_capture",  # Application Audio Capture (Discord, Spotify, browsers, ...)
+    "wasapi_process_output_capture",  # Application Audio Capture (Discord, Spotify, browsers, ...) -- Windows
+    "sck_audio_capture",  # Application Audio Capture -- macOS counterpart, see CROSS_PLATFORM_PLAN.md §6.1
 }
 
 
@@ -4421,9 +4454,16 @@ def build_watched_windows_editor(parent, initial_rows):
 # raw kind strings like "wasapi_input_capture" mean nothing to most users. Anything not listed
 # here just falls back to showing its raw kind string.
 INPUT_KIND_LABELS = {
-    "wasapi_output_capture": "Desktop Audio",
-    "wasapi_input_capture": "Microphone/Aux",
-    "wasapi_process_output_capture": "Application Audio Capture",
+    "wasapi_output_capture": "Desktop Audio",  # Windows
+    "wasapi_input_capture": "Microphone/Aux",  # Windows
+    "wasapi_process_output_capture": "Application Audio Capture",  # Windows
+    # macOS counterparts -- kind names confirmed live via GetInputKindList against a real OBS
+    # instance, see CROSS_PLATFORM_PLAN.md §6.1. Cosmetic only (this map just decides the input
+    # picker's display text); coreaudio_output_capture/coreaudio_input_capture aren't in
+    # AUDIO_TRACK_MANAGED_KINDS above since multi-track routing on macOS hasn't been verified.
+    "coreaudio_output_capture": "Desktop Audio",
+    "coreaudio_input_capture": "Microphone/Aux",
+    "sck_audio_capture": "Application Audio Capture",
     "dshow_input": "Video Capture Device",
     "browser_source": "Browser Source",
     "ffmpeg_source": "Media Source",
@@ -4679,11 +4719,21 @@ def compute_quick_setup_tracks(client, desktop_name, mic_name, game_audio_name, 
     for app in selected_apps:
         name = app["name"]
         if name not in current_inputs:
-            client.create_input(
-                scene, name, "wasapi_process_output_capture",
-                {"window": f"::{app['process_name']}", "priority": 2}, True,
-            )
-            created.append(name)
+            kind, settings = resolve_process_audio_capture(app["process_name"])
+            if kind:
+                # settings is None when the app isn't running yet (macOS can't resolve a bundle
+                # identifier without a live process to read it from) -- created anyway with the
+                # kind's own bare defaults so it exists in OBS at all; set_game_audio_capture_target
+                # re-points it for real the next time this app is actually detected running (the
+                # same self-healing re-point obs.game_audio_capture already gets on every recording
+                # start), rather than leaving the user to add the source by hand themselves.
+                client.create_input(scene, name, kind, settings or {}, True)
+                created.append(name)
+            else:
+                logging.warning(
+                    "Per-app audio capture has no confirmed OBS source kind on this OS yet; "
+                    "'%s' was not created.", name,
+                )
         tracks.append({"input_name": name, "track": QUICK_SETUP_CATEGORY_TRACKS[app["category"]]})
         app_captures[name] = app["process_name"]
 

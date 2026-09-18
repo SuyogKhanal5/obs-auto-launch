@@ -566,3 +566,18 @@ def run_clip_editor_space_bar_listener(editor_window_id, on_toggle, stop_event):
         )
     finally:
         display.close()
+
+
+# Confirmed negative finding, not an unimplemented feature -- CROSS_PLATFORM_PLAN.md §6.1: a real
+# CI spike (speaker-test + GetInputPropertiesListPropertyItems against a real pulse_output_capture
+# input) found no per-application audio capture kind exists under PulseAudio in the tested
+# config. None here means "confirmed this OS can't do it", exactly like process_audio_capture_kind
+# itself documents -- don't reintroduce a guessed kind string without a fresh empirical spike.
+PROCESS_AUDIO_CAPTURE_KIND = None
+
+
+def process_audio_capture_settings(process_name, exe_path):
+    """Always None -- see PROCESS_AUDIO_CAPTURE_KIND. Kept as a real function (not just relying
+    on callers checking process_audio_capture_kind() first) so platform_common's dispatch always
+    has a symmetric pair of functions to call on every OS."""
+    return None

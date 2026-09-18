@@ -611,3 +611,21 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
             "Clip editor: space bar play/pause hook failed unexpectedly -- use the on-screen "
             "play/pause button instead."
         )
+
+
+PROCESS_AUDIO_CAPTURE_KIND = "wasapi_process_output_capture"
+
+# OBS's own "match priority" enum for a wasapi_process_output_capture "window" field: 2 means
+# "match executable only" (no title/class needed), the fallback used when only a process name is
+# known. Deliberately a plain local constant, not a shared import from autostart_script.py's own
+# WINDOW_MATCH_PRIORITY_EXE_FALLBACK -- platform_windows.py sits below autostart_script.py in the
+# dependency direction (see platform_common.py's own module docstring) and must not import from
+# it; both constants encode the same OBS-protocol fact independently.
+WINDOW_MATCH_PRIORITY_EXE_FALLBACK = 2
+
+
+def process_audio_capture_settings(process_name, exe_path):
+    """Windows resolves a wasapi_process_output_capture target purely by process/executable name
+    -- exe_path is accepted (for signature parity with the macOS backend, which needs it to
+    resolve an app bundle identifier) but unused here."""
+    return {"window": f"::{process_name}", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}

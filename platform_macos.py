@@ -5,6 +5,7 @@ Minimum target: macOS 14.4 (Sonoma) -- see CROSS_PLATFORM_PLAN.md §2.6."""
 import glob
 import logging
 import os
+import plistlib
 import shutil
 import subprocess
 import threading
@@ -508,3 +509,64 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
         )
 
     _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_event=stop_event)
+
+
+# Confirmed empirically against a real OBS 30.2.3 on macOS 15.5 (Apple Silicon), obs-websocket
+# 5.5.2 -- CROSS_PLATFORM_PLAN.md §6.1. GetInputKindList surfaced "sck_audio_capture" (built on
+# ScreenCaptureKit's per-app audio taps, the macOS 14.4+ capability this app's macOS floor was
+# raised for); GetInputDefaultSettings gave {"application": "", "type": 0}. Its "type" property
+# is an enum with exactly two confirmed-safe values -- querying
+# GetInputPropertiesListPropertyItems(name, "type") on a real created input returned:
+#   0 -> "Desktop Audio Capture"
+#   1 -> "Application Audio Capture"
+# Only with type=1 does the "application" property's own live item list populate (confirmed with
+# real running apps, e.g. {"itemName": "Discord", "itemValue": "com.hnc.Discord"} -- a bundle
+# identifier, not a process/executable name); at type=0 it's an empty list (desktop audio needs
+# no target). A third value (2) was tried once to see whether a third meaningful mode existed --
+# OBS's whole process disappeared instantly, no crash report, no error surfaced over the
+# websocket first. Never pass "type" anything but 0 or 1.
+PROCESS_AUDIO_CAPTURE_KIND = "sck_audio_capture"
+SCK_AUDIO_CAPTURE_TYPE_APPLICATION = 1
+
+
+def resolve_bundle_identifier(exe_path):
+    """Walks up from a running process's own executable path (e.g.
+    /Applications/Balatro.app/Contents/MacOS/Balatro, the "exe" psutil reports) to find the
+    owning .app bundle's Info.plist and reads CFBundleIdentifier out of it -- the value
+    sck_audio_capture's "application" setting actually needs (confirmed live, see
+    PROCESS_AUDIO_CAPTURE_KIND above), not the process/executable name itself. Returns None if
+    exe_path isn't inside a .app bundle at all (a bare command-line binary, for instance -- rare
+    for an actual game, but not impossible), or if the plist can't be read/parsed for any reason
+    (a damaged bundle, unreadable permissions, etc.) -- this is a best-effort resolution, not
+    something callers should ever treat as guaranteed to succeed."""
+    if not exe_path:
+        return None
+    path = os.path.normpath(exe_path)
+    while True:
+        parent = os.path.dirname(path)
+        if path.endswith(".app"):
+            plist_path = os.path.join(path, "Contents", "Info.plist")
+            try:
+                with open(plist_path, "rb") as f:
+                    plist = plistlib.load(f)
+                return plist.get("CFBundleIdentifier")
+            except Exception:
+                return None
+        if parent == path:
+            return None
+        path = parent
+
+
+def process_audio_capture_settings(process_name, exe_path):
+    """Builds sck_audio_capture's settings dict for capturing one application's own audio -- the
+    macOS counterpart to Windows's wasapi_process_output_capture "window" field. process_name is
+    accepted for signature parity with the Windows backend but unused: macOS's "application"
+    field needs a bundle identifier, which only exe_path can resolve (see
+    resolve_bundle_identifier). Returns None if that resolution fails (the process isn't
+    currently running -- exe_path is None -- or its executable isn't inside a normal .app bundle
+    at all), so callers can leave whatever's already configured alone rather than writing a
+    setting guaranteed not to match anything real."""
+    bundle_id = resolve_bundle_identifier(exe_path)
+    if not bundle_id:
+        return None
+    return {"type": SCK_AUDIO_CAPTURE_TYPE_APPLICATION, "application": bundle_id}
