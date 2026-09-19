@@ -180,6 +180,8 @@ Found on real Mac hardware (Apple Silicon, macOS 15.5, Python 3.12 python.org bu
 
 Verified live end-to-end after the fix: the real app runs stably for several minutes with no crash, the tray icon actually renders in the real macOS menu bar (confirmed via screenshot), and clean shutdown leaves no orphaned process.
 
+**Related, found immediately after fixing the crash above**: with the app finally staying alive, the next real-hardware finding was that it also showed a generic, non-functional Python/rocket **Dock icon** alongside its real, working menu-bar tray icon -- a plain macOS process defaults to a normal Dock presence unless told otherwise, and nothing here ever set that. Fixed the same way (`platform_common.hide_dock_icon()`, macOS-only, a thin wrapper around `NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)`), called right after the priming `Tk()` step above -- ordering matters here too, since this also touches the shared `NSApplication` and would reproduce the exact same crash if called before Tk gets to register itself. Confirmed live via screenshot: Dock icon gone, tray icon still renders correctly.
+
 ### 5.6 Autostart ("start with Windows")
 
 - `installer.py:129-149` (`create_shortcut`) — shells out to `powershell -Command` running a `WScript.Shell` COM script to write a `.lnk`.

@@ -588,5 +588,23 @@ class ProcessAudioCaptureSettingsTests(unittest.TestCase):
         self.assertEqual(settings_a, settings_b)
 
 
+class HideDockIconTests(unittest.TestCase):
+    def test_sets_accessory_activation_policy(self):
+        fake_appkit = unittest.mock.MagicMock()
+        fake_appkit.NSApplicationActivationPolicyAccessory = 1
+        fake_app = unittest.mock.MagicMock()
+        fake_appkit.NSApplication.sharedApplication.return_value = fake_app
+
+        with unittest.mock.patch.dict(sys.modules, {"AppKit": fake_appkit}):
+            pmac.hide_dock_icon()
+
+        fake_app.setActivationPolicy_.assert_called_once_with(1)
+
+    def test_missing_pyobjc_is_logged_not_raised(self):
+        with unittest.mock.patch.dict(sys.modules, {"AppKit": None}):
+            with self.assertLogs(level="WARNING"):
+                pmac.hide_dock_icon()  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

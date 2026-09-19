@@ -629,3 +629,9 @@ def process_audio_capture_settings(process_name, exe_path):
     -- exe_path is accepted (for signature parity with the macOS backend, which needs it to
     resolve an app bundle identifier) but unused here."""
     return {"window": f"::{process_name}", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}
+
+
+def hide_dock_icon():
+    """No-op -- Windows has no Dock/Cmd-Tab equivalent that a pystray tray icon needs hiding
+    from; only accepted for signature parity with the macOS backend, which does real work here."""
+    pass

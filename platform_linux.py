@@ -581,3 +581,10 @@ def process_audio_capture_settings(process_name, exe_path):
     on callers checking process_audio_capture_kind() first) so platform_common's dispatch always
     has a symmetric pair of functions to call on every OS."""
     return None
+
+
+def hide_dock_icon():
+    """No-op -- Linux desktop environments don't give a pystray tray icon an equivalent unwanted
+    taskbar entry that needs hiding; only accepted for signature parity with the macOS backend,
+    which does real work here."""
+    pass

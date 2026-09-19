@@ -369,6 +369,15 @@ class BackendModulesAreSafelyImportableFromAnyOsTests(unittest.TestCase):
                 self.assertTrue(hasattr(backend, "LIBVLC_FILENAME"))
                 self.assertTrue(hasattr(backend, "PROCESS_AUDIO_CAPTURE_KIND"))
                 self.assertTrue(hasattr(backend, "process_audio_capture_settings"))
+                self.assertTrue(hasattr(backend, "hide_dock_icon"))
+
+
+class HideDockIconDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.hide_dock_icon(platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        mock_select.return_value.hide_dock_icon.assert_called_once_with()
 
 
 class ProcessAudioCaptureKindDispatchTests(unittest.TestCase):

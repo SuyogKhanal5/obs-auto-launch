@@ -511,5 +511,10 @@ class ProcessAudioCaptureSettingsTests(unittest.TestCase):
         self.assertIsNone(pl.process_audio_capture_settings("Balatro", None))
 
 
+class HideDockIconTests(unittest.TestCase):
+    def test_is_a_no_op(self):
+        pl.hide_dock_icon()  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

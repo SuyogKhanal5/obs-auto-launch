@@ -8150,6 +8150,13 @@ def main():
         primer = tk.Tk()
         tk.Frame(primer)
         primer.destroy()
+        # Must come after the priming Tk() above -- this also touches the shared NSApplication,
+        # and doing so before Tk registers itself reproduces the exact crash that priming step
+        # exists to avoid (see platform_macos.hide_dock_icon's own docstring). Without this, the
+        # app shows an unusable, generic Python/rocket Dock icon alongside its real, working
+        # menu-bar tray icon -- confirmed live, clicking it does nothing since there's no main
+        # window of its own.
+        platform_common.hide_dock_icon()
 
     icon = pystray.Icon(
         "OBSAutoRecorder",

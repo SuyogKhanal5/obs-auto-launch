@@ -344,3 +344,12 @@ def gui_requires_main_thread(platform_name=None):
     Python-catchable exception. False on Windows/Linux, where no such constraint exists."""
     platform_name = sys.platform if platform_name is None else platform_name
     return platform_name == "darwin"
+
+
+def hide_dock_icon(platform_name=None):
+    """Hides this process's Dock icon / Cmd-Tab entry, on whichever OS has one to hide at all --
+    macOS only (see platform_macos.hide_dock_icon). No-op everywhere else: a pystray tray icon on
+    Windows/Linux never puts an equivalent unwanted taskbar/dock entry alongside itself in the
+    first place, unlike a plain macOS process, which shows a generic, non-functional Python/
+    rocket Dock icon next to the real menu-bar tray icon unless told not to."""
+    return _select_backend(platform_name).hide_dock_icon()

@@ -570,3 +570,26 @@ def process_audio_capture_settings(process_name, exe_path):
     if not bundle_id:
         return None
     return {"type": SCK_AUDIO_CAPTURE_TYPE_APPLICATION, "application": bundle_id}
+
+
+def hide_dock_icon():
+    """Hides this process's Dock icon and Cmd-Tab/App-Switcher entry, making it behave as a
+    proper macOS menu-bar-only "accessory" app instead of showing a generic, non-functional
+    Python/rocket Dock icon alongside the real tray icon in the menu bar. Confirmed live: without
+    this, the app (whether run from source or from a --windowed PyInstaller build with no custom
+    Info.plist LSUIElement key) shows an unusable Dock icon next to its real, working menu-bar
+    icon -- clicking it does nothing meaningful, since this app has no main window of its own.
+
+    Must be called AFTER Tk has already initialized its own Cocoa integration (see main()'s own
+    throwaway-Tk() priming step and its docstring) -- this also touches the shared NSApplication,
+    and doing so before Tk gets to register itself reproduces the exact startup crash that
+    priming step exists to avoid. Best-effort: logs and continues on any failure (pyobjc missing,
+    or anything else) since running with a Dock icon present is a cosmetic annoyance, not
+    something worth crashing over."""
+    try:
+        import AppKit
+        AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+            AppKit.NSApplicationActivationPolicyAccessory
+        )
+    except Exception as exc:
+        logging.warning("Could not hide the Dock icon: %s", exc)

@@ -495,5 +495,10 @@ class ProcessAudioCaptureSettingsTests(unittest.TestCase):
         self.assertEqual(with_path, without_path)
 
 
+class HideDockIconTests(unittest.TestCase):
+    def test_is_a_no_op(self):
+        pw.hide_dock_icon()  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
