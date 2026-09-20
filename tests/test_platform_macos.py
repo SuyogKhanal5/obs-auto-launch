@@ -217,21 +217,105 @@ class AutostartTests(unittest.TestCase):
         self.assertFalse(pmac.is_autostart_enabled())
 
 
-class EmbedVideoPlayerTests(unittest.TestCase):
-    def test_wraps_winfo_id_as_ns_view_and_calls_set_nsobject(self):
-        fake_objc = unittest.mock.MagicMock()
-        fake_ns_view = object()
-        fake_objc.objc_object.return_value = fake_ns_view
+class FindLibtkDylibTests(unittest.TestCase):
+    # Real filesystem, real temp dirs -- this is pure path-searching logic with no macOS-specific
+    # API involved, so (like ResolveBundleIdentifierTests) it's exercisable on any real OS.
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+        self.lib_name = f"libtk{pmac.tkinter.TkVersion}.dylib"
 
+    def test_finds_a_dylib_under_sys_prefix(self):
+        lib_dir = os.path.join(self.tmp_dir, "lib")
+        os.makedirs(lib_dir)
+        lib_path = os.path.join(lib_dir, self.lib_name)
+        open(lib_path, "w").close()
+
+        with unittest.mock.patch.object(pmac.sys, "prefix", self.tmp_dir), \
+             unittest.mock.patch.object(pmac.sys, "base_prefix", self.tmp_dir), \
+             unittest.mock.patch.object(pmac.ctypes.util, "find_library", return_value=None):
+            self.assertEqual(pmac._find_libtk_dylib(), lib_path)
+
+    def test_finds_a_dylib_via_ctypes_find_library(self):
+        lib_path = os.path.join(self.tmp_dir, self.lib_name)
+        open(lib_path, "w").close()
+
+        with unittest.mock.patch.object(pmac.sys, "prefix", "/nonexistent"), \
+             unittest.mock.patch.object(pmac.sys, "base_prefix", "/nonexistent"), \
+             unittest.mock.patch.object(pmac.ctypes.util, "find_library", return_value=lib_path):
+            self.assertEqual(pmac._find_libtk_dylib(), lib_path)
+
+    def test_returns_none_when_not_found_anywhere(self):
+        with unittest.mock.patch.object(pmac.sys, "prefix", "/nonexistent"), \
+             unittest.mock.patch.object(pmac.sys, "base_prefix", "/nonexistent"), \
+             unittest.mock.patch.object(pmac.ctypes.util, "find_library", return_value=None), \
+             unittest.mock.patch.object(pmac.glob, "glob", return_value=[]):
+            self.assertIsNone(pmac._find_libtk_dylib())
+
+
+class EmbedVideoPlayerTests(unittest.TestCase):
+    # Confirmed live with a minimal reproduction script: winfo_id()'s raw value is NOT a real
+    # NSView pointer (wrapping it via objc.objc_object, this function's old behavior, segfaulted
+    # the instant anything tried to use it as one) -- the real, confirmed-correct conversion is
+    # Tk's own TkMacOSXGetRootControl C function, called via ctypes, per python-vlc's own
+    # official tkvlc.py example. No PyObjC/objc import is involved in the fixed version at all.
+    def test_calls_set_nsobject_with_the_resolved_ns_view(self):
+        player = unittest.mock.Mock()
+        widget = unittest.mock.Mock()
+        widget.winfo_id.return_value = 4242
+        fake_lib = unittest.mock.Mock()
+        fake_lib.TkMacOSXGetRootControl.return_value = 999999
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll:
+            mock_cdll.LoadLibrary.return_value = fake_lib
+            pmac.embed_video_player(player, widget)
+
+        mock_cdll.LoadLibrary.assert_called_once_with("/fake/libtk8.6.dylib")
+        fake_lib.TkMacOSXGetRootControl.assert_called_once_with(4242)
+        player.set_nsobject.assert_called_once_with(999999)
+        player.set_xwindow.assert_not_called()
+
+    def test_falls_back_to_set_xwindow_when_libtk_cannot_be_found(self):
         player = unittest.mock.Mock()
         widget = unittest.mock.Mock()
         widget.winfo_id.return_value = 4242
 
-        with unittest.mock.patch.dict(sys.modules, {"objc": fake_objc}):
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value=None):
+            with self.assertLogs(level="WARNING"):
+                pmac.embed_video_player(player, widget)
+
+        player.set_xwindow.assert_called_once_with(4242)
+        player.set_nsobject.assert_not_called()
+
+    def test_falls_back_to_set_xwindow_when_loading_libtk_fails(self):
+        player = unittest.mock.Mock()
+        widget = unittest.mock.Mock()
+        widget.winfo_id.return_value = 4242
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll:
+            mock_cdll.LoadLibrary.side_effect = OSError("boom")
+            with self.assertLogs(level="WARNING"):
+                pmac.embed_video_player(player, widget)
+
+        player.set_xwindow.assert_called_once_with(4242)
+        player.set_nsobject.assert_not_called()
+
+    def test_falls_back_to_set_xwindow_when_ns_view_is_null(self):
+        player = unittest.mock.Mock()
+        widget = unittest.mock.Mock()
+        widget.winfo_id.return_value = 4242
+        fake_lib = unittest.mock.Mock()
+        fake_lib.TkMacOSXGetRootControl.return_value = 0
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll:
+            mock_cdll.LoadLibrary.return_value = fake_lib
             pmac.embed_video_player(player, widget)
 
-        fake_objc.objc_object.assert_called_once_with(c_void_p=4242)
-        player.set_nsobject.assert_called_once_with(fake_ns_view)
+        player.set_xwindow.assert_called_once_with(4242)
+        player.set_nsobject.assert_not_called()
 
 
 def make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=True):

@@ -2,13 +2,17 @@
 schedule.
 
 Minimum target: macOS 14.4 (Sonoma) -- see CROSS_PLATFORM_PLAN.md §2.6."""
+import ctypes
+import ctypes.util
 import glob
 import logging
 import os
 import plistlib
 import shutil
 import subprocess
+import sys
 import threading
+import tkinter
 
 # The canonical libvlc shared-library name on macOS. Only used as a presence signal by
 # platform_common.find_vlc_directory() -- see that function's own docstring for why the exact
@@ -425,26 +429,68 @@ def install_optional_dependency(package, timeout=600):
     return False, (result.stdout or result.stderr or f"brew exited with code {result.returncode}")[-500:].strip()
 
 
+def _find_libtk_dylib():
+    """Locates the libtkX.Y.dylib actually bundled with THIS Python interpreter -- must match
+    tkinter.TkVersion exactly, since a different build's exported symbols could differ or not
+    exist at all. Mirrors the search order in python-vlc's own official tkvlc.py example
+    (https://github.com/oaubert/python-vlc/blob/master/examples/tkvlc.py), which is the
+    confirmed-correct source for this whole mechanism (see embed_video_player's own docstring for
+    why that matters here). Returns None if it can't be found anywhere searched."""
+    lib_name = f"libtk{tkinter.TkVersion}.dylib"
+    candidates = [
+        os.path.join(getattr(sys, "base_prefix", ""), "lib", lib_name),
+        os.path.join(sys.prefix, "lib", lib_name),
+    ]
+    found = ctypes.util.find_library(lib_name)
+    if found:
+        candidates.append(found)
+    for cellar_root in ("/opt/homebrew/Cellar", "/usr/local/Cellar", "/opt/local/Cellar"):
+        candidates.extend(glob.glob(os.path.join(cellar_root, "tcl-tk", "*", "lib", lib_name)))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def embed_video_player(player, tk_widget):
     """Embeds a python-vlc player's output into tk_widget -- unlike Windows/Linux (which both
     hand set_hwnd/set_xwindow the plain numeric id winfo_id() already returns), python-vlc's
-    macOS set_nsobject() needs a real NSView Objective-C object, not a raw integer.
+    macOS set_nsobject() needs a real NSView pointer.
 
-    Modern Tk/Aqua (Cocoa-based -- what every current Tcl/Tk build uses; the old Carbon-based Tk
-    port is long deprecated) returns the NSView*'s own pointer value directly from winfo_id(), so
-    this wraps that raw pointer as a real PyObjC object via objc.objc_object(...) rather than
-    trying to locate/match an NSWindow through some other, less direct path (e.g. searching
-    NSApp's window list). This is the single least-confident piece of code in this phase (see
-    CROSS_PLATFORM_PLAN.md §5.5) -- not verified against real macOS hardware in this session; if
-    the pointer-cast assumption above turns out wrong for some Tk/macOS version combination, the
-    most likely real symptom is a blank/black video surface (set_nsobject's own argument
-    validation is lenient) rather than a crash, so this needs real-hardware confirmation, not
-    just "did it raise" CI coverage."""
-    import objc
+    Confirmed live (a real SIGSEGV, reproduced with a minimal script) that winfo_id()'s own
+    return value is NOT that pointer at all -- it's an opaque Tk-internal "drawable" handle, and
+    passing it to set_nsobject() directly (or wrapping it as a PyObjC object first, which is what
+    this function used to do) crashes the instant anything tries to use it as a real Objective-C
+    object, since it isn't one. The actual, correct conversion -- confirmed against python-vlc's
+    own official tkvlc.py example, not guessed -- is Tk's own (non-public, but exported) C
+    function TkMacOSXGetRootControl, called via ctypes against the real libtk dylib this
+    interpreter loaded. It returns a plain pointer value, not a PyObjC object -- set_nsobject()
+    (a ctypes-based python-vlc binding, not a PyObjC one) takes that raw value directly; no
+    `objc` import is needed here at all, unlike what this function used to assume.
 
+    Falls back to set_xwindow() (audio-only, no video -- but confirmed not to crash) if libtk
+    can't be found or the lookup fails for any reason, matching tkvlc.py's own documented
+    fallback rather than leaving video embedding entirely broken."""
     view_ptr = tk_widget.winfo_id()
-    ns_view = objc.objc_object(c_void_p=view_ptr)
-    player.set_nsobject(ns_view)
+    libtk_path = _find_libtk_dylib()
+    ns_view = None
+    if libtk_path:
+        try:
+            lib = ctypes.cdll.LoadLibrary(libtk_path)
+            get_ns_view = lib.TkMacOSXGetRootControl
+            get_ns_view.restype = ctypes.c_void_p
+            get_ns_view.argtypes = (ctypes.c_void_p,)
+            ns_view = get_ns_view(view_ptr)
+        except Exception as exc:
+            logging.warning("Could not resolve a real NSView for video embedding: %s", exc)
+    else:
+        logging.warning("Could not find libtk%s.dylib for video embedding.", tkinter.TkVersion)
+
+    if ns_view:
+        player.set_nsobject(ns_view)
+    else:
+        logging.warning("Falling back to audio-only playback (no video preview) for this clip.")
+        player.set_xwindow(view_ptr)
 
 
 def resolve_editor_top_level_window(tk_window_id):
