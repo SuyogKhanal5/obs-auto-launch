@@ -7935,6 +7935,103 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     start_space_bar_listener()
 
 
+# --- macOS-only tray menu (see CROSS_PLATFORM_PLAN.md's Tk/AppKit menu-crash finding) ---
+# Confirmed live: pystray's native NSMenu (what every other OS uses unmodified) crashes Tk's own
+# macOS backend outright the instant that menu's tracking session ends -- a real SIGSEGV inside
+# Tk's own compiled code (RecursivelyClearActiveMenu/TkActivateMenuEntry), reacting to a global
+# AppKit notification about ANY menu closing, not just Tk's own. Not something a Python-level fix
+# to this app or a newer Tcl/Tk version resolves (tried Tcl/Tk 9.0.4 -- a different, earlier
+# startup crash instead). The only reliable fix: never let a native NSMenu exist at all -- this
+# app's tray Icon is constructed with menu=None on macOS specifically, and the exact same
+# pystray.Menu/MenuItem structure every other OS hands to pystray directly is instead rendered
+# here as a plain Tk popup, so all menu interaction stays inside Tk's own event handling.
+_MENU_BG = "#2b2b2b"
+_MENU_FG = "#eeeeee"
+_MENU_DISABLED_FG = "#777777"
+_MENU_HOVER_BG = "#3d6fd6"
+_MENU_SEPARATOR_COLOR = "#555555"
+
+
+def show_macos_tray_menu(overlay_root, menu, icon):
+    """Renders a pystray.Menu as a plain Tk popup at the current mouse position, instead of a
+    native NSMenu. Submenus (this app only ever nests one level deep -- Overlay Monitor's list of
+    displays) navigate within the SAME window via a "Back" row rather than opening a second
+    Toplevel -- deliberately, since a second window stealing focus would fire the first one's own
+    <FocusOut>-triggered dismissal while the submenu is still open, closing everything prematurely
+    (a real Tk cross-window-focus quirk, not just a hypothetical one)."""
+    if overlay_root is None:
+        logging.warning("Overlay isn't ready yet; can't show the tray menu. Try again in a moment.")
+        return
+
+    x, y = overlay_root.winfo_pointerxy()
+    popup = tk.Toplevel(overlay_root)
+    popup.overrideredirect(True)
+    popup.attributes("-topmost", True)
+    popup.configure(bg=_MENU_BG)
+    popup.geometry(f"+{x}+{y}")
+
+    def close(_event=None):
+        try:
+            popup.destroy()
+        except tk.TclError:
+            pass
+
+    nav_stack = [menu]
+
+    def add_row(text, command, enabled=True):
+        row = tk.Label(
+            popup, text=text, anchor="w", bg=_MENU_BG, fg=_MENU_FG if enabled else _MENU_DISABLED_FG,
+            font=("Segoe UI", 12), padx=14, pady=5,
+        )
+        row.pack(fill="x")
+        if enabled and command:
+            row.bind("<Enter>", lambda _e: row.configure(bg=_MENU_HOVER_BG))
+            row.bind("<Leave>", lambda _e: row.configure(bg=_MENU_BG))
+            row.bind("<Button-1>", lambda _e: command())
+
+    def add_separator():
+        tk.Frame(popup, height=1, bg=_MENU_SEPARATOR_COLOR).pack(fill="x", padx=2, pady=4)
+
+    def enter_submenu(submenu):
+        nav_stack.append(submenu)
+        render()
+
+    def go_back():
+        nav_stack.pop()
+        render()
+
+    def activate(item):
+        def command():
+            close()
+            try:
+                item(icon)
+            except Exception:
+                logging.exception("Tray menu item '%s' failed.", item.text)
+        return command
+
+    def render():
+        for widget in popup.winfo_children():
+            widget.destroy()
+        if len(nav_stack) > 1:
+            add_row("◀ Back", go_back)
+            add_separator()
+        for item in nav_stack[-1]:
+            if item is pystray.Menu.SEPARATOR:
+                add_separator()
+                continue
+            if item.submenu is not None:
+                add_row(f"{item.text}  ▸", lambda item=item: enter_submenu(item.submenu), item.enabled)
+                continue
+            prefix = "✓ " if item.checked else ("   " if item.checked is not None else "")
+            add_row(prefix + item.text, activate(item), item.enabled)
+        popup.update_idletasks()
+
+    render()
+    popup.bind("<FocusOut>", close)
+    popup.bind("<Escape>", close)
+    popup.focus_force()
+
+
 def main():
     config = load_config()
 
@@ -8158,12 +8255,27 @@ def main():
         # window of its own.
         platform_common.hide_dock_icon()
 
-    icon = pystray.Icon(
-        "OBSAutoRecorder",
-        icon=build_tray_image(IDLE_COLOR),
-        title="OBS Auto Recorder - Starting...",
-        menu=menu,
-    )
+        class _MacTrayIcon(pystray.Icon):
+            """Overrides what a click on the status item ends up calling. pystray's own
+            Icon.__call__ only ever does anything when self._menu is not None -- but giving the
+            Icon a real Menu at all makes pystray assign it as a native NSMenu (see this
+            section's own module-level comment for why that crashes Tk), so this Icon is always
+            constructed with menu=None. AppKit's status-item click routing falls back to the
+            button's plain action/target (this override, via IconDelegate.activate_button's
+            self.icon() call) once no native menu is attached to the status item at all."""
+            def __call__(self):
+                show_macos_tray_menu(overlay_state.get("root"), menu, self)
+
+        icon = _MacTrayIcon(
+            "OBSAutoRecorder", icon=build_tray_image(IDLE_COLOR), title="OBS Auto Recorder - Starting...",
+        )
+    else:
+        icon = pystray.Icon(
+            "OBSAutoRecorder",
+            icon=build_tray_image(IDLE_COLOR),
+            title="OBS Auto Recorder - Starting...",
+            menu=menu,
+        )
 
     watcher_thread = threading.Thread(
         target=watcher_loop,
