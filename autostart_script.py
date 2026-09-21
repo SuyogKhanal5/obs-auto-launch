@@ -2922,10 +2922,25 @@ CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS = [
 # Performance is the safer default for the editor's own preview until that's understood better,
 # not "Best" despite the label. Never touches the exported file either way.
 CLIP_EDITOR_DEFAULT_PREVIEW_QUALITY = CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS[2]
+# ":avcodec-hw=none" alone only disables hardware decode *within* the avcodec module's own
+# hwaccel path (DXVA2/D3D11VA on Windows, VAAPI on Linux) -- confirmed live that on macOS it has
+# no effect at all, because VLC doesn't decode h264 through avcodec's hwaccel there in the first
+# place: it picks its own separate "vt" (VideoToolbox) decoder module ahead of avcodec entirely,
+# which ":avcodec-*" options can't reach. That made "Performance (software decode)" a no-op on
+# macOS specifically -- confirmed by VLC's own log still showing "Using Video Toolbox to decode"
+# with every one of these flags set, and by a real stutter during playback (timestamps
+# repeating/jumping in an automated sampling test, matching VLC's own "picture is too late to be
+# displayed"/"pic_holder_wait timed out" warnings) that persisted regardless of this dropdown.
+# ":codec=avcodec" (confirmed live, same per-media :-prefixed override syntax as the flags below)
+# forces libvlc to use the plain avcodec module specifically, bypassing "vt" (and equally
+# bypassing whatever platform-specific module a future Linux hardware-decode path might add) --
+# the actual fix for "software decode" to mean software decode on every OS, not just Windows.
 CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS = {
     "Best (hardware decode)": [],
     "Balanced": [":avcodec-skiploopfilter=nonref"],
-    "Performance (software decode)": [":avcodec-hw=none", ":avcodec-skiploopfilter=all", ":avcodec-fast"],
+    "Performance (software decode)": [
+        ":codec=avcodec", ":avcodec-hw=none", ":avcodec-skiploopfilter=all", ":avcodec-fast",
+    ],
 }
 
 CLIP_EDITOR_TARGET_AUDIO_BITRATE_KBPS = 128
@@ -4130,6 +4145,83 @@ DARK_BG = "#2b2b2b"
 DARK_FG = "#e6e6e6"
 DARK_ENTRY_BG = "#3c3c3c"
 DARK_MUTED_FG = "#888888"
+
+
+class ClickableLabel(tk.Label):
+    """A tk.Button substitute for the dark-themed editors, macOS only.
+
+    Confirmed live via screenshot: classic tk.Button ignores bg/activebackground on macOS's Aqua
+    theme -- it always draws the native button chrome (a light rounded rect) instead, regardless
+    of what's passed in. Against this app's dark custom theme that makes every button render as a
+    barely-legible light native button, with icon/text colors that don't reliably match either
+    (the clip editor's play/stop glyphs came out nearly invisible, a light gray shape on a light
+    background). Windows' classic tk.Button isn't native-chrome-constrained this way and already
+    renders bg/fg correctly there -- this class only replaces tk.Button on macOS (see dark_button
+    below), Windows/Linux keep the plain tk.Button they already had.
+
+    tk.Label doesn't have this problem (it's not drawn as native chrome at all) -- already the
+    mechanism this app's own custom tray-menu popup uses for exactly the same reason (see
+    show_macos_tray_menu's add_row). This reproduces just enough of tk.Button's interface --
+    text/state via .config(), a command callback, hover and pressed feedback -- to drop in at
+    every existing dark_button/fixed_size_button call site unchanged."""
+
+    def __init__(self, parent, text="", command=None, bg=DARK_ENTRY_BG, fg=DARK_FG,
+                 activebackground=None, activeforeground=None, disabledforeground=DARK_MUTED_FG,
+                 font=None, **kwargs):
+        self._command = command
+        self._normal_bg = bg
+        self._normal_fg = fg
+        self._active_bg = activebackground or bg
+        self._active_fg = activeforeground or fg
+        self._disabled_fg = disabledforeground
+        self._button_state = "normal"
+        super().__init__(
+            parent, text=text, bg=bg, fg=fg, font=font, relief="raised", borderwidth=1,
+            padx=6, pady=2, **kwargs
+        )
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def _on_click(self, _event=None):
+        if self._button_state == "disabled":
+            return
+        tk.Label.config(self, relief="sunken")
+        self.after(80, lambda: tk.Label.config(self, relief="raised"))
+        if self._command:
+            self._command()
+
+    def invoke(self):
+        """Matches tk.Button's own .invoke() -- runs the command directly (no-op while disabled,
+        confirmed against a real tk.Button that this is real Tk behavior, not an assumption)."""
+        if self._button_state != "disabled" and self._command:
+            self._command()
+
+    def _on_enter(self, _event=None):
+        if self._button_state != "disabled":
+            tk.Label.config(self, bg=self._active_bg, fg=self._active_fg)
+
+    def _on_leave(self, _event=None):
+        if self._button_state != "disabled":
+            tk.Label.config(self, bg=self._normal_bg, fg=self._normal_fg)
+
+    def config(self, **kwargs):
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "state" in kwargs:
+            self._button_state = kwargs.pop("state")
+            if self._button_state == "disabled":
+                tk.Label.config(self, fg=self._disabled_fg, bg=self._normal_bg, cursor="arrow")
+            else:
+                tk.Label.config(self, fg=self._normal_fg, bg=self._normal_bg, cursor="")
+        super().config(**kwargs)
+
+    configure = config
+
+    def cget(self, key):
+        if key == "state":
+            return self._button_state
+        return super().cget(key)
 
 
 def make_scrollable_tab(notebook, title):
@@ -6707,8 +6799,13 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     root.protocol("WM_DELETE_WINDOW", close_editor)
     root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
 
+    # ClickableLabel only on macOS -- see its own docstring for why: Windows' plain tk.Button
+    # already renders this editor's dark theme correctly (confirmed by years of real use there),
+    # so it stays completely unchanged rather than risk a needless visual regression.
+    _button_cls = ClickableLabel if sys.platform == "darwin" else tk.Button
+
     def dark_button(parent, **kwargs):
-        return tk.Button(parent, bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG, **kwargs)
+        return _button_cls(parent, bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG, **kwargs)
 
     def fixed_size_button(parent, text, width_px, height_px, command, font=("Segoe UI", 11)):
         # tk.Button's own width/height options are in text-grid units, not pixels, so identical
