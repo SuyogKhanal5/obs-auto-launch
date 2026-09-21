@@ -439,13 +439,30 @@ def clear_obs_crash_sentinel():
     if not obs_config_dir:
         return
     sentinel_dir = os.path.join(obs_config_dir, ".sentinel")
-    if not os.path.isdir(sentinel_dir):
-        return
-    for entry in os.listdir(sentinel_dir):
-        try:
-            os.remove(os.path.join(sentinel_dir, entry))
-        except OSError:
-            pass
+    if os.path.isdir(sentinel_dir):
+        for entry in os.listdir(sentinel_dir):
+            try:
+                os.remove(os.path.join(sentinel_dir, entry))
+            except OSError:
+                pass
+    # Confirmed live on a real macOS OBS install: this OBS version's actual unclean-shutdown
+    # marker isn't the .sentinel/ directory above at all (that directory never existed on this
+    # machine) -- it's a single plain empty file directly under obs_config_dir, "safe_mode",
+    # left behind by a prior run that didn't exit cleanly (including this app's own
+    # kill_process_by_name, used for its hung-OBS/memory-bloat recovery). Left in place, OBS's
+    # very next launch blocks on its own "Run in Safe Mode?" dialog before doing anything else --
+    # including starting obs-websocket's server -- and since that dialog needs a real GUI click
+    # to dismiss, every following connection attempt just times out with the process sitting
+    # there, unresponsive, looking exactly like a hang. Removed unconditionally alongside the
+    # .sentinel/ directory rather than replacing it, since nothing here has verified whether the
+    # directory form is real on any actually-tested Windows/Linux install either -- safest to
+    # clear both markers every launch regardless of which one(s) this OS/OBS version actually
+    # uses.
+    safe_mode_marker = os.path.join(obs_config_dir, "safe_mode")
+    try:
+        os.remove(safe_mode_marker)
+    except OSError:
+        pass
 
 
 def cleanup_orphaned_pyinstaller_temp_dirs():
@@ -3640,6 +3657,26 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     watched_windows = config.get("watched_windows", [])
     poll_interval = config.get("poll_interval_seconds", 1.5)
     obs_config = config["obs"]
+    # Self-heals a config.json carried over from another OS, the same way launch_obs's own
+    # fallback does for obs.path -- confirmed live (a real config with "obs64.exe" opened on
+    # macOS): is_obs_running/kill_process_by_name/get_process_memory_bytes all key off this exact
+    # string, so a Windows-only process_name here means this app can never recognize an OBS it
+    # (or the user) already launched. Left uncaught, that's not just cosmetic: every poll tick
+    # sees OBS as "not running" and calls launch_obs again, piling up a fresh duplicate OBS
+    # process every cycle instead of reusing the one already there. Fixed once, up front (rather
+    # than only inside launch_obs) so every check below sees the corrected name from the very
+    # first iteration, not just after the first launch.
+    resolved_obs_path = platform_common.find_obs_executable(configured_path=obs_config.get("path"))
+    if resolved_obs_path:
+        expected_process_name = os.path.basename(resolved_obs_path)
+        if obs_config.get("process_name", "").lower() != expected_process_name.lower():
+            logging.warning(
+                "Configured OBS process name %r doesn't match this OS's OBS (%r); using %r "
+                "instead. Update it in Settings to stop seeing this.",
+                obs_config.get("process_name"), expected_process_name, expected_process_name,
+            )
+            obs_config["process_name"] = expected_process_name
+        obs_config["path"] = resolved_obs_path
     steam_config = config.get("steam", {})
     xbox_config = config.get("xbox", {})
     battlenet_config = config.get("battlenet", {})

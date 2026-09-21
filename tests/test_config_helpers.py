@@ -230,6 +230,22 @@ class ClearObsCrashSentinelTests(unittest.TestCase):
         with patch.object(a.platform_common, "obs_config_dir", return_value=self.tmpdir.name):
             a.clear_obs_crash_sentinel()  # must not raise
 
+    def test_removes_macos_safe_mode_marker_file(self):
+        # Confirmed live against a real macOS OBS install: this OBS version's actual
+        # unclean-shutdown marker is a plain empty file, "safe_mode", directly under
+        # obs_config_dir -- not the .sentinel/ directory above, which never existed on that
+        # machine at all. Left in place, OBS's next launch blocks on its own "Run in Safe Mode?"
+        # dialog before ever starting obs-websocket's server.
+        safe_mode_marker = os.path.join(self.tmpdir.name, "safe_mode")
+        open(safe_mode_marker, "w").close()
+        with patch.object(a.platform_common, "obs_config_dir", return_value=self.tmpdir.name):
+            a.clear_obs_crash_sentinel()
+        self.assertFalse(os.path.isfile(safe_mode_marker))
+
+    def test_missing_safe_mode_marker_does_not_raise(self):
+        with patch.object(a.platform_common, "obs_config_dir", return_value=self.tmpdir.name):
+            a.clear_obs_crash_sentinel()  # must not raise
+
     def test_unresolvable_obs_config_dir_does_not_raise(self):
         with patch.object(a.platform_common, "obs_config_dir", return_value=None):
             a.clear_obs_crash_sentinel()  # must not raise
