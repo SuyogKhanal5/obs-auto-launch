@@ -508,8 +508,23 @@ def set_startup_shortcut_enabled(enabled):
 def launch_obs(obs_config):
     path = obs_config["path"]
     if not os.path.isfile(path):
-        logging.error("OBS executable not found at %s", path)
-        return False
+        # The configured path can be stale rather than genuinely missing -- e.g. a config.json
+        # carried over from another OS (confirmed live: a Windows-created config's literal
+        # "C:\Program Files\obs-studio\bin\64bit\obs64.exe" path, opened as-is on macOS) or from
+        # before OBS was reinstalled elsewhere. find_obs_executable's own per-OS discovery (the
+        # same search installer.py already runs when creating a config from scratch) gives this
+        # a real second chance instead of failing outright whenever the exact configured path
+        # happens not to exist -- still returns None (falling through to the same error as
+        # before) if nothing can be found anywhere.
+        discovered = platform_common.find_obs_executable()
+        if not discovered:
+            logging.error("OBS executable not found at %s", path)
+            return False
+        logging.warning(
+            "Configured OBS path %s doesn't exist; found OBS at %s instead. Update it in "
+            "Settings to stop seeing this.", path, discovered,
+        )
+        path = obs_config["path"] = discovered
     clear_obs_crash_sentinel()
     logging.info("OBS not running, launching from %s", path)
     subprocess.Popen(
@@ -8262,9 +8277,51 @@ def main():
             section's own module-level comment for why that crashes Tk), so this Icon is always
             constructed with menu=None. AppKit's status-item click routing falls back to the
             button's plain action/target (this override, via IconDelegate.activate_button's
-            self.icon() call) once no native menu is attached to the status item at all."""
+            self.icon() call) once no native menu is attached to the status item at all.
+
+            Also overrides icon/title/visible -- confirmed live that this app's game-watcher
+            thread (a background thread) setting icon.icon/icon.title directly, exactly as this
+            file does throughout (set_status and its many call sites), crashed the whole process
+            with a SIGABRT inside Tk's own Cocoa event dispatch a few seconds later: those
+            setters call pystray's macOS backend's _update_icon()/_update_title(), which touch
+            AppKit's NSStatusItem/NSImage synchronously, and AppKit forbids that off the main
+            thread. platform_common.run_on_main_thread marshals the real update onto the main
+            thread instead, so every existing icon.icon =/icon.title = call site elsewhere in
+            this file keeps working unchanged. update_menu() is a plain no-op here rather than
+            marshaled: it exists purely to refresh a *native* NSMenu pystray cached from a
+            previous open, but this Icon never has one (menu=None, see above) -- the custom Tk
+            popup in show_macos_tray_menu always renders live state at popup-open time, so
+            there's nothing to refresh, and skipping it avoids yet another AppKit call
+            (_update_menu's own status_item.setMenu_(...)) from a non-main thread."""
             def __call__(self):
                 show_macos_tray_menu(overlay_state.get("root"), menu, self)
+
+            @property
+            def icon(self):
+                return pystray.Icon.icon.fget(self)
+
+            @icon.setter
+            def icon(self, value):
+                platform_common.run_on_main_thread(lambda: pystray.Icon.icon.fset(self, value))
+
+            @property
+            def title(self):
+                return pystray.Icon.title.fget(self)
+
+            @title.setter
+            def title(self, value):
+                platform_common.run_on_main_thread(lambda: pystray.Icon.title.fset(self, value))
+
+            @property
+            def visible(self):
+                return pystray.Icon.visible.fget(self)
+
+            @visible.setter
+            def visible(self, value):
+                platform_common.run_on_main_thread(lambda: pystray.Icon.visible.fset(self, value))
+
+            def update_menu(self):
+                pass
 
         icon = _MacTrayIcon(
             "OBSAutoRecorder", icon=build_tray_image(IDLE_COLOR), title="OBS Auto Recorder - Starting...",

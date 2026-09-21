@@ -588,3 +588,10 @@ def hide_dock_icon():
     taskbar entry that needs hiding; only accepted for signature parity with the macOS backend,
     which does real work here."""
     pass
+
+
+def run_on_main_thread(func):
+    """No-op marshaling -- Linux's tray/GUI toolkits have no macOS-style main-thread-only AppKit
+    constraint, so func() just runs immediately on whichever thread called this. Only accepted for
+    signature parity with the macOS backend, which does real work here."""
+    func()

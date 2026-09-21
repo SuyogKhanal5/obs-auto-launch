@@ -353,3 +353,15 @@ def hide_dock_icon(platform_name=None):
     first place, unlike a plain macOS process, which shows a generic, non-functional Python/
     rocket Dock icon next to the real menu-bar tray icon unless told not to."""
     return _select_backend(platform_name).hide_dock_icon()
+
+
+def run_on_main_thread(func, platform_name=None):
+    """Schedules func to run on the real process main thread and returns immediately, without
+    waiting for it to actually run there -- only macOS needs this at all (see
+    platform_macos.run_on_main_thread): confirmed live that the game-watcher background thread
+    setting the tray icon's image/title directly (icon.icon = .../icon.title = ..., both touching
+    AppKit's NSStatusItem under the hood) crashed the whole process with a SIGABRT deep inside
+    Tk's own Cocoa event dispatch a few seconds later -- a background thread is never allowed to
+    touch AppKit on macOS. Windows/Linux have no such constraint, so func() just runs immediately,
+    synchronously, on whichever thread called this."""
+    return _select_backend(platform_name).run_on_main_thread(func)

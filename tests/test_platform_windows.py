@@ -500,5 +500,12 @@ class HideDockIconTests(unittest.TestCase):
         pw.hide_dock_icon()  # must not raise
 
 
+class RunOnMainThreadTests(unittest.TestCase):
+    def test_runs_func_immediately(self):
+        calls = []
+        pw.run_on_main_thread(lambda: calls.append(1))
+        self.assertEqual(calls, [1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -452,6 +452,39 @@ def _find_libtk_dylib():
     return None
 
 
+def _resolve_root_ns_view(tk_widget):
+    """Returns the raw NSView* pointer (a plain int, not a PyObjC object) of tk_widget's
+    TOPLEVEL's own Cocoa content view, or None if it can't be resolved. See embed_video_player's
+    docstring for why this goes through Tk's own TkMacOSXGetRootControl rather than winfo_id()
+    directly."""
+    libtk_path = _find_libtk_dylib()
+    if not libtk_path:
+        logging.warning("Could not find libtk%s.dylib for video embedding.", tkinter.TkVersion)
+        return None
+    try:
+        lib = ctypes.cdll.LoadLibrary(libtk_path)
+        get_root_view = lib.TkMacOSXGetRootControl
+        get_root_view.restype = ctypes.c_void_p
+        get_root_view.argtypes = (ctypes.c_void_p,)
+        return get_root_view(tk_widget.winfo_id())
+    except Exception as exc:
+        logging.warning("Could not resolve a real NSView for video embedding: %s", exc)
+        return None
+
+
+def _tk_widget_rect_in_appkit_coords(tk_widget, toplevel):
+    """tk_widget's on-screen rectangle, in the coordinate system of toplevel's own root content
+    view -- Tk's y grows downward from the top-left corner; AppKit's non-flipped views (which is
+    what a plain NSView, like the one created below, defaults to) grow upward from the
+    bottom-left, so the y axis has to be flipped relative to the toplevel's current height."""
+    x = tk_widget.winfo_rootx() - toplevel.winfo_rootx()
+    y_tk = tk_widget.winfo_rooty() - toplevel.winfo_rooty()
+    w = tk_widget.winfo_width()
+    h = tk_widget.winfo_height()
+    y_appkit = toplevel.winfo_height() - y_tk - h
+    return x, y_appkit, w, h
+
+
 def embed_video_player(player, tk_widget):
     """Embeds a python-vlc player's output into tk_widget -- unlike Windows/Linux (which both
     hand set_hwnd/set_xwindow the plain numeric id winfo_id() already returns), python-vlc's
@@ -464,33 +497,60 @@ def embed_video_player(player, tk_widget):
     object, since it isn't one. The actual, correct conversion -- confirmed against python-vlc's
     own official tkvlc.py example, not guessed -- is Tk's own (non-public, but exported) C
     function TkMacOSXGetRootControl, called via ctypes against the real libtk dylib this
-    interpreter loaded. It returns a plain pointer value, not a PyObjC object -- set_nsobject()
-    (a ctypes-based python-vlc binding, not a PyObjC one) takes that raw value directly; no
-    `objc` import is needed here at all, unlike what this function used to assume.
+    interpreter loaded.
 
-    Falls back to set_xwindow() (audio-only, no video -- but confirmed not to crash) if libtk
-    can't be found or the lookup fails for any reason, matching tkvlc.py's own documented
-    fallback rather than leaving video embedding entirely broken."""
-    view_ptr = tk_widget.winfo_id()
-    libtk_path = _find_libtk_dylib()
-    ns_view = None
-    if libtk_path:
-        try:
-            lib = ctypes.cdll.LoadLibrary(libtk_path)
-            get_ns_view = lib.TkMacOSXGetRootControl
-            get_ns_view.restype = ctypes.c_void_p
-            get_ns_view.argtypes = (ctypes.c_void_p,)
-            ns_view = get_ns_view(view_ptr)
-        except Exception as exc:
-            logging.warning("Could not resolve a real NSView for video embedding: %s", exc)
-    else:
-        logging.warning("Could not find libtk%s.dylib for video embedding.", tkinter.TkVersion)
+    That resolves a real NSView* -- but confirmed live (screenshots of a minimal repro, both
+    with and without the fix below) that it is specifically the TOPLEVEL WINDOW's own single
+    shared Cocoa content view, the same one no matter which descendant widget's winfo_id() is
+    passed in -- Tk's Cocoa port draws every child widget of a toplevel into that one NSView
+    itself, rather than giving each child widget its own. Handing that raw pointer straight to
+    set_nsobject() (as this function used to) therefore doesn't confine VLC's video to
+    tk_widget's own rectangle at all: VLC paints over the *entire* window, hiding every other Tk
+    widget sharing it (confirmed live: a clip editor's transport controls and timeline visually
+    vanished the instant a video actually started playing, once the prior SIGSEGV above was
+    fixed and this became reachable for the first time). python-vlc's own official tkvlc.py
+    example never hits this, because it never puts the video in the same window as any other
+    widget in the first place -- it uses one Toplevel exclusively for video and a second,
+    completely separate Toplevel for all the playback controls.
 
-    if ns_view:
-        player.set_nsobject(ns_view)
-    else:
+    Rather than restructure this app's clip editor into two windows to match, this creates a
+    second, real NSView scoped to tk_widget's own on-screen rectangle and adds it as a subview
+    of the toplevel's root view -- confirmed live (same repro, screenshotted again after this
+    fix) that this keeps the video correctly confined to tk_widget's own bounds while every
+    sibling widget in the same window stays visible. A <Configure> binding on tk_widget keeps
+    the subview's frame in sync if the window is later resized (the clip editor's window is
+    resizable, so tk_widget's own size/position aren't fixed for the widget's lifetime)."""
+    toplevel = tk_widget.winfo_toplevel()
+    root_view_ptr = _resolve_root_ns_view(tk_widget)
+    if not root_view_ptr:
         logging.warning("Falling back to audio-only playback (no video preview) for this clip.")
-        player.set_xwindow(view_ptr)
+        player.set_xwindow(tk_widget.winfo_id())
+        return
+
+    try:
+        import objc
+        import AppKit
+
+        root_view = objc.objc_object(c_void_p=root_view_ptr)
+        x, y, w, h = _tk_widget_rect_in_appkit_coords(tk_widget, toplevel)
+        child_view = AppKit.NSView.alloc().initWithFrame_(AppKit.NSMakeRect(x, y, w, h))
+        root_view.addSubview_(child_view)
+
+        def _sync_frame(_event=None):
+            try:
+                x, y, w, h = _tk_widget_rect_in_appkit_coords(tk_widget, toplevel)
+                child_view.setFrame_(AppKit.NSMakeRect(x, y, w, h))
+            except Exception:
+                logging.exception("Could not resync the video subview's frame after a resize.")
+
+        tk_widget.bind("<Configure>", _sync_frame, add="+")
+        player.set_nsobject(objc.pyobjc_id(child_view))
+    except Exception as exc:
+        logging.warning(
+            "Could not create a properly-bounded video subview (%s); falling back to the "
+            "whole window's view -- video will show, but may cover other controls.", exc,
+        )
+        player.set_nsobject(root_view_ptr)
 
 
 def resolve_editor_top_level_window(tk_window_id):
@@ -639,3 +699,34 @@ def hide_dock_icon():
         )
     except Exception as exc:
         logging.warning("Could not hide the Dock icon: %s", exc)
+
+
+def run_on_main_thread(func):
+    """Schedules func to run (asynchronously) on the real process main thread, from any thread.
+
+    Confirmed live: this app's game-watcher loop runs on its own background thread (started from
+    pystray's setup callback, which pystray itself documents as running "in a separate thread"),
+    and it directly sets the tray icon's image/title (icon.icon = .../icon.title = ...) whenever
+    recording state changes. Those property setters end up calling pystray's macOS backend's
+    _update_icon()/_update_title(), which touch AppKit's NSStatusItem/NSImage directly -- and
+    AppKit forbids that from any thread but the main one. A real crash report from this exact
+    sequence (detecting a watched game, then failing to reach OBS, then updating the tray icon to
+    show the error) showed a SIGABRT a few seconds later, deep inside Tk's own Cocoa event
+    dispatch (PythonCmd -> PyEval_RestoreThread -> fatal_error) -- the same class of "any AppKit
+    misuse anywhere in the process can corrupt Tk's own fragile macOS backend" finding as the
+    tray-menu-crash bug (see CROSS_PLATFORM_PLAN.md).
+
+    PyObjCTools.AppHelper.callAfter is PyObjC's own documented mechanism for handing a callable to
+    the main thread's run loop from any other thread, without going through Tkinter at all (Tk's
+    own .after() is itself a Tcl/Tk call, and making *that* safe to call cross-thread is exactly
+    the kind of misuse this function exists to avoid). If already on the main thread, func() just
+    runs immediately -- callAfter would still work, but there's no reason to round-trip through
+    the run loop when nothing needs marshaling."""
+    if threading.current_thread() is threading.main_thread():
+        func()
+        return
+    try:
+        from PyObjCTools import AppHelper
+        AppHelper.callAfter(func)
+    except Exception:
+        logging.exception("Could not marshal a callback onto the macOS main thread.")

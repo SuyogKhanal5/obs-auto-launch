@@ -258,21 +258,95 @@ class EmbedVideoPlayerTests(unittest.TestCase):
     # NSView pointer (wrapping it via objc.objc_object, this function's old behavior, segfaulted
     # the instant anything tried to use it as one) -- the real, confirmed-correct conversion is
     # Tk's own TkMacOSXGetRootControl C function, called via ctypes, per python-vlc's own
-    # official tkvlc.py example. No PyObjC/objc import is involved in the fixed version at all.
-    def test_calls_set_nsobject_with_the_resolved_ns_view(self):
-        player = unittest.mock.Mock()
+    # official tkvlc.py example.
+    #
+    # A second, separate finding (also confirmed live, via screenshots of a minimal repro): that
+    # resolved NSView is the TOPLEVEL WINDOW's own single shared content view, not one scoped to
+    # tk_widget specifically -- Tk's Cocoa port draws every child widget of a toplevel into that
+    # one view. Handing it to set_nsobject() directly makes VLC paint over the whole window,
+    # hiding every sibling widget (e.g. a clip editor's transport controls) the moment video
+    # actually starts playing. The fix creates a second, real NSView scoped to tk_widget's own
+    # on-screen rectangle and adds it as a subview of that root view instead.
+    def _make_widget_and_toplevel(self, widget_id=4242):
         widget = unittest.mock.Mock()
-        widget.winfo_id.return_value = 4242
+        widget.winfo_id.return_value = widget_id
+        widget.winfo_rootx.return_value = 110
+        widget.winfo_rooty.return_value = 124
+        widget.winfo_width.return_value = 620
+        widget.winfo_height.return_value = 400
+        toplevel = unittest.mock.Mock()
+        toplevel.winfo_rootx.return_value = 100
+        toplevel.winfo_rooty.return_value = 100
+        toplevel.winfo_height.return_value = 480
+        widget.winfo_toplevel.return_value = toplevel
+        return widget, toplevel
+
+    def _fake_libtk(self, root_view_ptr=999999):
         fake_lib = unittest.mock.Mock()
-        fake_lib.TkMacOSXGetRootControl.return_value = 999999
+        fake_lib.TkMacOSXGetRootControl.return_value = root_view_ptr
+        return fake_lib
+
+    def test_creates_a_scoped_subview_and_calls_set_nsobject_with_it(self):
+        player = unittest.mock.Mock()
+        widget, toplevel = self._make_widget_and_toplevel()
+        fake_lib = self._fake_libtk()
+
+        fake_objc = unittest.mock.MagicMock()
+        fake_root_view = unittest.mock.MagicMock()
+        fake_objc.objc_object.return_value = fake_root_view
+        fake_child_view = unittest.mock.MagicMock()
+        fake_appkit = unittest.mock.MagicMock()
+        fake_appkit.NSView.alloc.return_value.initWithFrame_.return_value = fake_child_view
+        fake_objc.pyobjc_id.return_value = 555555
 
         with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
-             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll:
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll, \
+             unittest.mock.patch.dict(sys.modules, {"objc": fake_objc, "AppKit": fake_appkit}):
             mock_cdll.LoadLibrary.return_value = fake_lib
             pmac.embed_video_player(player, widget)
 
-        mock_cdll.LoadLibrary.assert_called_once_with("/fake/libtk8.6.dylib")
         fake_lib.TkMacOSXGetRootControl.assert_called_once_with(4242)
+        fake_objc.objc_object.assert_called_once_with(c_void_p=999999)
+        fake_root_view.addSubview_.assert_called_once_with(fake_child_view)
+        self.assertEqual(widget.bind.call_args[0][0], "<Configure>")
+        player.set_nsobject.assert_called_once_with(555555)
+        player.set_xwindow.assert_not_called()
+
+    def test_resize_binding_resyncs_the_subview_frame(self):
+        player = unittest.mock.Mock()
+        widget, toplevel = self._make_widget_and_toplevel()
+        fake_lib = self._fake_libtk()
+
+        fake_objc = unittest.mock.MagicMock()
+        fake_objc.objc_object.return_value = unittest.mock.MagicMock()
+        fake_child_view = unittest.mock.MagicMock()
+        fake_appkit = unittest.mock.MagicMock()
+        fake_appkit.NSView.alloc.return_value.initWithFrame_.return_value = fake_child_view
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll, \
+             unittest.mock.patch.dict(sys.modules, {"objc": fake_objc, "AppKit": fake_appkit}):
+            mock_cdll.LoadLibrary.return_value = fake_lib
+            pmac.embed_video_player(player, widget)
+            resync = widget.bind.call_args[0][1]
+            widget.winfo_width.return_value = 900
+            toplevel.winfo_height.return_value = 650
+            resync()
+
+        self.assertEqual(fake_child_view.setFrame_.call_count, 1)
+
+    def test_falls_back_to_whole_window_view_when_subview_creation_fails(self):
+        player = unittest.mock.Mock()
+        widget, toplevel = self._make_widget_and_toplevel()
+        fake_lib = self._fake_libtk()
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll, \
+             unittest.mock.patch.dict(sys.modules, {"objc": None}):
+            mock_cdll.LoadLibrary.return_value = fake_lib
+            with self.assertLogs(level="WARNING"):
+                pmac.embed_video_player(player, widget)
+
         player.set_nsobject.assert_called_once_with(999999)
         player.set_xwindow.assert_not_called()
 
@@ -688,6 +762,59 @@ class HideDockIconTests(unittest.TestCase):
         with unittest.mock.patch.dict(sys.modules, {"AppKit": None}):
             with self.assertLogs(level="WARNING"):
                 pmac.hide_dock_icon()  # must not raise
+
+
+class RunOnMainThreadTests(unittest.TestCase):
+    # Confirmed live: the game-watcher background thread setting the tray icon's image/title
+    # directly crashed the whole process (SIGABRT deep inside Tk's own Cocoa event dispatch) --
+    # AppKit forbids touching it off the main thread. See platform_macos.run_on_main_thread's own
+    # docstring for the full crash-report trail.
+    def test_runs_immediately_when_already_on_main_thread(self):
+        calls = []
+        self.assertIs(threading.current_thread(), threading.main_thread())
+        pmac.run_on_main_thread(lambda: calls.append(1))
+        self.assertEqual(calls, [1])
+
+    def test_marshals_via_callafter_when_off_main_thread(self):
+        fake_app_helper = unittest.mock.MagicMock()
+        fake_pyobjctools = unittest.mock.MagicMock(AppHelper=fake_app_helper)
+        func = lambda: None
+
+        errors = []
+
+        def run_off_main_thread():
+            try:
+                with unittest.mock.patch.dict(sys.modules, {
+                    "PyObjCTools": fake_pyobjctools,
+                    "PyObjCTools.AppHelper": fake_app_helper,
+                }):
+                    pmac.run_on_main_thread(func)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_off_main_thread)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(errors, [])
+        fake_app_helper.callAfter.assert_called_once_with(func)
+
+    def test_missing_pyobjc_off_main_thread_is_logged_not_raised(self):
+        errors = []
+
+        def run_off_main_thread():
+            try:
+                with unittest.mock.patch.dict(sys.modules, {"PyObjCTools": None}):
+                    with self.assertLogs(level="ERROR"):
+                        pmac.run_on_main_thread(lambda: None)  # must not raise
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_off_main_thread)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":
