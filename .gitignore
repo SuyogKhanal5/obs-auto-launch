@@ -7,3 +7,4 @@ dist/
 OBSAutoRecorder.exe
 OBSAutoRecorderInstaller*.exe
 .claude/
+venv/
