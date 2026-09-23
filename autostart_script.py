@@ -7198,7 +7198,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
     trim_button = dark_button(range_row, text="✂ Trim Clip", command=lambda: do_trim())
     trim_button.pack(side="right")
-    dark_button(range_row, text="✕ Close", command=close_editor).pack(side="right", padx=(0, 8))
+    close_button = dark_button(range_row, text="✕ Close", command=close_editor)
+    close_button.pack(side="right", padx=(0, 8))
 
     # --- Audio tracks row: "Fix audio track sync" checkbox (left) + "Track Routing..." button
     # (right), both on one line. A prior version of the sync fix reapplied one fixed, configured
@@ -7688,6 +7689,11 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
         set_status(f"Trimming to {os.path.basename(output_path)}...")
         trim_button.config(state="disabled")
+        # Label-only -- closing the editor while a trim is running doesn't actually stop the
+        # ffmpeg subprocess (see finish()'s "editor was closed while this trim was still running"
+        # comment below); "Cancel" just tells the user honestly that leaving now means abandoning
+        # the trim's own window rather than seeing it finish, not that it aborts the encode.
+        close_button.config(text="✕ Cancel")
         progress.config(mode="indeterminate")
         progress.pack(fill="x", padx=10, pady=(0, 6), before=status_label)
         progress.start(12)
@@ -7808,6 +7814,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 progress.stop()
                 progress.pack_forget()
                 trim_button.config(state="normal")
+                close_button.config(text="✕ Close")
                 if success:
                     status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}")
                 else:
