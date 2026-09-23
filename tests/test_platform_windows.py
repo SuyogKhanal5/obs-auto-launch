@@ -382,7 +382,7 @@ class RunCustomKeybindListenerRegistrationRetryTests(unittest.TestCase):
                 self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
                 icon=icon, notifications_config={"enabled": True},
             )
-        self.assertEqual(self.mock_user32.RegisterHotKey.call_count, 5)
+        self.assertEqual(self.mock_user32.RegisterHotKey.call_count, 30)
         self.notify.assert_called_once()
 
 

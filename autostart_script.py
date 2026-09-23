@@ -3042,9 +3042,11 @@ def build_audio_routing_filter_args(
             continue
         dest_gains = gains_db.get(dest, {})
         mix_inputs = []
+        any_gain_applied = False
         for s in sources:
             gain = dest_gains.get(s)
             if gain:
+                any_gain_applied = True
                 gained_label = f"again{dest}_{s}"
                 filter_parts.append(f"[asrc{s}]volume={gain}dB[{gained_label}]")
                 mix_inputs.append(gained_label)
@@ -3055,8 +3057,21 @@ def build_audio_routing_filter_args(
         else:
             mixed_label = f"amix{dest}"
             inputs = "".join(f"[{label}]" for label in mix_inputs)
+            # amix's own "normalize" option defaults ON -- it silently rescales EVERY input by
+            # 1/N regardless of any gain already applied above, which would otherwise cancel out
+            # a meaningful chunk of a deliberate boost the moment 2+ sources land in the same
+            # destination (confirmed live: mixing 2 sources with one boosted +12dB measured a
+            # further -6dB from amix's own normalization on top -- exactly 1/2 in dB -- and it
+            # only gets worse with more sources mixed together). Once the user has taken explicit
+            # control of one source's relative level here, amix re-normalizing on top of that
+            # would just be fighting the user's own choice -- so it's turned off for any
+            # destination that actually used a gain. Left at its default (on) when no gain was
+            # set for this destination at all, so plain track consolidation (the original,
+            # gain-less feature) keeps its prior auto-balanced behavior unchanged.
+            normalize_arg = ":normalize=0" if any_gain_applied else ""
             filter_parts.append(
-                f"{inputs}amix=inputs={len(mix_inputs)}:duration=longest:dropout_transition=0[{mixed_label}]"
+                f"{inputs}amix=inputs={len(mix_inputs)}:duration=longest:"
+                f"dropout_transition=0{normalize_arg}[{mixed_label}]"
             )
         if dest in muted_destinations:
             final_label = f"adest{dest}"

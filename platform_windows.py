@@ -245,12 +245,18 @@ def run_custom_keybind_listener(
         # that race silently and permanently disables the keybind for the rest of this session
         # (confirmed live: an "Add Marker" keybind that lost this race never worked again until
         # the next restart, with no further sign of it beyond one cold WARNING log line).
+        # 30 attempts at 0.5s (15s ceiling), not the 5x0.3s (1.5s) originally here: confirmed live,
+        # twice in the same real session, that 1.5s genuinely isn't enough -- a restart with a
+        # clip editor open (VLC/libvlc threads still unwinding) took noticeably longer than that
+        # for the old process to actually let go, and both times the keybind silently never came
+        # back until the NEXT restart happened to win the race instead. This only ever costs
+        # anything in that exact race (a plain first launch always succeeds on attempt 1, instantly).
         registered_ok = False
-        for _attempt in range(5):
+        for _attempt in range(30):
             if user32.RegisterHotKey(None, hotkey_id, mods, vk):
                 registered_ok = True
                 break
-            time.sleep(0.3)
+            time.sleep(0.5)
         if registered_ok:
             registered.append((hotkey_id, binding))
             logging.info("Registered custom keybind %s -> %s", describe_keybind(binding), binding.get("action"))

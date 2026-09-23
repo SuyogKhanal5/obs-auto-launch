@@ -264,6 +264,28 @@ class BuildAudioRoutingFilterArgsTests(unittest.TestCase):
         self.assertIn("[again1_1][asrc2]amix=inputs=2", filter_complex)
         self.assertEqual(map_args, ["-map", "[amix1]"])
 
+    def test_gain_disables_amixs_own_normalize_so_the_boost_actually_lands(self):
+        # Confirmed live: amix's own "normalize" defaults ON and silently rescales every input by
+        # 1/N regardless of any gain already applied -- e.g. a +12dB boost on one of 2 mixed
+        # sources measured a further -6dB from amix itself on top, almost completely canceling
+        # the boost out. Once any gain is set for a destination, amix's own auto-balancing has
+        # to be turned off there, or the whole feature would silently defeat itself the moment
+        # 2+ sources land in the same output.
+        filter_args, _map_args = a.build_audio_routing_filter_args(
+            3, routing={1: [1, 2, 3]}, gains_db={1: {1: 12}},
+        )
+        filter_complex = filter_args[1]
+        self.assertIn("amix=inputs=3:duration=longest:dropout_transition=0:normalize=0[amix1]", filter_complex)
+
+    def test_no_gain_leaves_amixs_default_normalize_untouched(self):
+        # Pure track consolidation (the original, gain-less feature) must keep its prior
+        # behavior exactly -- amix's own default auto-balancing across sources being combined
+        # with no explicit gain involved is the whole point there, unlike the case above.
+        filter_args, _map_args = a.build_audio_routing_filter_args(3, routing={1: [1, 2, 3]})
+        filter_complex = filter_args[1]
+        self.assertIn("amix=inputs=3:duration=longest:dropout_transition=0[amix1]", filter_complex)
+        self.assertNotIn("normalize", filter_complex)
+
     def test_gain_and_mute_stack_on_the_same_destination(self):
         filter_args, map_args = a.build_audio_routing_filter_args(
             2, routing={1: [1]}, muted_destinations=[1], gains_db={1: {1: 12}},
