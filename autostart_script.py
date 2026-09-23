@@ -5897,7 +5897,10 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "values whenever it's opened -- still freely changeable (or clearable) per trim from "
             "there. Boosts (positive) or attenuates (negative) a source only when it's routed "
             "into that one output track (the row); the same source can have a different default "
-            "-- or none -- on each output it's also routed to. Leave blank or 0 for no default."
+            "-- or none -- on each output it's also routed to. Leave blank or 0 for no default. "
+            "This changes the exported FILE itself (via ffmpeg) once a trim actually runs -- it's "
+            "unrelated to the clip editor's own \"Preview\" volume slider, which only ever affects "
+            "what you hear while scrubbing a clip, never the exported output."
         ),
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
@@ -7257,7 +7260,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
     volume_group = tk.Frame(controls_row, bg=EDITOR_BG)
     volume_group.grid(row=0, column=2, sticky="e")
-    tk.Label(volume_group, text="🔊", font=("Segoe UI", 11), bg=EDITOR_BG, fg=EDITOR_FG).pack(side="left", padx=(0, 6))
+    # Explicitly labeled "Preview" -- this only ever calls player.audio_set_volume() on the VLC
+    # instance showing THIS window's playback; it never reaches ffmpeg or the exported file at
+    # all. Confirmed live this reads as ambiguous against Track Routing's per-track dB gain below
+    # (which DOES change the exported file) -- a bare speaker icon gave no hint they're two
+    # completely separate things, one temporary/for-your-ears-right-now, the other permanent and
+    # baked into the output.
+    tk.Label(
+        volume_group, text="🔊 Preview:", font=("Segoe UI", 9), bg=EDITOR_BG, fg=EDITOR_FG,
+    ).pack(side="left", padx=(0, 6))
     volume_var = tk.IntVar(value=100)
 
     def on_volume_change(value):
@@ -7453,7 +7464,9 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 "keep an output track present but silent. The dB box under a checked source boosts "
                 "(positive) or attenuates (negative) just that source for that one output -- the "
                 "same source can have a different gain (or none) on each output it's routed to; "
-                "leave blank or 0 for no change."
+                "leave blank or 0 for no change. This is baked into the exported FILE itself by "
+                "ffmpeg -- separate from (and unaffected by) the \"Preview\" volume slider above, "
+                "which only ever changes what you hear while scrubbing here, never the output."
             ),
             bg=EDITOR_BG, fg=EDITOR_FG, anchor="w", justify="left", wraplength=90 + 46 * n,
         ).grid(row=0, column=0, columnspan=n + 2, sticky="w", padx=10, pady=(10, 8))
