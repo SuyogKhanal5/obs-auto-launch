@@ -102,6 +102,7 @@
         "output_suffix": "_trimmed",
         "delete_original_after_trim": false,
         "auto_fix_audio_sync": false,
+        "default_gains_db": {},
         "trim_mode": "precise",
         "default_output_format": "Same as source",
         "default_quality": "Same as source",

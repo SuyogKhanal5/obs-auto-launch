@@ -5873,6 +5873,63 @@ def _run_config_editor(master_root, restart_callback, on_close):
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
 
+    add_section_label(clip_editor_tab, row, "Default Track Gains (dB)")
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Pre-fills the Track Routing dialog's own per-track gain boxes with these "
+            "values whenever it's opened -- still freely changeable (or clearable) per trim from "
+            "there. Boosts (positive) or attenuates (negative) a source only when it's routed "
+            "into that one output track (the row); the same source can have a different default "
+            "-- or none -- on each output it's also routed to. Leave blank or 0 for no default."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    # A fixed 6x6 grid rather than one sized to any particular recording's real track count --
+    # Settings has no specific file open to probe, and 6 is OBS's own hard cap on simultaneous
+    # audio tracks (see e.g. CALIBRATION_TARGET_TRACK and the multi_track_audio tab's own track
+    # dropdown above, both hardcoded to range(1, 7) for the same reason). Keyed by track NUMBER,
+    # same convention as track_name_hints/multi_track_audio.tracks -- this app's own multi-track
+    # routing assigns each source to a fixed, stable track number, so a number-keyed default
+    # reliably means the same source every time, unlike e.g. a source's on-disk stream index.
+    DEFAULT_GAIN_GRID_TRACKS = 6
+    default_gains_config = clip_editor_config.get("default_gains_db") or {}
+    gain_track_hints = track_name_hints(obs_config)
+
+    def default_gain_text(dest, src):
+        value = default_gains_config.get(str(dest), {}).get(str(src))
+        return "" if not value else str(value)
+
+    default_gain_vars = {
+        dest: {
+            src: tk.StringVar(value=default_gain_text(dest, src))
+            for src in range(1, DEFAULT_GAIN_GRID_TRACKS + 1)
+        }
+        for dest in range(1, DEFAULT_GAIN_GRID_TRACKS + 1)
+    }
+    gain_header_row = row
+    for src in range(1, DEFAULT_GAIN_GRID_TRACKS + 1):
+        hint = gain_track_hints.get(src)
+        header_text = f"{src}\n({hint})" if hint else str(src)
+        tk.Label(
+            clip_editor_tab, text=header_text, bg=DARK_BG, fg=DARK_FG, justify="center",
+            font=("Segoe UI", 8),
+        ).grid(row=gain_header_row, column=src, padx=2, pady=(0, 2))
+    row += 1
+    for dest in range(1, DEFAULT_GAIN_GRID_TRACKS + 1):
+        tk.Label(clip_editor_tab, text=f"-> Track {dest}:", bg=DARK_BG, fg=DARK_FG, anchor="w").grid(
+            row=row, column=0, sticky="w", padx=(10, 4), pady=1
+        )
+        for src in range(1, DEFAULT_GAIN_GRID_TRACKS + 1):
+            tk.Entry(
+                clip_editor_tab, textvariable=default_gain_vars[dest][src], width=4,
+                bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG, justify="center",
+            ).grid(row=row, column=src, padx=1, pady=1)
+        row += 1
+
     add_section_label(clip_editor_tab, row, "Video Preview (VLC)")
     row += 1
 
@@ -6247,6 +6304,26 @@ def _run_config_editor(master_root, restart_callback, on_close):
         clip_editor["output_suffix"] = clip_output_suffix_var.get()
         clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
         clip_editor["auto_fix_audio_sync"] = clip_auto_fix_sync_var.get()
+        default_gains_out = {}
+        for gain_dest, gain_sources in default_gain_vars.items():
+            dest_gains_out = {}
+            for gain_src, gain_var in gain_sources.items():
+                text = gain_var.get().strip()
+                if not text:
+                    continue
+                try:
+                    value = float(text)
+                except ValueError:
+                    errors.append(f"Default Track Gains: 'Track {gain_dest}' column {gain_src} must be a number")
+                    continue
+                if value:
+                    dest_gains_out[str(gain_src)] = value
+            if dest_gains_out:
+                default_gains_out[str(gain_dest)] = dest_gains_out
+        if default_gains_out:
+            clip_editor["default_gains_db"] = default_gains_out
+        else:
+            clip_editor.pop("default_gains_db", None)
         clip_editor["trim_mode"] = CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL.get(trim_mode_var.get(), "precise")
         if clip_target_size_var.get().strip():
             target_size_value = read_float(clip_target_size_var, "Default target size", None)
@@ -7302,8 +7379,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             for dest in range(1, track_count + 1)
         }
         routing_state["mute_vars"] = {dest: tk.BooleanVar(value=False) for dest in range(1, track_count + 1)}
+        # Pre-fills from Settings > Clip Editor > "Default Track Gains (dB)" (same {dest: {src:
+        # gain}} shape, string-keyed since it round-trips through JSON) -- still freely editable
+        # or clearable per trim from here, this is just the dialog's own starting point.
+        default_gains = clip_editor_config.get("default_gains_db") or {}
         routing_state["gain_vars"] = {
-            dest: {src: tk.StringVar(value="") for src in range(1, track_count + 1)}
+            dest: {
+                src: tk.StringVar(value=str(default_gains.get(str(dest), {}).get(str(src)) or ""))
+                for src in range(1, track_count + 1)
+            }
             for dest in range(1, track_count + 1)
         }
         track_routing_button.config(state="normal" if track_count else "disabled")
@@ -7408,11 +7492,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 selectcolor=END_MARKER_COLOR,
             ).grid(row=row, column=n + 1, padx=(14, 10), pady=2)
 
+        default_gains = clip_editor_config.get("default_gains_db") or {}
+
         def reset_to_defaults():
             for dest in range(1, n + 1):
                 for src in range(1, n + 1):
                     routing_state["routing_vars"][dest][src].set(src == dest)
-                    routing_state["gain_vars"][dest][src].set("")
+                    routing_state["gain_vars"][dest][src].set(
+                        str(default_gains.get(str(dest), {}).get(str(src)) or "")
+                    )
                 routing_state["mute_vars"][dest].set(False)
 
         button_row = header_row + n + 1
