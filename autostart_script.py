@@ -2954,13 +2954,16 @@ def build_audio_track_filter_args(audio_stream_count, shift_ms_by_track=None, mu
     return ["-filter_complex", ";".join(filter_parts)], map_args
 
 
-def build_audio_routing_filter_args(audio_stream_count, routing=None, muted_destinations=None, shift_ms_by_track=None):
+def build_audio_routing_filter_args(
+    audio_stream_count, routing=None, muted_destinations=None, shift_ms_by_track=None, gains_db=None,
+):
     """Builds (-filter_complex ..., -map ... -map ...) args for the clip editor's Track Routing
     dialog -- lets a user consolidate multiple source tracks into fewer output tracks (e.g. mix
     Spotify and Firefox together), drop a source entirely (e.g. remove Desktop Audio from the
-    export), and mute an output track, on top of whatever per-source sync-fix shift already
-    applies -- rather than the simpler 1:1 build_audio_track_filter_args, which has no notion of
-    combining or dropping tracks at all.
+    export), mute an output track, and/or boost or attenuate a specific source's gain going into a
+    specific output, on top of whatever per-source sync-fix shift already applies -- rather than
+    the simpler 1:1 build_audio_track_filter_args, which has no notion of combining or dropping
+    tracks at all.
 
     routing: {destination_track: [source_track, ...]} -- which 1-based source track(s) (as in the
     original file) get mixed together into each 1-based destination track of the output. Defaults
@@ -2979,17 +2982,29 @@ def build_audio_routing_filter_args(audio_stream_count, routing=None, muted_dest
     measure_clip_audio_sync_shifts_ms) to shift before mixing, so a per-track sync-fix correction
     still applies correctly to a source even after it's combined with others.
 
-    Returns ([], []) if the result would be a pure identity passthrough with nothing muted or
-    shifted -- the caller falls back to its own plain "-map 0:a" wildcard (eligible for a fast
-    stream copy) in that case, same as build_audio_track_filter_args always has."""
+    gains_db: {destination_track: {source_track: gain_db}} -- an optional dB gain (positive
+    boosts, negative attenuates) applied to one SOURCE only as it feeds into one particular
+    DESTINATION, before mixing -- e.g. boosting a mic +12dB into destination 1 but leaving it
+    unboosted into destination 2, where the same source is routed to both. Applied per
+    (destination, source) pair rather than per source, precisely because the same source can need
+    different treatment depending on which output track it ends up in -- a per-source-only gain
+    couldn't express that. A missing or 0 entry means no change for that pair.
+
+    Returns ([], []) if the result would be a pure identity passthrough with nothing muted,
+    shifted, or gained -- the caller falls back to its own plain "-map 0:a" wildcard (eligible for
+    a fast stream copy) in that case, same as build_audio_track_filter_args always has."""
     if not audio_stream_count:
         return [], []
     identity_routing = {t: [t] for t in range(1, audio_stream_count + 1)}
     routing = routing if routing is not None else identity_routing
     muted_destinations = set(muted_destinations or [])
     shift_by_source = {t: ms for t, ms in (shift_ms_by_track or {}).items() if ms}
+    gains_db = gains_db or {}
+    has_gains = any(
+        gains_db.get(dest, {}).get(s) for dest, sources in routing.items() for s in sources
+    )
 
-    if not muted_destinations and not shift_by_source and routing == identity_routing:
+    if not muted_destinations and not shift_by_source and not has_gains and routing == identity_routing:
         return [], []
 
     referenced_sources = sorted({
@@ -2998,9 +3013,11 @@ def build_audio_routing_filter_args(audio_stream_count, routing=None, muted_dest
     if not referenced_sources:
         return [], []
 
-    # Stage 1: per-source filters (shift only -- destination muting happens in stage 2, after
-    # mixing, so it silences the COMBINED result of everything routed there, not just one
-    # contributing source).
+    # Stage 1: per-source filters (shift only -- destination muting happens after mixing, in
+    # stage 2 below, so it silences the COMBINED result of everything routed there rather than
+    # just one contributing source; gain happens in stage 2 too, and specifically NOT here,
+    # since gain can differ per destination for the very same source -- a single per-source
+    # filter here couldn't express "boost this source on destination 1 but not destination 2").
     filter_parts = []
     for s in referenced_sources:
         i = s - 1
@@ -3014,20 +3031,32 @@ def build_audio_routing_filter_args(audio_stream_count, routing=None, muted_dest
         else:
             filter_parts.append(f"[0:a:{i}]anull[{label}]")
 
-    # Stage 2: mix each destination's source(s) (or pass the one straight through), then mute if
-    # asked. A destination with no valid sources at all is simply omitted from the output.
+    # Stage 2: apply this destination's own gain (if any) to its own copy of each source, mix
+    # each destination's (possibly gain-adjusted) source(s) together -- or pass the one straight
+    # through -- then mute if asked. A destination with no valid sources at all is simply
+    # omitted from the output.
     map_args = []
     for dest in sorted(routing.keys()):
         sources = [s for s in routing[dest] if 1 <= s <= audio_stream_count]
         if not sources:
             continue
-        if len(sources) == 1:
-            mixed_label = f"asrc{sources[0]}"
+        dest_gains = gains_db.get(dest, {})
+        mix_inputs = []
+        for s in sources:
+            gain = dest_gains.get(s)
+            if gain:
+                gained_label = f"again{dest}_{s}"
+                filter_parts.append(f"[asrc{s}]volume={gain}dB[{gained_label}]")
+                mix_inputs.append(gained_label)
+            else:
+                mix_inputs.append(f"asrc{s}")
+        if len(mix_inputs) == 1:
+            mixed_label = mix_inputs[0]
         else:
             mixed_label = f"amix{dest}"
-            inputs = "".join(f"[asrc{s}]" for s in sources)
+            inputs = "".join(f"[{label}]" for label in mix_inputs)
             filter_parts.append(
-                f"{inputs}amix=inputs={len(sources)}:duration=longest:dropout_transition=0[{mixed_label}]"
+                f"{inputs}amix=inputs={len(mix_inputs)}:duration=longest:dropout_transition=0[{mixed_label}]"
             )
         if dest in muted_destinations:
             final_label = f"adest{dest}"
@@ -3069,7 +3098,7 @@ def probe_audio_stream_count(ffmpeg_path, input_path):
 def build_trim_command(
     ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False, crf=None,
     scale_height=None, audio_shift_ms_by_track=None, audio_stream_count=None,
-    audio_routing=None, muted_destinations=None,
+    audio_routing=None, muted_destinations=None, gains_db=None,
 ):
     """Builds the ffmpeg argv to cut [start_seconds, end_seconds) out of input_path. Always uses
     -t (duration) rather than -to (absolute end time) even though both express the same cut --
@@ -3102,18 +3131,19 @@ def build_trim_command(
     audio_shift_ms_by_track/audio_stream_count: shift each given 1-based OBS track number by its
     own ms amount (a per-track dict, since real process-capture tracks were confirmed live to
     each lag Desktop Audio by a genuinely different amount) to fix a clip whose isolated audio
-    track(s) still sound a few ms out of sync with the rest. audio_routing/muted_destinations:
-    the clip editor's Track Routing dialog -- consolidate multiple source tracks into fewer
-    output tracks, drop a source entirely, and/or mute an output track; see
-    build_audio_routing_filter_args, which this delegates to (and which also applies
-    audio_shift_ms_by_track to the right SOURCE tracks before any consolidation mixes them
-    together). Requires audio_stream_count (e.g. from probe_audio_stream_count) to correctly
-    re-map every track; using any of this forces the AUDIO side to re-encode (a filter graph
-    can't be stream-copied) but never touches video's own copy-vs-re-encode decision above."""
+    track(s) still sound a few ms out of sync with the rest. audio_routing/muted_destinations/
+    gains_db: the clip editor's Track Routing dialog -- consolidate multiple source tracks into
+    fewer output tracks, drop a source entirely, mute an output track, and/or boost/attenuate one
+    source's gain into one specific output track; see build_audio_routing_filter_args, which this
+    delegates to (and which also applies audio_shift_ms_by_track to the right SOURCE tracks before
+    any consolidation mixes them together). Requires audio_stream_count (e.g. from
+    probe_audio_stream_count) to correctly re-map every track; using any of this forces the AUDIO
+    side to re-encode (a filter graph can't be stream-copied) but never touches video's own
+    copy-vs-re-encode decision above."""
     start_str = format_timestamp(start_seconds)
     duration_str = format_timestamp(end_seconds - start_seconds)
     filter_complex_args, shifted_audio_map_args = build_audio_routing_filter_args(
-        audio_stream_count, audio_routing, muted_destinations, audio_shift_ms_by_track,
+        audio_stream_count, audio_routing, muted_destinations, audio_shift_ms_by_track, gains_db,
     )
     filtering_audio = bool(filter_complex_args)
     # Only video and audio -- not "-map 0" for every stream. OBS's Hybrid MP4 recordings carry
@@ -3286,19 +3316,19 @@ def trim_clip(
     input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
     delete_original=False, icon=None, notifications_config=None, crf=None, scale_height=None,
     target_size_mb=None, audio_shift_ms_by_track=None, audio_routing=None, muted_destinations=None,
-    progress_callback=None,
+    gains_db=None, progress_callback=None,
 ):
     """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
     way transcode_recording's callers do. Verifies the output file actually exists and has a
     nonzero size before reporting success or deleting the source; never deletes on a failed or
     suspicious-looking trim, same rule transcode_recording already follows.
 
-    audio_shift_ms_by_track/audio_routing/muted_destinations: see build_audio_routing_filter_args.
-    Only probes the source's real audio track count (an extra ffprobe subprocess) when any of
-    them is actually requested -- the common case (none) pays nothing extra. Not supported
-    together with target_size_mb: a size-targeted export already keeps only the first audio track
-    (see build_two_pass_size_targeted_commands), so there's nothing left to shift, route, or
-    mute.
+    audio_shift_ms_by_track/audio_routing/muted_destinations/gains_db: see
+    build_audio_routing_filter_args. Only probes the source's real audio track count (an extra
+    ffprobe subprocess) when any of them is actually requested -- the common case (none) pays
+    nothing extra. Not supported together with target_size_mb: a size-targeted export already
+    keeps only the first audio track (see build_two_pass_size_targeted_commands), so there's
+    nothing left to shift, route, mute, or boost/attenuate.
 
     progress_callback(phase_text, fraction), if given, is called repeatedly with real progress
     (fraction in [0, 1]) as the actual output-producing encode runs -- see
@@ -3311,9 +3341,9 @@ def trim_clip(
 
     passlog_prefix = None
     if target_size_mb:
-        if audio_shift_ms_by_track or audio_routing or muted_destinations:
+        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db:
             logging.warning(
-                "Clip editor: ignoring the audio sync shift/routing/mute for %s -- a "
+                "Clip editor: ignoring the audio sync shift/routing/mute/gain for %s -- a "
                 "size-targeted export only keeps the first audio track, so there's nothing left "
                 "to apply it to.",
                 basename,
@@ -3353,16 +3383,16 @@ def trim_clip(
         logging.info("Trimming %s (pass 2/2): %s", basename, " ".join(cmd))
     else:
         audio_stream_count = None
-        if audio_shift_ms_by_track or audio_routing or muted_destinations:
+        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db:
             audio_stream_count = probe_audio_stream_count(ffmpeg_path, input_path)
             if not audio_stream_count:
                 logging.warning(
                     "Clip editor: could not determine %s's audio track count -- skipping the "
-                    "requested audio sync shift/routing/mute.", basename,
+                    "requested audio sync shift/routing/mute/gain.", basename,
                 )
         cmd = build_trim_command(
             ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise, crf, scale_height,
-            audio_shift_ms_by_track, audio_stream_count, audio_routing, muted_destinations,
+            audio_shift_ms_by_track, audio_stream_count, audio_routing, muted_destinations, gains_db,
         )
         phase_text = "Encoding clip"
         logging.info("Trimming %s: %s", basename, " ".join(cmd))
@@ -7255,7 +7285,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     # recording and stale routing for a since-replaced file's track layout could silently apply
     # to the wrong tracks.
     track_name_hints_map = track_name_hints(obs_config)
-    routing_state = {"track_count": 0, "routing_vars": {}, "mute_vars": {}}
+    routing_state = {"track_count": 0, "routing_vars": {}, "mute_vars": {}, "gain_vars": {}}
     routing_dialog_state = {"window": None}
 
     def rebuild_routing_state(track_count):
@@ -7272,6 +7302,10 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             for dest in range(1, track_count + 1)
         }
         routing_state["mute_vars"] = {dest: tk.BooleanVar(value=False) for dest in range(1, track_count + 1)}
+        routing_state["gain_vars"] = {
+            dest: {src: tk.StringVar(value="") for src in range(1, track_count + 1)}
+            for dest in range(1, track_count + 1)
+        }
         track_routing_button.config(state="normal" if track_count else "disabled")
 
     def probe_track_count_for_routing(path):
@@ -7317,9 +7351,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 "Check which source track(s) (columns) feed into each output track (rows) below "
                 "-- check several under one output to mix them together, leave a source "
                 "unchecked everywhere to drop it from the export entirely, or check \"Mute\" to "
-                "keep an output track present but silent."
+                "keep an output track present but silent. The dB box under a checked source boosts "
+                "(positive) or attenuates (negative) just that source for that one output -- the "
+                "same source can have a different gain (or none) on each output it's routed to; "
+                "leave blank or 0 for no change."
             ),
-            bg=EDITOR_BG, fg=EDITOR_FG, anchor="w", justify="left", wraplength=60 + 46 * n,
+            bg=EDITOR_BG, fg=EDITOR_FG, anchor="w", justify="left", wraplength=90 + 46 * n,
         ).grid(row=0, column=0, columnspan=n + 2, sticky="w", padx=10, pady=(10, 8))
 
         header_row = 1
@@ -7339,6 +7376,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 row=row, column=0, sticky="w", padx=(10, 4), pady=2
             )
             for src in range(1, n + 1):
+                # A small Frame per cell keeps the checkbox and its gain entry stacked in the
+                # same grid position, rather than needing a whole extra row/column pair per
+                # source just for gain -- the entry stays visible (not shown/hidden on check
+                # state) since that would need extra trace callbacks for no real benefit: a
+                # gain typed under an unchecked source is simply never read (see do_trim's
+                # gains_db build, which only looks at gain for sources actually routed
+                # somewhere).
+                cell = tk.Frame(dialog, bg=EDITOR_BG)
+                cell.grid(row=row, column=src, pady=2, padx=1)
                 # indicatoron=False + a real width/height renders as a solid block that swaps
                 # its WHOLE background color between bg (off) and selectcolor (on), rather than
                 # a native tiny indicator square with a checkmark drawn inside it -- confirmed
@@ -7346,11 +7392,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 # theme (a dark glyph on a dark selectcolor fill has very little contrast); a
                 # full color swap is unambiguous regardless of theme.
                 tk.Checkbutton(
-                    dialog, variable=routing_state["routing_vars"][dest][src],
+                    cell, variable=routing_state["routing_vars"][dest][src],
                     indicatoron=False, width=2, height=1,
                     bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG,
                     selectcolor=START_MARKER_COLOR,
-                ).grid(row=row, column=src, pady=2, padx=1)
+                ).pack()
+                tk.Entry(
+                    cell, textvariable=routing_state["gain_vars"][dest][src], width=4,
+                    bg=ENTRY_BG, fg=EDITOR_FG, insertbackground=EDITOR_FG, justify="center",
+                ).pack(pady=(2, 0))
             tk.Checkbutton(
                 dialog, variable=routing_state["mute_vars"][dest],
                 indicatoron=False, width=2, height=1,
@@ -7362,6 +7412,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             for dest in range(1, n + 1):
                 for src in range(1, n + 1):
                     routing_state["routing_vars"][dest][src].set(src == dest)
+                    routing_state["gain_vars"][dest][src].set("")
                 routing_state["mute_vars"][dest].set(False)
 
         button_row = header_row + n + 1
@@ -7643,6 +7694,36 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             if routing != identity_routing or muted:
                 audio_routing = routing
                 muted_destinations = muted
+        gains_db = None
+        if n:
+            gains = {}
+            invalid_gain_cells = []
+            for dest in range(1, n + 1):
+                dest_gains = {}
+                for src, var in routing_state["gain_vars"][dest].items():
+                    text = var.get().strip()
+                    if not text:
+                        continue
+                    try:
+                        value = float(text)
+                    except ValueError:
+                        invalid_gain_cells.append(f"Output {dest}, track {src}")
+                        continue
+                    if value:
+                        dest_gains[src] = value
+                if dest_gains:
+                    gains[dest] = dest_gains
+            if invalid_gain_cells:
+                logging.warning(
+                    "Clip editor: could not start trim -- invalid gain (dB) value for %s.",
+                    ", ".join(invalid_gain_cells),
+                )
+                status_label.config(
+                    fg=END_MARKER_COLOR, text=f"Invalid gain (dB) value for: {', '.join(invalid_gain_cells)}.",
+                )
+                return
+            if gains:
+                gains_db = gains
         source_path = state["path"]
 
         # Measures a representative window starting at the trim's own start point -- but NOT
@@ -7809,7 +7890,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 notifications_config=notifications_config, scale_height=scale_height,
                 target_size_mb=target_size_mb, audio_routing=audio_routing,
                 muted_destinations=muted_destinations, audio_shift_ms_by_track=audio_shift_ms_by_track,
-                progress_callback=on_trim_progress,
+                gains_db=gains_db, progress_callback=on_trim_progress,
             )
 
             def finish():

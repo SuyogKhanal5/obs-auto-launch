@@ -232,6 +232,56 @@ class BuildAudioRoutingFilterArgsTests(unittest.TestCase):
         self.assertIn("[asrc1]", map_args)
         self.assertIn("[asrc1][asrc2]amix=inputs=2", filter_complex)
 
+    def test_zero_or_blank_gains_are_a_no_op(self):
+        self.assertEqual(
+            a.build_audio_routing_filter_args(3, routing={1: [1], 2: [2], 3: [3]}, gains_db={1: {1: 0}}),
+            ([], []),
+        )
+
+    def test_gain_on_single_source_destination_inserts_volume_filter(self):
+        filter_args, map_args = a.build_audio_routing_filter_args(2, routing={1: [1]}, gains_db={1: {1: 12}})
+        filter_complex = filter_args[1]
+        self.assertIn("[asrc1]volume=12dB[again1_1]", filter_complex)
+        self.assertEqual(map_args, ["-map", "[again1_1]"])
+
+    def test_same_source_gets_different_gain_on_different_destinations(self):
+        # The example that motivated this feature: boost a mic +12dB on one output track but
+        # leave it unboosted (0dB, i.e. no filter at all) on another output it's also routed to.
+        filter_args, map_args = a.build_audio_routing_filter_args(
+            2, routing={1: [1], 2: [1]}, gains_db={1: {1: 12}},
+        )
+        filter_complex = filter_args[1]
+        self.assertIn("[asrc1]volume=12dB[again1_1]", filter_complex)
+        self.assertNotIn("again2_1", filter_complex)
+        self.assertEqual(map_args, ["-map", "[again1_1]", "-map", "[asrc1]"])
+
+    def test_gain_applies_before_mixing_with_an_unboosted_source(self):
+        filter_args, map_args = a.build_audio_routing_filter_args(
+            2, routing={1: [1, 2]}, gains_db={1: {1: -6}},
+        )
+        filter_complex = filter_args[1]
+        self.assertIn("[asrc1]volume=-6dB[again1_1]", filter_complex)
+        self.assertIn("[again1_1][asrc2]amix=inputs=2", filter_complex)
+        self.assertEqual(map_args, ["-map", "[amix1]"])
+
+    def test_gain_and_mute_stack_on_the_same_destination(self):
+        filter_args, map_args = a.build_audio_routing_filter_args(
+            2, routing={1: [1]}, muted_destinations=[1], gains_db={1: {1: 12}},
+        )
+        filter_complex = filter_args[1]
+        self.assertIn("[asrc1]volume=12dB[again1_1]", filter_complex)
+        self.assertIn("[again1_1]volume=0[adest1]", filter_complex)
+        self.assertEqual(map_args, ["-map", "[adest1]"])
+
+    def test_gain_for_an_unrouted_source_is_ignored(self):
+        # Identity routing (default) means destination 1's only source is 1, not 2 -- a stray
+        # gain entry filed under the wrong destination/source pair should be silently irrelevant
+        # rather than forcing a real filter graph or leaking into the output.
+        self.assertEqual(
+            a.build_audio_routing_filter_args(2, gains_db={1: {2: 12}}),
+            ([], []),
+        )
+
 
 class ProbeAudioStreamCountTests(unittest.TestCase):
     def test_returns_none_when_ffprobe_not_found_next_to_ffmpeg(self):
