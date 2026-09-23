@@ -5733,6 +5733,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
         clip_delete_original_var,
     )
     row += 1
+    clip_auto_fix_sync_var = tk.BooleanVar(value=clip_editor_config.get("auto_fix_audio_sync", False))
+    add_checkbox(
+        clip_editor_tab, row, "Automatically check \"Fix audio track sync\" when opening a clip to trim",
+        clip_auto_fix_sync_var,
+    )
+    row += 1
     configured_trim_mode = clip_editor_config.get("trim_mode", "precise")
     if configured_trim_mode not in CLIP_EDITOR_TRIM_MODE_OPTIONS:
         configured_trim_mode = "precise"
@@ -6210,6 +6216,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             clip_editor.pop("output_folder", None)
         clip_editor["output_suffix"] = clip_output_suffix_var.get()
         clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
+        clip_editor["auto_fix_audio_sync"] = clip_auto_fix_sync_var.get()
         clip_editor["trim_mode"] = CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL.get(trim_mode_var.get(), "precise")
         if clip_target_size_var.get().strip():
             target_size_value = read_float(clip_target_size_var, "Default target size", None)
@@ -7217,7 +7224,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     audio_tracks_row.pack(fill="x", padx=10, pady=4)
     fix_sync_tracks = compute_process_capture_tracks(obs_config)
     fix_sync_reference_track = compute_reference_track(obs_config)
-    fix_sync_var = tk.BooleanVar(value=False)
+    fix_sync_var = tk.BooleanVar(value=clip_editor_config.get("auto_fix_audio_sync", False))
     fix_sync_checkbox = tk.Checkbutton(
         audio_tracks_row, text="Fix audio track sync", variable=fix_sync_var,
         bg=EDITOR_BG, fg=EDITOR_FG, activebackground=EDITOR_BG, activeforeground=EDITOR_FG,

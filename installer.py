@@ -266,6 +266,30 @@ def is_existing_install(install_dir):
     return os.path.isfile(os.path.join(install_dir, app_relative_path()))
 
 
+def grant_user_write_access(install_dir):
+    """Windows only: grants the built-in Users group Modify rights on install_dir, recursively.
+    Confirmed live: the default install location (Program Files) inherits Windows' standard
+    TrustedInstaller-owned ACL, which gives standard (non-elevated) processes only Read+Execute --
+    no write. Since this installer itself always runs elevated (--uac-admin) but the app it
+    installs normally runs NON-elevated afterward (a plain double-click or the autostart shortcut,
+    never elevated again), every later run was silently unable to write config.json OR its own
+    log file, with no visible error (a --noconsole build has nowhere for the resulting exception to
+    even go). Best-effort and non-fatal: a failure here still leaves a working install, just with
+    the same silent-write-failure bug as before, so it's logged via on_progress rather than raised.
+    Uses the well-known Users SID (S-1-5-32-545) instead of the localized "Users" group name so
+    this works the same on any Windows display-language install."""
+    if sys.platform != "win32":
+        return True
+    try:
+        result = subprocess.run(
+            ["icacls", install_dir, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/C", "/Q"],
+            capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs(),
+        )
+        return result.returncode == 0
+    except OSError:
+        return False
+
+
 def do_install(install_dir, obs_path, options, on_progress, write_config=True):
     on_progress(f"Creating {install_dir} ...")
     os.makedirs(install_dir, exist_ok=True)
@@ -286,6 +310,15 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
         # exist. Embedded here as a whole folder (APP_FOLDER_NAME) rather than a single file;
         # dirs_exist_ok=True lets Update overwrite an existing install in place.
         shutil.copytree(resource_path(APP_FOLDER_NAME), install_dir, dirs_exist_ok=True)
+
+    if sys.platform == "win32":
+        on_progress("Setting folder permissions...")
+        if not grant_user_write_access(install_dir):
+            on_progress(
+                "Warning: could not grant standard-user write access to the install folder -- "
+                "config saves and logging may silently fail once the app is run without "
+                "administrator rights."
+            )
 
     password = None
     obs_ws_configured = None
