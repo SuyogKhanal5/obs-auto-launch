@@ -104,6 +104,54 @@ class EnsureHybridMp4ForMarkersTests(unittest.TestCase):
         self.assertFalse(needs_restart)
 
 
+class PredictMicBoostOutputMulTests(unittest.TestCase):
+    def test_zero_input_is_zero_output(self):
+        self.assertEqual(a.predict_mic_boost_output_mul(0.0, 12.0), 0.0)
+
+    def test_below_compressor_threshold_gets_a_flat_boost(self):
+        # -40dBFS is below the compressor's -30dB threshold -- no compression applies, so a
+        # +12dB boost should land exactly 12dB higher, unclamped (well under the -1dB limiter).
+        result = a.predict_mic_boost_output_mul(10 ** (-40 / 20), 12.0)
+        self.assertAlmostEqual(result, 10 ** (-28 / 20), places=6)
+
+    def test_above_compressor_threshold_is_compressed_before_the_boost(self):
+        # -20dBFS is 10dB above the -30dB threshold; at a 3:1 ratio that 10dB becomes 3.33dB
+        # above threshold (-26.67dBFS) BEFORE the +12dB makeup gain is added.
+        result = a.predict_mic_boost_output_mul(10 ** (-20 / 20), 12.0)
+        expected_db = -30 + (-20 - -30) / 3 + 12
+        self.assertAlmostEqual(result, 10 ** (expected_db / 20), places=6)
+
+    def test_limiter_clamps_a_large_boost(self):
+        # A full-scale (0dBFS) input with a generous +30dB boost would land at +10dBFS post-
+        # compression -- the limiter's -1dB ceiling must cap it there instead.
+        result = a.predict_mic_boost_output_mul(1.0, 30.0)
+        self.assertAlmostEqual(result, 10 ** (-1 / 20), places=6)
+
+    def test_noise_gate_silences_below_its_threshold(self):
+        # -60dBFS is below a -50dB open_threshold -- the gate should silence it entirely,
+        # regardless of whatever boost_db would otherwise apply.
+        result = a.predict_mic_boost_output_mul(
+            10 ** (-60 / 20), 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-50.0,
+        )
+        self.assertEqual(result, 0.0)
+
+    def test_noise_gate_passes_through_above_its_threshold(self):
+        result = a.predict_mic_boost_output_mul(
+            10 ** (-60 / 20), 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-70.0,
+        )
+        self.assertGreater(result, 0.0)
+
+    def test_disabled_noise_gate_never_silences_anything(self):
+        result = a.predict_mic_boost_output_mul(
+            10 ** (-60 / 20), 12.0, noise_gate_enabled=False, noise_gate_threshold_db=-10.0,
+        )
+        self.assertGreater(result, 0.0)
+
+    def test_result_never_exceeds_the_full_scale_multiplier(self):
+        result = a.predict_mic_boost_output_mul(1.0, 200.0)
+        self.assertLessEqual(result, 1.0)
+
+
 class EnsureMicBoostFilterTests(unittest.TestCase):
     def _client(self):
         return FakeObsClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})

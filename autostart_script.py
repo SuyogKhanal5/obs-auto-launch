@@ -956,6 +956,35 @@ MIC_BOOST_COMPRESSOR_BASE_SETTINGS = {
 MIC_BOOST_LIMITER_SETTINGS = {"threshold": -1.0}
 
 
+def predict_mic_boost_output_mul(peak_mul, boost_db, noise_gate_enabled=False, noise_gate_threshold_db=None):
+    """Approximates what the Audio Mixer Levels overlay's live meter reading for this input would
+    become once the real mic-boost filter chain is actually applied, using each filter's own
+    static input/output curve (dB in, dB out) rather than fully emulating their real envelope-
+    follower timing (attack/hold/release) -- a single instantaneous peak reading has no signal
+    history to feed a real stateful compressor/gate simulation anyway. Deliberately only useful
+    for PREVIEWING a candidate boost_db/threshold against the CURRENT raw signal before actually
+    enabling it: once mic_boost is genuinely enabled, OBS's own InputVolumeMeters for this input
+    already reports the real post-filter level directly (confirmed live: a real +30dB boost raised
+    a live reading's mean peak from ~0.0028 to ~0.109, matching this same compressor+limiter
+    shape) -- computing this on top of an ALREADY-boosted reading would double-apply the chain.
+
+    peak_mul/return value: both an OBS-style 0-1 linear multiplier peak (same units as
+    audio_state["levels"]), not dB -- callers never need to think in dB themselves."""
+    if peak_mul <= 0:
+        return 0.0
+    peak_db = 20 * math.log10(peak_mul)
+
+    if noise_gate_enabled and noise_gate_threshold_db is not None and peak_db < noise_gate_threshold_db:
+        return 0.0
+
+    threshold = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["threshold"]
+    ratio = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["ratio"]
+    compressed_db = threshold + (peak_db - threshold) / ratio if peak_db > threshold else peak_db
+    boosted_db = compressed_db + boost_db
+    output_db = min(boosted_db, MIC_BOOST_LIMITER_SETTINGS["threshold"])
+    return min(1.0, 10 ** (output_db / 20))
+
+
 def _ensure_obs_filter_settings(client, input_name, filter_name, filter_kind, settings):
     """Shared create-or-update-if-changed logic behind every filter in
     ensure_mic_boost_filter's chain. Returns (current_or_new_filter, just_created) --
@@ -4065,19 +4094,19 @@ def meter_bar_color(peak):
     return METER_LOW_COLOR
 
 
-def run_overlay(monitors, overlay_state, audio_state, status, stop_event):
+def run_overlay(monitors, overlay_state, audio_state, status, stop_event, mic_boost_config=None):
     # Without this wrapper, an exception anywhere in here (Tk init, widget construction, the
     # poll loop) kills the thread completely silently in a --noconsole build -- no stderr to
     # print a traceback to -- permanently disabling both the overlay AND Settings (which now
     # depends on this same interpreter) with zero trace in the log. Matches watcher_loop's
     # own try/except-wrapping-impl pattern below.
     try:
-        _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event)
+        _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event, mic_boost_config or {})
     except Exception:
         logging.exception("Overlay thread crashed unexpectedly; overlay and Settings are unavailable this session.")
 
 
-def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
+def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event, mic_boost_config):
     # A Tk() failure right after a relaunch (before the fix to stop inheriting a stale
     # TCL_LIBRARY/TK_LIBRARY from the parent process) is the one failure mode transient enough
     # to be worth retrying rather than just logging once and giving up.
@@ -4162,7 +4191,26 @@ def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
         show = audio_state["enabled"]
         index = overlay_state["monitor_index"] if show else None
         levels = audio_state["levels"]
-        row_count = max(len(levels), 1)
+
+        # A preview row showing what this reading would become after the mic-boost chain, right
+        # under the mic's own real (raw) row -- only while mic_boost isn't actually enabled yet.
+        # Once it genuinely IS enabled, OBS's own reading for this input already reports the real
+        # post-filter level directly (confirmed live -- see predict_mic_boost_output_mul's own
+        # docstring), so a second computed row at that point would just be a redundant, slightly-
+        # off approximation of a number already being shown correctly.
+        preview_input_name = None if mic_boost_config.get("enabled") else mic_boost_config.get("input_name")
+        rows = []
+        for name, peak in levels.items():
+            rows.append((name, peak))
+            if name == preview_input_name:
+                noise_gate_config = mic_boost_config.get("noise_gate", {})
+                predicted = predict_mic_boost_output_mul(
+                    peak, mic_boost_config.get("boost_db", 0.0),
+                    noise_gate_enabled=noise_gate_config.get("enabled", False),
+                    noise_gate_threshold_db=noise_gate_config.get("threshold_db"),
+                )
+                rows.append((f"{name} (after boost)", predicted))
+        row_count = max(len(rows), 1)
 
         if index != meter_shown_index[0] or row_count != meter_row_count[0]:
             meter_shown_index[0] = index
@@ -4180,12 +4228,12 @@ def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
 
         if meter_shown_index[0] is not None:
             meter_canvas.delete("all")
-            if not levels:
+            if not rows:
                 meter_canvas.create_text(
                     8, METER_ROW_HEIGHT // 2, anchor="w", fill="#888888", text="No active audio sources"
                 )
             else:
-                for i, (name, peak) in enumerate(levels.items()):
+                for i, (name, peak) in enumerate(rows):
                     top = i * METER_ROW_HEIGHT
                     label = name if len(name) <= METER_LABEL_CHARS else name[: METER_LABEL_CHARS - 1] + "…"
                     bar_x = 90
@@ -8531,7 +8579,8 @@ def main():
         daemon=True,
     )
     overlay_thread = threading.Thread(
-        target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event), daemon=True
+        target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event),
+        kwargs={"mic_boost_config": config.get("obs", {}).get("mic_boost", {})}, daemon=True,
     )
     custom_keybinds = config.get("obs", {}).get("custom_keybinds", [])
     manual_split_buffer_seconds = config.get("obs", {}).get("manual_split", {}).get("buffer_seconds", 0)
