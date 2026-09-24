@@ -3934,12 +3934,21 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                             # apply_mic_boost_from_config's own docstring for why this matters:
                             # without it, the overlay would never show a boosted level at all
                             # while just idly talking into the mic outside of a real recording.
-                            req_client = connect_obs(obs_config["websocket"], retries=1, delay=0)
-                            if req_client:
-                                try:
-                                    apply_mic_boost_from_config(req_client, obs_config)
-                                finally:
-                                    req_client.disconnect()
+                            # On its own background thread (like launch_obs below): confirmed
+                            # live that OBS can still answer "not ready" (code 207) to a plain
+                            # request for a few seconds right after its websocket first accepts a
+                            # connection -- connect_obs's own default retries/delay ride that out,
+                            # but doing that on the watcher loop's own thread would stall game
+                            # detection for as long as it takes.
+                            def apply_mic_boost_in_background():
+                                req_client = connect_obs(obs_config["websocket"])
+                                if req_client:
+                                    try:
+                                        apply_mic_boost_from_config(req_client, obs_config)
+                                    finally:
+                                        req_client.disconnect()
+
+                            threading.Thread(target=apply_mic_boost_in_background, daemon=True).start()
                     else:
                         audio_state["levels"] = {}
                         # Show Audio Mixer Levels used to just sit there showing "No active audio
