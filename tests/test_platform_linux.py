@@ -523,5 +523,12 @@ class RunOnMainThreadTests(unittest.TestCase):
         self.assertEqual(calls, [1])
 
 
+class OpenPathTests(unittest.TestCase):
+    def test_calls_xdg_open(self):
+        with unittest.mock.patch.object(pl.subprocess, "run") as mock_run:
+            pl.open_path("/some/path")
+        mock_run.assert_called_once_with(["xdg-open", "/some/path"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -642,3 +642,9 @@ def run_on_main_thread(func):
     constraint, so func() just runs immediately on whichever thread called this. Only accepted for
     signature parity with the macOS backend, which does real work here."""
     func()
+
+
+def open_path(path):
+    """os.startfile() -- Windows' own "open with whatever's registered for this file type"
+    mechanism, the one every other backend's open_path() is emulating via a subprocess."""
+    os.startfile(path)

@@ -595,3 +595,10 @@ def run_on_main_thread(func):
     constraint, so func() just runs immediately on whichever thread called this. Only accepted for
     signature parity with the macOS backend, which does real work here."""
     func()
+
+
+def open_path(path):
+    """xdg-open -- the freedesktop.org-standard "open this with whatever's registered for it"
+    command, present on essentially every Linux desktop environment (GNOME, KDE, XFCE, etc. all
+    ship or depend on it), the closest Linux equivalent to os.startfile()/macOS's `open`."""
+    subprocess.run(["xdg-open", path])

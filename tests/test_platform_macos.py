@@ -817,5 +817,12 @@ class RunOnMainThreadTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+class OpenPathTests(unittest.TestCase):
+    def test_calls_open_command(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            pmac.open_path("/some/path")
+        mock_run.assert_called_once_with(["open", "/some/path"])
+
+
 if __name__ == "__main__":
     unittest.main()

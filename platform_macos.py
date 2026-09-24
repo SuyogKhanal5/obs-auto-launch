@@ -730,3 +730,13 @@ def run_on_main_thread(func):
         AppHelper.callAfter(func)
     except Exception:
         logging.exception("Could not marshal a callback onto the macOS main thread.")
+
+
+def open_path(path):
+    """macOS has no os.startfile() equivalent function -- `open` (the same command Terminal's own
+    `open` runs) is the real, documented way to hand a file or folder to Finder/whatever app owns
+    that file type. Confirmed live: this app's "Open Log File"/"Open Recordings Folder" tray menu
+    items called os.startfile() directly and had never been exercised on macOS -- AttributeError
+    (no such function outside Windows), silently swallowed by the tray menu's own error handling,
+    so clicking either looked exactly like nothing happened at all."""
+    subprocess.run(["open", path])

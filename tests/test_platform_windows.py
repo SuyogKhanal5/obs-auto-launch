@@ -507,5 +507,15 @@ class RunOnMainThreadTests(unittest.TestCase):
         self.assertEqual(calls, [1])
 
 
+class OpenPathTests(unittest.TestCase):
+    # os.startfile only exists on a real Windows Python build -- create=True lets this test
+    # inject a fake regardless of which real OS is running it, same reasoning as the winreg
+    # mocking above.
+    def test_calls_os_startfile(self):
+        with unittest.mock.patch.object(pw.os, "startfile", create=True) as mock_startfile:
+            pw.open_path("C:\\some\\path")
+        mock_startfile.assert_called_once_with("C:\\some\\path")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4717,16 +4717,33 @@ def build_custom_keybinds_editor(parent, initial_rows):
             parent_, bg=DARK_BG, activebackground=DARK_BG, selectcolor=DARK_ENTRY_BG, **kwargs
         )
 
+    # Modifier column order/labels/defaults, macOS-specific: macOS has no physical Win key at all
+    # (labeling this checkbox "Win" there is just confusing) and Mac users reach for Cmd as their
+    # everyday modifier the way Windows/Linux users reach for Ctrl -- putting it first (and
+    # defaulting a new row to it) matches that convention instead of showing it last, under a
+    # Windows-centric name, as if it were a rarely-used option. The underlying stored modifier
+    # name stays "win" on every OS -- platform_macos.py's run_custom_keybind_listener already
+    # maps it to Cmd (kCGEventFlagMaskCommand), so this is a display/default change only, nothing
+    # about how a saved config.json is interpreted.
+    if sys.platform == "darwin":
+        MODIFIER_COLUMNS = [("win", "Cmd"), ("ctrl", "Ctrl"), ("alt", "Alt"), ("shift", "Shift")]
+        DEFAULT_KEYBIND_MODIFIERS = ["win", "alt"]
+    else:
+        MODIFIER_COLUMNS = [("ctrl", "Ctrl"), ("alt", "Alt"), ("shift", "Shift"), ("win", "Win")]
+        DEFAULT_KEYBIND_MODIFIERS = ["ctrl", "alt"]
+
     # A grid table (not pack) so header labels and row widgets share real column boundaries --
     # packing a Label(width=N) next to a Checkbutton(width=N) or Combobox(width=N) doesn't
     # actually line them up, since a Checkbutton's width includes its indicator box on top of the
     # same character-width unit, so identical widths still render as different pixel widths.
     table = tk.Frame(parent, bg=DARK_BG)
     table.pack(fill="x", padx=10)
-    for col, text in enumerate(["On", "Action", "Ctrl", "Alt", "Shift", "Win", "Key", ""]):
+    header_columns = ["On", "Action"] + [label for _name, label in MODIFIER_COLUMNS] + ["Key", ""]
+    for col, text in enumerate(header_columns):
         tk.Label(
             table, text=text, anchor="w", font=("Segoe UI", 9, "bold"), bg=DARK_BG, fg=DARK_FG,
         ).grid(row=0, column=col, sticky="w", padx=4, pady=(0, 4))
+    KEY_COLUMN = 2 + len(MODIFIER_COLUMNS)
 
     rows = []
 
@@ -4736,7 +4753,7 @@ def build_custom_keybinds_editor(parent, initial_rows):
                 widget.grid(row=i)
 
     def add_row(enabled=True, action="split_record_file", modifiers=None, key="S"):
-        modifiers = modifiers if modifiers is not None else ["ctrl", "alt"]
+        modifiers = modifiers if modifiers is not None else DEFAULT_KEYBIND_MODIFIERS
         r = len(rows) + 1
 
         enabled_var = tk.BooleanVar(value=enabled)
@@ -4750,31 +4767,27 @@ def build_custom_keybinds_editor(parent, initial_rows):
         )
         action_combo.grid(row=r, column=1, sticky="w", padx=4, pady=1)
 
-        ctrl_var = tk.BooleanVar(value="ctrl" in modifiers)
-        alt_var = tk.BooleanVar(value="alt" in modifiers)
-        shift_var = tk.BooleanVar(value="shift" in modifiers)
-        win_var = tk.BooleanVar(value="win" in modifiers)
-        ctrl_cb = dark_checkbutton(table, variable=ctrl_var)
-        ctrl_cb.grid(row=r, column=2, padx=4, pady=1)
-        alt_cb = dark_checkbutton(table, variable=alt_var)
-        alt_cb.grid(row=r, column=3, padx=4, pady=1)
-        shift_cb = dark_checkbutton(table, variable=shift_var)
-        shift_cb.grid(row=r, column=4, padx=4, pady=1)
-        win_cb = dark_checkbutton(table, variable=win_var)
-        win_cb.grid(row=r, column=5, padx=4, pady=1)
+        modifier_vars = {}
+        modifier_widgets = []
+        for col, (name, _label) in enumerate(MODIFIER_COLUMNS, start=2):
+            var = tk.BooleanVar(value=name in modifiers)
+            cb = dark_checkbutton(table, variable=var)
+            cb.grid(row=r, column=col, padx=4, pady=1)
+            modifier_vars[name] = var
+            modifier_widgets.append(cb)
 
         key_var = tk.StringVar(value=(key or "S").upper())
         key_combo = ttk.Combobox(
             table, textvariable=key_var, values=CUSTOM_KEYBIND_KEY_OPTIONS, state="readonly", width=4,
             style="Settings.TCombobox",
         )
-        key_combo.grid(row=r, column=6, padx=4, pady=1)
+        key_combo.grid(row=r, column=KEY_COLUMN, padx=4, pady=1)
 
-        widgets = [enabled_cb, action_combo, ctrl_cb, alt_cb, shift_cb, win_cb, key_combo]
+        widgets = [enabled_cb, action_combo] + modifier_widgets + [key_combo]
 
         entry = {
             "enabled": enabled_var, "action_label": action_label_var,
-            "ctrl": ctrl_var, "alt": alt_var, "shift": shift_var, "win": win_var,
+            **modifier_vars,
             "key": key_var, "widgets": widgets,
         }
 
@@ -4789,7 +4802,7 @@ def build_custom_keybinds_editor(parent, initial_rows):
             table, text="Remove", command=remove, bg=DARK_ENTRY_BG, fg=DARK_FG,
             activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
         )
-        remove_btn.grid(row=r, column=7, padx=4, pady=1)
+        remove_btn.grid(row=r, column=KEY_COLUMN + 1, padx=4, pady=1)
         widgets.append(remove_btn)
         rows.append(entry)
 
@@ -8264,7 +8277,7 @@ def main():
             logging.warning("Recordings folder unknown (OBS not connected yet).")
             return
         try:
-            os.startfile(folder)
+            platform_common.open_path(folder)
         except OSError as exc:
             logging.error("Could not open recordings folder %s: %s", folder, exc)
 
@@ -8279,7 +8292,7 @@ def main():
             logging.warning("Log file does not exist yet: %s", log_path)
             return
         try:
-            os.startfile(log_path)
+            platform_common.open_path(log_path)
         except OSError as exc:
             logging.error("Could not open log file %s: %s", log_path, exc)
 

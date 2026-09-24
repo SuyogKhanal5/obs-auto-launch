@@ -365,3 +365,14 @@ def run_on_main_thread(func, platform_name=None):
     touch AppKit on macOS. Windows/Linux have no such constraint, so func() just runs immediately,
     synchronously, on whichever thread called this."""
     return _select_backend(platform_name).run_on_main_thread(func)
+
+
+def open_path(path, platform_name=None):
+    """Opens a file or folder with the OS's own default handler (Explorer on Windows, Finder on
+    macOS, whichever app xdg-open resolves to on Linux) -- the cross-platform equivalent of
+    os.startfile(), which only exists on Windows at all. Confirmed live: the tray menu's "Open Log
+    File" and "Open Recordings Folder" items called os.startfile() directly and had never been
+    exercised on macOS -- clicking either there raised AttributeError (no such function outside
+    Windows), caught and logged by the tray menu's own error handling, so from the user's side it
+    looked exactly like the menu item silently doing nothing."""
+    return _select_backend(platform_name).open_path(path)

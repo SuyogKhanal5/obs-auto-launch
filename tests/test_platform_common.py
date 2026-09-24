@@ -371,6 +371,7 @@ class BackendModulesAreSafelyImportableFromAnyOsTests(unittest.TestCase):
                 self.assertTrue(hasattr(backend, "process_audio_capture_settings"))
                 self.assertTrue(hasattr(backend, "hide_dock_icon"))
                 self.assertTrue(hasattr(backend, "run_on_main_thread"))
+                self.assertTrue(hasattr(backend, "open_path"))
 
 
 class HideDockIconDispatchTests(unittest.TestCase):
@@ -390,6 +391,14 @@ class RunOnMainThreadDispatchTests(unittest.TestCase):
             pc.run_on_main_thread(func, platform_name="darwin")
         mock_select.assert_called_once_with("darwin")
         mock_select.return_value.run_on_main_thread.assert_called_once_with(func)
+
+
+class OpenPathDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.open_path("/some/path", platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        mock_select.return_value.open_path.assert_called_once_with("/some/path")
 
 
 class ProcessAudioCaptureKindDispatchTests(unittest.TestCase):
