@@ -282,7 +282,7 @@ def unregister_global_hotkey(display, root, handle):
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None,
+    icon=None, notifications_config=None, status=None, stop_event=None,
 ):
     """X11 counterpart of platform_windows.run_custom_keybind_listener -- registers every enabled
     binding via XGrabKey, then blocks in an XNextEvent loop on this same thread for the
@@ -290,7 +290,13 @@ def run_custom_keybind_listener(
     both the grab and the events it produces belong to the connection/thread that made it).
     fire_keybind/describe_keybind/notify are passed in rather than imported from
     autostart_script.py to avoid backend modules depending on it (the dependency only ever goes
-    the other way -- see CROSS_PLATFORM_PLAN.md §3)."""
+    the other way -- see CROSS_PLATFORM_PLAN.md §3).
+
+    stop_event: accepted only for interface parity with platform_windows.py's own backend (see its
+    docstring), which needs it to dodge a confirmed-live restart race; not currently used here --
+    XNextEvent's blocking wait has no equivalent PeekMessage-style non-blocking poll to switch to
+    without a real X11-specific redesign, and this hasn't been confirmed to hit the same race in
+    practice on Linux."""
     if is_wayland_session():
         logging.warning(
             "Custom keybinds need a real global hotkey, which isn't available under Wayland -- "

@@ -272,13 +272,18 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None,
+    icon=None, notifications_config=None, status=None, stop_event=None,
 ):
     """macOS counterpart of platform_windows.run_custom_keybind_listener -- see the module
     comment above for why this uses a passive CGEventTap rather than an exclusive-grab API.
     fire_keybind/describe_keybind/notify are passed in rather than imported from
     autostart_script.py to avoid backend modules depending on it (the dependency only ever goes
-    the other way -- see CROSS_PLATFORM_PLAN.md §3)."""
+    the other way -- see CROSS_PLATFORM_PLAN.md §3).
+
+    stop_event: accepted only for interface parity with platform_windows.py's own backend (see its
+    docstring), which needs it to dodge a confirmed-live restart race; not currently used here --
+    a CGEventTap has no OS-level "already in use" failure mode the way RegisterHotKey does (it's a
+    passive, non-exclusive tap), so there's no equivalent race to dodge in the first place."""
     try:
         import Quartz
     except ImportError:

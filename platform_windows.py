@@ -221,12 +221,27 @@ def mod_flags_for(modifiers):
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None,
+    icon=None, notifications_config=None, status=None, stop_event=None,
 ):
     """Runs for its whole lifetime on one dedicated daemon thread: RegisterHotKey (and the
     WM_HOTKEY messages it produces) has thread affinity, so every binding must be registered from
     -- and received on -- the same thread. Passing hwnd=None posts WM_HOTKEY straight to this
-    thread's message queue instead of routing through a window, so no hidden window is needed."""
+    thread's message queue instead of routing through a window, so no hidden window is needed.
+
+    stop_event: a threading.Event -- same PeekMessageW-polling pattern as
+    run_clip_editor_space_bar_listener's own stop_event handling (see that function's own
+    docstring for the full rationale), used here so THIS process's own UnregisterHotKey cleanup
+    below actually runs within ~50ms of being asked to shut down, instead of only whenever Windows
+    gets around to noticing the whole process has died. That distinction matters a lot here
+    specifically: confirmed live (repeatedly, in real use) that a plain GetMessageW loop with no
+    stop_event -- relying solely on process-death cleanup -- left a self-restarted app's new
+    process racing the OLD one for the same hotkey, and the old process's real teardown time (VLC/
+    libvlc, Tk, pystray, etc. all still unwinding) was observed to exceed even a generous 15-second
+    retry budget on the NEW process's side. Proactively releasing here removes the race entirely
+    for any graceful shutdown (a Settings-save restart, or Quit); an actual crash/force-kill still
+    falls back to Windows' own process-death cleanup, same as before. Optional (defaults to None,
+    falling back to the old plain GetMessageW loop) only so a caller that genuinely has no
+    stop_event of its own doesn't crash -- every real caller in this app always provides one."""
     user32 = ctypes.windll.user32
     registered = []
     for index, binding in enumerate(bindings):
@@ -275,19 +290,30 @@ def run_custom_keybind_listener(
         return
 
     by_id = dict(registered)
+
+    def dispatch(msg):
+        if msg.message == WM_HOTKEY:
+            binding = by_id.get(msg.wParam)
+            if binding:
+                threading.Thread(
+                    target=fire_keybind,
+                    args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                    daemon=True,
+                ).start()
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+
     msg = wintypes.MSG()
     try:
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-            if msg.message == WM_HOTKEY:
-                binding = by_id.get(msg.wParam)
-                if binding:
-                    threading.Thread(
-                        target=fire_keybind,
-                        args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
-                        daemon=True,
-                    ).start()
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
+        if stop_event is None:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                dispatch(msg)
+        else:
+            while not stop_event.is_set():
+                if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):  # PM_REMOVE
+                    dispatch(msg)
+                else:
+                    stop_event.wait(0.05)
     finally:
         for hotkey_id, _ in registered:
             user32.UnregisterHotKey(None, hotkey_id)

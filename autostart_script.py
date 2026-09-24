@@ -2436,6 +2436,7 @@ def fire_custom_keybind(
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
+    stop_event=None,
 ):
     """Thin dispatcher -- the real per-OS implementation (RegisterHotKey/GetMessageW on Windows,
     XGrabKey/XNextEvent on Linux/X11, a CGEventTap/CFRunLoop on macOS; a clear logged no-op under
@@ -2443,10 +2444,12 @@ def run_custom_keybind_listener(
     platform_windows.py / platform_linux.py / platform_macos.py, see
     CROSS_PLATFORM_PLAN.md Phase 3. fire_custom_keybind/describe_keybind/notify are passed in
     rather than imported by the backend modules, so those never depend on this one (the
-    dependency only ever goes the other way)."""
+    dependency only ever goes the other way). stop_event: passed straight through so
+    platform_windows.py's backend can release its hotkeys the moment shutdown is requested rather
+    than waiting on process death -- see that function's own docstring for why this matters."""
     platform_common.run_custom_keybind_listener(
         bindings, get_client, get_manual_split_buffer_seconds, fire_custom_keybind, describe_keybind, notify,
-        icon=icon, notifications_config=notifications_config, status=status,
+        icon=icon, notifications_config=notifications_config, status=status, stop_event=stop_event,
     )
 
 
@@ -8324,6 +8327,7 @@ def main():
                 custom_keybinds, lambda: runtime_state.get("obs_client"), lambda: manual_split_buffer_seconds,
                 icon, config.get("notifications", {}), status,
             ),
+            kwargs={"stop_event": stop_event},
             daemon=True,
         )
 

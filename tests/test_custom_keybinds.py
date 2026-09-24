@@ -96,7 +96,7 @@ class RunCustomKeybindListenerDispatchTests(unittest.TestCase):
         mock_run.assert_called_once_with(
             [{"enabled": True, "key": "S", "modifiers": []}], "get_client", "get_seconds",
             a.fire_custom_keybind, a.describe_keybind, a.notify,
-            icon="icon", notifications_config="notif_cfg", status="status",
+            icon="icon", notifications_config="notif_cfg", status="status", stop_event=None,
         )
 
 

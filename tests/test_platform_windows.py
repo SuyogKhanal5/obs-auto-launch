@@ -387,6 +387,56 @@ class RunCustomKeybindListenerRegistrationRetryTests(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hotkey API")
+class RunCustomKeybindListenerStopEventTests(unittest.TestCase):
+    # A graceful shutdown (Settings-save restart, or Quit) should release this process's own
+    # hotkeys near-instantly via stop_event, rather than only whenever Windows notices the whole
+    # process has died -- confirmed live that the latter can take longer than even a generous
+    # retry budget on the NEW process's side, permanently losing the "Add Marker" keybind for the
+    # rest of that session. See run_custom_keybind_listener's own docstring for the full story.
+    def setUp(self):
+        self.mock_user32 = unittest.mock.Mock()
+        self.mock_user32.RegisterHotKey.return_value = True
+        self.bindings = [{"enabled": True, "action": "add_marker", "modifiers": ["ctrl"], "key": "F3"}]
+        self.fire_keybind = unittest.mock.Mock()
+        self.describe_keybind = unittest.mock.Mock(return_value="Ctrl+F3")
+        self.notify = unittest.mock.Mock()
+        self.patchers = [
+            unittest.mock.patch.object(pw.ctypes.windll, "user32", self.mock_user32),
+            unittest.mock.patch.object(pw.time, "sleep"),
+        ]
+        for p in self.patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_already_set_stop_event_exits_without_blocking_on_getmessage(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw.run_custom_keybind_listener(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.GetMessageW.assert_not_called()
+        self.mock_user32.PeekMessageW.assert_not_called()
+
+    def test_stop_event_release_unregisters_the_hotkey(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw.run_custom_keybind_listener(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.UnregisterHotKey.assert_called_once_with(None, 1)
+
+    def test_no_stop_event_still_uses_the_old_blocking_getmessage_loop(self):
+        self.mock_user32.GetMessageW.return_value = 0
+        pw.run_custom_keybind_listener(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+        )
+        self.mock_user32.GetMessageW.assert_called_once()
+        self.mock_user32.PeekMessageW.assert_not_called()
+
+
+@unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hotkey API")
 class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
     def setUp(self):
         self.mock_user32 = unittest.mock.Mock()
