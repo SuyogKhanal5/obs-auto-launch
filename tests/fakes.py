@@ -215,6 +215,24 @@ class FakeObsClient:
         filters[filter_name]["enabled"] = enabled
         self.calls.append(("set_source_filter_enabled", source_name, filter_name, enabled))
 
+    def set_source_filter_index(self, source_name, filter_name, filter_index):
+        filters = self._filters(source_name)
+        if filter_name not in filters:
+            raise OBSSDKRequestError(
+                "SetSourceFilterIndex", RESOURCE_NOT_FOUND_CODE,
+                f"No filter was found in the source `{source_name}` with the name `{filter_name}`",
+            )
+        names = list(filters.keys())
+        names.remove(filter_name)
+        names.insert(filter_index, filter_name)
+        self.inputs[source_name]["filters"] = {name: filters[name] for name in names}
+        self.calls.append(("set_source_filter_index", source_name, filter_name, filter_index))
+
+    def remove_source_filter(self, source_name, filter_name):
+        filters = self._filters(source_name)
+        filters.pop(filter_name, None)
+        self.calls.append(("remove_source_filter", source_name, filter_name))
+
     # --- replay buffer / split / recording control (custom keybind actions) ---
     def save_replay_buffer(self):
         self.calls.append(("save_replay_buffer",))

@@ -142,7 +142,11 @@
         "mic_boost": {
             "enabled": false,
             "input_name": "",
-            "boost_db": 0.0
+            "boost_db": 0.0,
+            "noise_gate": {
+                "enabled": false,
+                "threshold_db": -26.0
+            }
         },
         "process_audio_capture_sync_offset_ms": -27,
         "multi_track_audio": {

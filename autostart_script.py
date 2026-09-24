@@ -811,7 +811,12 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
     # restart to take effect.
     mic_boost_config = obs_config.get("mic_boost", {})
     if mic_boost_config.get("enabled") and mic_boost_config.get("input_name"):
-        ensure_mic_boost_filter(client, mic_boost_config["input_name"], mic_boost_config.get("boost_db", 0.0))
+        noise_gate_config = mic_boost_config.get("noise_gate", {})
+        ensure_mic_boost_filter(
+            client, mic_boost_config["input_name"], mic_boost_config.get("boost_db", 0.0),
+            noise_gate_enabled=noise_gate_config.get("enabled", False),
+            noise_gate_threshold_db=noise_gate_config.get("threshold_db", DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB),
+        )
 
     if replay_buffer_restart_needed or marker_restart_needed:
         reasons = []
@@ -914,8 +919,18 @@ def set_game_audio_capture_target(client, input_name, process_name):
         logging.warning("Could not create '%s' audio capture input in OBS: %s", input_name, exc)
 
 
+MIC_BOOST_NOISE_GATE_FILTER_NAME = "OBS Auto Recorder - Mic Boost Noise Gate"
 MIC_BOOST_COMPRESSOR_FILTER_NAME = "OBS Auto Recorder - Mic Boost"
 MIC_BOOST_LIMITER_FILTER_NAME = "OBS Auto Recorder - Mic Boost Limiter"
+# Fixed noise-gate shape -- only open_threshold (the user's own configured threshold_db) varies.
+# close_threshold is derived from it (see ensure_mic_boost_filter) rather than left at OBS's own
+# fixed default, since a user-chosen open_threshold could otherwise land ABOVE a hardcoded close
+# value -- backwards hysteresis, which would make the gate chatter open/closed unpredictably
+# instead of cleanly gating silence out. attack/hold/release keep OBS's own real defaults
+# (confirmed live via GetSourceFilterDefaultSettings) since those rarely need tuning per source.
+MIC_BOOST_NOISE_GATE_HYSTERESIS_DB = 6.0
+DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB = -26.0  # OBS's own real noise_gate_filter default (open_threshold)
+MIC_BOOST_NOISE_GATE_BASE_SETTINGS = {"attack_time": 25, "hold_time": 200, "release_time": 150}
 # Fixed compressor shape -- only output_gain (the user's own configured boost_db) varies.
 # Threshold sits comfortably below a genuinely quiet mic's own peaks (confirmed live against a
 # real recording: -25dBFS peaks on a source averaging -67dBFS) so compression actually engages on
@@ -941,50 +956,101 @@ MIC_BOOST_COMPRESSOR_BASE_SETTINGS = {
 MIC_BOOST_LIMITER_SETTINGS = {"threshold": -1.0}
 
 
-def ensure_mic_boost_filter(client, input_name, boost_db):
-    """Applies OBS Auto Recorder's mic-boost filter chain (a Compressor for makeup gain + dynamics
-    control, followed by a Limiter as a hard safety ceiling) directly to input_name -- live, at
-    OBS's own audio pipeline, so every FUTURE recording captures this source boosted from the
-    start. Deliberately independent from (and stackable with) the clip editor's own per-trim
-    ffmpeg gain (Track Routing dialog / Settings > Clip Editor > Default Track Gains): that one can
-    only re-encode an already-recorded FILE, and can't do anything about a source that was
-    captured too quiet to begin with -- see the settings above for why a flat gain alone can't
-    either, at any single stage.
+def _ensure_obs_filter_settings(client, input_name, filter_name, filter_kind, settings):
+    """Shared create-or-update-if-changed logic behind every filter in
+    ensure_mic_boost_filter's chain. Returns (current_or_new_filter, just_created) --
+    just_created lets a caller do something ONLY the first time a filter comes into existence
+    (e.g. moving it to a specific position in the chain, which would be pointless -- and would
+    fight a user's own manual reordering in OBS -- on every later idempotent check). Returns
+    (None, False) on any failure; every failure is logged, never raised, matching this app's
+    established rule for OBS-facing background calls."""
+    try:
+        current = client.get_source_filter(input_name, filter_name)
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
+            logging.warning("Could not check mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
+            return None, False
+        try:
+            client.create_source_filter(input_name, filter_name, filter_kind, settings)
+            logging.info("Created OBS mic-boost filter '%s' on '%s'.", filter_name, input_name)
+            return client.get_source_filter(input_name, filter_name), True
+        except Exception as create_exc:
+            logging.warning("Could not create mic-boost filter '%s' on '%s': %s", filter_name, input_name, create_exc)
+            return None, False
+    except Exception as exc:
+        logging.warning("Could not check mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
+        return None, False
 
-    Idempotent and safe to call on every OBS-ready check: creates both filters the first time, and
-    only writes a settings update when they've actually drifted from what's configured here, so
-    this never resets a filter's enabled state if the user disabled one by hand in OBS itself."""
+    if not all(current.filter_settings.get(key) == value for key, value in settings.items()):
+        try:
+            client.set_source_filter_settings(input_name, filter_name, settings, overlay=False)
+            logging.info("Updated OBS mic-boost filter '%s' on '%s'.", filter_name, input_name)
+            current = client.get_source_filter(input_name, filter_name)
+        except Exception as exc:
+            logging.warning("Could not update mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
+    return current, False
+
+
+def ensure_mic_boost_filter(
+    client, input_name, boost_db, noise_gate_enabled=False, noise_gate_threshold_db=None,
+):
+    """Applies OBS Auto Recorder's mic-boost filter chain directly to input_name -- live, at OBS's
+    own audio pipeline, so every FUTURE recording captures this source boosted from the start.
+    Deliberately independent from (and stackable with) the clip editor's own per-trim ffmpeg gain
+    (Track Routing dialog / Settings > Clip Editor > Default Track Gains): that one can only
+    re-encode an already-recorded FILE, and can't do anything about a source that was captured too
+    quiet to begin with -- see the settings above for why a flat gain alone can't either, at any
+    single stage.
+
+    Chain order (signal flows top to bottom): an optional Noise Gate first (so it gates the RAW
+    signal before anything downstream amplifies whatever noise floor is left), then a Compressor
+    for makeup gain + dynamics control, then a Limiter as a hard safety ceiling. New filters are
+    appended to the end of OBS's own filter list by CreateSourceFilter -- harmless for the
+    Compressor/Limiter pair (always created together, in the right relative order), but the Gate
+    specifically gets moved to index 0 right after its own creation, since it can be toggled on
+    independently, later, well after the other two already exist.
+
+    noise_gate_enabled/noise_gate_threshold_db: unlike the Compressor/Limiter (created once and
+    otherwise left alone -- see _ensure_obs_filter_settings), the gate's own OBS-side enabled
+    state is actively kept in sync with noise_gate_enabled on every call, since "toggleable" is
+    the whole point of exposing it as its own Settings checkbox -- a user flipping it needs that
+    to actually take effect, not just influence whether the filter gets created in the first
+    place.
+
+    Idempotent and safe to call on every OBS-ready check: only writes a settings/enabled update
+    when something has actually drifted from what's configured here, so this never resets the
+    Compressor's or Limiter's enabled state if the user disabled one of THOSE by hand in OBS."""
     if not input_name:
         return
-    compressor_settings = dict(MIC_BOOST_COMPRESSOR_BASE_SETTINGS, output_gain=boost_db)
-    for filter_name, filter_kind, settings in (
-        (MIC_BOOST_COMPRESSOR_FILTER_NAME, "compressor_filter", compressor_settings),
-        (MIC_BOOST_LIMITER_FILTER_NAME, "limiter_filter", MIC_BOOST_LIMITER_SETTINGS),
-    ):
-        try:
-            current = client.get_source_filter(input_name, filter_name)
-        except obsws.error.OBSSDKRequestError as exc:
-            if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
-                logging.warning("Could not check mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
-                continue
-            try:
-                client.create_source_filter(input_name, filter_name, filter_kind, settings)
-                logging.info("Created OBS mic-boost filter '%s' on '%s'.", filter_name, input_name)
-            except Exception as create_exc:
-                logging.warning(
-                    "Could not create mic-boost filter '%s' on '%s': %s", filter_name, input_name, create_exc,
-                )
-            continue
-        except Exception as exc:
-            logging.warning("Could not check mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
-            continue
 
-        if not all(current.filter_settings.get(key) == value for key, value in settings.items()):
-            try:
-                client.set_source_filter_settings(input_name, filter_name, settings, overlay=False)
-                logging.info("Updated OBS mic-boost filter '%s' on '%s'.", filter_name, input_name)
-            except Exception as exc:
-                logging.warning("Could not update mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
+    if noise_gate_threshold_db is not None:
+        gate_settings = dict(
+            MIC_BOOST_NOISE_GATE_BASE_SETTINGS,
+            open_threshold=noise_gate_threshold_db,
+            close_threshold=noise_gate_threshold_db - MIC_BOOST_NOISE_GATE_HYSTERESIS_DB,
+        )
+        gate, gate_just_created = _ensure_obs_filter_settings(
+            client, input_name, MIC_BOOST_NOISE_GATE_FILTER_NAME, "noise_gate_filter", gate_settings,
+        )
+        if gate is not None:
+            if gate_just_created:
+                try:
+                    client.set_source_filter_index(input_name, MIC_BOOST_NOISE_GATE_FILTER_NAME, 0)
+                except Exception as exc:
+                    logging.warning("Could not move mic-boost noise gate to the front of the chain: %s", exc)
+            if gate.filter_enabled != noise_gate_enabled:
+                try:
+                    client.set_source_filter_enabled(input_name, MIC_BOOST_NOISE_GATE_FILTER_NAME, noise_gate_enabled)
+                    logging.info(
+                        "%s OBS mic-boost noise gate on '%s'.",
+                        "Enabled" if noise_gate_enabled else "Disabled", input_name,
+                    )
+                except Exception as exc:
+                    logging.warning("Could not toggle mic-boost noise gate on '%s': %s", input_name, exc)
+
+    compressor_settings = dict(MIC_BOOST_COMPRESSOR_BASE_SETTINGS, output_gain=boost_db)
+    _ensure_obs_filter_settings(client, input_name, MIC_BOOST_COMPRESSOR_FILTER_NAME, "compressor_filter", compressor_settings)
+    _ensure_obs_filter_settings(client, input_name, MIC_BOOST_LIMITER_FILTER_NAME, "limiter_filter", MIC_BOOST_LIMITER_SETTINGS)
 
 
 # Confirmed live via a controlled cross-correlation test: a real-world sound captured
@@ -5463,6 +5529,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
     row += 1
     mic_boost_input_var = tk.StringVar(value=mic_boost_config.get("input_name", ""))
     add_labeled_entry(obs_tab, row, "Microphone input source name", mic_boost_input_var)
+
+    def pick_mic_boost_input():
+        open_obs_input_picker(obs_tab, get_current_ws_config, on_pick=lambda name: mic_boost_input_var.set(name))
+
+    dark_button(obs_tab, text="Pick...", command=pick_mic_boost_input).grid(row=row, column=2, padx=(0, 10), pady=4)
     row += 1
     mic_boost_db_var = tk.StringVar(value=str(mic_boost_config.get("boost_db", 0.0)))
     add_labeled_entry(obs_tab, row, "Boost amount (dB)", mic_boost_db_var, width=10)
@@ -5479,8 +5550,30 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "quiet in the first place -- confirmed live that a genuinely under-recorded mic "
             "(e.g. -67dBFS average) can't be fixed by a flat gain at any single stage, since its "
             "existing peaks hit the digital ceiling long before the quiet parts catch up. The two "
-            "can be used together. Input source name must match the exact OBS source name (the "
-            "same one used in Multi-Track Audio below, e.g. \"Scarlet\")."
+            "can be used together."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    mic_noise_gate_config = mic_boost_config.get("noise_gate", {})
+    mic_noise_gate_enabled_var = tk.BooleanVar(value=mic_noise_gate_config.get("enabled", False))
+    add_checkbox(obs_tab, row, "Also add a noise gate ahead of the boost, to cut background noise", mic_noise_gate_enabled_var)
+    row += 1
+    mic_noise_gate_threshold_var = tk.StringVar(
+        value=str(mic_noise_gate_config.get("threshold_db", DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB))
+    )
+    add_labeled_entry(obs_tab, row, "Noise gate threshold (dB)", mic_noise_gate_threshold_var, width=10)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    Silences the mic whenever it's quieter than this threshold, before the boost "
+            "above amplifies whatever's left -- lower (more negative) is more permissive, higher "
+            "cuts out more. Placed first in the chain regardless of when it was added, so it "
+            "gates the RAW signal rather than the already-boosted one. Freely toggleable here "
+            "without losing its threshold -- unchecking it disables the filter in OBS rather "
+            "than removing it, so re-checking it later remembers this value."
         ),
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
@@ -6332,6 +6425,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
         mic_boost["boost_db"] = read_float(mic_boost_db_var, "Microphone boost amount", mic_boost.get("boost_db", 0.0))
         if mic_boost_enabled_var.get() and not mic_boost["input_name"]:
             errors.append("\"Microphone input source name\" is required when Microphone Boost is enabled")
+        mic_noise_gate = mic_boost.setdefault("noise_gate", {})
+        mic_noise_gate["enabled"] = mic_noise_gate_enabled_var.get()
+        mic_noise_gate["threshold_db"] = read_float(
+            mic_noise_gate_threshold_var, "Noise gate threshold",
+            mic_noise_gate.get("threshold_db", DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB),
+        )
 
         multi_track_audio = obs.setdefault("multi_track_audio", {})
         multi_track_audio["enabled"] = multi_track_enabled_var.get()

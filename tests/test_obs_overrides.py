@@ -174,6 +174,63 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         client = self._client()
         a.ensure_mic_boost_filter(client, "No Such Source", 12.0)  # must not raise
 
+    def test_no_threshold_given_skips_the_noise_gate_entirely(self):
+        # Backward compatible with a caller that never opted into the noise gate at all (the
+        # default noise_gate_threshold_db=None) -- must not create it or touch anything gate-named.
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        names = {f.filter_name for f in client.get_source_filter_list("Scarlet").filters}
+        self.assertNotIn(a.MIC_BOOST_NOISE_GATE_FILTER_NAME, names)
+
+    def test_noise_gate_created_with_derived_close_threshold_and_moved_to_front(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-40.0)
+        gate = client.get_source_filter("Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
+        self.assertEqual(gate.filter_settings["open_threshold"], -40.0)
+        # Hysteresis: close_threshold must stay BELOW open_threshold regardless of how low the
+        # user's own chosen threshold is, or the gate's open/close logic would run backwards.
+        self.assertEqual(gate.filter_settings["close_threshold"], -40.0 - a.MIC_BOOST_NOISE_GATE_HYSTERESIS_DB)
+        self.assertTrue(gate.filter_enabled)
+        names = [f.filter_name for f in client.get_source_filter_list("Scarlet").filters]
+        self.assertEqual(names[0], a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
+
+    def test_noise_gate_disabled_toggle_is_synced_even_though_the_filter_stays(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=False, noise_gate_threshold_db=-30.0)
+        gate = client.get_source_filter("Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
+        self.assertFalse(gate.filter_enabled)  # toggled off, but not deleted -- threshold survives
+        self.assertEqual(gate.filter_settings["open_threshold"], -30.0)
+
+    def test_noise_gate_reenabled_restores_without_recreating(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=False, noise_gate_threshold_db=-30.0)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
+        self.assertEqual(
+            [c for c in client.calls if c[0] == "create_source_filter"], [],  # never recreated
+        )
+        self.assertIn(("set_source_filter_enabled", "Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME, True), client.calls)
+
+    def test_unchanged_noise_gate_state_is_not_rewritten(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
+        self.assertEqual(client.calls, [])
+
+    def test_changed_threshold_updates_settings_without_touching_enabled_state(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-20.0)
+        self.assertEqual(
+            [c for c in client.calls if c[0] == "set_source_filter_enabled"], [],
+        )
+        gate = client.get_source_filter("Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
+        self.assertEqual(gate.filter_settings["open_threshold"], -20.0)
+
 
 class GetReplayBufferModeTests(unittest.TestCase):
     def test_explicit_mode_wins(self):
