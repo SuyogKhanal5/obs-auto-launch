@@ -858,6 +858,31 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
 OBS_NOT_READY_CODE = 207
 
 
+def wait_until_obs_ready(client, retries=6, delay=2):
+    """Blocks until client answers a trivial, harmless read-only request successfully, retrying
+    past OBS's own "not ready yet" response (code 207) -- confirmed live (twice, in two different
+    call paths this same session) that OBS can accept a websocket connection well before it's
+    actually ready to answer ANY request at all, for a few real seconds right after either OBS
+    itself or its websocket plugin has just started up. Same retry shape as start_recording's own
+    handling of this exact code, reused here for callers (like measure_noise_gate_threshold) that
+    need OBS to be genuinely ready before doing their own real work, not just connected.
+
+    Returns True once ready, False if it never became ready within the retry budget (a caller
+    should treat that as "couldn't reach OBS", not silently proceed)."""
+    for attempt in range(1, retries + 1):
+        try:
+            client.get_record_status()
+            return True
+        except obsws.error.OBSSDKRequestError as exc:
+            if exc.code == OBS_NOT_READY_CODE and attempt < retries:
+                time.sleep(delay)
+                continue
+            return False
+        except Exception:
+            return False
+    return False
+
+
 def start_recording(client, retries=6, delay=2):
     for attempt in range(1, retries + 1):
         try:
@@ -1148,6 +1173,12 @@ def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
         return None, (
             "Could not connect to OBS over its WebSocket using the settings above. Make sure OBS "
             "is running and the host/port/password are correct, then try again."
+        )
+    if not wait_until_obs_ready(client):
+        client.disconnect()
+        return None, (
+            "OBS accepted the connection but never became ready to answer requests. If it was "
+            "just launched, wait a few more seconds and try again."
         )
 
     filter_names = (MIC_BOOST_NOISE_GATE_FILTER_NAME, MIC_BOOST_COMPRESSOR_FILTER_NAME, MIC_BOOST_LIMITER_FILTER_NAME)
@@ -4090,7 +4121,16 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                                 req_client = connect_obs(obs_config["websocket"])
                                 if req_client:
                                     try:
-                                        apply_mic_boost_from_config(req_client, obs_config)
+                                        # connect_obs only retries the connection/identify
+                                        # handshake itself -- confirmed live that OBS can still
+                                        # answer "not ready" (207) to the very next real request
+                                        # for a few seconds after that succeeds, on a fresh
+                                        # launch. This has no UI and no natural retry trigger
+                                        # like the calibration button does, so it's worth
+                                        # actually waiting out here rather than silently skipping
+                                        # this one attempt.
+                                        if wait_until_obs_ready(req_client):
+                                            apply_mic_boost_from_config(req_client, obs_config)
                                     finally:
                                         req_client.disconnect()
 

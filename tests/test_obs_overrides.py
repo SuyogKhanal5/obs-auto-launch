@@ -10,6 +10,58 @@ import autostart_script as a
 from tests.fakes import FakeObsClient
 
 
+class WaitUntilObsReadyTests(unittest.TestCase):
+    # Confirmed live, twice in one session: OBS can accept a websocket connection and finish the
+    # identify handshake well before it's actually ready to answer ANY request -- connect_obs's
+    # own retries only cover the connection itself, not this. wait_until_obs_ready is the guard
+    # for callers that need OBS genuinely ready, not just connected.
+    def test_ready_immediately_returns_true_without_sleeping(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a.time, "sleep") as mock_sleep:
+            self.assertTrue(a.wait_until_obs_ready(client))
+        mock_sleep.assert_not_called()
+
+    def test_retries_past_transient_not_ready_then_succeeds(self):
+        class FlakyClient(FakeObsClient):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            def get_record_status(self):
+                self.attempts += 1
+                if self.attempts < 3:
+                    raise a.obsws.error.OBSSDKRequestError("GetRecordStatus", a.OBS_NOT_READY_CODE, "not ready")
+                return super().get_record_status()
+
+        client = FlakyClient()
+        with unittest.mock.patch.object(a.time, "sleep"):
+            self.assertTrue(a.wait_until_obs_ready(client))
+        self.assertEqual(client.attempts, 3)
+
+    def test_gives_up_after_retries_exhausted(self):
+        class AlwaysNotReadyClient(FakeObsClient):
+            def get_record_status(self):
+                raise a.obsws.error.OBSSDKRequestError("GetRecordStatus", a.OBS_NOT_READY_CODE, "not ready")
+
+        client = AlwaysNotReadyClient()
+        with unittest.mock.patch.object(a.time, "sleep"):
+            self.assertFalse(a.wait_until_obs_ready(client, retries=3, delay=0))
+
+    def test_a_different_error_code_gives_up_immediately_without_retrying(self):
+        class DifferentErrorClient(FakeObsClient):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            def get_record_status(self):
+                self.attempts += 1
+                raise a.obsws.error.OBSSDKRequestError("GetRecordStatus", 500, "something else entirely")
+
+        client = DifferentErrorClient()
+        self.assertFalse(a.wait_until_obs_ready(client))
+        self.assertEqual(client.attempts, 1)
+
+
 class ApplyOutputFolderTests(unittest.TestCase):
     def test_none_is_a_noop(self):
         client = FakeObsClient()
