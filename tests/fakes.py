@@ -161,6 +161,60 @@ class FakeObsClient:
         self.calls.append(("create_input", sceneName, inputName, inputKind, inputSettings))
         return SimpleNamespace(scene_item_id=len(self.inputs))
 
+    # --- source filters ---
+    def _filters(self, source_name):
+        if source_name not in self.inputs:
+            raise OBSSDKRequestError(
+                "GetSourceFilterList", RESOURCE_NOT_FOUND_CODE, f"No source was found by the name of `{source_name}`"
+            )
+        return self.inputs[source_name].setdefault("filters", {})
+
+    def get_source_filter_list(self, source_name):
+        filters = self._filters(source_name)
+        return SimpleNamespace(filters=[
+            SimpleNamespace(filter_name=name, filter_kind=f["kind"], filter_enabled=f["enabled"])
+            for name, f in filters.items()
+        ])
+
+    def get_source_filter(self, source_name, filter_name):
+        filters = self._filters(source_name)
+        if filter_name not in filters:
+            raise OBSSDKRequestError(
+                "GetSourceFilter", RESOURCE_NOT_FOUND_CODE,
+                f"No filter was found in the source `{source_name}` with the name `{filter_name}`",
+            )
+        f = filters[filter_name]
+        return SimpleNamespace(filter_kind=f["kind"], filter_settings=dict(f["settings"]), filter_enabled=f["enabled"])
+
+    def create_source_filter(self, source_name, filter_name, filter_kind, filter_settings=None):
+        filters = self._filters(source_name)
+        filters[filter_name] = {"kind": filter_kind, "settings": dict(filter_settings or {}), "enabled": True}
+        self.calls.append(("create_source_filter", source_name, filter_name, filter_kind, filter_settings))
+
+    def set_source_filter_settings(self, source_name, filter_name, settings, overlay=None):
+        filters = self._filters(source_name)
+        if filter_name not in filters:
+            raise OBSSDKRequestError(
+                "SetSourceFilterSettings", RESOURCE_NOT_FOUND_CODE,
+                f"No filter was found in the source `{source_name}` with the name `{filter_name}`",
+            )
+        current = filters[filter_name]["settings"]
+        if overlay is False:
+            filters[filter_name]["settings"] = dict(settings)
+        else:
+            current.update(settings)
+        self.calls.append(("set_source_filter_settings", source_name, filter_name, dict(settings), overlay))
+
+    def set_source_filter_enabled(self, source_name, filter_name, enabled):
+        filters = self._filters(source_name)
+        if filter_name not in filters:
+            raise OBSSDKRequestError(
+                "SetSourceFilterEnabled", RESOURCE_NOT_FOUND_CODE,
+                f"No filter was found in the source `{source_name}` with the name `{filter_name}`",
+            )
+        filters[filter_name]["enabled"] = enabled
+        self.calls.append(("set_source_filter_enabled", source_name, filter_name, enabled))
+
     # --- replay buffer / split / recording control (custom keybind actions) ---
     def save_replay_buffer(self):
         self.calls.append(("save_replay_buffer",))

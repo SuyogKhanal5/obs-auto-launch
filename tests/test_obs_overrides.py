@@ -104,6 +104,77 @@ class EnsureHybridMp4ForMarkersTests(unittest.TestCase):
         self.assertFalse(needs_restart)
 
 
+class EnsureMicBoostFilterTests(unittest.TestCase):
+    def _client(self):
+        return FakeObsClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})
+
+    def test_no_input_name_is_a_noop(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "", 12.0)
+        self.assertEqual(client.calls, [])
+
+    def test_creates_both_filters_on_a_fresh_source(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        filters = client.get_source_filter_list("Scarlet").filters
+        names = {f.filter_name: f.filter_kind for f in filters}
+        self.assertEqual(
+            names,
+            {
+                a.MIC_BOOST_COMPRESSOR_FILTER_NAME: "compressor_filter",
+                a.MIC_BOOST_LIMITER_FILTER_NAME: "limiter_filter",
+            },
+        )
+        compressor = client.get_source_filter("Scarlet", a.MIC_BOOST_COMPRESSOR_FILTER_NAME)
+        self.assertEqual(compressor.filter_settings["output_gain"], 12.0)
+        limiter = client.get_source_filter("Scarlet", a.MIC_BOOST_LIMITER_FILTER_NAME)
+        self.assertEqual(limiter.filter_settings["threshold"], -1.0)
+
+    def test_compressor_created_before_limiter_in_the_chain(self):
+        # Ordering matters here: a limiter has to come AFTER the compressor's own output_gain to
+        # actually catch what that gain produces, not before it.
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        create_calls = [c for c in client.calls if c[0] == "create_source_filter"]
+        self.assertEqual(
+            [c[2] for c in create_calls], [a.MIC_BOOST_COMPRESSOR_FILTER_NAME, a.MIC_BOOST_LIMITER_FILTER_NAME],
+        )
+
+    def test_already_matching_settings_are_not_rewritten(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        self.assertEqual(client.calls, [])
+
+    def test_changed_boost_db_updates_the_compressor_only(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 24.0)
+        self.assertEqual(
+            client.calls,
+            [(
+                "set_source_filter_settings", "Scarlet", a.MIC_BOOST_COMPRESSOR_FILTER_NAME,
+                dict(a.MIC_BOOST_COMPRESSOR_BASE_SETTINGS, output_gain=24.0), False,
+            )],
+        )
+        compressor = client.get_source_filter("Scarlet", a.MIC_BOOST_COMPRESSOR_FILTER_NAME)
+        self.assertEqual(compressor.filter_settings["output_gain"], 24.0)
+
+    def test_never_raises_when_client_errors(self):
+        class RaisingClient(FakeObsClient):
+            def create_source_filter(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        client = RaisingClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)  # must not raise
+
+    def test_unknown_source_is_logged_not_raised(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "No Such Source", 12.0)  # must not raise
+
+
 class GetReplayBufferModeTests(unittest.TestCase):
     def test_explicit_mode_wins(self):
         self.assertEqual(a.get_replay_buffer_mode({"mode": "only", "enabled": False}), "only")

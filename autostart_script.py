@@ -807,6 +807,12 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
     replay_buffer_restart_needed = apply_replay_buffer_settings(client, obs_config.get("replay_buffer", {}))
     marker_restart_needed = ensure_hybrid_mp4_for_markers(client) if markers_wanted else False
 
+    # Filters apply live -- unlike the profile-parameter writes above, this never needs OBS to
+    # restart to take effect.
+    mic_boost_config = obs_config.get("mic_boost", {})
+    if mic_boost_config.get("enabled") and mic_boost_config.get("input_name"):
+        ensure_mic_boost_filter(client, mic_boost_config["input_name"], mic_boost_config.get("boost_db", 0.0))
+
     if replay_buffer_restart_needed or marker_restart_needed:
         reasons = []
         if replay_buffer_restart_needed:
@@ -906,6 +912,79 @@ def set_game_audio_capture_target(client, input_name, process_name):
         )
     except Exception as exc:
         logging.warning("Could not create '%s' audio capture input in OBS: %s", input_name, exc)
+
+
+MIC_BOOST_COMPRESSOR_FILTER_NAME = "OBS Auto Recorder - Mic Boost"
+MIC_BOOST_LIMITER_FILTER_NAME = "OBS Auto Recorder - Mic Boost Limiter"
+# Fixed compressor shape -- only output_gain (the user's own configured boost_db) varies.
+# Threshold sits comfortably below a genuinely quiet mic's own peaks (confirmed live against a
+# real recording: -25dBFS peaks on a source averaging -67dBFS) so compression actually engages on
+# most of what the mic captures, tempering how hard the loudest moments get pushed up right along
+# with the quiet ones. A plain volume/Gain filter has no such mechanism at all -- it multiplies
+# every sample by the same fixed amount, so it hits 0dBFS (full digital clipping) far sooner than
+# a compressor's makeup gain does, confirmed live via the SAME real recording: a flat +36dB
+# export-time gain in the clip editor already had this source's peaks pinned at 0.0dBFS while its
+# average level still only reached -32.5dBFS -- there simply isn't a single-stage flat-gain fix
+# for a source recorded this quiet.
+MIC_BOOST_COMPRESSOR_BASE_SETTINGS = {
+    "threshold": -30.0,
+    "ratio": 3.0,
+    "attack_time": 6,
+    "release_time": 60,
+    "sidechain_source": "none",
+}
+# A hard safety ceiling chained AFTER the compressor's own output_gain -- confirmed live (via
+# GetSourceFilterKindList/GetSourceFilterDefaultSettings against a real OBS instance) that this is
+# a genuinely separate OBS filter kind ("limiter_filter"), not something the compressor itself
+# also provides; without it, a large boost_db could still clip outright on a moment the
+# compressor's own ratio/threshold didn't fully tame.
+MIC_BOOST_LIMITER_SETTINGS = {"threshold": -1.0}
+
+
+def ensure_mic_boost_filter(client, input_name, boost_db):
+    """Applies OBS Auto Recorder's mic-boost filter chain (a Compressor for makeup gain + dynamics
+    control, followed by a Limiter as a hard safety ceiling) directly to input_name -- live, at
+    OBS's own audio pipeline, so every FUTURE recording captures this source boosted from the
+    start. Deliberately independent from (and stackable with) the clip editor's own per-trim
+    ffmpeg gain (Track Routing dialog / Settings > Clip Editor > Default Track Gains): that one can
+    only re-encode an already-recorded FILE, and can't do anything about a source that was
+    captured too quiet to begin with -- see the settings above for why a flat gain alone can't
+    either, at any single stage.
+
+    Idempotent and safe to call on every OBS-ready check: creates both filters the first time, and
+    only writes a settings update when they've actually drifted from what's configured here, so
+    this never resets a filter's enabled state if the user disabled one by hand in OBS itself."""
+    if not input_name:
+        return
+    compressor_settings = dict(MIC_BOOST_COMPRESSOR_BASE_SETTINGS, output_gain=boost_db)
+    for filter_name, filter_kind, settings in (
+        (MIC_BOOST_COMPRESSOR_FILTER_NAME, "compressor_filter", compressor_settings),
+        (MIC_BOOST_LIMITER_FILTER_NAME, "limiter_filter", MIC_BOOST_LIMITER_SETTINGS),
+    ):
+        try:
+            current = client.get_source_filter(input_name, filter_name)
+        except obsws.error.OBSSDKRequestError as exc:
+            if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
+                logging.warning("Could not check mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
+                continue
+            try:
+                client.create_source_filter(input_name, filter_name, filter_kind, settings)
+                logging.info("Created OBS mic-boost filter '%s' on '%s'.", filter_name, input_name)
+            except Exception as create_exc:
+                logging.warning(
+                    "Could not create mic-boost filter '%s' on '%s': %s", filter_name, input_name, create_exc,
+                )
+            continue
+        except Exception as exc:
+            logging.warning("Could not check mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
+            continue
+
+        if not all(current.filter_settings.get(key) == value for key, value in settings.items()):
+            try:
+                client.set_source_filter_settings(input_name, filter_name, settings, overlay=False)
+                logging.info("Updated OBS mic-boost filter '%s' on '%s'.", filter_name, input_name)
+            except Exception as exc:
+                logging.warning("Could not update mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
 
 
 # Confirmed live via a controlled cross-correlation test: a real-world sound captured
@@ -5376,6 +5455,37 @@ def _run_config_editor(master_root, restart_callback, on_close):
 
     calibrate_button.config(command=start_calibration)
 
+    mic_boost_config = obs_config.get("mic_boost", {})
+    add_section_label(obs_tab, row, "Microphone Boost")
+    row += 1
+    mic_boost_enabled_var = tk.BooleanVar(value=mic_boost_config.get("enabled", False))
+    add_checkbox(obs_tab, row, "Boost a quiet microphone live, in OBS itself", mic_boost_enabled_var)
+    row += 1
+    mic_boost_input_var = tk.StringVar(value=mic_boost_config.get("input_name", ""))
+    add_labeled_entry(obs_tab, row, "Microphone input source name", mic_boost_input_var)
+    row += 1
+    mic_boost_db_var = tk.StringVar(value=str(mic_boost_config.get("boost_db", 0.0)))
+    add_labeled_entry(obs_tab, row, "Boost amount (dB)", mic_boost_db_var, width=10)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    Applies a Compressor (for makeup gain that doesn't push already-loud moments as "
+            "hard as quiet ones) plus a Limiter (a hard safety ceiling) directly to this OBS input "
+            "-- live, so every future recording captures it boosted from the start. This is "
+            "separate from the clip editor's own Track Routing gain (Settings > Clip Editor > "
+            "Default Track Gains, or the dialog itself): that one only re-encodes an already-"
+            "recorded FILE per trim and can't do anything about a source that was captured too "
+            "quiet in the first place -- confirmed live that a genuinely under-recorded mic "
+            "(e.g. -67dBFS average) can't be fixed by a flat gain at any single stage, since its "
+            "existing peaks hit the digital ceiling long before the quiet parts catch up. The two "
+            "can be used together. Input source name must match the exact OBS source name (the "
+            "same one used in Multi-Track Audio below, e.g. \"Scarlet\")."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
     multi_track_config = obs_config.get("multi_track_audio", {})
     # Keyed by input name so re-running Quick Setup (or hand-editing tracks afterward) never
     # loses a previously-recorded app -> process mapping; collect_config() below reads this back
@@ -6215,6 +6325,13 @@ def _run_config_editor(master_root, restart_callback, on_close):
         obs["process_audio_capture_sync_offset_ms"] = read_int(
             process_capture_sync_offset_var, "Audio capture sync offset", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS,
         )
+
+        mic_boost = obs.setdefault("mic_boost", {})
+        mic_boost["enabled"] = mic_boost_enabled_var.get()
+        mic_boost["input_name"] = mic_boost_input_var.get().strip()
+        mic_boost["boost_db"] = read_float(mic_boost_db_var, "Microphone boost amount", mic_boost.get("boost_db", 0.0))
+        if mic_boost_enabled_var.get() and not mic_boost["input_name"]:
+            errors.append("\"Microphone input source name\" is required when Microphone Boost is enabled")
 
         multi_track_audio = obs.setdefault("multi_track_audio", {})
         multi_track_audio["enabled"] = multi_track_enabled_var.get()
