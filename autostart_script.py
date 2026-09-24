@@ -1096,6 +1096,152 @@ def apply_mic_boost_from_config(client, obs_config):
     )
 
 
+NOISE_GATE_CALIBRATION_QUIET_SECONDS = 3.0
+NOISE_GATE_CALIBRATION_VOICE_SECONDS = 4.0
+# How far above the measured noise floor to place the threshold, as a fraction of the gap to the
+# measured voice level -- biased low (toward the noise floor) rather than the midpoint, since a
+# threshold that's too permissive just lets a little more room noise through the gate, but one
+# that's too aggressive clips the soft start of real words. Confirmed live this session that a
+# threshold sitting right at (not even above) this mic's own peak level closed the gate on nearly
+# everything -- erring permissive is the safer failure mode.
+NOISE_GATE_CALIBRATION_THRESHOLD_FRACTION = 0.35
+# Below this gap (voice level over noise floor), the two are too close to calibrate a meaningful
+# threshold between them -- likely nothing was actually said, or the input is silent/wrong.
+NOISE_GATE_CALIBRATION_MIN_USEFUL_GAP_DB = 6.0
+NOISE_GATE_CALIBRATION_MIN_THRESHOLD_DB = -60.0
+NOISE_GATE_CALIBRATION_MAX_THRESHOLD_DB = -10.0
+
+
+def _mul_to_db(peak_mul):
+    return 20 * math.log10(peak_mul) if peak_mul > 0 else -100.0
+
+
+def _percentile(values, fraction):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return ordered[index]
+
+
+def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
+    """Live-measures input_name's own real peak levels over two short phases -- quiet, then
+    talking normally -- to compute a noise gate open_threshold that actually fits THIS mic and
+    room, rather than guessing. Confirmed live this session that a generic default (-26dB) can sit
+    right at a real mic's own peak level, closing the gate almost permanently -- this measures the
+    actual gap between "room quiet" and "talking normally" on the real hardware instead.
+
+    Temporarily disables this app's own mic-boost filter chain on input_name for the duration (if
+    any of it already exists) -- the gate needs to see the RAW signal to calibrate against, not
+    whatever the chain already did to it (in particular, an already-active gate would silence the
+    very "quiet" phase this needs real ambient noise readings from). Restores every filter's prior
+    enabled state before returning either way, success or failure; never touches a filter's
+    settings, only whether it's temporarily disabled.
+
+    on_phase(phase_name, seconds_remaining), if given, is called roughly once a second during each
+    phase (phase_name is "quiet" or "voice") so a caller can show live countdown feedback.
+
+    Returns (threshold_db, error_message) -- error_message is None on success, and is a
+    human-readable reason (mic unreachable, no real gap measured, etc.) on failure."""
+    client = connect_obs(ws_config, retries=1, delay=0)
+    if not client:
+        return None, (
+            "Could not connect to OBS over its WebSocket using the settings above. Make sure OBS "
+            "is running and the host/port/password are correct, then try again."
+        )
+
+    filter_names = (MIC_BOOST_NOISE_GATE_FILTER_NAME, MIC_BOOST_COMPRESSOR_FILTER_NAME, MIC_BOOST_LIMITER_FILTER_NAME)
+    prior_enabled = {}
+    try:
+        for filter_name in filter_names:
+            try:
+                prior_enabled[filter_name] = client.get_source_filter(input_name, filter_name).filter_enabled
+                client.set_source_filter_enabled(input_name, filter_name, False)
+            except obsws.error.OBSSDKRequestError as exc:
+                if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
+                    logging.warning("Noise gate calibration: could not disable '%s': %s", filter_name, exc)
+
+        event_client = None
+        try:
+            event_client = obsws.EventClient(
+                host=ws_config.get("host", "localhost"), port=ws_config.get("port", 4455),
+                password=ws_config.get("password", ""), timeout=5,
+                subs=obsws.Subs.LOW_VOLUME | obsws.Subs.INPUTVOLUMEMETERS,
+            )
+        except Exception as exc:
+            return None, f"Could not start listening to '{input_name}': {exc}"
+
+        readings = {"quiet": [], "voice": []}
+        phase = {"name": "quiet"}
+
+        def on_input_volume_meters(data):
+            for entry in data.inputs:
+                if entry.get("inputName") != input_name:
+                    continue
+                peak = 0.0
+                for channel in entry.get("inputLevelsMul") or []:
+                    for value in channel:
+                        if isinstance(value, (int, float)) and value > peak:
+                            peak = value
+                readings[phase["name"]].append(peak)
+
+        event_client.callback.register(on_input_volume_meters)
+        try:
+            for phase_name, seconds in (
+                ("quiet", NOISE_GATE_CALIBRATION_QUIET_SECONDS),
+                ("voice", NOISE_GATE_CALIBRATION_VOICE_SECONDS),
+            ):
+                phase["name"] = phase_name
+                remaining = seconds
+                while remaining > 0:
+                    if on_phase:
+                        try:
+                            on_phase(phase_name, remaining)
+                        except Exception:
+                            logging.exception("Noise gate calibration: on_phase callback failed.")
+                    step = min(1.0, remaining)
+                    time.sleep(step)
+                    remaining -= step
+        finally:
+            event_client.disconnect()
+    finally:
+        for filter_name, was_enabled in prior_enabled.items():
+            try:
+                client.set_source_filter_enabled(input_name, filter_name, was_enabled)
+            except Exception as exc:
+                logging.warning("Noise gate calibration: could not restore '%s': %s", filter_name, exc)
+        client.disconnect()
+
+    return compute_noise_gate_threshold_from_samples(readings["quiet"], readings["voice"], input_name)
+
+
+def compute_noise_gate_threshold_from_samples(quiet_peaks, voice_peaks, input_name="the input"):
+    """Pure calibration math behind measure_noise_gate_threshold, split out so it's testable with
+    plain synthetic sample lists instead of a live OBS connection -- this is the part most likely
+    to actually have a bug, and the part with no live-I/O excuse not to test thoroughly.
+
+    quiet_peaks/voice_peaks: OBS-style 0-1 linear multiplier peak readings collected during each
+    phase. Returns (threshold_db, error_message), same contract as measure_noise_gate_threshold."""
+    if not quiet_peaks and not voice_peaks:
+        return None, (
+            f"No signal at all was received from '{input_name}' -- check the input name is exactly "
+            "right (use Pick...) and that the mic isn't muted."
+        )
+
+    noise_db = _mul_to_db(_percentile(quiet_peaks, 0.9))
+    voice_db = _mul_to_db(_percentile(voice_peaks, 0.3))
+    if voice_db - noise_db < NOISE_GATE_CALIBRATION_MIN_USEFUL_GAP_DB:
+        return None, (
+            "Couldn't measure a clear enough difference between quiet and talking -- either "
+            "nothing was said during the \"talk normally\" phase, or the room noise is already "
+            "about as loud as your voice. Try again in a quieter room, speaking normally."
+        )
+
+    threshold_db = noise_db + (voice_db - noise_db) * NOISE_GATE_CALIBRATION_THRESHOLD_FRACTION
+    threshold_db = max(NOISE_GATE_CALIBRATION_MIN_THRESHOLD_DB, min(NOISE_GATE_CALIBRATION_MAX_THRESHOLD_DB, threshold_db))
+    return round(threshold_db, 1), None
+
+
 # Confirmed live via a controlled cross-correlation test: a real-world sound captured
 # simultaneously through OBS's two WASAPI audio capture paths lands later on a
 # wasapi_process_output_capture input (Application Audio Capture -- what Game Audio and every
@@ -5650,6 +5796,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
         value=str(mic_noise_gate_config.get("threshold_db", DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB))
     )
     add_labeled_entry(obs_tab, row, "Noise gate threshold (dB)", mic_noise_gate_threshold_var, width=10)
+    noise_gate_detect_button = tk.Button(
+        obs_tab, text="Auto-Detect...", bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    )
+    noise_gate_detect_button.grid(row=row, column=2, padx=(0, 10), pady=4)
     row += 1
     tk.Label(
         obs_tab,
@@ -5659,11 +5810,89 @@ def _run_config_editor(master_root, restart_callback, on_close):
             "cuts out more. Placed first in the chain regardless of when it was added, so it "
             "gates the RAW signal rather than the already-boosted one. Freely toggleable here "
             "without losing its threshold -- unchecking it disables the filter in OBS rather "
-            "than removing it, so re-checking it later remembers this value."
+            "than removing it, so re-checking it later remembers this value. \"Auto-Detect\" "
+            "measures your own mic and room instead of guessing -- confirmed live that a generic "
+            "default can sit right at a quiet mic's own peak level and close the gate on almost "
+            "everything, which is exactly the failure mode this avoids."
         ),
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
+
+    def run_noise_gate_detection(ws_config, input_name, progress_window, progress_label):
+        def on_phase(phase_name, seconds_remaining):
+            text = (
+                f"Stay quiet -- measuring room noise... {seconds_remaining:.0f}s"
+                if phase_name == "quiet" else
+                f"Now talk normally (like you would while playing)... {seconds_remaining:.0f}s"
+            )
+
+            def update():
+                if progress_window.winfo_exists():
+                    progress_label.config(text=text)
+            try:
+                obs_tab.after(0, update)
+            except tk.TclError:
+                pass
+
+        threshold_db, error_message = measure_noise_gate_threshold(ws_config, input_name, on_phase=on_phase)
+
+        def finish():
+            if progress_window.winfo_exists():
+                progress_window.destroy()
+            noise_gate_detect_button.config(state="normal", text="Auto-Detect...")
+            if error_message:
+                messagebox.showwarning("Can't auto-detect", error_message, parent=obs_tab)
+            else:
+                mic_noise_gate_threshold_var.set(str(threshold_db))
+                messagebox.showinfo(
+                    "Auto-detect complete",
+                    f"Measured threshold: {threshold_db}dB. The field above has been updated -- "
+                    "click Save for it to take effect.",
+                    parent=obs_tab,
+                )
+        try:
+            obs_tab.after(0, finish)
+        except tk.TclError:
+            pass
+
+    def start_noise_gate_detection():
+        input_name = mic_boost_input_var.get().strip()
+        if not input_name:
+            messagebox.showwarning(
+                "No microphone set", "Set \"Microphone input source name\" above first.", parent=obs_tab,
+            )
+            return
+        proceed = messagebox.askyesno(
+            "Auto-Detect Noise Gate Threshold",
+            f"This briefly listens to '{input_name}' in two steps: stay quiet for "
+            f"{NOISE_GATE_CALIBRATION_QUIET_SECONDS:.0f}s so it can measure your room's own "
+            f"background noise, then talk normally for {NOISE_GATE_CALIBRATION_VOICE_SECONDS:.0f}s "
+            "so it can measure your voice. The boost/gate are both temporarily turned off during "
+            "this so it can hear the real, raw signal.\n\nContinue?",
+            parent=obs_tab,
+        )
+        if not proceed:
+            return
+
+        progress_window = tk.Toplevel(obs_tab)
+        progress_window.title("Auto-Detect Noise Gate Threshold")
+        progress_window.configure(bg=DARK_BG)
+        progress_window.transient(obs_tab.winfo_toplevel())
+        progress_window.resizable(False, False)
+        progress_label = tk.Label(
+            progress_window, text="Starting...", bg=DARK_BG, fg=DARK_FG, font=("Segoe UI", 11), padx=30, pady=30,
+        )
+        progress_label.pack()
+
+        noise_gate_detect_button.config(state="disabled", text="Listening...")
+        threading.Thread(
+            target=run_noise_gate_detection,
+            args=(get_current_ws_config(), input_name, progress_window, progress_label),
+            daemon=True,
+        ).start()
+
+    noise_gate_detect_button.config(command=start_noise_gate_detection)
 
     multi_track_config = obs_config.get("multi_track_audio", {})
     # Keyed by input name so re-running Quick Setup (or hand-editing tracks afterward) never

@@ -104,6 +104,88 @@ class EnsureHybridMp4ForMarkersTests(unittest.TestCase):
         self.assertFalse(needs_restart)
 
 
+class ComputeNoiseGateThresholdFromSamplesTests(unittest.TestCase):
+    def test_no_samples_at_all_reports_no_signal(self):
+        threshold_db, error = a.compute_noise_gate_threshold_from_samples([], [], input_name="Scarlet")
+        self.assertIsNone(threshold_db)
+        self.assertIn("Scarlet", error)
+        self.assertIn("No signal", error)
+
+    def test_quiet_and_voice_too_close_is_inconclusive(self):
+        # Confirmed live: this is exactly the real-world failure this has to catch -- a mic
+        # recorded so quiet that its actual speech peaks sit right where room noise already is,
+        # same as the default -26dB threshold sitting right at this mic's own real peak level.
+        quiet = [10 ** (-50 / 20)] * 10
+        voice = [10 ** (-48 / 20)] * 10
+        threshold_db, error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
+        self.assertIsNone(threshold_db)
+        self.assertIn("clear enough difference", error)
+
+    def test_clear_gap_computes_a_threshold_between_the_two(self):
+        quiet = [10 ** (-60 / 20)] * 10
+        voice = [10 ** (-20 / 20)] * 10
+        threshold_db, error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
+        self.assertIsNone(error)
+        self.assertGreater(threshold_db, -60)
+        self.assertLess(threshold_db, -20)
+
+    def test_threshold_is_biased_toward_the_quieter_side_not_the_midpoint(self):
+        # NOISE_GATE_CALIBRATION_THRESHOLD_FRACTION < 0.5 -- confirmed live this session that
+        # erring permissive (closer to the noise floor) is the safer failure mode than erring
+        # aggressive (closer to voice level), which clips the soft start of real words.
+        quiet = [10 ** (-60 / 20)] * 10
+        voice = [10 ** (-20 / 20)] * 10
+        threshold_db, _error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
+        midpoint = (-60 + -20) / 2
+        self.assertLess(threshold_db, midpoint)
+
+    def test_result_is_clamped_to_the_sane_range(self):
+        # An extreme, unrealistic gap shouldn't produce a threshold outside sane bounds.
+        quiet = [10 ** (-90 / 20)] * 10
+        voice = [1.0] * 10
+        threshold_db, _error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
+        self.assertGreaterEqual(threshold_db, a.NOISE_GATE_CALIBRATION_MIN_THRESHOLD_DB)
+        self.assertLessEqual(threshold_db, a.NOISE_GATE_CALIBRATION_MAX_THRESHOLD_DB)
+
+    def test_uses_a_high_percentile_of_quiet_so_one_stray_loud_moment_doesnt_dominate(self):
+        # A single loud transient during the "quiet" phase (a chair creak, a door) shouldn't
+        # force the threshold way up -- the 90th percentile should mostly reflect the STEADY
+        # noise floor, not that one outlier.
+        quiet = [10 ** (-60 / 20)] * 19 + [10 ** (-10 / 20)]  # one loud outlier in 20 samples
+        voice = [10 ** (-20 / 20)] * 10
+        threshold_db, _error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
+        self.assertLess(threshold_db, -30)  # nowhere near dragged up to the -10dB outlier
+
+    def test_uses_a_low_percentile_of_voice_so_soft_words_still_open_the_gate(self):
+        # A couple of extra-loud words shouldn't be the only thing the threshold is set to just
+        # barely clear -- using a low percentile of voice samples keeps softer, typical speech
+        # comfortably above the threshold too.
+        quiet = [10 ** (-60 / 20)] * 10
+        voice = [10 ** (-40 / 20)] * 7 + [10 ** (-10 / 20)] * 3  # mostly soft, a few loud words
+        threshold_db, _error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
+        self.assertLess(threshold_db, -35)  # comfortably below even the soft, typical words
+
+
+class MulToDbAndPercentileTests(unittest.TestCase):
+    def test_mul_to_db_zero_is_a_very_low_floor_not_an_error(self):
+        self.assertEqual(a._mul_to_db(0.0), -100.0)
+
+    def test_mul_to_db_full_scale_is_zero_db(self):
+        self.assertAlmostEqual(a._mul_to_db(1.0), 0.0, places=6)
+
+    def test_mul_to_db_matches_known_value(self):
+        self.assertAlmostEqual(a._mul_to_db(0.1), -20.0, places=6)
+
+    def test_percentile_empty_is_zero(self):
+        self.assertEqual(a._percentile([], 0.5), 0.0)
+
+    def test_percentile_zero_is_the_minimum(self):
+        self.assertEqual(a._percentile([3, 1, 2], 0.0), 1)
+
+    def test_percentile_one_is_the_maximum(self):
+        self.assertEqual(a._percentile([3, 1, 2], 1.0), 3)
+
+
 class PredictMicBoostOutputMulTests(unittest.TestCase):
     def test_zero_input_is_zero_output(self):
         self.assertEqual(a.predict_mic_boost_output_mul(0.0, 12.0), 0.0)
