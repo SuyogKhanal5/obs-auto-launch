@@ -1188,9 +1188,15 @@ def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
             try:
                 prior_enabled[filter_name] = client.get_source_filter(input_name, filter_name).filter_enabled
                 client.set_source_filter_enabled(input_name, filter_name, False)
+                logging.info(
+                    "Noise gate calibration: disabled '%s' for the duration (was enabled=%s).",
+                    filter_name, prior_enabled[filter_name],
+                )
             except obsws.error.OBSSDKRequestError as exc:
                 if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
                     logging.warning("Noise gate calibration: could not disable '%s': %s", filter_name, exc)
+                else:
+                    logging.info("Noise gate calibration: '%s' doesn't exist yet -- nothing to disable.", filter_name)
 
         event_client = None
         try:
@@ -1243,7 +1249,20 @@ def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
                 logging.warning("Noise gate calibration: could not restore '%s': %s", filter_name, exc)
         client.disconnect()
 
-    return compute_noise_gate_threshold_from_samples(readings["quiet"], readings["voice"], input_name)
+    logging.info(
+        "Noise gate calibration: collected %d quiet-phase and %d voice-phase readings for '%s'. "
+        "Quiet samples (first 10): %s. Voice samples (first 10): %s.",
+        len(readings["quiet"]), len(readings["voice"]), input_name,
+        [round(v, 5) for v in readings["quiet"][:10]], [round(v, 5) for v in readings["voice"][:10]],
+    )
+    threshold_db, error_message = compute_noise_gate_threshold_from_samples(
+        readings["quiet"], readings["voice"], input_name,
+    )
+    if error_message:
+        logging.warning("Noise gate calibration: %s", error_message)
+    else:
+        logging.info("Noise gate calibration: computed threshold %sdB for '%s'.", threshold_db, input_name)
+    return threshold_db, error_message
 
 
 def compute_noise_gate_threshold_from_samples(quiet_peaks, voice_peaks, input_name="the input"):
