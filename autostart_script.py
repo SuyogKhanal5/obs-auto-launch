@@ -5581,7 +5581,10 @@ def _run_config_editor(master_root, restart_callback, on_close):
     def pick_mic_boost_input():
         open_obs_input_picker(obs_tab, get_current_ws_config, on_pick=lambda name: mic_boost_input_var.set(name))
 
-    dark_button(obs_tab, text="Pick...", command=pick_mic_boost_input).grid(row=row, column=2, padx=(0, 10), pady=4)
+    tk.Button(
+        obs_tab, text="Pick...", command=pick_mic_boost_input, bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    ).grid(row=row, column=2, padx=(0, 10), pady=4)
     row += 1
     mic_boost_db_var = tk.StringVar(value=str(mic_boost_config.get("boost_db", 0.0)))
     add_labeled_entry(obs_tab, row, "Boost amount (dB)", mic_boost_db_var, width=10)
