@@ -152,6 +152,49 @@ class PredictMicBoostOutputMulTests(unittest.TestCase):
         self.assertLessEqual(result, 1.0)
 
 
+class ApplyMicBoostFromConfigTests(unittest.TestCase):
+    def _client(self):
+        return FakeObsClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})
+
+    def test_disabled_is_a_noop(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(client, {"mic_boost": {"enabled": False, "input_name": "Scarlet"}})
+        self.assertEqual(client.calls, [])
+
+    def test_enabled_with_no_input_name_is_a_noop(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(client, {"mic_boost": {"enabled": True, "input_name": ""}})
+        self.assertEqual(client.calls, [])
+
+    def test_enabled_applies_the_configured_boost(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(
+            client, {"mic_boost": {"enabled": True, "input_name": "Scarlet", "boost_db": 24.0}},
+        )
+        compressor = client.get_source_filter("Scarlet", a.MIC_BOOST_COMPRESSOR_FILTER_NAME)
+        self.assertEqual(compressor.filter_settings["output_gain"], 24.0)
+
+    def test_enabled_applies_the_configured_noise_gate(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(
+            client,
+            {
+                "mic_boost": {
+                    "enabled": True, "input_name": "Scarlet", "boost_db": 24.0,
+                    "noise_gate": {"enabled": True, "threshold_db": -30.0},
+                },
+            },
+        )
+        gate = client.get_source_filter("Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
+        self.assertTrue(gate.filter_enabled)
+        self.assertEqual(gate.filter_settings["open_threshold"], -30.0)
+
+    def test_missing_mic_boost_key_entirely_is_a_noop(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(client, {})
+        self.assertEqual(client.calls, [])
+
+
 class EnsureMicBoostFilterTests(unittest.TestCase):
     def _client(self):
         return FakeObsClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})

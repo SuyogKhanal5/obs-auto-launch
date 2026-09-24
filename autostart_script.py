@@ -809,14 +809,7 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
 
     # Filters apply live -- unlike the profile-parameter writes above, this never needs OBS to
     # restart to take effect.
-    mic_boost_config = obs_config.get("mic_boost", {})
-    if mic_boost_config.get("enabled") and mic_boost_config.get("input_name"):
-        noise_gate_config = mic_boost_config.get("noise_gate", {})
-        ensure_mic_boost_filter(
-            client, mic_boost_config["input_name"], mic_boost_config.get("boost_db", 0.0),
-            noise_gate_enabled=noise_gate_config.get("enabled", False),
-            noise_gate_threshold_db=noise_gate_config.get("threshold_db", DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB),
-        )
+    apply_mic_boost_from_config(client, obs_config)
 
     if replay_buffer_restart_needed or marker_restart_needed:
         reasons = []
@@ -1080,6 +1073,27 @@ def ensure_mic_boost_filter(
     compressor_settings = dict(MIC_BOOST_COMPRESSOR_BASE_SETTINGS, output_gain=boost_db)
     _ensure_obs_filter_settings(client, input_name, MIC_BOOST_COMPRESSOR_FILTER_NAME, "compressor_filter", compressor_settings)
     _ensure_obs_filter_settings(client, input_name, MIC_BOOST_LIMITER_FILTER_NAME, "limiter_filter", MIC_BOOST_LIMITER_SETTINGS)
+
+
+def apply_mic_boost_from_config(client, obs_config):
+    """Reads obs.mic_boost out of a full obs_config dict and applies it via
+    ensure_mic_boost_filter if enabled. Shared by ensure_obs_ready (the recording-start path) AND
+    watcher_loop's own idle Audio-Mixer-Levels-only path -- confirmed live that without the
+    latter, the boost was never actually applied until a watched game got detected and a real
+    recording started, even with mic_boost.enabled true the whole time: a user just talking into
+    the mic to check the overlay (not recording anything) had no path that ever created the
+    filters at all, so the overlay correctly showed the true, unboosted level -- not a display
+    bug, but this exact lifecycle gap. Calling this wherever OBS is confirmed reachable at all,
+    not only at actual recording start, closes it."""
+    mic_boost_config = obs_config.get("mic_boost", {})
+    if not (mic_boost_config.get("enabled") and mic_boost_config.get("input_name")):
+        return
+    noise_gate_config = mic_boost_config.get("noise_gate", {})
+    ensure_mic_boost_filter(
+        client, mic_boost_config["input_name"], mic_boost_config.get("boost_db", 0.0),
+        noise_gate_enabled=noise_gate_config.get("enabled", False),
+        noise_gate_threshold_db=noise_gate_config.get("threshold_db", DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB),
+    )
 
 
 # Confirmed live via a controlled cross-correlation test: a real-world sound captured
@@ -3914,6 +3928,18 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                 if not obs_event_client:
                     if obs_running_now:
                         obs_event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
+                        if obs_event_client:
+                            # Applies mic_boost as soon as OBS is confirmed reachable, not only
+                            # once a watched game triggers ensure_obs_ready -- see
+                            # apply_mic_boost_from_config's own docstring for why this matters:
+                            # without it, the overlay would never show a boosted level at all
+                            # while just idly talking into the mic outside of a real recording.
+                            req_client = connect_obs(obs_config["websocket"], retries=1, delay=0)
+                            if req_client:
+                                try:
+                                    apply_mic_boost_from_config(req_client, obs_config)
+                                finally:
+                                    req_client.disconnect()
                     else:
                         audio_state["levels"] = {}
                         # Show Audio Mixer Levels used to just sit there showing "No active audio
