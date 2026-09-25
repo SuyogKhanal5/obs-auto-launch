@@ -1003,6 +1003,55 @@ def predict_mic_boost_output_mul(peak_mul, boost_db, noise_gate_enabled=False, n
     return min(1.0, 10 ** (output_db / 20))
 
 
+MIC_BOOST_CALIBRATION_VOICE_SECONDS = 5.0
+# A comfortable, moderate listening level (broadcast/podcast territory) to aim a TYPICAL speaking
+# level at -- not the loudest possible without clipping, since the compressor+limiter already
+# guard against that regardless of exactly how this lands.
+MIC_BOOST_CALIBRATION_TARGET_DB = -18.0
+# Median, not peak -- a handful of extra-loud words shouldn't be what the whole boost gets
+# calibrated against (same reasoning as the noise gate calibration's own low-percentile voice
+# reading, just simpler here since there's no gap to preserve, only one target to hit).
+MIC_BOOST_CALIBRATION_REFERENCE_PERCENTILE = 0.5
+MIC_BOOST_CALIBRATION_MIN_BOOST_DB = 0.0
+MIC_BOOST_CALIBRATION_MAX_BOOST_DB = 40.0
+# Below this, the reference reading is close enough to silence that computing a boost against it
+# would mostly be amplifying noise floor, not voice -- likely nothing was actually said.
+MIC_BOOST_CALIBRATION_MIN_SIGNAL_DB = -85.0
+
+
+def compute_mic_boost_db_from_samples(voice_peaks, target_db=MIC_BOOST_CALIBRATION_TARGET_DB, input_name="the input"):
+    """Pure calibration math behind measure_mic_boost_db, split out so it's testable with plain
+    synthetic sample lists instead of a live OBS connection -- same reasoning as
+    compute_noise_gate_threshold_from_samples's own split.
+
+    Solves for the boost_db that would land a TYPICAL (median, not peak) raw speaking level at
+    target_db, inverting the exact same compressor transfer curve predict_mic_boost_output_mul
+    already uses going forward: below the compressor's own threshold, a boost is a flat 1:1
+    addition in dB; above it, the compressor's ratio already closes part of the gap on its own,
+    so the same formula run in reverse has to account for that too, or it would over-boost
+    anything already loud enough to engage compression.
+
+    Returns (boost_db, error_message) -- error_message is None on success."""
+    if not voice_peaks:
+        return None, (
+            f"No signal at all was received from '{input_name}' -- check the input name is exactly "
+            "right (use Pick...) and that the mic isn't muted."
+        )
+    reference_db = _mul_to_db(_percentile(voice_peaks, MIC_BOOST_CALIBRATION_REFERENCE_PERCENTILE))
+    if reference_db <= MIC_BOOST_CALIBRATION_MIN_SIGNAL_DB:
+        return None, (
+            "Didn't hear anything loud enough to calibrate against -- make sure you're talking "
+            "normally (like you would while playing) during the listening phase, then try again."
+        )
+
+    threshold = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["threshold"]
+    ratio = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["ratio"]
+    compressed_db = threshold + (reference_db - threshold) / ratio if reference_db > threshold else reference_db
+    boost_db = target_db - compressed_db
+    boost_db = max(MIC_BOOST_CALIBRATION_MIN_BOOST_DB, min(MIC_BOOST_CALIBRATION_MAX_BOOST_DB, boost_db))
+    return round(boost_db, 1), None
+
+
 def _ensure_obs_filter_settings(client, input_name, filter_name, filter_kind, settings):
     """Shared create-or-update-if-changed logic behind every filter in
     ensure_mic_boost_filter's chain. Returns (current_or_new_filter, just_created) --
@@ -1149,25 +1198,24 @@ def _percentile(values, fraction):
     return ordered[index]
 
 
-def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
-    """Live-measures input_name's own real peak levels over two short phases -- quiet, then
-    talking normally -- to compute a noise gate open_threshold that actually fits THIS mic and
-    room, rather than guessing. Confirmed live this session that a generic default (-26dB) can sit
-    right at a real mic's own peak level, closing the gate almost permanently -- this measures the
-    actual gap between "room quiet" and "talking normally" on the real hardware instead.
+def _measure_mic_chain_input_levels(ws_config, input_name, phases, on_phase=None, label="calibration"):
+    """Shared live-measurement scaffolding behind both measure_noise_gate_threshold and
+    measure_mic_boost_db: connects, waits for OBS to genuinely be ready (not just connected -- see
+    wait_until_obs_ready), temporarily disables this app's own mic-boost filter chain on
+    input_name for the duration (if any of it already exists) so the RAW, unprocessed signal is
+    what actually gets measured, listens through each of `phases` collecting real peak readings,
+    then restores every filter's prior enabled state before returning either way, success or
+    failure -- never touches a filter's settings, only whether it's temporarily disabled.
 
-    Temporarily disables this app's own mic-boost filter chain on input_name for the duration (if
-    any of it already exists) -- the gate needs to see the RAW signal to calibrate against, not
-    whatever the chain already did to it (in particular, an already-active gate would silence the
-    very "quiet" phase this needs real ambient noise readings from). Restores every filter's prior
-    enabled state before returning either way, success or failure; never touches a filter's
-    settings, only whether it's temporarily disabled.
+    phases: an ordered sequence of (phase_name, seconds) pairs -- e.g. a single ("voice", 5.0)
+    phase for a boost-level calibration, or ("quiet", 3.0)/("voice", 4.0) for a gate-threshold
+    calibration that needs to compare two different moments.
 
     on_phase(phase_name, seconds_remaining), if given, is called roughly once a second during each
-    phase (phase_name is "quiet" or "voice") so a caller can show live countdown feedback.
+    phase so a caller can show live countdown feedback. label is used only in log messages, to
+    tell which calibration feature's log lines are which.
 
-    Returns (threshold_db, error_message) -- error_message is None on success, and is a
-    human-readable reason (mic unreachable, no real gap measured, etc.) on failure."""
+    Returns ({phase_name: [peak_mul, ...]}, error_message) -- error_message is None on success."""
     client = connect_obs(ws_config, retries=1, delay=0)
     if not client:
         return None, (
@@ -1183,20 +1231,21 @@ def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
 
     filter_names = (MIC_BOOST_NOISE_GATE_FILTER_NAME, MIC_BOOST_COMPRESSOR_FILTER_NAME, MIC_BOOST_LIMITER_FILTER_NAME)
     prior_enabled = {}
+    readings = {phase_name: [] for phase_name, _seconds in phases}
     try:
         for filter_name in filter_names:
             try:
                 prior_enabled[filter_name] = client.get_source_filter(input_name, filter_name).filter_enabled
                 client.set_source_filter_enabled(input_name, filter_name, False)
                 logging.info(
-                    "Noise gate calibration: disabled '%s' for the duration (was enabled=%s).",
-                    filter_name, prior_enabled[filter_name],
+                    "%s: disabled '%s' for the duration (was enabled=%s).",
+                    label, filter_name, prior_enabled[filter_name],
                 )
             except obsws.error.OBSSDKRequestError as exc:
                 if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
-                    logging.warning("Noise gate calibration: could not disable '%s': %s", filter_name, exc)
+                    logging.warning("%s: could not disable '%s': %s", label, filter_name, exc)
                 else:
-                    logging.info("Noise gate calibration: '%s' doesn't exist yet -- nothing to disable.", filter_name)
+                    logging.info("%s: '%s' doesn't exist yet -- nothing to disable.", label, filter_name)
 
         event_client = None
         try:
@@ -1208,8 +1257,7 @@ def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
         except Exception as exc:
             return None, f"Could not start listening to '{input_name}': {exc}"
 
-        readings = {"quiet": [], "voice": []}
-        phase = {"name": "quiet"}
+        phase = {"name": phases[0][0]}
 
         def on_input_volume_meters(data):
             for entry in data.inputs:
@@ -1224,10 +1272,7 @@ def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
 
         event_client.callback.register(on_input_volume_meters)
         try:
-            for phase_name, seconds in (
-                ("quiet", NOISE_GATE_CALIBRATION_QUIET_SECONDS),
-                ("voice", NOISE_GATE_CALIBRATION_VOICE_SECONDS),
-            ):
+            for phase_name, seconds in phases:
                 phase["name"] = phase_name
                 remaining = seconds
                 while remaining > 0:
@@ -1235,7 +1280,7 @@ def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
                         try:
                             on_phase(phase_name, remaining)
                         except Exception:
-                            logging.exception("Noise gate calibration: on_phase callback failed.")
+                            logging.exception("%s: on_phase callback failed.", label)
                     step = min(1.0, remaining)
                     time.sleep(step)
                     remaining -= step
@@ -1246,15 +1291,39 @@ def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
             try:
                 client.set_source_filter_enabled(input_name, filter_name, was_enabled)
             except Exception as exc:
-                logging.warning("Noise gate calibration: could not restore '%s': %s", filter_name, exc)
+                logging.warning("%s: could not restore '%s': %s", label, filter_name, exc)
         client.disconnect()
 
     logging.info(
-        "Noise gate calibration: collected %d quiet-phase and %d voice-phase readings for '%s'. "
-        "Quiet samples (first 10): %s. Voice samples (first 10): %s.",
-        len(readings["quiet"]), len(readings["voice"]), input_name,
-        [round(v, 5) for v in readings["quiet"][:10]], [round(v, 5) for v in readings["voice"][:10]],
+        "%s: collected readings for '%s': %s.", label, input_name,
+        {name: f"{len(samples)} samples, first 10: {[round(v, 5) for v in samples[:10]]}" for name, samples in readings.items()},
     )
+    return readings, None
+
+
+def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
+    """Live-measures input_name's own real peak levels over two short phases -- quiet, then
+    talking normally -- to compute a noise gate open_threshold that actually fits THIS mic and
+    room, rather than guessing. Confirmed live this session that a generic default (-26dB) can sit
+    right at a real mic's own peak level, closing the gate almost permanently -- this measures the
+    actual gap between "room quiet" and "talking normally" on the real hardware instead.
+
+    See _measure_mic_chain_input_levels for how the raw signal is actually measured (temporarily
+    disabling this app's own mic-boost chain, restoring it afterward either way).
+
+    on_phase(phase_name, seconds_remaining), if given, is called roughly once a second during each
+    phase (phase_name is "quiet" or "voice") so a caller can show live countdown feedback.
+
+    Returns (threshold_db, error_message) -- error_message is None on success, and is a
+    human-readable reason (mic unreachable, no real gap measured, etc.) on failure."""
+    readings, error_message = _measure_mic_chain_input_levels(
+        ws_config, input_name,
+        [("quiet", NOISE_GATE_CALIBRATION_QUIET_SECONDS), ("voice", NOISE_GATE_CALIBRATION_VOICE_SECONDS)],
+        on_phase=on_phase, label="Noise gate calibration",
+    )
+    if error_message:
+        return None, error_message
+
     threshold_db, error_message = compute_noise_gate_threshold_from_samples(
         readings["quiet"], readings["voice"], input_name,
     )
@@ -1263,6 +1332,35 @@ def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
     else:
         logging.info("Noise gate calibration: computed threshold %sdB for '%s'.", threshold_db, input_name)
     return threshold_db, error_message
+
+
+def measure_mic_boost_db(ws_config, input_name, on_phase=None):
+    """Live-measures input_name's own real raw voice level while talking normally, to compute a
+    boost_db that lands a typical speaking level at a comfortable target (see
+    compute_mic_boost_db_from_samples for the target and the math against the compressor's own
+    transfer curve) -- rather than guessing, which is exactly how this app's own mic ended up
+    boosted +36dB via a flat export-time gain earlier this session, clipping badly.
+
+    See _measure_mic_chain_input_levels for how the raw signal is actually measured (temporarily
+    disabling this app's own mic-boost chain, restoring it afterward either way).
+
+    on_phase(phase_name, seconds_remaining), if given, is called roughly once a second during the
+    single "voice" phase, so a caller can show live countdown feedback.
+
+    Returns (boost_db, error_message) -- error_message is None on success."""
+    readings, error_message = _measure_mic_chain_input_levels(
+        ws_config, input_name, [("voice", MIC_BOOST_CALIBRATION_VOICE_SECONDS)],
+        on_phase=on_phase, label="Mic boost calibration",
+    )
+    if error_message:
+        return None, error_message
+
+    boost_db, error_message = compute_mic_boost_db_from_samples(readings["voice"], input_name=input_name)
+    if error_message:
+        logging.warning("Mic boost calibration: %s", error_message)
+    else:
+        logging.info("Mic boost calibration: computed boost %sdB for '%s'.", boost_db, input_name)
+    return boost_db, error_message
 
 
 def compute_noise_gate_threshold_from_samples(quiet_peaks, voice_peaks, input_name="the input"):
@@ -5828,7 +5926,97 @@ def _run_config_editor(master_root, restart_callback, on_close):
     row += 1
     mic_boost_db_var = tk.StringVar(value=str(mic_boost_config.get("boost_db", 0.0)))
     add_labeled_entry(obs_tab, row, "Boost amount (dB)", mic_boost_db_var, width=10)
+    mic_boost_db_detect_button = tk.Button(
+        obs_tab, text="Auto-Detect...", bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    )
+    mic_boost_db_detect_button.grid(row=row, column=2, padx=(0, 10), pady=4)
     row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    \"Auto-Detect\" measures your own real speaking level instead of guessing -- "
+            "confirmed live this session that a guessed, too-large flat gain (+36dB, from the "
+            "clip editor's own export-time gain, a different feature from this one) clipped this "
+            "app's own Desktop Audio track badly once mixed with other audio. This one is safer "
+            "by construction (it solves for a target level against the Compressor's own curve "
+            "above, not a blind flat number), but still measures your real mic and room rather "
+            "than assuming."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    def run_mic_boost_db_detection(ws_config, input_name, progress_window, progress_label):
+        def on_phase(phase_name, seconds_remaining):
+            text = f"Talk normally (like you would while playing)... {seconds_remaining:.0f}s"
+
+            def update():
+                if progress_window.winfo_exists():
+                    progress_label.config(text=text)
+            try:
+                obs_tab.after(0, update)
+            except tk.TclError:
+                pass
+
+        boost_db, error_message = measure_mic_boost_db(ws_config, input_name, on_phase=on_phase)
+
+        def finish():
+            if progress_window.winfo_exists():
+                progress_window.destroy()
+            mic_boost_db_detect_button.config(state="normal", text="Auto-Detect...")
+            if error_message:
+                messagebox.showwarning("Can't auto-detect", error_message, parent=obs_tab)
+            else:
+                mic_boost_db_var.set(str(boost_db))
+                messagebox.showinfo(
+                    "Auto-detect complete",
+                    f"Measured boost: {boost_db}dB. The field above has been updated -- click "
+                    "Save for it to take effect.",
+                    parent=obs_tab,
+                )
+        try:
+            obs_tab.after(0, finish)
+        except tk.TclError:
+            pass
+
+    def start_mic_boost_db_detection():
+        input_name = mic_boost_input_var.get().strip()
+        if not input_name:
+            messagebox.showwarning(
+                "No microphone set", "Set \"Microphone input source name\" above first.", parent=obs_tab,
+            )
+            return
+        proceed = messagebox.askyesno(
+            "Auto-Detect Boost Amount",
+            f"This briefly listens to '{input_name}' while you talk normally for "
+            f"{MIC_BOOST_CALIBRATION_VOICE_SECONDS:.0f}s (like you would while playing), then "
+            "computes a boost that lands your typical speaking level at a comfortable target. "
+            "The boost/gate are both temporarily turned off during this so it can hear the real, "
+            "raw signal.\n\nContinue?",
+            parent=obs_tab,
+        )
+        if not proceed:
+            return
+
+        progress_window = tk.Toplevel(obs_tab)
+        progress_window.title("Auto-Detect Boost Amount")
+        progress_window.configure(bg=DARK_BG)
+        progress_window.transient(obs_tab.winfo_toplevel())
+        progress_window.resizable(False, False)
+        progress_label = tk.Label(
+            progress_window, text="Starting...", bg=DARK_BG, fg=DARK_FG, font=("Segoe UI", 11), padx=30, pady=30,
+        )
+        progress_label.pack()
+
+        mic_boost_db_detect_button.config(state="disabled", text="Listening...")
+        threading.Thread(
+            target=run_mic_boost_db_detection,
+            args=(get_current_ws_config(), input_name, progress_window, progress_label),
+            daemon=True,
+        ).start()
+
+    mic_boost_db_detect_button.config(command=start_mic_boost_db_detection)
     tk.Label(
         obs_tab,
         text=(

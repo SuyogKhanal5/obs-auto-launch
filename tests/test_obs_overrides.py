@@ -156,6 +156,58 @@ class EnsureHybridMp4ForMarkersTests(unittest.TestCase):
         self.assertFalse(needs_restart)
 
 
+class ComputeMicBoostDbFromSamplesTests(unittest.TestCase):
+    def test_no_samples_reports_no_signal(self):
+        boost_db, error = a.compute_mic_boost_db_from_samples([], input_name="Scarlet")
+        self.assertIsNone(boost_db)
+        self.assertIn("Scarlet", error)
+        self.assertIn("No signal", error)
+
+    def test_near_silence_is_inconclusive_not_a_huge_boost(self):
+        # Below MIC_BOOST_CALIBRATION_MIN_SIGNAL_DB -- shouldn't compute a boost against what's
+        # basically silence, even though the math could technically produce a (meaningless) number.
+        voice = [10 ** (-90 / 20)] * 10
+        boost_db, error = a.compute_mic_boost_db_from_samples(voice)
+        self.assertIsNone(boost_db)
+        self.assertIn("normally", error)
+
+    def test_quiet_voice_below_compressor_threshold_gets_a_flat_solve(self):
+        # -50dBFS is below the compressor's -30dB threshold -- no compression applies, so the
+        # needed boost is simply target - reference, unclamped.
+        voice = [10 ** (-50 / 20)] * 10
+        boost_db, error = a.compute_mic_boost_db_from_samples(voice, target_db=-18.0)
+        self.assertIsNone(error)
+        self.assertAlmostEqual(boost_db, -18.0 - -50.0, places=1)
+
+    def test_loud_voice_above_compressor_threshold_accounts_for_the_ratio(self):
+        # -20dBFS is 10dB above the -30dB threshold; at a 3:1 ratio the compressor itself already
+        # pulls that down to just 3.33dB above threshold (-26.67dBFS) BEFORE any boost is added --
+        # so reaching the target actually needs MORE boost than a naive flat solve (target minus
+        # raw reference, ignoring what compression already did to the signal) would suggest.
+        voice = [10 ** (-20 / 20)] * 10
+        boost_db, error = a.compute_mic_boost_db_from_samples(voice, target_db=-18.0)
+        self.assertIsNone(error)
+        naive_flat_solve = -18.0 - -20.0
+        self.assertGreater(boost_db, naive_flat_solve)
+
+    def test_result_is_clamped_to_the_sane_range(self):
+        very_quiet = [10 ** (-84 / 20)] * 10  # just above the min-signal floor
+        boost_db, _error = a.compute_mic_boost_db_from_samples(very_quiet, target_db=-18.0)
+        self.assertLessEqual(boost_db, a.MIC_BOOST_CALIBRATION_MAX_BOOST_DB)
+
+        already_loud = [10 ** (10 / 20)] * 10
+        boost_db, _error = a.compute_mic_boost_db_from_samples(already_loud, target_db=-18.0)
+        self.assertGreaterEqual(boost_db, a.MIC_BOOST_CALIBRATION_MIN_BOOST_DB)
+
+    def test_uses_the_median_so_a_few_loud_words_dont_dominate(self):
+        # Mostly soft speech with a few loud words shouldn't drag the calibration toward the loud
+        # end -- the median should reflect the typical (soft) level, not the occasional peak.
+        voice = [10 ** (-50 / 20)] * 8 + [10 ** (-10 / 20)] * 2
+        boost_db, _error = a.compute_mic_boost_db_from_samples(voice, target_db=-18.0)
+        # Should land close to the flat solve for the typical (-50dB) level, not the loud one.
+        self.assertGreater(boost_db, 20)
+
+
 class ComputeNoiseGateThresholdFromSamplesTests(unittest.TestCase):
     def test_no_samples_at_all_reports_no_signal(self):
         threshold_db, error = a.compute_noise_gate_threshold_from_samples([], [], input_name="Scarlet")
