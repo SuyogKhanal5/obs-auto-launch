@@ -7408,22 +7408,23 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         style="ClipEditor.TCombobox",
     ).pack(side="left", padx=(6, 0))
 
-    # A separate row, deliberately not packed into range_row above alongside Start/End/Resolution/
-    # Limit-size/Output-format -- confirmed live that once every one of those widgets pack(side=
-    # "left") along one row, their combined natural width (over 1400px) badly exceeds this
-    # window's own minsize(760, ...), and Tk's pack geometry manager doesn't wrap: it just stops
-    # giving room to whichever widgets were packed last once the row's cavity runs out, silently
-    # unmapping them entirely (winfo_ismapped() confirmed 0, not just visually clipped) rather
-    # than shrinking or reflowing them. Trim Clip -- the one button that actually matters most --
-    # happened to be exactly what disappeared first, since it (and Close) were packed last, side=
-    # "right", into that same overloaded row. Giving them this own row means they only ever
-    # compete with each other for space, never with the wider controls above, so they stay visible
-    # at any window width down to the app's own minsize.
+    # A separate row for Trim Clip alone, deliberately not packed into range_row above alongside
+    # Start/End/Resolution/Limit-size/Output-format -- confirmed live that once every one of those
+    # widgets pack(side="left") along one row, their combined natural width (over 1400px) badly
+    # exceeds this window's own minsize(760, ...), and Tk's pack geometry manager doesn't wrap: it
+    # just stops giving room to whichever widgets were packed last once the row's cavity runs out,
+    # silently unmapping them entirely (winfo_ismapped() confirmed 0, not just visually clipped)
+    # rather than shrinking or reflowing them. Trim Clip -- the one button that actually matters --
+    # happened to be exactly what disappeared first, since it was packed last, side="right", into
+    # that same overloaded row. Giving it its own row means it never competes with the wider
+    # controls above for space, so it stays visible at any window width down to the app's own
+    # minsize. Close is fine staying in range_row and being squeezed out under the same
+    # conditions -- the window's own native close control covers that case.
     actions_row = tk.Frame(root, bg=EDITOR_BG)
     actions_row.pack(fill="x", padx=10, pady=(0, 4))
-    dark_button(actions_row, text="✕ Close", command=close_editor).pack(side="right", padx=(0, 8))
     trim_button = dark_button(actions_row, text="✂ Trim Clip", command=lambda: do_trim())
     trim_button.pack(side="right")
+    dark_button(range_row, text="✕ Close", command=close_editor).pack(side="right", padx=(0, 8))
 
     # --- Audio tracks row: "Fix audio track sync" checkbox (left) + "Track Routing..." button
     # (right), both on one line. A prior version of the sync fix reapplied one fixed, configured
