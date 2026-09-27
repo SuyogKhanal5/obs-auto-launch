@@ -208,68 +208,6 @@ class ComputeMicBoostDbFromSamplesTests(unittest.TestCase):
         self.assertGreater(boost_db, 20)
 
 
-class ComputeNoiseGateThresholdFromSamplesTests(unittest.TestCase):
-    def test_no_samples_at_all_reports_no_signal(self):
-        threshold_db, error = a.compute_noise_gate_threshold_from_samples([], [], input_name="Scarlet")
-        self.assertIsNone(threshold_db)
-        self.assertIn("Scarlet", error)
-        self.assertIn("No signal", error)
-
-    def test_quiet_and_voice_too_close_is_inconclusive(self):
-        # Confirmed live: this is exactly the real-world failure this has to catch -- a mic
-        # recorded so quiet that its actual speech peaks sit right where room noise already is,
-        # same as the default -26dB threshold sitting right at this mic's own real peak level.
-        quiet = [10 ** (-50 / 20)] * 10
-        voice = [10 ** (-48 / 20)] * 10
-        threshold_db, error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
-        self.assertIsNone(threshold_db)
-        self.assertIn("clear enough difference", error)
-
-    def test_clear_gap_computes_a_threshold_between_the_two(self):
-        quiet = [10 ** (-60 / 20)] * 10
-        voice = [10 ** (-20 / 20)] * 10
-        threshold_db, error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
-        self.assertIsNone(error)
-        self.assertGreater(threshold_db, -60)
-        self.assertLess(threshold_db, -20)
-
-    def test_threshold_is_biased_toward_the_quieter_side_not_the_midpoint(self):
-        # NOISE_GATE_CALIBRATION_THRESHOLD_FRACTION < 0.5 -- confirmed live this session that
-        # erring permissive (closer to the noise floor) is the safer failure mode than erring
-        # aggressive (closer to voice level), which clips the soft start of real words.
-        quiet = [10 ** (-60 / 20)] * 10
-        voice = [10 ** (-20 / 20)] * 10
-        threshold_db, _error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
-        midpoint = (-60 + -20) / 2
-        self.assertLess(threshold_db, midpoint)
-
-    def test_result_is_clamped_to_the_sane_range(self):
-        # An extreme, unrealistic gap shouldn't produce a threshold outside sane bounds.
-        quiet = [10 ** (-90 / 20)] * 10
-        voice = [1.0] * 10
-        threshold_db, _error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
-        self.assertGreaterEqual(threshold_db, a.NOISE_GATE_CALIBRATION_MIN_THRESHOLD_DB)
-        self.assertLessEqual(threshold_db, a.NOISE_GATE_CALIBRATION_MAX_THRESHOLD_DB)
-
-    def test_uses_a_high_percentile_of_quiet_so_one_stray_loud_moment_doesnt_dominate(self):
-        # A single loud transient during the "quiet" phase (a chair creak, a door) shouldn't
-        # force the threshold way up -- the 90th percentile should mostly reflect the STEADY
-        # noise floor, not that one outlier.
-        quiet = [10 ** (-60 / 20)] * 19 + [10 ** (-10 / 20)]  # one loud outlier in 20 samples
-        voice = [10 ** (-20 / 20)] * 10
-        threshold_db, _error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
-        self.assertLess(threshold_db, -30)  # nowhere near dragged up to the -10dB outlier
-
-    def test_uses_a_low_percentile_of_voice_so_soft_words_still_open_the_gate(self):
-        # A couple of extra-loud words shouldn't be the only thing the threshold is set to just
-        # barely clear -- using a low percentile of voice samples keeps softer, typical speech
-        # comfortably above the threshold too.
-        quiet = [10 ** (-60 / 20)] * 10
-        voice = [10 ** (-40 / 20)] * 7 + [10 ** (-10 / 20)] * 3  # mostly soft, a few loud words
-        threshold_db, _error = a.compute_noise_gate_threshold_from_samples(quiet, voice)
-        self.assertLess(threshold_db, -35)  # comfortably below even the soft, typical words
-
-
 class MulToDbAndPercentileTests(unittest.TestCase):
     def test_mul_to_db_zero_is_a_very_low_floor_not_an_error(self):
         self.assertEqual(a._mul_to_db(0.0), -100.0)
@@ -313,26 +251,6 @@ class PredictMicBoostOutputMulTests(unittest.TestCase):
         result = a.predict_mic_boost_output_mul(1.0, 30.0)
         self.assertAlmostEqual(result, 10 ** (-1 / 20), places=6)
 
-    def test_noise_gate_silences_below_its_threshold(self):
-        # -60dBFS is below a -50dB open_threshold -- the gate should silence it entirely,
-        # regardless of whatever boost_db would otherwise apply.
-        result = a.predict_mic_boost_output_mul(
-            10 ** (-60 / 20), 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-50.0,
-        )
-        self.assertEqual(result, 0.0)
-
-    def test_noise_gate_passes_through_above_its_threshold(self):
-        result = a.predict_mic_boost_output_mul(
-            10 ** (-60 / 20), 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-70.0,
-        )
-        self.assertGreater(result, 0.0)
-
-    def test_disabled_noise_gate_never_silences_anything(self):
-        result = a.predict_mic_boost_output_mul(
-            10 ** (-60 / 20), 12.0, noise_gate_enabled=False, noise_gate_threshold_db=-10.0,
-        )
-        self.assertGreater(result, 0.0)
-
     def test_result_never_exceeds_the_full_scale_multiplier(self):
         result = a.predict_mic_boost_output_mul(1.0, 200.0)
         self.assertLessEqual(result, 1.0)
@@ -360,20 +278,20 @@ class ApplyMicBoostFromConfigTests(unittest.TestCase):
         compressor = client.get_source_filter("Scarlet", a.MIC_BOOST_COMPRESSOR_FILTER_NAME)
         self.assertEqual(compressor.filter_settings["output_gain"], 24.0)
 
-    def test_enabled_applies_the_configured_noise_gate(self):
+    def test_enabled_applies_the_configured_voice_isolation(self):
         client = self._client()
         a.apply_mic_boost_from_config(
             client,
             {
                 "mic_boost": {
                     "enabled": True, "input_name": "Scarlet", "boost_db": 24.0,
-                    "noise_gate": {"enabled": True, "threshold_db": -30.0},
+                    "voice_isolation": {"enabled": True},
                 },
             },
         )
-        gate = client.get_source_filter("Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
-        self.assertTrue(gate.filter_enabled)
-        self.assertEqual(gate.filter_settings["open_threshold"], -30.0)
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertTrue(voice_isolation.filter_enabled)
+        self.assertEqual(voice_isolation.filter_settings["method"], "rnnoise")
 
     def test_missing_mic_boost_key_entirely_is_a_noop(self):
         client = self._client()
@@ -390,7 +308,7 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         a.ensure_mic_boost_filter(client, "", 12.0)
         self.assertEqual(client.calls, [])
 
-    def test_creates_both_filters_on_a_fresh_source(self):
+    def test_creates_all_three_filters_on_a_fresh_source(self):
         client = self._client()
         a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
         filters = client.get_source_filter_list("Scarlet").filters
@@ -398,6 +316,7 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         self.assertEqual(
             names,
             {
+                a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME: "noise_suppress_filter_v2",
                 a.MIC_BOOST_COMPRESSOR_FILTER_NAME: "compressor_filter",
                 a.MIC_BOOST_LIMITER_FILTER_NAME: "limiter_filter",
             },
@@ -406,6 +325,34 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         self.assertEqual(compressor.filter_settings["output_gain"], 12.0)
         limiter = client.get_source_filter("Scarlet", a.MIC_BOOST_LIMITER_FILTER_NAME)
         self.assertEqual(limiter.filter_settings["threshold"], -1.0)
+        # Not enabled unless explicitly opted into -- voice_isolation_enabled defaults to False,
+        # same as the noise gate it replaced never enabled itself just by existing.
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertFalse(voice_isolation.filter_enabled)
+        self.assertEqual(voice_isolation.filter_settings["method"], "rnnoise")
+
+    def test_legacy_noise_gate_is_removed_if_present(self):
+        # Simulates a source left over from before this app switched from a Noise Gate to voice
+        # isolation -- must be actively removed, not just ignored, or it would keep gating the raw
+        # signal alongside the new filter.
+        client = self._client()
+        client.create_source_filter(
+            "Scarlet", a._LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME, "noise_gate_filter", {"open_threshold": -30.0},
+        )
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        names = {f.filter_name for f in client.get_source_filter_list("Scarlet").filters}
+        self.assertNotIn(a._LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME, names)
+        self.assertIn(("remove_source_filter", "Scarlet", a._LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME), client.calls)
+
+    def test_no_legacy_noise_gate_present_sends_no_extra_requests(self):
+        # The common case (nothing to clean up) must stay a true no-op -- no remove_source_filter
+        # call, not even one that would just no-op server-side.
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        self.assertNotIn(
+            "remove_source_filter", [c[0] for c in client.calls],
+        )
 
     def test_compressor_created_before_limiter_in_the_chain(self):
         # Ordering matters here: a limiter has to come AFTER the compressor's own output_gain to
@@ -414,7 +361,8 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
         create_calls = [c for c in client.calls if c[0] == "create_source_filter"]
         self.assertEqual(
-            [c[2] for c in create_calls], [a.MIC_BOOST_COMPRESSOR_FILTER_NAME, a.MIC_BOOST_LIMITER_FILTER_NAME],
+            [c[2] for c in create_calls],
+            [a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, a.MIC_BOOST_COMPRESSOR_FILTER_NAME, a.MIC_BOOST_LIMITER_FILTER_NAME],
         )
 
     def test_already_matching_settings_are_not_rewritten(self):
@@ -451,62 +399,39 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         client = self._client()
         a.ensure_mic_boost_filter(client, "No Such Source", 12.0)  # must not raise
 
-    def test_no_threshold_given_skips_the_noise_gate_entirely(self):
-        # Backward compatible with a caller that never opted into the noise gate at all (the
-        # default noise_gate_threshold_db=None) -- must not create it or touch anything gate-named.
+    def test_voice_isolation_created_enabled_and_moved_to_front(self):
         client = self._client()
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
-        names = {f.filter_name for f in client.get_source_filter_list("Scarlet").filters}
-        self.assertNotIn(a.MIC_BOOST_NOISE_GATE_FILTER_NAME, names)
-
-    def test_noise_gate_created_with_derived_close_threshold_and_moved_to_front(self):
-        client = self._client()
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-40.0)
-        gate = client.get_source_filter("Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
-        self.assertEqual(gate.filter_settings["open_threshold"], -40.0)
-        # Hysteresis: close_threshold must stay BELOW open_threshold regardless of how low the
-        # user's own chosen threshold is, or the gate's open/close logic would run backwards.
-        self.assertEqual(gate.filter_settings["close_threshold"], -40.0 - a.MIC_BOOST_NOISE_GATE_HYSTERESIS_DB)
-        self.assertTrue(gate.filter_enabled)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertEqual(voice_isolation.filter_settings["method"], "rnnoise")
+        self.assertTrue(voice_isolation.filter_enabled)
         names = [f.filter_name for f in client.get_source_filter_list("Scarlet").filters]
-        self.assertEqual(names[0], a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
+        self.assertEqual(names[0], a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
 
-    def test_noise_gate_disabled_toggle_is_synced_even_though_the_filter_stays(self):
+    def test_voice_isolation_disabled_toggle_is_synced_even_though_the_filter_stays(self):
         client = self._client()
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=False, noise_gate_threshold_db=-30.0)
-        gate = client.get_source_filter("Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
-        self.assertFalse(gate.filter_enabled)  # toggled off, but not deleted -- threshold survives
-        self.assertEqual(gate.filter_settings["open_threshold"], -30.0)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=False)
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertFalse(voice_isolation.filter_enabled)  # toggled off, but not deleted
 
-    def test_noise_gate_reenabled_restores_without_recreating(self):
+    def test_voice_isolation_reenabled_restores_without_recreating(self):
         client = self._client()
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=False, noise_gate_threshold_db=-30.0)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=False)
         client.calls.clear()
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
         self.assertEqual(
             [c for c in client.calls if c[0] == "create_source_filter"], [],  # never recreated
         )
-        self.assertIn(("set_source_filter_enabled", "Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME, True), client.calls)
+        self.assertIn(("set_source_filter_enabled", "Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, True), client.calls)
 
-    def test_unchanged_noise_gate_state_is_not_rewritten(self):
+    def test_unchanged_voice_isolation_state_is_not_rewritten(self):
         client = self._client()
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
         client.calls.clear()
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
         self.assertEqual(client.calls, [])
-
-    def test_changed_threshold_updates_settings_without_touching_enabled_state(self):
-        client = self._client()
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-30.0)
-        client.calls.clear()
-        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, noise_gate_enabled=True, noise_gate_threshold_db=-20.0)
-        self.assertEqual(
-            [c for c in client.calls if c[0] == "set_source_filter_enabled"], [],
-        )
-        gate = client.get_source_filter("Scarlet", a.MIC_BOOST_NOISE_GATE_FILTER_NAME)
-        self.assertEqual(gate.filter_settings["open_threshold"], -20.0)
 
 
 class GetReplayBufferModeTests(unittest.TestCase):

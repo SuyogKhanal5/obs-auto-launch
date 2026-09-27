@@ -864,7 +864,7 @@ def wait_until_obs_ready(client, retries=6, delay=2):
     call paths this same session) that OBS can accept a websocket connection well before it's
     actually ready to answer ANY request at all, for a few real seconds right after either OBS
     itself or its websocket plugin has just started up. Same retry shape as start_recording's own
-    handling of this exact code, reused here for callers (like measure_noise_gate_threshold) that
+    handling of this exact code, reused here for callers (like measure_mic_boost_db) that
     need OBS to be genuinely ready before doing their own real work, not just connected.
 
     Returns True once ready, False if it never became ready within the retry budget (a caller
@@ -937,18 +937,23 @@ def set_game_audio_capture_target(client, input_name, process_name):
         logging.warning("Could not create '%s' audio capture input in OBS: %s", input_name, exc)
 
 
-MIC_BOOST_NOISE_GATE_FILTER_NAME = "OBS Auto Recorder - Mic Boost Noise Gate"
+MIC_BOOST_VOICE_ISOLATION_FILTER_NAME = "OBS Auto Recorder - Mic Boost Voice Isolation"
 MIC_BOOST_COMPRESSOR_FILTER_NAME = "OBS Auto Recorder - Mic Boost"
 MIC_BOOST_LIMITER_FILTER_NAME = "OBS Auto Recorder - Mic Boost Limiter"
-# Fixed noise-gate shape -- only open_threshold (the user's own configured threshold_db) varies.
-# close_threshold is derived from it (see ensure_mic_boost_filter) rather than left at OBS's own
-# fixed default, since a user-chosen open_threshold could otherwise land ABOVE a hardcoded close
-# value -- backwards hysteresis, which would make the gate chatter open/closed unpredictably
-# instead of cleanly gating silence out. attack/hold/release keep OBS's own real defaults
-# (confirmed live via GetSourceFilterDefaultSettings) since those rarely need tuning per source.
-MIC_BOOST_NOISE_GATE_HYSTERESIS_DB = 6.0
-DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB = -26.0  # OBS's own real noise_gate_filter default (open_threshold)
-MIC_BOOST_NOISE_GATE_BASE_SETTINGS = {"attack_time": 25, "hold_time": 200, "release_time": 150}
+# The old Noise Gate filter's name, kept only so ensure_mic_boost_filter can find and remove one
+# left over on an input from before this app switched to voice isolation -- see there.
+_LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME = "OBS Auto Recorder - Mic Boost Noise Gate"
+# OBS's own real "Noise Suppression" filter kind (confirmed live via GetSourceFilterKindList),
+# using its RNNoise method -- a small neural network trained specifically to separate voice from
+# background noise, continuously and adaptively, rather than a Noise Gate's simple hard on/off
+# threshold (replaced here: a gate either passes the WHOLE signal or mutes it outright based on a
+# single per-room threshold that needs re-calibrating whenever the environment changes, and still
+# lets through any noise loud enough to sit above that threshold alongside real speech). RNNoise
+# needs no threshold or calibration at all, and -- unlike OBS's other noise-suppression method
+# (NVIDIA's "nvafx", which needs an NVIDIA GPU and the separate NVIDIA Broadcast runtime) -- runs
+# on any machine, which matters on this branch specifically. No other settings: OBS's own UI shows
+# nothing else to tune for this method either.
+MIC_BOOST_VOICE_ISOLATION_SETTINGS = {"method": "rnnoise"}
 # Fixed compressor shape -- only output_gain (the user's own configured boost_db) varies.
 # Threshold sits comfortably below a genuinely quiet mic's own peaks (confirmed live against a
 # real recording: -25dBFS peaks on a source averaging -67dBFS) so compression actually engages on
@@ -974,26 +979,28 @@ MIC_BOOST_COMPRESSOR_BASE_SETTINGS = {
 MIC_BOOST_LIMITER_SETTINGS = {"threshold": -1.0}
 
 
-def predict_mic_boost_output_mul(peak_mul, boost_db, noise_gate_enabled=False, noise_gate_threshold_db=None):
+def predict_mic_boost_output_mul(peak_mul, boost_db):
     """Approximates what the Audio Mixer Levels overlay's live meter reading for this input would
     become once the real mic-boost filter chain is actually applied, using each filter's own
     static input/output curve (dB in, dB out) rather than fully emulating their real envelope-
     follower timing (attack/hold/release) -- a single instantaneous peak reading has no signal
-    history to feed a real stateful compressor/gate simulation anyway. Deliberately only useful
-    for PREVIEWING a candidate boost_db/threshold against the CURRENT raw signal before actually
-    enabling it: once mic_boost is genuinely enabled, OBS's own InputVolumeMeters for this input
-    already reports the real post-filter level directly (confirmed live: a real +30dB boost raised
-    a live reading's mean peak from ~0.0028 to ~0.109, matching this same compressor+limiter
-    shape) -- computing this on top of an ALREADY-boosted reading would double-apply the chain.
+    history to feed a real stateful compressor simulation anyway. Deliberately only useful for
+    PREVIEWING a candidate boost_db against the CURRENT raw signal before actually enabling it:
+    once mic_boost is genuinely enabled, OBS's own InputVolumeMeters for this input already
+    reports the real post-filter level directly (confirmed live: a real +30dB boost raised a live
+    reading's mean peak from ~0.0028 to ~0.109, matching this same compressor+limiter shape) --
+    computing this on top of an ALREADY-boosted reading would double-apply the chain.
+
+    Doesn't model voice isolation (RNNoise) at all -- unlike a noise gate's simple threshold, it's
+    a continuously adaptive neural denoiser with no static dB in/out curve to approximate; a real
+    reading through it also isn't representative sample-to-sample the way a gate's hard cutoff
+    was, so this preview only ever shows the boost/compressor/limiter stage.
 
     peak_mul/return value: both an OBS-style 0-1 linear multiplier peak (same units as
     audio_state["levels"]), not dB -- callers never need to think in dB themselves."""
     if peak_mul <= 0:
         return 0.0
     peak_db = 20 * math.log10(peak_mul)
-
-    if noise_gate_enabled and noise_gate_threshold_db is not None and peak_db < noise_gate_threshold_db:
-        return 0.0
 
     threshold = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["threshold"]
     ratio = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["ratio"]
@@ -1009,8 +1016,7 @@ MIC_BOOST_CALIBRATION_VOICE_SECONDS = 5.0
 # guard against that regardless of exactly how this lands.
 MIC_BOOST_CALIBRATION_TARGET_DB = -18.0
 # Median, not peak -- a handful of extra-loud words shouldn't be what the whole boost gets
-# calibrated against (same reasoning as the noise gate calibration's own low-percentile voice
-# reading, just simpler here since there's no gap to preserve, only one target to hit).
+# calibrated against.
 MIC_BOOST_CALIBRATION_REFERENCE_PERCENTILE = 0.5
 MIC_BOOST_CALIBRATION_MIN_BOOST_DB = 0.0
 MIC_BOOST_CALIBRATION_MAX_BOOST_DB = 40.0
@@ -1021,8 +1027,7 @@ MIC_BOOST_CALIBRATION_MIN_SIGNAL_DB = -85.0
 
 def compute_mic_boost_db_from_samples(voice_peaks, target_db=MIC_BOOST_CALIBRATION_TARGET_DB, input_name="the input"):
     """Pure calibration math behind measure_mic_boost_db, split out so it's testable with plain
-    synthetic sample lists instead of a live OBS connection -- same reasoning as
-    compute_noise_gate_threshold_from_samples's own split.
+    synthetic sample lists instead of a live OBS connection.
 
     Solves for the boost_db that would land a TYPICAL (median, not peak) raw speaking level at
     target_db, inverting the exact same compressor transfer curve predict_mic_boost_output_mul
@@ -1088,7 +1093,7 @@ def _ensure_obs_filter_settings(client, input_name, filter_name, filter_kind, se
 
 
 def ensure_mic_boost_filter(
-    client, input_name, boost_db, noise_gate_enabled=False, noise_gate_threshold_db=None,
+    client, input_name, boost_db, voice_isolation_enabled=False,
 ):
     """Applies OBS Auto Recorder's mic-boost filter chain directly to input_name -- live, at OBS's
     own audio pipeline, so every FUTURE recording captures this source boosted from the start.
@@ -1098,20 +1103,20 @@ def ensure_mic_boost_filter(
     quiet to begin with -- see the settings above for why a flat gain alone can't either, at any
     single stage.
 
-    Chain order (signal flows top to bottom): an optional Noise Gate first (so it gates the RAW
-    signal before anything downstream amplifies whatever noise floor is left), then a Compressor
-    for makeup gain + dynamics control, then a Limiter as a hard safety ceiling. New filters are
-    appended to the end of OBS's own filter list by CreateSourceFilter -- harmless for the
-    Compressor/Limiter pair (always created together, in the right relative order), but the Gate
-    specifically gets moved to index 0 right after its own creation, since it can be toggled on
-    independently, later, well after the other two already exist.
+    Chain order (signal flows top to bottom): optional Voice Isolation (RNNoise noise suppression)
+    first (so it cleans the RAW signal before anything downstream amplifies whatever noise is
+    left), then a Compressor for makeup gain + dynamics control, then a Limiter as a hard safety
+    ceiling. New filters are appended to the end of OBS's own filter list by CreateSourceFilter --
+    harmless for the Compressor/Limiter pair (always created together, in the right relative
+    order), but Voice Isolation specifically gets moved to index 0 right after its own creation,
+    since it can be toggled on independently, later, well after the other two already exist.
 
-    noise_gate_enabled/noise_gate_threshold_db: unlike the Compressor/Limiter (created once and
-    otherwise left alone -- see _ensure_obs_filter_settings), the gate's own OBS-side enabled
-    state is actively kept in sync with noise_gate_enabled on every call, since "toggleable" is
-    the whole point of exposing it as its own Settings checkbox -- a user flipping it needs that
-    to actually take effect, not just influence whether the filter gets created in the first
-    place.
+    voice_isolation_enabled: unlike the Compressor/Limiter (created once and otherwise left alone
+    -- see _ensure_obs_filter_settings), this filter's own OBS-side enabled state is actively kept
+    in sync on every call, since "toggleable" is the whole point of exposing it as its own
+    Settings checkbox -- a user flipping it needs that to actually take effect, not just influence
+    whether the filter gets created in the first place. Its settings are otherwise fixed (RNNoise
+    has no threshold or other tunable to keep in sync, unlike the noise gate this replaced).
 
     Idempotent and safe to call on every OBS-ready check: only writes a settings/enabled update
     when something has actually drifted from what's configured here, so this never resets the
@@ -1119,30 +1124,46 @@ def ensure_mic_boost_filter(
     if not input_name:
         return
 
-    if noise_gate_threshold_db is not None:
-        gate_settings = dict(
-            MIC_BOOST_NOISE_GATE_BASE_SETTINGS,
-            open_threshold=noise_gate_threshold_db,
-            close_threshold=noise_gate_threshold_db - MIC_BOOST_NOISE_GATE_HYSTERESIS_DB,
-        )
-        gate, gate_just_created = _ensure_obs_filter_settings(
-            client, input_name, MIC_BOOST_NOISE_GATE_FILTER_NAME, "noise_gate_filter", gate_settings,
-        )
-        if gate is not None:
-            if gate_just_created:
-                try:
-                    client.set_source_filter_index(input_name, MIC_BOOST_NOISE_GATE_FILTER_NAME, 0)
-                except Exception as exc:
-                    logging.warning("Could not move mic-boost noise gate to the front of the chain: %s", exc)
-            if gate.filter_enabled != noise_gate_enabled:
-                try:
-                    client.set_source_filter_enabled(input_name, MIC_BOOST_NOISE_GATE_FILTER_NAME, noise_gate_enabled)
-                    logging.info(
-                        "%s OBS mic-boost noise gate on '%s'.",
-                        "Enabled" if noise_gate_enabled else "Disabled", input_name,
-                    )
-                except Exception as exc:
-                    logging.warning("Could not toggle mic-boost noise gate on '%s': %s", input_name, exc)
+    # One-time cleanup for anyone upgrading from before this filter existed: the old Noise Gate
+    # this replaced may still be sitting on input_name, actively enabled, from before the switch.
+    # Left alone, it would keep gating the raw signal alongside (and independently of) the new
+    # Voice Isolation filter below -- removed outright, not just disabled, since the whole point
+    # of switching approaches was to stop using it, not run both at once. Checked first (a cheap
+    # read) rather than attempting the removal unconditionally on every call, so this is a true
+    # no-op -- no request sent at all -- once it's actually gone (or for anyone who never had it).
+    try:
+        client.get_source_filter(input_name, _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME)
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
+            logging.warning("Could not check for the old mic-boost noise gate filter on '%s': %s", input_name, exc)
+    except Exception as exc:
+        logging.warning("Could not check for the old mic-boost noise gate filter on '%s': %s", input_name, exc)
+    else:
+        try:
+            client.remove_source_filter(input_name, _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME)
+            logging.info("Removed the old mic-boost noise gate filter on '%s' (replaced by voice isolation).", input_name)
+        except Exception as exc:
+            logging.warning("Could not remove the old mic-boost noise gate filter on '%s': %s", input_name, exc)
+
+    voice_isolation, just_created = _ensure_obs_filter_settings(
+        client, input_name, MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, "noise_suppress_filter_v2",
+        MIC_BOOST_VOICE_ISOLATION_SETTINGS,
+    )
+    if voice_isolation is not None:
+        if just_created:
+            try:
+                client.set_source_filter_index(input_name, MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, 0)
+            except Exception as exc:
+                logging.warning("Could not move mic-boost voice isolation to the front of the chain: %s", exc)
+        if voice_isolation.filter_enabled != voice_isolation_enabled:
+            try:
+                client.set_source_filter_enabled(input_name, MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, voice_isolation_enabled)
+                logging.info(
+                    "%s OBS mic-boost voice isolation on '%s'.",
+                    "Enabled" if voice_isolation_enabled else "Disabled", input_name,
+                )
+            except Exception as exc:
+                logging.warning("Could not toggle mic-boost voice isolation on '%s': %s", input_name, exc)
 
     compressor_settings = dict(MIC_BOOST_COMPRESSOR_BASE_SETTINGS, output_gain=boost_db)
     _ensure_obs_filter_settings(client, input_name, MIC_BOOST_COMPRESSOR_FILTER_NAME, "compressor_filter", compressor_settings)
@@ -1162,28 +1183,11 @@ def apply_mic_boost_from_config(client, obs_config):
     mic_boost_config = obs_config.get("mic_boost", {})
     if not (mic_boost_config.get("enabled") and mic_boost_config.get("input_name")):
         return
-    noise_gate_config = mic_boost_config.get("noise_gate", {})
+    voice_isolation_config = mic_boost_config.get("voice_isolation", {})
     ensure_mic_boost_filter(
         client, mic_boost_config["input_name"], mic_boost_config.get("boost_db", 0.0),
-        noise_gate_enabled=noise_gate_config.get("enabled", False),
-        noise_gate_threshold_db=noise_gate_config.get("threshold_db", DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB),
+        voice_isolation_enabled=voice_isolation_config.get("enabled", False),
     )
-
-
-NOISE_GATE_CALIBRATION_QUIET_SECONDS = 3.0
-NOISE_GATE_CALIBRATION_VOICE_SECONDS = 4.0
-# How far above the measured noise floor to place the threshold, as a fraction of the gap to the
-# measured voice level -- biased low (toward the noise floor) rather than the midpoint, since a
-# threshold that's too permissive just lets a little more room noise through the gate, but one
-# that's too aggressive clips the soft start of real words. Confirmed live this session that a
-# threshold sitting right at (not even above) this mic's own peak level closed the gate on nearly
-# everything -- erring permissive is the safer failure mode.
-NOISE_GATE_CALIBRATION_THRESHOLD_FRACTION = 0.35
-# Below this gap (voice level over noise floor), the two are too close to calibrate a meaningful
-# threshold between them -- likely nothing was actually said, or the input is silent/wrong.
-NOISE_GATE_CALIBRATION_MIN_USEFUL_GAP_DB = 6.0
-NOISE_GATE_CALIBRATION_MIN_THRESHOLD_DB = -60.0
-NOISE_GATE_CALIBRATION_MAX_THRESHOLD_DB = -10.0
 
 
 def _mul_to_db(peak_mul):
@@ -1199,17 +1203,16 @@ def _percentile(values, fraction):
 
 
 def _measure_mic_chain_input_levels(ws_config, input_name, phases, on_phase=None, label="calibration"):
-    """Shared live-measurement scaffolding behind both measure_noise_gate_threshold and
-    measure_mic_boost_db: connects, waits for OBS to genuinely be ready (not just connected -- see
-    wait_until_obs_ready), temporarily disables this app's own mic-boost filter chain on
-    input_name for the duration (if any of it already exists) so the RAW, unprocessed signal is
-    what actually gets measured, listens through each of `phases` collecting real peak readings,
-    then restores every filter's prior enabled state before returning either way, success or
-    failure -- never touches a filter's settings, only whether it's temporarily disabled.
+    """Shared live-measurement scaffolding behind measure_mic_boost_db: connects, waits for OBS to
+    genuinely be ready (not just connected -- see wait_until_obs_ready), temporarily disables this
+    app's own mic-boost filter chain on input_name for the duration (if any of it already exists)
+    so the RAW, unprocessed signal is what actually gets measured, listens through each of
+    `phases` collecting real peak readings, then restores every filter's prior enabled state
+    before returning either way, success or failure -- never touches a filter's settings, only
+    whether it's temporarily disabled.
 
     phases: an ordered sequence of (phase_name, seconds) pairs -- e.g. a single ("voice", 5.0)
-    phase for a boost-level calibration, or ("quiet", 3.0)/("voice", 4.0) for a gate-threshold
-    calibration that needs to compare two different moments.
+    phase for a boost-level calibration.
 
     on_phase(phase_name, seconds_remaining), if given, is called roughly once a second during each
     phase so a caller can show live countdown feedback. label is used only in log messages, to
@@ -1229,7 +1232,7 @@ def _measure_mic_chain_input_levels(ws_config, input_name, phases, on_phase=None
             "just launched, wait a few more seconds and try again."
         )
 
-    filter_names = (MIC_BOOST_NOISE_GATE_FILTER_NAME, MIC_BOOST_COMPRESSOR_FILTER_NAME, MIC_BOOST_LIMITER_FILTER_NAME)
+    filter_names = (MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, MIC_BOOST_COMPRESSOR_FILTER_NAME, MIC_BOOST_LIMITER_FILTER_NAME)
     prior_enabled = {}
     readings = {phase_name: [] for phase_name, _seconds in phases}
     try:
@@ -1301,39 +1304,6 @@ def _measure_mic_chain_input_levels(ws_config, input_name, phases, on_phase=None
     return readings, None
 
 
-def measure_noise_gate_threshold(ws_config, input_name, on_phase=None):
-    """Live-measures input_name's own real peak levels over two short phases -- quiet, then
-    talking normally -- to compute a noise gate open_threshold that actually fits THIS mic and
-    room, rather than guessing. Confirmed live this session that a generic default (-26dB) can sit
-    right at a real mic's own peak level, closing the gate almost permanently -- this measures the
-    actual gap between "room quiet" and "talking normally" on the real hardware instead.
-
-    See _measure_mic_chain_input_levels for how the raw signal is actually measured (temporarily
-    disabling this app's own mic-boost chain, restoring it afterward either way).
-
-    on_phase(phase_name, seconds_remaining), if given, is called roughly once a second during each
-    phase (phase_name is "quiet" or "voice") so a caller can show live countdown feedback.
-
-    Returns (threshold_db, error_message) -- error_message is None on success, and is a
-    human-readable reason (mic unreachable, no real gap measured, etc.) on failure."""
-    readings, error_message = _measure_mic_chain_input_levels(
-        ws_config, input_name,
-        [("quiet", NOISE_GATE_CALIBRATION_QUIET_SECONDS), ("voice", NOISE_GATE_CALIBRATION_VOICE_SECONDS)],
-        on_phase=on_phase, label="Noise gate calibration",
-    )
-    if error_message:
-        return None, error_message
-
-    threshold_db, error_message = compute_noise_gate_threshold_from_samples(
-        readings["quiet"], readings["voice"], input_name,
-    )
-    if error_message:
-        logging.warning("Noise gate calibration: %s", error_message)
-    else:
-        logging.info("Noise gate calibration: computed threshold %sdB for '%s'.", threshold_db, input_name)
-    return threshold_db, error_message
-
-
 def measure_mic_boost_db(ws_config, input_name, on_phase=None):
     """Live-measures input_name's own real raw voice level while talking normally, to compute a
     boost_db that lands a typical speaking level at a comfortable target (see
@@ -1361,33 +1331,6 @@ def measure_mic_boost_db(ws_config, input_name, on_phase=None):
     else:
         logging.info("Mic boost calibration: computed boost %sdB for '%s'.", boost_db, input_name)
     return boost_db, error_message
-
-
-def compute_noise_gate_threshold_from_samples(quiet_peaks, voice_peaks, input_name="the input"):
-    """Pure calibration math behind measure_noise_gate_threshold, split out so it's testable with
-    plain synthetic sample lists instead of a live OBS connection -- this is the part most likely
-    to actually have a bug, and the part with no live-I/O excuse not to test thoroughly.
-
-    quiet_peaks/voice_peaks: OBS-style 0-1 linear multiplier peak readings collected during each
-    phase. Returns (threshold_db, error_message), same contract as measure_noise_gate_threshold."""
-    if not quiet_peaks and not voice_peaks:
-        return None, (
-            f"No signal at all was received from '{input_name}' -- check the input name is exactly "
-            "right (use Pick...) and that the mic isn't muted."
-        )
-
-    noise_db = _mul_to_db(_percentile(quiet_peaks, 0.9))
-    voice_db = _mul_to_db(_percentile(voice_peaks, 0.3))
-    if voice_db - noise_db < NOISE_GATE_CALIBRATION_MIN_USEFUL_GAP_DB:
-        return None, (
-            "Couldn't measure a clear enough difference between quiet and talking -- either "
-            "nothing was said during the \"talk normally\" phase, or the room noise is already "
-            "about as loud as your voice. Try again in a quieter room, speaking normally."
-        )
-
-    threshold_db = noise_db + (voice_db - noise_db) * NOISE_GATE_CALIBRATION_THRESHOLD_FRACTION
-    threshold_db = max(NOISE_GATE_CALIBRATION_MIN_THRESHOLD_DB, min(NOISE_GATE_CALIBRATION_MAX_THRESHOLD_DB, threshold_db))
-    return round(threshold_db, 1), None
 
 
 # Confirmed live via a controlled cross-correlation test: a real-world sound captured
@@ -4691,12 +4634,7 @@ def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event, 
         for name, peak in levels.items():
             rows.append((name, peak))
             if name == preview_input_name:
-                noise_gate_config = mic_boost_config.get("noise_gate", {})
-                predicted = predict_mic_boost_output_mul(
-                    peak, mic_boost_config.get("boost_db", 0.0),
-                    noise_gate_enabled=noise_gate_config.get("enabled", False),
-                    noise_gate_threshold_db=noise_gate_config.get("threshold_db"),
-                )
+                predicted = predict_mic_boost_output_mul(peak, mic_boost_config.get("boost_db", 0.0))
                 rows.append((f"{name} (after boost)", predicted))
         row_count = max(len(rows), 1)
 
@@ -6185,111 +6123,26 @@ def _run_config_editor(master_root, restart_callback, on_close):
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
 
-    mic_noise_gate_config = mic_boost_config.get("noise_gate", {})
-    mic_noise_gate_enabled_var = tk.BooleanVar(value=mic_noise_gate_config.get("enabled", False))
-    add_checkbox(obs_tab, row, "Also add a noise gate ahead of the boost, to cut background noise", mic_noise_gate_enabled_var)
-    row += 1
-    mic_noise_gate_threshold_var = tk.StringVar(
-        value=str(mic_noise_gate_config.get("threshold_db", DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB))
+    mic_voice_isolation_config = mic_boost_config.get("voice_isolation", {})
+    mic_voice_isolation_enabled_var = tk.BooleanVar(value=mic_voice_isolation_config.get("enabled", False))
+    add_checkbox(
+        obs_tab, row, "Also add voice isolation ahead of the boost, to reduce background noise",
+        mic_voice_isolation_enabled_var,
     )
-    add_labeled_entry(obs_tab, row, "Noise gate threshold (dB)", mic_noise_gate_threshold_var, width=10)
-    noise_gate_detect_button = tk.Button(
-        obs_tab, text="Auto-Detect...", bg=DARK_ENTRY_BG, fg=DARK_FG,
-        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
-    )
-    noise_gate_detect_button.grid(row=row, column=2, padx=(0, 10), pady=4)
     row += 1
     tk.Label(
         obs_tab,
         text=(
-            "    Silences the mic whenever it's quieter than this threshold, before the boost "
-            "above amplifies whatever's left -- lower (more negative) is more permissive, higher "
-            "cuts out more. Placed first in the chain regardless of when it was added, so it "
-            "gates the RAW signal rather than the already-boosted one. Freely toggleable here "
-            "without losing its threshold -- unchecking it disables the filter in OBS rather "
-            "than removing it, so re-checking it later remembers this value. \"Auto-Detect\" "
-            "measures your own mic and room instead of guessing -- confirmed live that a generic "
-            "default can sit right at a quiet mic's own peak level and close the gate on almost "
-            "everything, which is exactly the failure mode this avoids."
+            "    Runs OBS's own RNNoise noise suppression (a small neural network trained to "
+            "separate voice from background noise) on the RAW signal before the boost above "
+            "amplifies whatever's left -- placed first in the chain regardless of when it was "
+            "added. Unlike a noise gate, it continuously reduces noise instead of hard-muting "
+            "below a threshold, so there's no per-room calibration to keep up to date. Freely "
+            "toggleable here -- unchecking it disables the filter in OBS rather than removing it."
         ),
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
-
-    def run_noise_gate_detection(ws_config, input_name, progress_window, progress_label):
-        def on_phase(phase_name, seconds_remaining):
-            text = (
-                f"Stay quiet -- measuring room noise... {seconds_remaining:.0f}s"
-                if phase_name == "quiet" else
-                f"Now talk normally (like you would while playing)... {seconds_remaining:.0f}s"
-            )
-
-            def update():
-                if progress_window.winfo_exists():
-                    progress_label.config(text=text)
-            try:
-                obs_tab.after(0, update)
-            except tk.TclError:
-                pass
-
-        threshold_db, error_message = measure_noise_gate_threshold(ws_config, input_name, on_phase=on_phase)
-
-        def finish():
-            if progress_window.winfo_exists():
-                progress_window.destroy()
-            noise_gate_detect_button.config(state="normal", text="Auto-Detect...")
-            if error_message:
-                messagebox.showwarning("Can't auto-detect", error_message, parent=obs_tab)
-            else:
-                mic_noise_gate_threshold_var.set(str(threshold_db))
-                messagebox.showinfo(
-                    "Auto-detect complete",
-                    f"Measured threshold: {threshold_db}dB. The field above has been updated -- "
-                    "click Save for it to take effect.",
-                    parent=obs_tab,
-                )
-        try:
-            obs_tab.after(0, finish)
-        except tk.TclError:
-            pass
-
-    def start_noise_gate_detection():
-        input_name = mic_boost_input_var.get().strip()
-        if not input_name:
-            messagebox.showwarning(
-                "No microphone set", "Set \"Microphone input source name\" above first.", parent=obs_tab,
-            )
-            return
-        proceed = messagebox.askyesno(
-            "Auto-Detect Noise Gate Threshold",
-            f"This briefly listens to '{input_name}' in two steps: stay quiet for "
-            f"{NOISE_GATE_CALIBRATION_QUIET_SECONDS:.0f}s so it can measure your room's own "
-            f"background noise, then talk normally for {NOISE_GATE_CALIBRATION_VOICE_SECONDS:.0f}s "
-            "so it can measure your voice. The boost/gate are both temporarily turned off during "
-            "this so it can hear the real, raw signal.\n\nContinue?",
-            parent=obs_tab,
-        )
-        if not proceed:
-            return
-
-        progress_window = tk.Toplevel(obs_tab)
-        progress_window.title("Auto-Detect Noise Gate Threshold")
-        progress_window.configure(bg=DARK_BG)
-        progress_window.transient(obs_tab.winfo_toplevel())
-        progress_window.resizable(False, False)
-        progress_label = tk.Label(
-            progress_window, text="Starting...", bg=DARK_BG, fg=DARK_FG, font=("Segoe UI", 11), padx=30, pady=30,
-        )
-        progress_label.pack()
-
-        noise_gate_detect_button.config(state="disabled", text="Listening...")
-        threading.Thread(
-            target=run_noise_gate_detection,
-            args=(get_current_ws_config(), input_name, progress_window, progress_label),
-            daemon=True,
-        ).start()
-
-    noise_gate_detect_button.config(command=start_noise_gate_detection)
 
     multi_track_config = obs_config.get("multi_track_audio", {})
     # Keyed by input name so re-running Quick Setup (or hand-editing tracks afterward) never
@@ -7137,12 +6990,9 @@ def _run_config_editor(master_root, restart_callback, on_close):
         mic_boost["boost_db"] = read_float(mic_boost_db_var, "Microphone boost amount", mic_boost.get("boost_db", 0.0))
         if mic_boost_enabled_var.get() and not mic_boost["input_name"]:
             errors.append("\"Microphone input source name\" is required when Microphone Boost is enabled")
-        mic_noise_gate = mic_boost.setdefault("noise_gate", {})
-        mic_noise_gate["enabled"] = mic_noise_gate_enabled_var.get()
-        mic_noise_gate["threshold_db"] = read_float(
-            mic_noise_gate_threshold_var, "Noise gate threshold",
-            mic_noise_gate.get("threshold_db", DEFAULT_MIC_BOOST_NOISE_GATE_THRESHOLD_DB),
-        )
+        mic_voice_isolation = mic_boost.setdefault("voice_isolation", {})
+        mic_voice_isolation["enabled"] = mic_voice_isolation_enabled_var.get()
+        mic_boost.pop("noise_gate", None)
 
         multi_track_audio = obs.setdefault("multi_track_audio", {})
         multi_track_audio["enabled"] = multi_track_enabled_var.get()
