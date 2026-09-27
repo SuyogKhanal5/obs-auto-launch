@@ -6080,8 +6080,8 @@ def _run_config_editor(master_root, restart_callback, on_close):
             f"This briefly listens to '{input_name}' while you talk normally for "
             f"{MIC_BOOST_CALIBRATION_VOICE_SECONDS:.0f}s (like you would while playing), then "
             "computes a boost that lands your typical speaking level at a comfortable target. "
-            "The boost/gate are both temporarily turned off during this so it can hear the real, "
-            "raw signal.\n\nContinue?",
+            "The boost/voice isolation are both temporarily turned off during this so it can hear "
+            "the real, raw signal.\n\nContinue?",
             parent=obs_tab,
         )
         if not proceed:
