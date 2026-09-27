@@ -1292,28 +1292,27 @@ class TrimClipProgressCallbackTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def fake_popen(cmd, **kwargs):
-                # pass 1 (analysis, discarded to NUL) goes through _run_cancellable_subprocess,
-                # which is Popen-based (not plain subprocess.run) specifically so a Cancel button
-                # can kill it mid-flight.
-                self.assertEqual(cmd[-1], "NUL")
-                return _FakePopen(cmd, write_output=False)
-
             def fake_progress_runner(cmd, total_duration, on_progress, cancel_event=None):
+                # Both pass 1 (analysis, discarded to NUL) and pass 2 go through
+                # _run_ffmpeg_with_progress when a progress_callback is given -- pass 1 re-encodes
+                # the whole clip too (its output is thrown away), so it takes just as long as
+                # pass 2 and needs its own real progress rather than a single frozen 0% call.
+                on_progress(0.5)
                 with open(cmd[-1], "wb") as f:
                     f.write(b"data")
                 return 0, "", False
 
             calls = []
-            with patch.object(a.subprocess, "Popen", side_effect=fake_popen):
-                with patch.object(a, "_run_ffmpeg_with_progress", side_effect=fake_progress_runner):
-                    result = a.trim_clip(
-                        src, 0, 5, out, target_size_mb=5,
-                        progress_callback=lambda phase, frac: calls.append((phase, frac)),
-                    )
+            with patch.object(a, "_run_ffmpeg_with_progress", side_effect=fake_progress_runner):
+                result = a.trim_clip(
+                    src, 0, 5, out, target_size_mb=5,
+                    progress_callback=lambda phase, frac: calls.append((phase, frac)),
+                )
             self.assertTrue(result)
-            self.assertTrue(any(phase == "Analyzing (pass 1 of 2)" for phase, _ in calls))
-            self.assertTrue(any(phase == "Encoding (pass 2 of 2)" for phase, _ in calls))
+            self.assertIn(("Analyzing (pass 1 of 2)", 0.0), calls)
+            self.assertIn(("Analyzing (pass 1 of 2)", 0.5), calls)
+            self.assertIn(("Encoding (pass 2 of 2)", 0.0), calls)
+            self.assertIn(("Encoding (pass 2 of 2)", 0.5), calls)
 
     def test_no_progress_callback_still_works_via_the_cancellable_runner(self):
         with tempfile.TemporaryDirectory() as tmp:

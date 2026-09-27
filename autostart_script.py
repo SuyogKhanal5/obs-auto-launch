@@ -3596,7 +3596,11 @@ def probe_audio_stream_count(ffmpeg_path, input_path):
 
 
 WAVEFORM_BG_COLOR = "0x2b2b2b"
-WAVEFORM_LINE_COLOR = "0x3b82f6"
+# A brighter blue than the app's usual accent color specifically for contrast against the dark
+# background -- confirmed live the original (0x3b82f6) rendered as a thin, hard-to-see line at a
+# glance; this one, combined with draw=full/scale=sqrt below, reads as an actual solid waveform
+# shape instead.
+WAVEFORM_LINE_COLOR = "0x60a5fa"
 
 
 def build_waveform_image_command(
@@ -3626,9 +3630,13 @@ def build_waveform_image_command(
     # filename (confirmed live: ffmpeg 9.0.1 warns without it, about wanting a sequence pattern
     # like %03d instead -- still wrote a valid file this time, but on a fixed filename rather
     # than something guaranteed to keep working).
+    # draw=full fills the whole waveform shape (peak-to-peak) rather than the default's thin
+    # single-pixel-tall line per column; scale=sqrt compresses the visual dynamic range so a quiet
+    # passage still shows SOME visible shape instead of looking flat next to a loud one -- both
+    # confirmed live to matter a lot for actually being able to see anything at this size.
     filter_complex = (
         f"color=c={WAVEFORM_BG_COLOR}:s={width}x{height}[bg];"
-        f"[0:a:{track_index}]showwavespic=s={width}x{height}:colors={WAVEFORM_LINE_COLOR}[wave];"
+        f"[0:a:{track_index}]showwavespic=s={width}x{height}:colors={WAVEFORM_LINE_COLOR}:draw=full:scale=sqrt[wave];"
         f"[bg][wave]overlay=format=auto"
     )
     return [
@@ -3637,7 +3645,7 @@ def build_waveform_image_command(
     ]
 
 
-def generate_waveform_image(ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width=760, height=80):
+def generate_waveform_image(ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width=760, height=120):
     """Runs build_waveform_image_command and reports whether it actually produced a real image --
     blocking, callers run this on a background thread the same way trim_clip's callers do.
     Returns True on success, False on any failure (never raises)."""
@@ -3977,13 +3985,23 @@ def trim_clip(
             passlog_prefix,
         )
         logging.info("Trimming %s (pass 1/2, targeting %s MB): %s", basename, target_size_mb, " ".join(pass1_cmd))
-        if progress_callback:
-            try:
-                progress_callback("Analyzing (pass 1 of 2)", 0.0)
-            except Exception:
-                logging.exception("Trim progress callback failed.")
+        pass1_phase_text = "Analyzing (pass 1 of 2)"
         try:
-            returncode1, _stdout1, stderr1, cancelled1 = _run_cancellable_subprocess(pass1_cmd, cancel_event)
+            if progress_callback:
+                progress_callback(pass1_phase_text, 0.0)
+                # Pass 1 re-encodes the WHOLE clip too (its output is thrown away -- it's only
+                # used to measure bitrate stats for pass 2) and so takes just as long as pass 2 in
+                # practice. Reporting real progress for it the same way as pass 2 (rather than a
+                # single 0% call before running it as one opaque blocking step) is what actually
+                # fixes "stuck at 0% with no sign of life" -- confirmed that was pass 1, not pass 2,
+                # since pass 2 already had per-frame progress via _run_ffmpeg_with_progress below.
+                returncode1, stderr1, cancelled1 = _run_ffmpeg_with_progress(
+                    pass1_cmd, end_seconds - start_seconds,
+                    lambda fraction: progress_callback(pass1_phase_text, fraction),
+                    cancel_event=cancel_event,
+                )
+            else:
+                returncode1, _stdout1, stderr1, cancelled1 = _run_cancellable_subprocess(pass1_cmd, cancel_event)
         except OSError as exc:
             logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
             notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
@@ -7696,8 +7714,6 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     )
     audio_track_combo.pack(side="right")
     tk.Label(open_row, text="Audio track:", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="right", padx=(0, 6))
-    waveform_button = dark_button(open_row, text="🌊 Waveform", command=lambda: refresh_waveform())
-    waveform_button.pack(side="right", padx=(0, 16))
 
     configured_preview_quality = clip_editor_config.get("preview_quality", CLIP_EDITOR_DEFAULT_PREVIEW_QUALITY)
     if configured_preview_quality not in CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS:
@@ -7759,15 +7775,18 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         if current_id in audio_track_ids:
             audio_track_combo.current(audio_track_ids.index(current_id))
         state["tracks_loaded"] = True
+        schedule_waveform_refresh()
 
     def on_audio_track_selected(_event):
         index = audio_track_combo.current()
         if 0 <= index < len(audio_track_ids):
             player.audio_set_track(audio_track_ids[index])
         # The displayed waveform (if any) is for whichever track was selected when it was
-        # rendered -- invalidates it rather than silently leaving a now-mismatched one on screen.
+        # rendered -- invalidates it rather than silently leaving a now-mismatched one on screen;
+        # schedule_waveform_refresh() below then renders the new one automatically.
         waveform_state["generation"] += 1
-        show_waveform_placeholder("Audio track changed -- click \"🌊 Waveform\" to render it for this track.")
+        show_waveform_placeholder("Rendering waveform...")
+        schedule_waveform_refresh()
 
     audio_track_combo.bind("<<ComboboxSelected>>", on_audio_track_selected)
 
@@ -7793,39 +7812,111 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     timeline_canvas = tk.Canvas(root, height=TIMELINE_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
     timeline_canvas.pack(fill="x", padx=10, pady=(0, 4))
 
-    # --- Waveform of the current [start, end) selection, for whichever track is selected above --
-    # generated on demand (not live on every keystroke) since each render is a real ffmpeg process;
-    # a button matches this app's own established pattern for "worth doing, not worth doing on
-    # every UI tick" operations (e.g. Calibrate Audio Sync).
-    WAVEFORM_HEIGHT = 80
+    # --- Waveform for whichever audio track is selected above, spanning the SAME zoomed/panned
+    # view window as the timeline track (not the trim selection) -- scroll to zoom, right-drag to
+    # pan, exactly like the timeline itself, and the two stay in sync since they share view_state.
+    # Renders automatically (debounced) whenever the file, track, or view window changes, rather
+    # than needing a button click for every adjustment.
+    WAVEFORM_HEIGHT = 120
+    WAVEFORM_DEBOUNCE_MS = 400
     waveform_canvas = tk.Canvas(root, height=WAVEFORM_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
     waveform_canvas.pack(fill="x", padx=10, pady=(0, 4))
-    waveform_state = {"photo": None, "generation": 0}
+    waveform_state = {
+        "photo": None, "generation": 0, "pending_after_id": None,
+        "rendered_start": None, "rendered_end": None,
+    }
 
     def show_waveform_placeholder(text):
+        waveform_state["rendered_start"] = None
+        waveform_state["rendered_end"] = None
         waveform_canvas.delete("all")
         waveform_canvas.create_text(
             8, WAVEFORM_HEIGHT // 2, anchor="w", fill=MUTED_TEXT_COLOR, text=text,
         )
 
-    show_waveform_placeholder("No waveform yet -- click \"🌊 Waveform\" to render one for the current selection.")
+    show_waveform_placeholder("Open a recording to see its waveform here.")
+
+    def schedule_waveform_refresh():
+        # Debounced rather than firing on every single keystroke/drag step -- each render is a
+        # real ffmpeg process, and typing a timestamp or dragging a marker produces a burst of
+        # rapid changes that would otherwise each spawn one. Cancelling and rescheduling on every
+        # call means only the LAST change in a burst actually triggers a render, ~400ms after
+        # things settle.
+        if waveform_state["pending_after_id"] is not None:
+            try:
+                root.after_cancel(waveform_state["pending_after_id"])
+            except tk.TclError:
+                pass
+        try:
+            waveform_state["pending_after_id"] = root.after(WAVEFORM_DEBOUNCE_MS, refresh_waveform)
+        except tk.TclError:
+            pass
+
+    def draw_waveform_overlay():
+        # Draws the start/end trim markers and the playhead on top of whatever waveform image is
+        # currently displayed, exactly like draw_timeline() draws them on the timeline's own
+        # track -- mapped against rendered_start/rendered_end (the view window the CURRENT image
+        # was actually rendered for), not the live view_state, since a zoom/pan made after that
+        # render but before the next one finishes (debounced ~400ms) would otherwise misalign
+        # these against an image that doesn't reflect it yet.
+        waveform_canvas.delete("waveform_overlay")
+        rendered_start = waveform_state["rendered_start"]
+        rendered_end = waveform_state["rendered_end"]
+        if rendered_start is None or rendered_end is None:
+            return
+        width = waveform_canvas.winfo_width()
+        span = rendered_end - rendered_start
+        if width <= 0 or span <= 0:
+            return
+
+        def x_of(seconds):
+            return (seconds - rendered_start) / span * width
+
+        try:
+            x = x_of(parse_timestamp(start_var.get()))
+            if 0 <= x <= width:
+                waveform_canvas.create_line(
+                    x, 0, x, WAVEFORM_HEIGHT, fill=START_MARKER_COLOR, width=2, tags="waveform_overlay",
+                )
+        except ValueError:
+            pass
+        try:
+            x = x_of(parse_timestamp(end_var.get()))
+            if 0 <= x <= width:
+                waveform_canvas.create_line(
+                    x, 0, x, WAVEFORM_HEIGHT, fill=END_MARKER_COLOR, width=2, tags="waveform_overlay",
+                )
+        except ValueError:
+            pass
+        if state["path"]:
+            x = x_of(player.get_time() / 1000)
+            if 0 <= x <= width:
+                waveform_canvas.create_line(
+                    x, 0, x, WAVEFORM_HEIGHT, fill=SEEKER_COLOR, width=1, tags="waveform_overlay",
+                )
 
     def refresh_waveform():
+        waveform_state["pending_after_id"] = None
         if not state["path"]:
-            show_waveform_placeholder("Open a recording first.")
+            show_waveform_placeholder("Open a recording to see its waveform here.")
             return
-        try:
-            start_seconds = parse_timestamp(start_var.get())
-            end_seconds = parse_timestamp(end_var.get())
-        except ValueError as exc:
-            show_waveform_placeholder(str(exc))
+        if not state["duration"]:
+            show_waveform_placeholder("Loading waveform...")
             return
+        if not view_state["initialized"]:
+            reset_view()
+        # Renders whatever time window is currently VISIBLE on the timeline (not the trim
+        # selection) -- scrolling/zooming the timeline changes this the same way it changes the
+        # ruler and markers, so the waveform can be zoomed in on exactly like the timeline track
+        # itself. The trim start/end markers are drawn as an overlay on top instead (see
+        # draw_waveform_overlay), same as they're drawn on top of the timeline's track.
+        start_seconds = view_state["start"]
+        end_seconds = view_state["end"]
         if end_seconds <= start_seconds:
-            show_waveform_placeholder("End must be after Start to render a waveform.")
             return
         track_index = audio_track_combo.current()
         if track_index < 0:
-            show_waveform_placeholder("Pick an audio track above first.")
+            show_waveform_placeholder("No audio track detected yet.")
             return
         ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
         if not ffmpeg_path:
@@ -7839,8 +7930,6 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         this_generation = waveform_state["generation"]
         source_path = state["path"]
         width = max(200, waveform_canvas.winfo_width() or 760)
-        show_waveform_placeholder("Rendering waveform...")
-        waveform_button.config(state="disabled")
 
         def worker():
             tmp_path = os.path.join(tempfile.gettempdir(), f"obsautorec_waveform_{os.getpid()}_{int(time.time() * 1000)}.png")
@@ -7850,7 +7939,6 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             )
 
             def finish():
-                waveform_button.config(state="normal")
                 if this_generation != waveform_state["generation"]:
                     # Superseded by a newer request while this one was rendering -- its own
                     # finish() (or a later one still) owns showing something, not this one.
@@ -7878,8 +7966,11 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                     except OSError:
                         pass
                 waveform_state["photo"] = photo  # kept alive -- Tkinter drops a PhotoImage with no live reference
+                waveform_state["rendered_start"] = start_seconds
+                waveform_state["rendered_end"] = end_seconds
                 waveform_canvas.delete("all")
-                waveform_canvas.create_image(0, 0, anchor="nw", image=photo)
+                waveform_canvas.create_image(0, 0, anchor="nw", image=photo, tags="waveform_image")
+                draw_waveform_overlay()
 
             try:
                 root.after(0, finish)
@@ -7994,6 +8085,10 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 timeline_canvas.create_line(
                     tx, 0, tx, TRACK_Y + 3, fill=TEMP_TIMESTAMP_COLOR, width=2, dash=(3, 2)
                 )
+        # Keeps the waveform's own start/end/playhead overlay in sync with every single thing
+        # that moves them on the timeline (seeking, dragging a marker, playback, a marker jump) --
+        # piggybacking on draw_timeline's own call sites rather than duplicating each one.
+        draw_waveform_overlay()
 
     def refresh_markers():
         # OBS chapter markers ("markers" in the app's own terminology) -- only ever present on a
@@ -8124,6 +8219,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         view_state["start"] = new_start
         view_state["end"] = new_start + new_span
         draw_timeline()
+        schedule_waveform_refresh()
 
     def on_timeline_wheel(event):
         if not state["duration"]:
@@ -8147,6 +8243,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         view_state["start"] = new_start
         view_state["end"] = new_start + span
         draw_timeline()
+        schedule_waveform_refresh()
 
     def zoom_in_button():
         if not state["duration"]:
@@ -8163,6 +8260,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     def zoom_reset_button():
         reset_view()
         draw_timeline()
+        schedule_waveform_refresh()
 
     def on_pan_press(event):
         pan_state["active"] = True
@@ -8180,6 +8278,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         view_state["start"] = new_start
         view_state["end"] = new_start + span
         draw_timeline()
+        schedule_waveform_refresh()
 
     def on_pan_release(_event):
         pan_state["active"] = False
@@ -8208,6 +8307,17 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     timeline_canvas.bind("<MouseWheel>", on_timeline_wheel)
     timeline_canvas.bind("<Shift-MouseWheel>", on_timeline_horizontal_wheel)
     timeline_canvas.bind("<Configure>", lambda event: draw_timeline())
+    # The waveform shares the timeline's own zoomed/panned view window (see refresh_waveform), so
+    # it takes the same wheel-to-zoom and right-drag-to-pan gestures the timeline does, using the
+    # very same handlers -- zooming or panning from either one moves both together.
+    waveform_canvas.bind("<MouseWheel>", on_timeline_wheel)
+    waveform_canvas.bind("<Shift-MouseWheel>", on_timeline_horizontal_wheel)
+    waveform_canvas.bind("<Button-3>", on_pan_press)
+    waveform_canvas.bind("<B3-Motion>", on_pan_drag)
+    waveform_canvas.bind("<ButtonRelease-3>", on_pan_release)
+    # A resize changes the waveform canvas's own width too -- re-renders it at the new width
+    # rather than leaving a now-stretched/squashed old image in place.
+    waveform_canvas.bind("<Configure>", lambda event: schedule_waveform_refresh())
 
     # --- Controls row: zoom (left), transport (centered), volume (right) ---
     controls_row = tk.Frame(root, bg=EDITOR_BG)
@@ -8335,7 +8445,28 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         range_row, textvariable=target_size_var, width=6, bg=ENTRY_BG, fg=EDITOR_FG, insertbackground=EDITOR_FG,
     ).pack(side="left", padx=(4, 4))
     tk.Label(range_row, text="MB", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="left")
+    # A size target forces the export down to just the first audio track (see
+    # build_two_pass_size_targeted_commands) -- silently, from the user's point of view, since
+    # nothing about the checkbox itself hints at that tradeoff. Confirmed live: this bit a real
+    # export -- "Limit size to" stayed checked across several later, unrelated trims in the same
+    # open editor session, each one quietly losing every audio track but the first with no
+    # indication why. This hint makes that tradeoff visible right where the checkbox is, the
+    # moment it's checked, rather than only discoverable by inspecting the output file afterward.
+    size_limit_hint_label = tk.Label(
+        range_row, text="", fg=MUTED_TEXT_COLOR, bg=EDITOR_BG,
+    )
+    size_limit_hint_label.pack(side="left", padx=(6, 0))
 
+    def update_size_limit_hint(*_args):
+        size_limit_hint_label.config(text="(audio: track 1 only)" if limit_size_var.get() else "")
+
+    limit_size_var.trace_add("write", update_size_limit_hint)
+    update_size_limit_hint()
+
+    # Moving Start/End doesn't need a new waveform render -- draw_timeline() (called below) already
+    # calls draw_waveform_overlay() itself, which just redraws the marker lines on top of whatever
+    # waveform image is already showing. Only an actual view (zoom/pan) or track/file change needs
+    # a real re-render -- see schedule_waveform_refresh's other call sites.
     start_var.trace_add("write", lambda *_args: draw_timeline())
     end_var.trace_add("write", lambda *_args: draw_timeline())
 
@@ -8627,7 +8758,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         end_var.set(format_timestamp(0))
         status_label.config(text="")
         waveform_state["generation"] += 1
-        show_waveform_placeholder("No waveform yet -- click \"🌊 Waveform\" to render one for the current selection.")
+        show_waveform_placeholder("Loading waveform...")
         root.title(f"OBS Auto Recorder - Clip Editor - {os.path.basename(path)}")
         logging.info("Clip editor: opened %s", os.path.basename(path))
         rebuild_routing_state(0)
@@ -9042,7 +9173,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 trim_button.config(state="normal")
                 close_button.config(state="normal", text="✕ Close", command=close_editor)
                 if success:
-                    status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}")
+                    size_limit_note = " (audio: track 1 only, size-limited)" if target_size_mb else ""
+                    status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}{size_limit_note}")
                 elif cancel_event.is_set():
                     status_label.config(fg=END_MARKER_COLOR, text="Trim cancelled.")
                 else:
