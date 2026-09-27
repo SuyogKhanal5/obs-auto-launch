@@ -19,7 +19,7 @@ import obsws_python as obsws
 import psutil
 import pystray
 import screeninfo
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 
 import platform_common
 
@@ -3595,6 +3595,71 @@ def probe_audio_stream_count(ffmpeg_path, input_path):
     return count or None
 
 
+WAVEFORM_BG_COLOR = "0x2b2b2b"
+WAVEFORM_LINE_COLOR = "0x3b82f6"
+
+
+def build_waveform_image_command(
+    ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width, height,
+):
+    """Builds the ffmpeg argv that renders a single waveform PNG for one audio track over
+    [start_seconds, end_seconds) of input_path -- ffmpeg's own showwavespic filter does the actual
+    rendering server-side (peak amplitude per horizontal pixel), so there's no need to decode raw
+    PCM and draw it by hand in Python.
+
+    track_index: 0-based, same convention as every other ffmpeg audio-track reference in this
+    file (0:a:0 is the first audio stream) -- the clip editor's own audio track dropdown's
+    selected INDEX (not VLC's own internal track id, which uses a different, non-0-based
+    numbering) is what a caller should pass here.
+
+    A fast (before -i) seek is used deliberately -- this is a visual aid for picking a trim point,
+    not the trim itself, so the same keyframe-snap imprecision build_trim_command's own fast mode
+    accepts is a fine trade for speed here too, and matters more here since this can re-render on
+    every track/range change a user makes."""
+    start_str = format_timestamp(start_seconds)
+    duration_str = format_timestamp(end_seconds - start_seconds)
+    # showwavespic has no background-color option of its own -- it always renders onto opaque
+    # white -- so a color source + overlay composites it onto this app's own dark editor
+    # background instead of a jarring white rectangle sitting in an otherwise dark window
+    # (confirmed live: this composites correctly, matching EDITOR_BG exactly). -update 1 is
+    # required by newer ffmpeg's image2 muxer for a single still frame written to a fixed
+    # filename (confirmed live: ffmpeg 9.0.1 warns without it, about wanting a sequence pattern
+    # like %03d instead -- still wrote a valid file this time, but on a fixed filename rather
+    # than something guaranteed to keep working).
+    filter_complex = (
+        f"color=c={WAVEFORM_BG_COLOR}:s={width}x{height}[bg];"
+        f"[0:a:{track_index}]showwavespic=s={width}x{height}:colors={WAVEFORM_LINE_COLOR}[wave];"
+        f"[bg][wave]overlay=format=auto"
+    )
+    return [
+        ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str,
+        "-filter_complex", filter_complex, "-frames:v", "1", "-update", "1", output_path,
+    ]
+
+
+def generate_waveform_image(ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width=760, height=80):
+    """Runs build_waveform_image_command and reports whether it actually produced a real image --
+    blocking, callers run this on a background thread the same way trim_clip's callers do.
+    Returns True on success, False on any failure (never raises)."""
+    if end_seconds <= start_seconds:
+        return False
+    cmd = build_waveform_image_command(
+        ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width, height,
+    )
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs())
+    except OSError as exc:
+        logging.warning("Clip editor: could not run ffmpeg at '%s' to render a waveform: %s", ffmpeg_path, exc)
+        return False
+    if result.returncode != 0 or not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+        logging.warning(
+            "Clip editor: waveform render failed (exit code %s).\nCommand: %s\nstderr:\n%s",
+            result.returncode, " ".join(cmd), result.stderr[-2000:],
+        )
+        return False
+    return True
+
+
 def build_trim_command(
     ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False, crf=None,
     scale_height=None, audio_shift_ms_by_track=None, audio_stream_count=None,
@@ -3764,7 +3829,48 @@ def cleanup_two_pass_log_files(passlog_prefix):
             pass
 
 
-def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress):
+def _watch_for_cancel(proc, cancel_event, was_cancelled):
+    """Shared cancellation watcher for both _run_ffmpeg_with_progress and
+    _run_cancellable_subprocess: polls rather than a bare cancel_event.wait() so this thread
+    exits on its own once proc finishes normally, instead of leaking a thread blocked forever on
+    an Event that (each trim creates a fresh one) will never fire again. Kills proc the moment
+    cancellation is actually requested, regardless of whether the main thread is currently
+    blocked reading the process's stdout/stderr -- a plain "check a flag between lines" approach
+    would stay stuck until ffmpeg happened to emit its next line, which isn't guaranteed to be
+    prompt. was_cancelled is a single-item list used as an out-param (mutated in place) since a
+    daemon thread's return value has nowhere else to go."""
+    if cancel_event is None:
+        return
+    while proc.poll() is None:
+        if cancel_event.wait(timeout=0.2):
+            was_cancelled[0] = True
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return
+
+
+def _run_cancellable_subprocess(cmd, cancel_event=None):
+    """subprocess.run's capture_output=True equivalent, except killable mid-flight via
+    cancel_event (a threading.Event) -- subprocess.run blocks until the process exits with no way
+    to interrupt it early once started, which left trim_clip's own two-pass "Cancel" button
+    unable to actually stop a size-targeted export's first (analysis) pass.
+
+    Returns (returncode, stdout, stderr, was_cancelled)."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace", **platform_common.hide_console_subprocess_kwargs(),
+    )
+    was_cancelled = [False]
+    watcher = threading.Thread(target=_watch_for_cancel, args=(proc, cancel_event, was_cancelled), daemon=True)
+    watcher.start()
+    stdout, stderr = proc.communicate()
+    watcher.join(timeout=1)
+    return proc.returncode, stdout, stderr, was_cancelled[0]
+
+
+def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress, cancel_event=None):
     """Runs cmd (ffmpeg_path must be cmd[0]) via subprocess.Popen with -progress piped back to
     this process instead of trim_clip's usual subprocess.run, which only ever reports anything
     once the WHOLE command has already finished -- calls on_progress(fraction), fraction in
@@ -3773,14 +3879,19 @@ def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress):
     actually takes. Only used when a caller actually wants that (trim_clip's own progress_callback
     param); every other caller keeps using plain subprocess.run completely unchanged.
 
-    Returns (returncode, stderr_text) -- the same two fields callers already read off a
-    subprocess.run() CompletedProcess, so the caller's existing success/failure handling doesn't
-    need to know which of the two actually ran."""
+    cancel_event: see _watch_for_cancel -- optional, killable mid-flight if given.
+
+    Returns (returncode, stderr_text, was_cancelled) -- the first two are the same fields callers
+    already read off a subprocess.run() CompletedProcess, so the caller's existing success/failure
+    handling doesn't need to know which of the two actually ran."""
     progress_cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
     proc = subprocess.Popen(
         progress_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace", **platform_common.hide_console_subprocess_kwargs(),
     )
+    was_cancelled = [False]
+    watcher = threading.Thread(target=_watch_for_cancel, args=(proc, cancel_event, was_cancelled), daemon=True)
+    watcher.start()
     stderr_chunks = []
 
     def drain_stderr():
@@ -3809,14 +3920,15 @@ def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress):
 
     proc.wait()
     stderr_thread.join(timeout=5)
-    return proc.returncode, "".join(stderr_chunks)
+    watcher.join(timeout=1)
+    return proc.returncode, "".join(stderr_chunks), was_cancelled[0]
 
 
 def trim_clip(
     input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
     delete_original=False, icon=None, notifications_config=None, crf=None, scale_height=None,
     target_size_mb=None, audio_shift_ms_by_track=None, audio_routing=None, muted_destinations=None,
-    gains_db=None, progress_callback=None,
+    gains_db=None, progress_callback=None, cancel_event=None,
 ):
     """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
     way transcode_recording's callers do. Verifies the output file actually exists and has a
@@ -3833,11 +3945,22 @@ def trim_clip(
     progress_callback(phase_text, fraction), if given, is called repeatedly with real progress
     (fraction in [0, 1]) as the actual output-producing encode runs -- see
     _run_ffmpeg_with_progress. Left as None (the default), every ffmpeg invocation here still
-    goes through plain subprocess.run exactly as before, unchanged."""
+    goes through plain subprocess.run exactly as before, unchanged.
+
+    cancel_event: a threading.Event a caller can set from another thread (e.g. a Cancel button)
+    to kill whichever ffmpeg process is currently running -- every subprocess this function can
+    launch (pass 1, pass 2, and the plain single-pass path) is killable via this, not just the
+    main progress-reporting one. A cancelled run returns False exactly like a genuine failure
+    (there's no separate return value for it -- callers that care check cancel_event.is_set()
+    themselves afterward, same object they already own), but is logged/notified as a cancellation
+    rather than an error."""
     basename = os.path.basename(input_path)
     if end_seconds <= start_seconds:
         logging.error("Could not trim %s: end time must be after the start time.", basename)
         return False
+
+    def was_cancelled():
+        return cancel_event is not None and cancel_event.is_set()
 
     passlog_prefix = None
     if target_size_mb:
@@ -3860,17 +3983,19 @@ def trim_clip(
             except Exception:
                 logging.exception("Trim progress callback failed.")
         try:
-            result1 = subprocess.run(
-                pass1_cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs()
-            )
+            returncode1, _stdout1, stderr1, cancelled1 = _run_cancellable_subprocess(pass1_cmd, cancel_event)
         except OSError as exc:
             logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
             notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
             return False
-        if result1.returncode != 0:
+        if cancelled1:
+            logging.info("Trim of %s cancelled during pass 1/2.", basename)
+            cleanup_two_pass_log_files(passlog_prefix)
+            return False
+        if returncode1 != 0:
             logging.error(
                 "ffmpeg trim (pass 1/2) failed for %s (exit code %s).\nCommand: %s\nstderr:\n%s",
-                input_path, result1.returncode, " ".join(pass1_cmd), result1.stderr[-4000:],
+                input_path, returncode1, " ".join(pass1_cmd), stderr1[-4000:],
             )
             notify(
                 icon, notifications_config, "Trim failed",
@@ -3900,15 +4025,13 @@ def trim_clip(
     try:
         if progress_callback:
             progress_callback(phase_text, 0.0)
-            returncode, stderr_text = _run_ffmpeg_with_progress(
+            returncode, stderr_text, cancelled = _run_ffmpeg_with_progress(
                 cmd, end_seconds - start_seconds,
                 lambda fraction: progress_callback(phase_text, fraction),
+                cancel_event=cancel_event,
             )
         else:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs()
-            )
-            returncode, stderr_text = result.returncode, result.stderr
+            returncode, _stdout, stderr_text, cancelled = _run_cancellable_subprocess(cmd, cancel_event)
     except OSError as exc:
         logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
         notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
@@ -3916,6 +4039,15 @@ def trim_clip(
     finally:
         if passlog_prefix:
             cleanup_two_pass_log_files(passlog_prefix)
+
+    if cancelled or was_cancelled():
+        logging.info("Trim of %s cancelled.", basename)
+        if os.path.isfile(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return False
 
     output_ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
     if returncode != 0 or not output_ok:
@@ -7564,6 +7696,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     )
     audio_track_combo.pack(side="right")
     tk.Label(open_row, text="Audio track:", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="right", padx=(0, 6))
+    waveform_button = dark_button(open_row, text="🌊 Waveform", command=lambda: refresh_waveform())
+    waveform_button.pack(side="right", padx=(0, 16))
 
     configured_preview_quality = clip_editor_config.get("preview_quality", CLIP_EDITOR_DEFAULT_PREVIEW_QUALITY)
     if configured_preview_quality not in CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS:
@@ -7630,6 +7764,10 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         index = audio_track_combo.current()
         if 0 <= index < len(audio_track_ids):
             player.audio_set_track(audio_track_ids[index])
+        # The displayed waveform (if any) is for whichever track was selected when it was
+        # rendered -- invalidates it rather than silently leaving a now-mismatched one on screen.
+        waveform_state["generation"] += 1
+        show_waveform_placeholder("Audio track changed -- click \"🌊 Waveform\" to render it for this track.")
 
     audio_track_combo.bind("<<ComboboxSelected>>", on_audio_track_selected)
 
@@ -7654,6 +7792,101 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
     timeline_canvas = tk.Canvas(root, height=TIMELINE_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
     timeline_canvas.pack(fill="x", padx=10, pady=(0, 4))
+
+    # --- Waveform of the current [start, end) selection, for whichever track is selected above --
+    # generated on demand (not live on every keystroke) since each render is a real ffmpeg process;
+    # a button matches this app's own established pattern for "worth doing, not worth doing on
+    # every UI tick" operations (e.g. Calibrate Audio Sync).
+    WAVEFORM_HEIGHT = 80
+    waveform_canvas = tk.Canvas(root, height=WAVEFORM_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
+    waveform_canvas.pack(fill="x", padx=10, pady=(0, 4))
+    waveform_state = {"photo": None, "generation": 0}
+
+    def show_waveform_placeholder(text):
+        waveform_canvas.delete("all")
+        waveform_canvas.create_text(
+            8, WAVEFORM_HEIGHT // 2, anchor="w", fill=MUTED_TEXT_COLOR, text=text,
+        )
+
+    show_waveform_placeholder("No waveform yet -- click \"🌊 Waveform\" to render one for the current selection.")
+
+    def refresh_waveform():
+        if not state["path"]:
+            show_waveform_placeholder("Open a recording first.")
+            return
+        try:
+            start_seconds = parse_timestamp(start_var.get())
+            end_seconds = parse_timestamp(end_var.get())
+        except ValueError as exc:
+            show_waveform_placeholder(str(exc))
+            return
+        if end_seconds <= start_seconds:
+            show_waveform_placeholder("End must be after Start to render a waveform.")
+            return
+        track_index = audio_track_combo.current()
+        if track_index < 0:
+            show_waveform_placeholder("Pick an audio track above first.")
+            return
+        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+        if not ffmpeg_path:
+            show_waveform_placeholder("ffmpeg isn't installed -- install it from Settings > Post-Processing first.")
+            return
+
+        # Guards against a slow, stale render finishing AFTER a newer request (a different track
+        # or range picked while the first one was still rendering) and overwriting what should be
+        # shown now -- only the MOST RECENT request's own result is ever actually applied.
+        waveform_state["generation"] += 1
+        this_generation = waveform_state["generation"]
+        source_path = state["path"]
+        width = max(200, waveform_canvas.winfo_width() or 760)
+        show_waveform_placeholder("Rendering waveform...")
+        waveform_button.config(state="disabled")
+
+        def worker():
+            tmp_path = os.path.join(tempfile.gettempdir(), f"obsautorec_waveform_{os.getpid()}_{int(time.time() * 1000)}.png")
+            ok = generate_waveform_image(
+                ffmpeg_path, source_path, start_seconds, end_seconds, track_index, tmp_path,
+                width=width, height=WAVEFORM_HEIGHT,
+            )
+
+            def finish():
+                waveform_button.config(state="normal")
+                if this_generation != waveform_state["generation"]:
+                    # Superseded by a newer request while this one was rendering -- its own
+                    # finish() (or a later one still) owns showing something, not this one.
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    return
+                if not root.winfo_exists():
+                    return
+                if not ok:
+                    show_waveform_placeholder("Could not render a waveform -- see the log for details.")
+                    return
+                try:
+                    image = Image.open(tmp_path)
+                    image.load()  # force the read now, before the temp file is removed below
+                    photo = ImageTk.PhotoImage(image)
+                except Exception:
+                    logging.exception("Clip editor: could not load the rendered waveform image.")
+                    show_waveform_placeholder("Could not display the rendered waveform.")
+                    return
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                waveform_state["photo"] = photo  # kept alive -- Tkinter drops a PhotoImage with no live reference
+                waveform_canvas.delete("all")
+                waveform_canvas.create_image(0, 0, anchor="nw", image=photo)
+
+            try:
+                root.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # The visible [start, end) window into the clip -- always the full clip until the user zooms
     # in, at which point this shrinks and the ruler/markers/seeker are all drawn relative to it
@@ -8393,6 +8626,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         start_var.set(format_timestamp(0))
         end_var.set(format_timestamp(0))
         status_label.config(text="")
+        waveform_state["generation"] += 1
+        show_waveform_placeholder("No waveform yet -- click \"🌊 Waveform\" to render one for the current selection.")
         root.title(f"OBS Auto Recorder - Clip Editor - {os.path.basename(path)}")
         logging.info("Clip editor: opened %s", os.path.basename(path))
         rebuild_routing_state(0)
@@ -8674,11 +8909,17 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
         set_status(f"Trimming to {os.path.basename(output_path)}...")
         trim_button.config(state="disabled")
-        # Label-only -- closing the editor while a trim is running doesn't actually stop the
-        # ffmpeg subprocess (see finish()'s "editor was closed while this trim was still running"
-        # comment below); "Cancel" just tells the user honestly that leaving now means abandoning
-        # the trim's own window rather than seeing it finish, not that it aborts the encode.
-        close_button.config(text="✕ Cancel")
+        # "Cancel" now genuinely stops the running ffmpeg process (see trim_clip's own
+        # cancel_event support) rather than just closing the whole editor out from under an
+        # export that keeps running in the background regardless -- cancel_trim below sets this
+        # same event trim_clip is watching, instead of close_editor's window-teardown path.
+        cancel_event = threading.Event()
+
+        def cancel_trim():
+            cancel_event.set()
+            close_button.config(state="disabled", text="✕ Cancelling...")
+
+        close_button.config(text="✕ Cancel", command=cancel_trim)
         progress.config(mode="indeterminate")
         progress.pack(fill="x", padx=10, pady=(0, 6), before=status_label)
         progress.start(12)
@@ -8787,7 +9028,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 notifications_config=notifications_config, scale_height=scale_height,
                 target_size_mb=target_size_mb, audio_routing=audio_routing,
                 muted_destinations=muted_destinations, audio_shift_ms_by_track=audio_shift_ms_by_track,
-                gains_db=gains_db, progress_callback=on_trim_progress,
+                gains_db=gains_db, progress_callback=on_trim_progress, cancel_event=cancel_event,
             )
 
             def finish():
@@ -8799,9 +9040,11 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 progress.stop()
                 progress.pack_forget()
                 trim_button.config(state="normal")
-                close_button.config(text="✕ Close")
+                close_button.config(state="normal", text="✕ Close", command=close_editor)
                 if success:
                     status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}")
+                elif cancel_event.is_set():
+                    status_label.config(fg=END_MARKER_COLOR, text="Trim cancelled.")
                 else:
                     status_label.config(fg=END_MARKER_COLOR, text="Trim failed -- see the log for details.")
 
