@@ -441,60 +441,39 @@ class GenerateWaveformImageTests(unittest.TestCase):
                 self.assertFalse(a.generate_waveform_image("ffmpeg", "in.mp4", 0, 5, 0, "out.png"))
 
 
-class ComputeWaveformStretchCropTests(unittest.TestCase):
-    def test_identical_range_and_width_is_a_full_passthrough(self):
-        result = a.compute_waveform_stretch_crop(0, 10, 760, 0, 10, 760)
-        self.assertEqual(result, (0, 760, 0, 760))
+class ComputeWaveformViewCropTests(unittest.TestCase):
+    def test_full_view_is_a_full_passthrough(self):
+        self.assertEqual(a.compute_waveform_view_crop(10, 1000, 0, 10), (0, 1000))
 
-    def test_same_range_different_width_is_a_clean_resize(self):
-        # A pure canvas resize (e.g. the clip editor window itself resizing) -- same time range,
-        # new width -- should use the WHOLE old image, stretched to fill the whole new canvas.
-        crop_left, crop_right, dest_left, dest_width = a.compute_waveform_stretch_crop(0, 10, 760, 0, 10, 380)
-        self.assertEqual((crop_left, crop_right), (0, 760))
-        self.assertEqual(dest_left, 0)
-        self.assertEqual(dest_width, 380)
+    def test_zoomed_into_the_middle_crops_proportionally(self):
+        # A 20-second clip rendered at 1000px; viewing [8, 12) (the middle 20%) should crop the
+        # middle 200px.
+        self.assertEqual(a.compute_waveform_view_crop(20, 1000, 8, 12), (400, 600))
 
-    def test_zooming_in_crops_the_middle_and_fills_the_new_canvas(self):
-        # Old image covers [0, 10); zooming into [4, 6) is a crop of the old image's middle 20%,
-        # stretched to fill the entire new canvas (no partial overlap here -- fully contained).
-        crop_left, crop_right, dest_left, dest_width = a.compute_waveform_stretch_crop(0, 10, 1000, 4, 6, 500)
-        self.assertEqual((crop_left, crop_right), (400, 600))
-        self.assertEqual(dest_left, 0)
-        self.assertEqual(dest_width, 500)
+    def test_zoomed_to_the_very_start(self):
+        self.assertEqual(a.compute_waveform_view_crop(10, 1000, 0, 1), (0, 100))
 
-    def test_zooming_out_only_the_old_span_gets_a_real_crop_the_rest_stays_unfilled(self):
-        # Old image covers [4, 6); zooming out to [0, 10) means only the middle 20% of the new
-        # canvas can be approximated from the old image at all -- the rest is genuinely unknown
-        # until the real render arrives, so the caller must NOT stretch the old image to fill it.
-        crop_left, crop_right, dest_left, dest_width = a.compute_waveform_stretch_crop(4, 6, 500, 0, 10, 1000)
-        self.assertEqual((crop_left, crop_right), (0, 500))
-        self.assertEqual(dest_left, 400)
-        self.assertEqual(dest_width, 200)
+    def test_zoomed_to_the_very_end(self):
+        self.assertEqual(a.compute_waveform_view_crop(10, 1000, 9, 10), (900, 1000))
 
-    def test_panning_partially_overlapping_range_crops_and_offsets(self):
-        # Old image covers [0, 10); panning to [5, 15) -- only the [5, 10) half overlaps, and it
-        # belongs at the LEFT half of the new canvas (since [10, 15) is unknown, off to the right).
-        crop_left, crop_right, dest_left, dest_width = a.compute_waveform_stretch_crop(0, 10, 1000, 5, 15, 1000)
-        self.assertEqual((crop_left, crop_right), (500, 1000))
-        self.assertEqual(dest_left, 0)
-        self.assertEqual(dest_width, 500)
+    def test_view_always_within_duration_never_needs_clamping_in_practice(self):
+        # zoom_view/on_pan_drag always clamp view_state to [0, duration) themselves, so a valid
+        # view request should never actually need clamping -- this just confirms the math still
+        # lands exactly on the image's own bounds at the edges, not off by one either direction.
+        crop_left, crop_right = a.compute_waveform_view_crop(60, 6000, 0, 60)
+        self.assertEqual((crop_left, crop_right), (0, 6000))
 
-    def test_panning_to_a_completely_disjoint_range_has_no_overlap(self):
-        result = a.compute_waveform_stretch_crop(0, 10, 1000, 20, 30, 1000)
-        self.assertIsNone(result)
+    def test_degenerate_inputs_are_rejected(self):
+        self.assertIsNone(a.compute_waveform_view_crop(0, 1000, 0, 10))
+        self.assertIsNone(a.compute_waveform_view_crop(-5, 1000, 0, 10))
+        self.assertIsNone(a.compute_waveform_view_crop(10, 0, 0, 10))
+        self.assertIsNone(a.compute_waveform_view_crop(10, 1000, 5, 5))
+        self.assertIsNone(a.compute_waveform_view_crop(10, 1000, 6, 5))
 
-    def test_zero_or_negative_span_is_rejected(self):
-        self.assertIsNone(a.compute_waveform_stretch_crop(5, 5, 1000, 0, 10, 1000))
-        self.assertIsNone(a.compute_waveform_stretch_crop(0, 10, 1000, 5, 5, 1000))
-
-    def test_zero_width_is_rejected(self):
-        self.assertIsNone(a.compute_waveform_stretch_crop(0, 10, 0, 0, 10, 1000))
-        self.assertIsNone(a.compute_waveform_stretch_crop(0, 10, 1000, 0, 10, 0))
-
-    def test_dest_width_is_never_less_than_one_pixel(self):
-        # A tiny overlap must still round up to something paintable rather than a zero-width paste.
-        crop_left, crop_right, dest_left, dest_width = a.compute_waveform_stretch_crop(0, 1000, 1000, 999.9, 1999.9, 1000)
-        self.assertGreaterEqual(dest_width, 1)
+    def test_crop_width_is_never_less_than_one_pixel(self):
+        # A tiny (sub-pixel) view span must still round up to something croppable/paintable.
+        crop_left, crop_right = a.compute_waveform_view_crop(10000, 1000, 5000.0, 5000.05)
+        self.assertGreaterEqual(crop_right - crop_left, 1)
 
 
 class BuildTrimCommandTests(unittest.TestCase):

@@ -3581,10 +3581,6 @@ def probe_audio_stream_count(ffmpeg_path, input_path):
 
 
 WAVEFORM_BG_COLOR = "0x2b2b2b"
-# Same color as WAVEFORM_BG_COLOR above, as an (R, G, B) tuple -- PIL takes actual color values,
-# not an ffmpeg-style "0xRRGGBB" string, for the stretched-estimate canvas built in
-# compute_waveform_stretch_crop's own caller (refresh_waveform's show_stretched_waveform_estimate).
-WAVEFORM_BG_RGB = (0x2B, 0x2B, 0x2B)
 # A brighter blue than the app's usual accent color specifically for contrast against the dark
 # background -- confirmed live the original (0x3b82f6) rendered as a thin, hard-to-see line at a
 # glance; this one, combined with draw=full/scale=sqrt below, reads as an actual solid waveform
@@ -3592,52 +3588,37 @@ WAVEFORM_BG_RGB = (0x2B, 0x2B, 0x2B)
 WAVEFORM_LINE_COLOR = "0x60a5fa"
 
 
-def compute_waveform_stretch_crop(old_start, old_end, old_width, new_start, new_end, new_width):
-    """Computes how to cheaply APPROXIMATE a waveform image for [new_start, new_end) by cropping
-    and stretching/squashing an already-rendered image that covers [old_start, old_end) at
-    old_width pixels, instead of leaving the stale old image on screen (or nothing at all) for
-    however long the real re-render takes -- purely a fast, temporary visual placeholder shown the
-    instant the timeline's view changes; the real ffmpeg render (already in flight, debounced the
-    same as before) replaces it with the accurate image moments later.
+def compute_waveform_view_crop(duration, image_width, view_start, view_end):
+    """Maps a visible [view_start, view_end) time window onto the pixel range of a waveform image
+    that was rendered once for the WHOLE [0, duration) clip at image_width pixels -- the basis for
+    the clip editor's own zoom/pan: rather than re-rendering via ffmpeg on every zoom/pan step (or
+    approximating one render's own stretched pixels from another, which was confirmed live to look
+    jaggy and get progressively worse across a burst of zoom steps), the waveform is rendered ONCE
+    per file/track and all zooming/panning after that is a pure, instant crop+resize of that same
+    single image -- exactly how the timeline's own ruler/markers already work off one shared
+    view_state with no per-zoom re-render at all.
 
     Pure geometry, no image library involved, so it's fully unit-testable on its own -- same
-    reasoning as this file's other pure calibration/geometry helpers. A caller does the actual
-    PIL crop/resize/paste using the pixel offsets this returns.
+    reasoning as this file's other pure calibration/geometry helpers.
 
-    Returns None if there's no usable overlap at all between the old image and the new range (e.g.
-    the view jumped somewhere -- via zoom-to-a-distant-point or a big pan -- the old image doesn't
-    cover any part of), in which case stretching would produce something actively misleading rather
-    than a genuine approximation; a caller should just leave whatever's currently displayed alone
-    in that case and wait for the real render instead.
+    Because view_start/view_end are always themselves already clamped to [0, duration) (see
+    zoom_view/on_pan_drag's own clamping), the requested window can never actually fall outside
+    what the full-clip image covers -- unlike a stretch-from-whatever's-currently-shown approach,
+    there's no "no overlap at all" case to handle here; this only guards against degenerate inputs
+    (zero/negative duration, width, or span).
 
-    Returns (crop_left_px, crop_right_px, dest_left_px, dest_width_px), all ints, all in pixels:
-    crop_left_px/crop_right_px mark the horizontal slice of the OLD image (clamped to its own
-    [0, old_width] bounds) that overlaps the new range at all. dest_left_px/dest_width_px say
-    where in a new_width-wide canvas that (resized) slice belongs -- necessary rather than always
-    stretching across the full new width, since the new range can extend beyond what the old image
-    actually covered (e.g. panning to reveal previously off-screen time), and naively stretching a
-    PARTIAL overlap across the WHOLE new canvas would misalign it against the timeline ruler and
-    trim markers, which are drawn independently of this using the real [new_start, new_end)."""
-    old_span = old_end - old_start
-    new_span = new_end - new_start
-    if old_span <= 0 or new_span <= 0 or old_width <= 0 or new_width <= 0:
+    Returns (crop_left_px, crop_right_px), both ints, clamped to [0, image_width] -- or None on a
+    degenerate input. A caller crops the full image to this range, then resizes that crop to fill
+    its own canvas width."""
+    if duration <= 0 or image_width <= 0 or view_end <= view_start:
         return None
-    # Where the NEW range's own edges fall in the OLD image's pixel space.
-    old_px_start = (new_start - old_start) / old_span * old_width
-    old_px_end = (new_end - old_start) / old_span * old_width
-    if old_px_end <= old_px_start:
+    left = max(0.0, min(float(image_width), view_start / duration * image_width))
+    right = max(0.0, min(float(image_width), view_end / duration * image_width))
+    if right <= left:
         return None
-    clamped_start = max(0.0, old_px_start)
-    clamped_end = min(float(old_width), old_px_end)
-    if clamped_end <= clamped_start:
-        return None  # the new range doesn't overlap the old image at all
-    # Maps the clamped crop back to its correct horizontal position in the new canvas.
-    dest_left = (clamped_start - old_px_start) / (old_px_end - old_px_start) * new_width
-    dest_right = (clamped_end - old_px_start) / (old_px_end - old_px_start) * new_width
-    dest_width = max(1, int(round(dest_right - dest_left)))
-    crop_left = int(round(clamped_start))
-    crop_right = max(crop_left + 1, int(round(clamped_end)))
-    return crop_left, crop_right, int(round(dest_left)), dest_width
+    crop_left = int(round(left))
+    crop_right = max(crop_left + 1, int(round(right)))
+    return crop_left, crop_right
 
 
 def build_waveform_image_command(
@@ -7777,24 +7758,32 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     timeline_canvas = tk.Canvas(root, height=TIMELINE_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
     timeline_canvas.pack(fill="x", padx=10, pady=(0, 4))
 
-    # --- Waveform for whichever audio track is selected above, spanning the SAME zoomed/panned
-    # view window as the timeline track (not the trim selection) -- scroll to zoom, right-drag to
-    # pan, exactly like the timeline itself, and the two stay in sync since they share view_state.
-    # Renders automatically (debounced) whenever the file, track, or view window changes, rather
-    # than needing a button click for every adjustment.
+    # --- Waveform for whichever audio track is selected above -- rendered ONCE for the WHOLE clip
+    # per file/track change, then all zooming/panning is a pure, instant client-side crop+resize of
+    # that one image (see draw_waveform_view/compute_waveform_view_crop), exactly like the
+    # timeline's own ruler/markers already work off the same shared view_state with no per-zoom
+    # re-render. (An earlier version re-rendered via ffmpeg -- or approximated one render's own
+    # stretched pixels from another -- on every zoom/pan step; confirmed live that both felt
+    # laggy/jumpy and the repeated stretch-from-a-stretch approximation visibly degraded across a
+    # burst of zoom steps. Rendering once and cropping is both simpler and better on both counts.)
     WAVEFORM_HEIGHT = 120
+    # Generous width for the one full-clip render -- ffmpeg has to decode the WHOLE audio track
+    # regardless of requested width anyway (showwavespic needs every sample to compute accurate
+    # per-column peaks), so asking for many more columns than any single canvas width will ever
+    # show is nearly free relative to that, and keeps a deep zoom from visibly running out of real
+    # pixel detail (looking blocky/blown-up) too quickly.
+    WAVEFORM_FULL_RENDER_WIDTH = 16000
     WAVEFORM_DEBOUNCE_MS = 400
     waveform_canvas = tk.Canvas(root, height=WAVEFORM_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
     waveform_canvas.pack(fill="x", padx=10, pady=(0, 4))
     waveform_state = {
-        "photo": None, "pil_image": None, "generation": 0, "pending_after_id": None,
-        "rendered_start": None, "rendered_end": None,
+        "photo": None, "full_image": None, "full_duration": None,
+        "generation": 0, "pending_after_id": None,
     }
 
     def show_waveform_placeholder(text):
-        waveform_state["rendered_start"] = None
-        waveform_state["rendered_end"] = None
-        waveform_state["pil_image"] = None
+        waveform_state["full_image"] = None
+        waveform_state["full_duration"] = None
         waveform_canvas.delete("all")
         waveform_canvas.create_text(
             8, WAVEFORM_HEIGHT // 2, anchor="w", fill=MUTED_TEXT_COLOR, text=text,
@@ -7802,90 +7791,22 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
     show_waveform_placeholder("Open a recording to see its waveform here.")
 
-    def show_stretched_waveform_estimate(new_start, new_end):
-        # Fills the gap between "the view just changed" and "the real re-render for it finished"
-        # (the ~400ms debounce below, plus however long the actual ffmpeg render takes) with an
-        # instant, cheap approximation instead of leaving a stale or blank waveform on screen --
-        # the same trick most real editors use while a zoom/pan is still settling. Purely a
-        # placeholder: refresh_waveform's own real render (already scheduled by the caller right
-        # after this) replaces it with the accurate image moments later regardless of whether this
-        # produced anything.
-        old_image = waveform_state["pil_image"]
-        old_start = waveform_state["rendered_start"]
-        old_end = waveform_state["rendered_end"]
-        if old_image is None or old_start is None or old_end is None:
-            return
-        canvas_width = waveform_canvas.winfo_width()
-        if canvas_width <= 1:
-            return
-        crop = compute_waveform_stretch_crop(old_start, old_end, old_image.width, new_start, new_end, canvas_width)
-        if crop is None:
-            return
-        crop_left, crop_right, dest_left, dest_width = crop
-        try:
-            cropped = old_image.crop((crop_left, 0, crop_right, old_image.height)).convert("RGB")
-            resized = cropped.resize((dest_width, old_image.height), Image.NEAREST)
-            canvas_image = Image.new("RGB", (canvas_width, old_image.height), WAVEFORM_BG_RGB)
-            canvas_image.paste(resized, (dest_left, 0))
-            photo = ImageTk.PhotoImage(canvas_image)
-        except Exception:
-            logging.exception("Clip editor: could not build a stretched waveform estimate.")
-            return
-        # This estimate now represents [new_start, new_end) -- stored as the new "old" image/range
-        # so a FURTHER rapid zoom/pan (before the real render for even this one arrives) stretches
-        # from this estimate too, rather than jumping back to whatever was last real.
-        waveform_state["photo"] = photo
-        waveform_state["pil_image"] = canvas_image
-        waveform_state["rendered_start"] = new_start
-        waveform_state["rendered_end"] = new_end
-        waveform_canvas.delete("all")
-        waveform_canvas.create_image(0, 0, anchor="nw", image=photo, tags="waveform_image")
-        draw_waveform_overlay()
-
-    def schedule_waveform_refresh():
-        # Debounced rather than firing on every single keystroke/drag step -- each render is a
-        # real ffmpeg process, and typing a timestamp or dragging a marker produces a burst of
-        # rapid changes that would otherwise each spawn one. Cancelling and rescheduling on every
-        # call means only the LAST change in a burst actually triggers a render, ~400ms after
-        # things settle.
-        if waveform_state["pending_after_id"] is not None:
-            try:
-                root.after_cancel(waveform_state["pending_after_id"])
-            except tk.TclError:
-                pass
-        try:
-            waveform_state["pending_after_id"] = root.after(WAVEFORM_DEBOUNCE_MS, refresh_waveform)
-        except tk.TclError:
-            pass
-
-    def schedule_waveform_refresh_after_view_change():
-        # Used specifically by zoom/pan (not track/file changes, where the old image is a
-        # DIFFERENT track's waveform entirely and stretching it would show a misleading shape) --
-        # shows an instant stretched estimate of the new view right away, then still schedules the
-        # normal debounced real render exactly as before to replace it with the accurate image.
-        if view_state["initialized"]:
-            show_stretched_waveform_estimate(view_state["start"], view_state["end"])
-        schedule_waveform_refresh()
-
     def draw_waveform_overlay():
-        # Draws the start/end trim markers and the playhead on top of whatever waveform image is
-        # currently displayed, exactly like draw_timeline() draws them on the timeline's own
-        # track -- mapped against rendered_start/rendered_end (the view window the CURRENT image
-        # was actually rendered for), not the live view_state, since a zoom/pan made after that
-        # render but before the next one finishes (debounced ~400ms) would otherwise misalign
-        # these against an image that doesn't reflect it yet.
+        # Draws the start/end trim markers and the playhead on top of whatever's currently
+        # displayed -- always against the LIVE view_state now (draw_waveform_view below keeps the
+        # image itself exactly in sync with view_state on every call, with no debounce/staleness
+        # window to account for anymore, unlike when this had to track a separately-rendered
+        # range).
         waveform_canvas.delete("waveform_overlay")
-        rendered_start = waveform_state["rendered_start"]
-        rendered_end = waveform_state["rendered_end"]
-        if rendered_start is None or rendered_end is None:
+        if waveform_state["full_image"] is None:
             return
         width = waveform_canvas.winfo_width()
-        span = rendered_end - rendered_start
+        span = view_state["end"] - view_state["start"]
         if width <= 0 or span <= 0:
             return
 
         def x_of(seconds):
-            return (seconds - rendered_start) / span * width
+            return (seconds - view_state["start"]) / span * width
 
         try:
             x = x_of(parse_timestamp(start_var.get()))
@@ -7910,24 +7831,62 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                     x, 0, x, WAVEFORM_HEIGHT, fill=SEEKER_COLOR, width=1, tags="waveform_overlay",
                 )
 
+    def draw_waveform_view():
+        # Pure crop + resize of the one full-clip image to whatever view_state currently shows --
+        # instant (no ffmpeg, no debounce, no background thread) -- called directly from every
+        # zoom/pan/resize handler, the same way draw_timeline() redraws the ruler/markers directly
+        # off view_state with no re-render of its own either.
+        full_image = waveform_state["full_image"]
+        full_duration = waveform_state["full_duration"]
+        if full_image is None or not full_duration:
+            return
+        if not view_state["initialized"]:
+            reset_view()
+        canvas_width = waveform_canvas.winfo_width()
+        if canvas_width <= 1:
+            return
+        crop = compute_waveform_view_crop(full_duration, full_image.width, view_state["start"], view_state["end"])
+        if crop is None:
+            return
+        crop_left, crop_right = crop
+        try:
+            cropped = full_image.crop((crop_left, 0, crop_right, full_image.height))
+            resized = cropped.resize((canvas_width, full_image.height), Image.BILINEAR)
+            photo = ImageTk.PhotoImage(resized)
+        except Exception:
+            logging.exception("Clip editor: could not draw the waveform view.")
+            return
+        waveform_state["photo"] = photo  # kept alive -- Tkinter drops a PhotoImage with no live reference
+        waveform_canvas.delete("all")
+        waveform_canvas.create_image(0, 0, anchor="nw", image=photo, tags="waveform_image")
+        draw_waveform_overlay()
+
+    def schedule_waveform_refresh():
+        # Debounced rather than firing on every single keystroke -- e.g. rapidly switching audio
+        # tracks shouldn't each spawn their own full-clip ffmpeg render. NOT used for zoom/pan
+        # anymore -- those call draw_waveform_view() directly (see its own docstring for why that's
+        # now a cheap, instant, non-ffmpeg operation with nothing left to debounce).
+        if waveform_state["pending_after_id"] is not None:
+            try:
+                root.after_cancel(waveform_state["pending_after_id"])
+            except tk.TclError:
+                pass
+        try:
+            waveform_state["pending_after_id"] = root.after(WAVEFORM_DEBOUNCE_MS, refresh_waveform)
+        except tk.TclError:
+            pass
+
     def refresh_waveform():
+        # Renders the WHOLE clip ONCE (see WAVEFORM_FULL_RENDER_WIDTH) -- triggered by a file or
+        # track change, never by zoom/pan (draw_waveform_view handles those directly, with no
+        # re-render at all).
         waveform_state["pending_after_id"] = None
         if not state["path"]:
             show_waveform_placeholder("Open a recording to see its waveform here.")
             return
-        if not state["duration"]:
+        duration = state["duration"]
+        if not duration:
             show_waveform_placeholder("Loading waveform...")
-            return
-        if not view_state["initialized"]:
-            reset_view()
-        # Renders whatever time window is currently VISIBLE on the timeline (not the trim
-        # selection) -- scrolling/zooming the timeline changes this the same way it changes the
-        # ruler and markers, so the waveform can be zoomed in on exactly like the timeline track
-        # itself. The trim start/end markers are drawn as an overlay on top instead (see
-        # draw_waveform_overlay), same as they're drawn on top of the timeline's track.
-        start_seconds = view_state["start"]
-        end_seconds = view_state["end"]
-        if end_seconds <= start_seconds:
             return
         track_index = audio_track_combo.current()
         if track_index < 0:
@@ -7939,18 +7898,17 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             return
 
         # Guards against a slow, stale render finishing AFTER a newer request (a different track
-        # or range picked while the first one was still rendering) and overwriting what should be
-        # shown now -- only the MOST RECENT request's own result is ever actually applied.
+        # or a different file picked while the first one was still rendering) and overwriting what
+        # should be shown now -- only the MOST RECENT request's own result is ever actually applied.
         waveform_state["generation"] += 1
         this_generation = waveform_state["generation"]
         source_path = state["path"]
-        width = max(200, waveform_canvas.winfo_width() or 760)
 
         def worker():
             tmp_path = os.path.join(tempfile.gettempdir(), f"obsautorec_waveform_{os.getpid()}_{int(time.time() * 1000)}.png")
             ok = generate_waveform_image(
-                ffmpeg_path, source_path, start_seconds, end_seconds, track_index, tmp_path,
-                width=width, height=WAVEFORM_HEIGHT,
+                ffmpeg_path, source_path, 0.0, duration, track_index, tmp_path,
+                width=WAVEFORM_FULL_RENDER_WIDTH, height=WAVEFORM_HEIGHT,
             )
 
             def finish():
@@ -7970,7 +7928,6 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 try:
                     image = Image.open(tmp_path)
                     image.load()  # force the read now, before the temp file is removed below
-                    photo = ImageTk.PhotoImage(image)
                 except Exception:
                     logging.exception("Clip editor: could not load the rendered waveform image.")
                     show_waveform_placeholder("Could not display the rendered waveform.")
@@ -7980,13 +7937,9 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                         os.remove(tmp_path)
                     except OSError:
                         pass
-                waveform_state["photo"] = photo  # kept alive -- Tkinter drops a PhotoImage with no live reference
-                waveform_state["pil_image"] = image  # kept for a future zoom/pan's stretched estimate
-                waveform_state["rendered_start"] = start_seconds
-                waveform_state["rendered_end"] = end_seconds
-                waveform_canvas.delete("all")
-                waveform_canvas.create_image(0, 0, anchor="nw", image=photo, tags="waveform_image")
-                draw_waveform_overlay()
+                waveform_state["full_image"] = image
+                waveform_state["full_duration"] = duration
+                draw_waveform_view()
 
             try:
                 root.after(0, finish)
@@ -8235,7 +8188,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         view_state["start"] = new_start
         view_state["end"] = new_start + new_span
         draw_timeline()
-        schedule_waveform_refresh_after_view_change()
+        draw_waveform_view()
 
     def on_timeline_wheel(event):
         if not state["duration"]:
@@ -8259,7 +8212,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         view_state["start"] = new_start
         view_state["end"] = new_start + span
         draw_timeline()
-        schedule_waveform_refresh_after_view_change()
+        draw_waveform_view()
 
     def zoom_in_button():
         if not state["duration"]:
@@ -8276,7 +8229,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     def zoom_reset_button():
         reset_view()
         draw_timeline()
-        schedule_waveform_refresh_after_view_change()
+        draw_waveform_view()
 
     def on_pan_press(event):
         pan_state["active"] = True
@@ -8294,7 +8247,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         view_state["start"] = new_start
         view_state["end"] = new_start + span
         draw_timeline()
-        schedule_waveform_refresh_after_view_change()
+        draw_waveform_view()
 
     def on_pan_release(_event):
         pan_state["active"] = False
@@ -8331,11 +8284,9 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     waveform_canvas.bind("<Button-3>", on_pan_press)
     waveform_canvas.bind("<B3-Motion>", on_pan_drag)
     waveform_canvas.bind("<ButtonRelease-3>", on_pan_release)
-    # A resize changes the waveform canvas's own width too -- shows an immediate resized stretch of
-    # whatever's already displayed (same time range, new width -- compute_waveform_stretch_crop
-    # handles this as a clean full-width resize with no cropping needed), then re-renders for real
-    # at the new width, rather than leaving a now-mis-sized old image in place either way.
-    waveform_canvas.bind("<Configure>", lambda event: schedule_waveform_refresh_after_view_change())
+    # A resize changes the waveform canvas's own width too -- draw_waveform_view() re-crops from
+    # the full-clip image at the new width instantly, same as any other view change.
+    waveform_canvas.bind("<Configure>", lambda event: draw_waveform_view())
 
     # --- Controls row: zoom (left), transport (centered), volume (right) ---
     controls_row = tk.Frame(root, bg=EDITOR_BG)
