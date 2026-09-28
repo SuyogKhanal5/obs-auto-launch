@@ -943,6 +943,9 @@ MIC_BOOST_LIMITER_FILTER_NAME = "OBS Auto Recorder - Mic Boost Limiter"
 # The old Noise Gate filter's name, kept only so ensure_mic_boost_filter can find and remove one
 # left over on an input from before this app switched to voice isolation -- see there.
 _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME = "OBS Auto Recorder - Mic Boost Noise Gate"
+# Input names ensure_mic_boost_filter has already checked (and cleaned up if needed) for that
+# legacy filter, this app run -- see the check itself for why this only ever needs to happen once.
+_legacy_noise_gate_checked_inputs = set()
 # OBS's own real "Noise Suppression" filter kind (confirmed live via GetSourceFilterKindList),
 # using its RNNoise method -- a small neural network trained specifically to separate voice from
 # background noise, continuously and adaptively, rather than a Noise Gate's simple hard on/off
@@ -1128,22 +1131,30 @@ def ensure_mic_boost_filter(
     # this replaced may still be sitting on input_name, actively enabled, from before the switch.
     # Left alone, it would keep gating the raw signal alongside (and independently of) the new
     # Voice Isolation filter below -- removed outright, not just disabled, since the whole point
-    # of switching approaches was to stop using it, not run both at once. Checked first (a cheap
-    # read) rather than attempting the removal unconditionally on every call, so this is a true
-    # no-op -- no request sent at all -- once it's actually gone (or for anyone who never had it).
-    try:
-        client.get_source_filter(input_name, _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME)
-    except obsws.error.OBSSDKRequestError as exc:
-        if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
-            logging.warning("Could not check for the old mic-boost noise gate filter on '%s': %s", input_name, exc)
-    except Exception as exc:
-        logging.warning("Could not check for the old mic-boost noise gate filter on '%s': %s", input_name, exc)
-    else:
+    # of switching approaches was to stop using it, not run both at once. Skipped entirely after
+    # the first check per input_name per app run (_legacy_noise_gate_checked_inputs) -- otherwise
+    # this checks on EVERY call (every recording start, plus the idle watcher path), and unlike
+    # _ensure_obs_filter_settings's own get_source_filter probes (which only ever 404 ONCE, right
+    # before a filter's first creation), this one always 404s again forever once the legacy filter
+    # is actually gone -- confirmed live that obsws_python itself logs that 404 at ERROR level with
+    # a full traceback internally, before this function's own try/except ever sees it, which would
+    # otherwise spam one scary-looking (but harmless) ERROR block into the log on every single call
+    # for the rest of this app's life.
+    if input_name not in _legacy_noise_gate_checked_inputs:
+        _legacy_noise_gate_checked_inputs.add(input_name)
         try:
-            client.remove_source_filter(input_name, _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME)
-            logging.info("Removed the old mic-boost noise gate filter on '%s' (replaced by voice isolation).", input_name)
+            client.get_source_filter(input_name, _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME)
+        except obsws.error.OBSSDKRequestError as exc:
+            if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
+                logging.warning("Could not check for the old mic-boost noise gate filter on '%s': %s", input_name, exc)
         except Exception as exc:
-            logging.warning("Could not remove the old mic-boost noise gate filter on '%s': %s", input_name, exc)
+            logging.warning("Could not check for the old mic-boost noise gate filter on '%s': %s", input_name, exc)
+        else:
+            try:
+                client.remove_source_filter(input_name, _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME)
+                logging.info("Removed the old mic-boost noise gate filter on '%s' (replaced by voice isolation).", input_name)
+            except Exception as exc:
+                logging.warning("Could not remove the old mic-boost noise gate filter on '%s': %s", input_name, exc)
 
     voice_isolation, just_created = _ensure_obs_filter_settings(
         client, input_name, MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, "noise_suppress_filter_v2",
@@ -2863,14 +2874,14 @@ def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
     stop_event=None,
 ):
-    """Thin dispatcher -- the real per-OS implementation (RegisterHotKey/GetMessageW on Windows,
+    """Thin dispatcher -- the real per-OS implementation (a global WH_KEYBOARD_LL hook on Windows,
     XGrabKey/XNextEvent on Linux/X11, a CGEventTap/CFRunLoop on macOS; a clear logged no-op under
     Wayland) now lives in platform_common.run_custom_keybind_listener() /
     platform_windows.py / platform_linux.py / platform_macos.py, see
     CROSS_PLATFORM_PLAN.md Phase 3. fire_custom_keybind/describe_keybind/notify are passed in
     rather than imported by the backend modules, so those never depend on this one (the
     dependency only ever goes the other way). stop_event: passed straight through so
-    platform_windows.py's backend can release its hotkeys the moment shutdown is requested rather
+    platform_windows.py's backend can release its hook the moment shutdown is requested rather
     than waiting on process death -- see that function's own docstring for why this matters."""
     platform_common.run_custom_keybind_listener(
         bindings, get_client, get_manual_split_buffer_seconds, fire_custom_keybind, describe_keybind, notify,
@@ -3539,11 +3550,63 @@ def probe_audio_stream_count(ffmpeg_path, input_path):
 
 
 WAVEFORM_BG_COLOR = "0x2b2b2b"
+# Same color as WAVEFORM_BG_COLOR above, as an (R, G, B) tuple -- PIL takes actual color values,
+# not an ffmpeg-style "0xRRGGBB" string, for the stretched-estimate canvas built in
+# compute_waveform_stretch_crop's own caller (refresh_waveform's show_stretched_waveform_estimate).
+WAVEFORM_BG_RGB = (0x2B, 0x2B, 0x2B)
 # A brighter blue than the app's usual accent color specifically for contrast against the dark
 # background -- confirmed live the original (0x3b82f6) rendered as a thin, hard-to-see line at a
 # glance; this one, combined with draw=full/scale=sqrt below, reads as an actual solid waveform
 # shape instead.
 WAVEFORM_LINE_COLOR = "0x60a5fa"
+
+
+def compute_waveform_stretch_crop(old_start, old_end, old_width, new_start, new_end, new_width):
+    """Computes how to cheaply APPROXIMATE a waveform image for [new_start, new_end) by cropping
+    and stretching/squashing an already-rendered image that covers [old_start, old_end) at
+    old_width pixels, instead of leaving the stale old image on screen (or nothing at all) for
+    however long the real re-render takes -- purely a fast, temporary visual placeholder shown the
+    instant the timeline's view changes; the real ffmpeg render (already in flight, debounced the
+    same as before) replaces it with the accurate image moments later.
+
+    Pure geometry, no image library involved, so it's fully unit-testable on its own -- same
+    reasoning as this file's other pure calibration/geometry helpers. A caller does the actual
+    PIL crop/resize/paste using the pixel offsets this returns.
+
+    Returns None if there's no usable overlap at all between the old image and the new range (e.g.
+    the view jumped somewhere -- via zoom-to-a-distant-point or a big pan -- the old image doesn't
+    cover any part of), in which case stretching would produce something actively misleading rather
+    than a genuine approximation; a caller should just leave whatever's currently displayed alone
+    in that case and wait for the real render instead.
+
+    Returns (crop_left_px, crop_right_px, dest_left_px, dest_width_px), all ints, all in pixels:
+    crop_left_px/crop_right_px mark the horizontal slice of the OLD image (clamped to its own
+    [0, old_width] bounds) that overlaps the new range at all. dest_left_px/dest_width_px say
+    where in a new_width-wide canvas that (resized) slice belongs -- necessary rather than always
+    stretching across the full new width, since the new range can extend beyond what the old image
+    actually covered (e.g. panning to reveal previously off-screen time), and naively stretching a
+    PARTIAL overlap across the WHOLE new canvas would misalign it against the timeline ruler and
+    trim markers, which are drawn independently of this using the real [new_start, new_end)."""
+    old_span = old_end - old_start
+    new_span = new_end - new_start
+    if old_span <= 0 or new_span <= 0 or old_width <= 0 or new_width <= 0:
+        return None
+    # Where the NEW range's own edges fall in the OLD image's pixel space.
+    old_px_start = (new_start - old_start) / old_span * old_width
+    old_px_end = (new_end - old_start) / old_span * old_width
+    if old_px_end <= old_px_start:
+        return None
+    clamped_start = max(0.0, old_px_start)
+    clamped_end = min(float(old_width), old_px_end)
+    if clamped_end <= clamped_start:
+        return None  # the new range doesn't overlap the old image at all
+    # Maps the clamped crop back to its correct horizontal position in the new canvas.
+    dest_left = (clamped_start - old_px_start) / (old_px_end - old_px_start) * new_width
+    dest_right = (clamped_end - old_px_start) / (old_px_end - old_px_start) * new_width
+    dest_width = max(1, int(round(dest_right - dest_left)))
+    crop_left = int(round(clamped_start))
+    crop_right = max(crop_left + 1, int(round(clamped_end)))
+    return crop_left, crop_right, int(round(dest_left)), dest_width
 
 
 def build_waveform_image_command(
@@ -7672,19 +7735,60 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     waveform_canvas = tk.Canvas(root, height=WAVEFORM_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
     waveform_canvas.pack(fill="x", padx=10, pady=(0, 4))
     waveform_state = {
-        "photo": None, "generation": 0, "pending_after_id": None,
+        "photo": None, "pil_image": None, "generation": 0, "pending_after_id": None,
         "rendered_start": None, "rendered_end": None,
     }
 
     def show_waveform_placeholder(text):
         waveform_state["rendered_start"] = None
         waveform_state["rendered_end"] = None
+        waveform_state["pil_image"] = None
         waveform_canvas.delete("all")
         waveform_canvas.create_text(
             8, WAVEFORM_HEIGHT // 2, anchor="w", fill=MUTED_TEXT_COLOR, text=text,
         )
 
     show_waveform_placeholder("Open a recording to see its waveform here.")
+
+    def show_stretched_waveform_estimate(new_start, new_end):
+        # Fills the gap between "the view just changed" and "the real re-render for it finished"
+        # (the ~400ms debounce below, plus however long the actual ffmpeg render takes) with an
+        # instant, cheap approximation instead of leaving a stale or blank waveform on screen --
+        # the same trick most real editors use while a zoom/pan is still settling. Purely a
+        # placeholder: refresh_waveform's own real render (already scheduled by the caller right
+        # after this) replaces it with the accurate image moments later regardless of whether this
+        # produced anything.
+        old_image = waveform_state["pil_image"]
+        old_start = waveform_state["rendered_start"]
+        old_end = waveform_state["rendered_end"]
+        if old_image is None or old_start is None or old_end is None:
+            return
+        canvas_width = waveform_canvas.winfo_width()
+        if canvas_width <= 1:
+            return
+        crop = compute_waveform_stretch_crop(old_start, old_end, old_image.width, new_start, new_end, canvas_width)
+        if crop is None:
+            return
+        crop_left, crop_right, dest_left, dest_width = crop
+        try:
+            cropped = old_image.crop((crop_left, 0, crop_right, old_image.height)).convert("RGB")
+            resized = cropped.resize((dest_width, old_image.height), Image.NEAREST)
+            canvas_image = Image.new("RGB", (canvas_width, old_image.height), WAVEFORM_BG_RGB)
+            canvas_image.paste(resized, (dest_left, 0))
+            photo = ImageTk.PhotoImage(canvas_image)
+        except Exception:
+            logging.exception("Clip editor: could not build a stretched waveform estimate.")
+            return
+        # This estimate now represents [new_start, new_end) -- stored as the new "old" image/range
+        # so a FURTHER rapid zoom/pan (before the real render for even this one arrives) stretches
+        # from this estimate too, rather than jumping back to whatever was last real.
+        waveform_state["photo"] = photo
+        waveform_state["pil_image"] = canvas_image
+        waveform_state["rendered_start"] = new_start
+        waveform_state["rendered_end"] = new_end
+        waveform_canvas.delete("all")
+        waveform_canvas.create_image(0, 0, anchor="nw", image=photo, tags="waveform_image")
+        draw_waveform_overlay()
 
     def schedule_waveform_refresh():
         # Debounced rather than firing on every single keystroke/drag step -- each render is a
@@ -7701,6 +7805,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             waveform_state["pending_after_id"] = root.after(WAVEFORM_DEBOUNCE_MS, refresh_waveform)
         except tk.TclError:
             pass
+
+    def schedule_waveform_refresh_after_view_change():
+        # Used specifically by zoom/pan (not track/file changes, where the old image is a
+        # DIFFERENT track's waveform entirely and stretching it would show a misleading shape) --
+        # shows an instant stretched estimate of the new view right away, then still schedules the
+        # normal debounced real render exactly as before to replace it with the accurate image.
+        if view_state["initialized"]:
+            show_stretched_waveform_estimate(view_state["start"], view_state["end"])
+        schedule_waveform_refresh()
 
     def draw_waveform_overlay():
         # Draws the start/end trim markers and the playhead on top of whatever waveform image is
@@ -7816,6 +7929,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                     except OSError:
                         pass
                 waveform_state["photo"] = photo  # kept alive -- Tkinter drops a PhotoImage with no live reference
+                waveform_state["pil_image"] = image  # kept for a future zoom/pan's stretched estimate
                 waveform_state["rendered_start"] = start_seconds
                 waveform_state["rendered_end"] = end_seconds
                 waveform_canvas.delete("all")
@@ -8069,7 +8183,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         view_state["start"] = new_start
         view_state["end"] = new_start + new_span
         draw_timeline()
-        schedule_waveform_refresh()
+        schedule_waveform_refresh_after_view_change()
 
     def on_timeline_wheel(event):
         if not state["duration"]:
@@ -8093,7 +8207,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         view_state["start"] = new_start
         view_state["end"] = new_start + span
         draw_timeline()
-        schedule_waveform_refresh()
+        schedule_waveform_refresh_after_view_change()
 
     def zoom_in_button():
         if not state["duration"]:
@@ -8110,7 +8224,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     def zoom_reset_button():
         reset_view()
         draw_timeline()
-        schedule_waveform_refresh()
+        schedule_waveform_refresh_after_view_change()
 
     def on_pan_press(event):
         pan_state["active"] = True
@@ -8128,7 +8242,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         view_state["start"] = new_start
         view_state["end"] = new_start + span
         draw_timeline()
-        schedule_waveform_refresh()
+        schedule_waveform_refresh_after_view_change()
 
     def on_pan_release(_event):
         pan_state["active"] = False
@@ -8165,9 +8279,11 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     waveform_canvas.bind("<Button-3>", on_pan_press)
     waveform_canvas.bind("<B3-Motion>", on_pan_drag)
     waveform_canvas.bind("<ButtonRelease-3>", on_pan_release)
-    # A resize changes the waveform canvas's own width too -- re-renders it at the new width
-    # rather than leaving a now-stretched/squashed old image in place.
-    waveform_canvas.bind("<Configure>", lambda event: schedule_waveform_refresh())
+    # A resize changes the waveform canvas's own width too -- shows an immediate resized stretch of
+    # whatever's already displayed (same time range, new width -- compute_waveform_stretch_crop
+    # handles this as a clean full-width resize with no cropping needed), then re-renders for real
+    # at the new width, rather than leaving a now-mis-sized old image in place either way.
+    waveform_canvas.bind("<Configure>", lambda event: schedule_waveform_refresh_after_view_change())
 
     # --- Controls row: zoom (left), transport (centered), volume (right) ---
     controls_row = tk.Frame(root, bg=EDITOR_BG)

@@ -258,6 +258,7 @@ class PredictMicBoostOutputMulTests(unittest.TestCase):
 
 class ApplyMicBoostFromConfigTests(unittest.TestCase):
     def _client(self):
+        a._legacy_noise_gate_checked_inputs.clear()  # see EnsureMicBoostFilterTests._client
         return FakeObsClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})
 
     def test_disabled_is_a_noop(self):
@@ -301,6 +302,11 @@ class ApplyMicBoostFromConfigTests(unittest.TestCase):
 
 class EnsureMicBoostFilterTests(unittest.TestCase):
     def _client(self):
+        # ensure_mic_boost_filter only ever checks for the legacy noise gate ONCE per input_name
+        # per app run (see _legacy_noise_gate_checked_inputs) -- cleared here so each test starts
+        # fresh instead of a later test silently inheriting an earlier one's "already checked"
+        # state for the same "Scarlet" input name.
+        a._legacy_noise_gate_checked_inputs.clear()
         return FakeObsClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})
 
     def test_no_input_name_is_a_noop(self):
