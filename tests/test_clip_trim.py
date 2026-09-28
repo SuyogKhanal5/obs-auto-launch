@@ -476,6 +476,30 @@ class ComputeWaveformViewCropTests(unittest.TestCase):
         self.assertGreaterEqual(crop_right - crop_left, 1)
 
 
+class WaveformViewNeedsHigherResolutionTests(unittest.TestCase):
+    def test_full_view_never_needs_it(self):
+        # The whole clip, at the full-render width, always has at least as much detail as any
+        # canvas could ever show.
+        self.assertFalse(a.waveform_view_needs_higher_resolution(60, 16000, 0, 60, 1200))
+
+    def test_deep_zoom_needs_it(self):
+        # A 1-hour clip rendered at 16000px is ~4.4px/sec; zooming into a 2-second window has
+        # under 9 real source pixels behind a 1200px-wide canvas -- badly upscaled.
+        self.assertTrue(a.waveform_view_needs_higher_resolution(3600, 16000, 100, 102, 1200))
+
+    def test_source_pixels_exactly_equal_to_canvas_is_not_flagged(self):
+        # Exactly enough real detail (no upscaling at all) shouldn't trigger a real re-render --
+        # only genuinely FEWER source pixels than the canvas should.
+        self.assertFalse(a.waveform_view_needs_higher_resolution(1000, 1000, 0, 500, 500))
+
+    def test_degenerate_inputs_are_false_not_raised(self):
+        self.assertFalse(a.waveform_view_needs_higher_resolution(0, 16000, 0, 10, 1200))
+        self.assertFalse(a.waveform_view_needs_higher_resolution(-5, 16000, 0, 10, 1200))
+        self.assertFalse(a.waveform_view_needs_higher_resolution(60, 16000, 0, 60, 0))
+        self.assertFalse(a.waveform_view_needs_higher_resolution(60, 16000, 5, 5, 1200))
+        self.assertFalse(a.waveform_view_needs_higher_resolution(60, 16000, 6, 5, 1200))
+
+
 class BuildTrimCommandTests(unittest.TestCase):
     def test_fast_mode_seeks_before_input_and_stream_copies(self):
         cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=False)

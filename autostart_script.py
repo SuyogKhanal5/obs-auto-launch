@@ -3621,6 +3621,25 @@ def compute_waveform_view_crop(duration, image_width, view_start, view_end):
     return crop_left, crop_right
 
 
+def waveform_view_needs_higher_resolution(full_duration, full_image_width, view_start, view_end, canvas_width):
+    """True when the current view, cropped out of the one full-clip render, has FEWER real
+    source pixels behind it than the canvas has to display them in -- meaning it's being
+    upscaled and would look visibly blocky/soft next to a render made specifically for this
+    narrower window, at canvas resolution, where every displayed pixel has its own real,
+    ffmpeg-computed peak behind it instead of an interpolated guess. Used to decide whether a
+    zoomed-in view is worth a real (debounced) re-render at all, rather than firing one on every
+    zoom level regardless of whether the full-clip crop already has plenty of detail to show.
+
+    Pure geometry, unit-testable like compute_waveform_view_crop above."""
+    if full_duration <= 0 or canvas_width <= 0:
+        return False
+    view_span = view_end - view_start
+    if view_span <= 0:
+        return False
+    source_pixels = view_span / full_duration * full_image_width
+    return source_pixels < canvas_width
+
+
 def build_waveform_image_command(
     ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width, height,
 ):
@@ -7779,11 +7798,13 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     waveform_state = {
         "photo": None, "full_image": None, "full_duration": None,
         "generation": 0, "pending_after_id": None,
+        "view_generation": 0, "detail_pending_after_id": None,
     }
 
     def show_waveform_placeholder(text):
         waveform_state["full_image"] = None
         waveform_state["full_duration"] = None
+        waveform_state["view_generation"] += 1  # invalidates any in-flight detail render
         waveform_canvas.delete("all")
         waveform_canvas.create_text(
             8, WAVEFORM_HEIGHT // 2, anchor="w", fill=MUTED_TEXT_COLOR, text=text,
@@ -7860,6 +7881,13 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         waveform_canvas.delete("all")
         waveform_canvas.create_image(0, 0, anchor="nw", image=photo, tags="waveform_image")
         draw_waveform_overlay()
+        # This crop is only ever an upscale of the one full-clip render -- good enough as an
+        # instant response to every zoom/pan step, but genuinely blocky once zoomed in far enough
+        # (see waveform_view_needs_higher_resolution). schedule_waveform_detail_refresh below
+        # decides whether THIS specific view is actually worth a real, debounced re-render on top,
+        # and invalidates any earlier one still in flight for a now-superseded view either way.
+        waveform_state["view_generation"] += 1
+        schedule_waveform_detail_refresh()
 
     def schedule_waveform_refresh():
         # Debounced rather than firing on every single keystroke -- e.g. rapidly switching audio
@@ -7875,6 +7903,95 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             waveform_state["pending_after_id"] = root.after(WAVEFORM_DEBOUNCE_MS, refresh_waveform)
         except tk.TclError:
             pass
+
+    def schedule_waveform_detail_refresh():
+        # Debounced the same way the old per-zoom re-render was -- a burst of rapid zoom/pan steps
+        # should only ever fire ONE detail render, for wherever the view actually settles, not one
+        # per step.
+        if waveform_state["detail_pending_after_id"] is not None:
+            try:
+                root.after_cancel(waveform_state["detail_pending_after_id"])
+            except tk.TclError:
+                pass
+        try:
+            waveform_state["detail_pending_after_id"] = root.after(WAVEFORM_DEBOUNCE_MS, refresh_waveform_detail)
+        except tk.TclError:
+            pass
+
+    def refresh_waveform_detail():
+        # Real ffmpeg render for EXACTLY the current (settled) view, at canvas resolution -- only
+        # actually fired when the view is zoomed in enough that the full-clip crop is genuinely
+        # short on real detail (see waveform_view_needs_higher_resolution); most zoom levels never
+        # reach this at all. Draws directly over whatever draw_waveform_view already showed; the
+        # very next zoom/pan reverts to the instant crop-of-full immediately (same as before), and
+        # this fires again once THAT settles.
+        waveform_state["detail_pending_after_id"] = None
+        full_image = waveform_state["full_image"]
+        full_duration = waveform_state["full_duration"]
+        if full_image is None or not full_duration:
+            return
+        canvas_width = waveform_canvas.winfo_width()
+        if canvas_width <= 1:
+            return
+        view_start, view_end = view_state["start"], view_state["end"]
+        if not waveform_view_needs_higher_resolution(full_duration, full_image.width, view_start, view_end, canvas_width):
+            return
+        track_index = audio_track_combo.current()
+        if track_index < 0:
+            return
+        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+        if not ffmpeg_path:
+            return
+
+        this_view_generation = waveform_state["view_generation"]
+        source_path = state["path"]
+
+        def worker():
+            tmp_path = os.path.join(tempfile.gettempdir(), f"obsautorec_waveform_detail_{os.getpid()}_{int(time.time() * 1000)}.png")
+            ok = generate_waveform_image(
+                ffmpeg_path, source_path, view_start, view_end, track_index, tmp_path,
+                width=canvas_width, height=WAVEFORM_HEIGHT,
+            )
+
+            def finish():
+                if this_view_generation != waveform_state["view_generation"]:
+                    # The view moved on (or the file/track changed) before this finished -- a
+                    # newer draw_waveform_view() (and likely its own detail request) already owns
+                    # what's on screen now, so this stale result is simply discarded.
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    return
+                if not root.winfo_exists() or not ok:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    return
+                try:
+                    image = Image.open(tmp_path)
+                    image.load()
+                    photo = ImageTk.PhotoImage(image)
+                except Exception:
+                    logging.exception("Clip editor: could not load the detailed waveform image.")
+                    return
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                waveform_state["photo"] = photo
+                waveform_canvas.delete("all")
+                waveform_canvas.create_image(0, 0, anchor="nw", image=photo, tags="waveform_image")
+                draw_waveform_overlay()
+
+            try:
+                root.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def refresh_waveform():
         # Renders the WHOLE clip ONCE (see WAVEFORM_FULL_RENDER_WIDTH) -- triggered by a file or
@@ -7901,6 +8018,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         # or a different file picked while the first one was still rendering) and overwriting what
         # should be shown now -- only the MOST RECENT request's own result is ever actually applied.
         waveform_state["generation"] += 1
+        waveform_state["view_generation"] += 1  # invalidates any in-flight detail render too
         this_generation = waveform_state["generation"]
         source_path = state["path"]
 
