@@ -938,6 +938,7 @@ def set_game_audio_capture_target(client, input_name, process_name):
 
 
 MIC_BOOST_VOICE_ISOLATION_FILTER_NAME = "OBS Auto Recorder - Mic Boost Voice Isolation"
+MIC_BOOST_EQ_FILTER_NAME = "OBS Auto Recorder - Mic Boost EQ"
 MIC_BOOST_COMPRESSOR_FILTER_NAME = "OBS Auto Recorder - Mic Boost"
 MIC_BOOST_LIMITER_FILTER_NAME = "OBS Auto Recorder - Mic Boost Limiter"
 # The old Noise Gate filter's name, kept only so ensure_mic_boost_filter can find and remove one
@@ -972,6 +973,23 @@ MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS = {
     "speex": "Speex (lighter touch, clearer voice, less noise removed)",
 }
 MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS_BY_LABEL = {v: k for k, v in MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS.items()}
+# OBS's real "3-Band Equalizer" filter kind (confirmed live via GetSourceFilterKindList/
+# GetSourceFilterDefaultSettings) -- exactly 3 knobs (low/mid/high, each a shelf/band gain in dB
+# at OBS's own fixed crossover points; no frequency or Q control, unlike a fully parametric EQ).
+# Placed right after Voice Isolation and before the Compressor -- shaping tone on the CLEANED
+# signal (not the raw, noisy one) and before dynamics processing reacts to it, the standard order
+# for a voice chain.
+#
+# The default preset below is a conservative, generally-applicable "voice clarity" curve, not a
+# per-mic calibration (there's no live measurement behind it, unlike boost_db/the old noise gate
+# threshold): a mild low cut (less boominess/proximity effect/rumble), a mild mid cut (less
+# boxiness/mud), and a mild high boost (more presence/intelligibility) -- confirmed live to sound
+# better on a real report, but freely adjustable in Settings since "better" here is inherently
+# mic- and room-dependent, unlike voice isolation's method choice which at least has a clear
+# right-or-wrong failure mode (muffled or not).
+MIC_BOOST_EQ_PRESET_LOW_DB = -4.0
+MIC_BOOST_EQ_PRESET_MID_DB = -1.0
+MIC_BOOST_EQ_PRESET_HIGH_DB = 3.0
 
 
 def mic_boost_voice_isolation_settings(method):
@@ -1125,6 +1143,8 @@ def _ensure_obs_filter_settings(client, input_name, filter_name, filter_kind, se
 def ensure_mic_boost_filter(
     client, input_name, boost_db, voice_isolation_enabled=False,
     voice_isolation_method=DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD,
+    eq_enabled=False, eq_low_db=MIC_BOOST_EQ_PRESET_LOW_DB, eq_mid_db=MIC_BOOST_EQ_PRESET_MID_DB,
+    eq_high_db=MIC_BOOST_EQ_PRESET_HIGH_DB,
 ):
     """Applies OBS Auto Recorder's mic-boost filter chain directly to input_name -- live, at OBS's
     own audio pipeline, so every FUTURE recording captures this source boosted from the start.
@@ -1134,22 +1154,24 @@ def ensure_mic_boost_filter(
     quiet to begin with -- see the settings above for why a flat gain alone can't either, at any
     single stage.
 
-    Chain order (signal flows top to bottom): optional Voice Isolation (RNNoise noise suppression)
-    first (so it cleans the RAW signal before anything downstream amplifies whatever noise is
-    left), then a Compressor for makeup gain + dynamics control, then a Limiter as a hard safety
-    ceiling. New filters are appended to the end of OBS's own filter list by CreateSourceFilter --
-    harmless for the Compressor/Limiter pair (always created together, in the right relative
-    order), but Voice Isolation specifically gets moved to index 0 right after its own creation,
-    since it can be toggled on independently, later, well after the other two already exist.
+    Chain order (signal flows top to bottom): optional Voice Isolation (noise suppression) first
+    (so it cleans the RAW signal before anything downstream amplifies whatever noise is left),
+    then an optional 3-band EQ (shaping tone on that already-cleaned signal, before dynamics
+    processing reacts to it), then a Compressor for makeup gain + dynamics control, then a Limiter
+    as a hard safety ceiling. New filters are appended to the end of OBS's own filter list by
+    CreateSourceFilter -- harmless for the Compressor/Limiter pair (always created together, in
+    the right relative order), but Voice Isolation and EQ specifically get moved to indexes 0 and
+    1 right after their own creation, since either can be toggled on independently, later, well
+    after the other filters already exist.
 
-    voice_isolation_enabled: unlike the Compressor/Limiter (created once and otherwise left alone
-    -- see _ensure_obs_filter_settings), this filter's own OBS-side enabled state is actively kept
-    in sync on every call, since "toggleable" is the whole point of exposing it as its own
-    Settings checkbox -- a user flipping it needs that to actually take effect, not just influence
-    whether the filter gets created in the first place. voice_isolation_method (see
-    mic_boost_voice_isolation_settings) is likewise kept in sync via the same
-    _ensure_obs_filter_settings drift check every other filter here already uses, so switching
-    methods in Settings takes effect on the next apply without needing to delete/recreate anything.
+    voice_isolation_enabled/eq_enabled: unlike the Compressor/Limiter (created once and otherwise
+    left alone -- see _ensure_obs_filter_settings), these two filters' own OBS-side enabled state
+    is actively kept in sync on every call, since "toggleable" is the whole point of exposing them
+    as their own Settings checkboxes -- a user flipping one needs that to actually take effect,
+    not just influence whether the filter gets created in the first place. voice_isolation_method/
+    eq_low_db/eq_mid_db/eq_high_db are likewise kept in sync via the same _ensure_obs_filter_
+    settings drift check every other filter here already uses, so changing them in Settings takes
+    effect on the next apply without needing to delete/recreate anything.
 
     Idempotent and safe to call on every OBS-ready check: only writes a settings/enabled update
     when something has actually drifted from what's configured here, so this never resets the
@@ -1206,6 +1228,23 @@ def ensure_mic_boost_filter(
             except Exception as exc:
                 logging.warning("Could not toggle mic-boost voice isolation on '%s': %s", input_name, exc)
 
+    eq, eq_just_created = _ensure_obs_filter_settings(
+        client, input_name, MIC_BOOST_EQ_FILTER_NAME, "basic_eq_filter",
+        {"low": eq_low_db, "mid": eq_mid_db, "high": eq_high_db},
+    )
+    if eq is not None:
+        if eq_just_created:
+            try:
+                client.set_source_filter_index(input_name, MIC_BOOST_EQ_FILTER_NAME, 1)
+            except Exception as exc:
+                logging.warning("Could not move mic-boost EQ into place in the chain: %s", exc)
+        if eq.filter_enabled != eq_enabled:
+            try:
+                client.set_source_filter_enabled(input_name, MIC_BOOST_EQ_FILTER_NAME, eq_enabled)
+                logging.info("%s OBS mic-boost EQ on '%s'.", "Enabled" if eq_enabled else "Disabled", input_name)
+            except Exception as exc:
+                logging.warning("Could not toggle mic-boost EQ on '%s': %s", input_name, exc)
+
     compressor_settings = dict(MIC_BOOST_COMPRESSOR_BASE_SETTINGS, output_gain=boost_db)
     _ensure_obs_filter_settings(client, input_name, MIC_BOOST_COMPRESSOR_FILTER_NAME, "compressor_filter", compressor_settings)
     _ensure_obs_filter_settings(client, input_name, MIC_BOOST_LIMITER_FILTER_NAME, "limiter_filter", MIC_BOOST_LIMITER_SETTINGS)
@@ -1225,10 +1264,15 @@ def apply_mic_boost_from_config(client, obs_config):
     if not (mic_boost_config.get("enabled") and mic_boost_config.get("input_name")):
         return
     voice_isolation_config = mic_boost_config.get("voice_isolation", {})
+    eq_config = mic_boost_config.get("eq", {})
     ensure_mic_boost_filter(
         client, mic_boost_config["input_name"], mic_boost_config.get("boost_db", 0.0),
         voice_isolation_enabled=voice_isolation_config.get("enabled", False),
         voice_isolation_method=voice_isolation_config.get("method", DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD),
+        eq_enabled=eq_config.get("enabled", False),
+        eq_low_db=eq_config.get("low_db", MIC_BOOST_EQ_PRESET_LOW_DB),
+        eq_mid_db=eq_config.get("mid_db", MIC_BOOST_EQ_PRESET_MID_DB),
+        eq_high_db=eq_config.get("high_db", MIC_BOOST_EQ_PRESET_HIGH_DB),
     )
 
 
@@ -6256,6 +6300,39 @@ def _run_config_editor(master_root, restart_callback, on_close):
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
 
+    mic_eq_config = mic_boost_config.get("eq", {})
+    mic_eq_enabled_var = tk.BooleanVar(value=mic_eq_config.get("enabled", False))
+    add_checkbox(
+        obs_tab, row, "Also add a 3-band EQ ahead of the boost, to shape the tone",
+        mic_eq_enabled_var,
+    )
+    row += 1
+    mic_eq_low_var = tk.StringVar(value=str(mic_eq_config.get("low_db", MIC_BOOST_EQ_PRESET_LOW_DB)))
+    mic_eq_mid_var = tk.StringVar(value=str(mic_eq_config.get("mid_db", MIC_BOOST_EQ_PRESET_MID_DB)))
+    mic_eq_high_var = tk.StringVar(value=str(mic_eq_config.get("high_db", MIC_BOOST_EQ_PRESET_HIGH_DB)))
+    tk.Label(obs_tab, text="EQ (dB): Low / Mid / High", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    mic_eq_entries_row = tk.Frame(obs_tab, bg=DARK_BG)
+    mic_eq_entries_row.grid(row=row, column=1, sticky="w", pady=4)
+    for eq_var in (mic_eq_low_var, mic_eq_mid_var, mic_eq_high_var):
+        tk.Entry(
+            mic_eq_entries_row, textvariable=eq_var, width=6, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG,
+        ).pack(side="left", padx=(0, 8))
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    OBS's own 3-band equalizer, applied right after voice isolation (before the "
+            "boost/compressor react to it). Positive boosts, negative cuts. The prefilled values "
+            "are a mild, generally-applicable \"voice clarity\" curve -- a small low cut (less "
+            "boominess/rumble), a small mid cut (less boxiness), a small high boost (more "
+            "presence/intelligibility) -- not a per-mic calibration, so freely adjust to taste."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
     multi_track_config = obs_config.get("multi_track_audio", {})
     # Keyed by input name so re-running Quick Setup (or hand-editing tracks afterward) never
     # loses a previously-recorded app -> process mapping; collect_config() below reads this back
@@ -7107,6 +7184,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
         mic_voice_isolation["method"] = MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS_BY_LABEL.get(
             mic_voice_isolation_method_var.get(), DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD,
         )
+        mic_eq = mic_boost.setdefault("eq", {})
+        mic_eq["enabled"] = mic_eq_enabled_var.get()
+        mic_eq["low_db"] = read_float(mic_eq_low_var, "EQ low", mic_eq.get("low_db", MIC_BOOST_EQ_PRESET_LOW_DB))
+        mic_eq["mid_db"] = read_float(mic_eq_mid_var, "EQ mid", mic_eq.get("mid_db", MIC_BOOST_EQ_PRESET_MID_DB))
+        mic_eq["high_db"] = read_float(mic_eq_high_var, "EQ high", mic_eq.get("high_db", MIC_BOOST_EQ_PRESET_HIGH_DB))
         mic_boost.pop("noise_gate", None)
 
         multi_track_audio = obs.setdefault("multi_track_audio", {})

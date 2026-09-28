@@ -146,6 +146,12 @@
             "voice_isolation": {
                 "enabled": false,
                 "method": "rnnoise"
+            },
+            "eq": {
+                "enabled": false,
+                "low_db": -4.0,
+                "mid_db": -1.0,
+                "high_db": 3.0
             }
         },
         "process_audio_capture_sync_offset_ms": -27,

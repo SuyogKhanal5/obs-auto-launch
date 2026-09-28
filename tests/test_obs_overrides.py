@@ -324,6 +324,21 @@ class ApplyMicBoostFromConfigTests(unittest.TestCase):
             voice_isolation.filter_settings["suppress_level"], a.MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB,
         )
 
+    def test_configured_eq_is_applied(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(
+            client,
+            {
+                "mic_boost": {
+                    "enabled": True, "input_name": "Scarlet", "boost_db": 24.0,
+                    "eq": {"enabled": True, "low_db": -6.0, "mid_db": 1.0, "high_db": 4.0},
+                },
+            },
+        )
+        eq = client.get_source_filter("Scarlet", a.MIC_BOOST_EQ_FILTER_NAME)
+        self.assertTrue(eq.filter_enabled)
+        self.assertEqual(eq.filter_settings, {"low": -6.0, "mid": 1.0, "high": 4.0})
+
     def test_missing_mic_boost_key_entirely_is_a_noop(self):
         client = self._client()
         a.apply_mic_boost_from_config(client, {})
@@ -344,7 +359,7 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         a.ensure_mic_boost_filter(client, "", 12.0)
         self.assertEqual(client.calls, [])
 
-    def test_creates_all_three_filters_on_a_fresh_source(self):
+    def test_creates_all_four_filters_on_a_fresh_source(self):
         client = self._client()
         a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
         filters = client.get_source_filter_list("Scarlet").filters
@@ -353,6 +368,7 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
             names,
             {
                 a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME: "noise_suppress_filter_v2",
+                a.MIC_BOOST_EQ_FILTER_NAME: "basic_eq_filter",
                 a.MIC_BOOST_COMPRESSOR_FILTER_NAME: "compressor_filter",
                 a.MIC_BOOST_LIMITER_FILTER_NAME: "limiter_filter",
             },
@@ -361,11 +377,43 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         self.assertEqual(compressor.filter_settings["output_gain"], 12.0)
         limiter = client.get_source_filter("Scarlet", a.MIC_BOOST_LIMITER_FILTER_NAME)
         self.assertEqual(limiter.filter_settings["threshold"], -1.0)
-        # Not enabled unless explicitly opted into -- voice_isolation_enabled defaults to False,
-        # same as the noise gate it replaced never enabled itself just by existing.
+        # Not enabled unless explicitly opted into -- voice_isolation_enabled/eq_enabled default
+        # to False, same as the noise gate they replaced never enabled itself just by existing.
         voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
         self.assertFalse(voice_isolation.filter_enabled)
         self.assertEqual(voice_isolation.filter_settings["method"], "rnnoise")
+        eq = client.get_source_filter("Scarlet", a.MIC_BOOST_EQ_FILTER_NAME)
+        self.assertFalse(eq.filter_enabled)
+        self.assertEqual(
+            eq.filter_settings,
+            {"low": a.MIC_BOOST_EQ_PRESET_LOW_DB, "mid": a.MIC_BOOST_EQ_PRESET_MID_DB, "high": a.MIC_BOOST_EQ_PRESET_HIGH_DB},
+        )
+        # EQ sits between Voice Isolation and the Compressor.
+        ordered_names = [f.filter_name for f in filters]
+        self.assertEqual(
+            ordered_names,
+            [
+                a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, a.MIC_BOOST_EQ_FILTER_NAME,
+                a.MIC_BOOST_COMPRESSOR_FILTER_NAME, a.MIC_BOOST_LIMITER_FILTER_NAME,
+            ],
+        )
+
+    def test_eq_enabled_with_custom_values(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, eq_enabled=True, eq_low_db=-6.0, eq_mid_db=0.0, eq_high_db=5.0)
+        eq = client.get_source_filter("Scarlet", a.MIC_BOOST_EQ_FILTER_NAME)
+        self.assertTrue(eq.filter_enabled)
+        self.assertEqual(eq.filter_settings, {"low": -6.0, "mid": 0.0, "high": 5.0})
+
+    def test_eq_toggle_and_value_changes_do_not_recreate(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, eq_enabled=True)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, eq_enabled=False, eq_low_db=-8.0)
+        self.assertEqual([c for c in client.calls if c[0] == "create_source_filter"], [])
+        eq = client.get_source_filter("Scarlet", a.MIC_BOOST_EQ_FILTER_NAME)
+        self.assertFalse(eq.filter_enabled)
+        self.assertEqual(eq.filter_settings["low"], -8.0)
 
     def test_legacy_noise_gate_is_removed_if_present(self):
         # Simulates a source left over from before this app switched from a Noise Gate to voice
@@ -398,7 +446,10 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         create_calls = [c for c in client.calls if c[0] == "create_source_filter"]
         self.assertEqual(
             [c[2] for c in create_calls],
-            [a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, a.MIC_BOOST_COMPRESSOR_FILTER_NAME, a.MIC_BOOST_LIMITER_FILTER_NAME],
+            [
+                a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, a.MIC_BOOST_EQ_FILTER_NAME,
+                a.MIC_BOOST_COMPRESSOR_FILTER_NAME, a.MIC_BOOST_LIMITER_FILTER_NAME,
+            ],
         )
 
     def test_already_matching_settings_are_not_rewritten(self):
