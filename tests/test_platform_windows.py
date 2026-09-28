@@ -300,16 +300,53 @@ class VkCodeForKeyTests(unittest.TestCase):
         self.assertIsNone(pw.vk_code_for_key(None))
 
 
-class ModFlagsForTests(unittest.TestCase):
-    def test_combines_flags(self):
-        self.assertEqual(pw.mod_flags_for(["ctrl", "alt"]), pw.MOD_CONTROL | pw.MOD_ALT)
+class HeldModifierNamesTests(unittest.TestCase):
+    def test_no_keys_down_is_empty(self):
+        self.assertEqual(pw.held_modifier_names(lambda vk: False), set())
 
-    def test_empty_or_none_is_zero(self):
-        self.assertEqual(pw.mod_flags_for([]), 0)
-        self.assertEqual(pw.mod_flags_for(None), 0)
+    def test_ctrl_down_reports_ctrl(self):
+        self.assertEqual(pw.held_modifier_names(lambda vk: vk == pw.VK_CONTROL), {"ctrl"})
 
-    def test_unknown_modifier_is_ignored(self):
-        self.assertEqual(pw.mod_flags_for(["ctrl", "bogus"]), pw.MOD_CONTROL)
+    def test_either_win_key_reports_win(self):
+        self.assertEqual(pw.held_modifier_names(lambda vk: vk == pw.VK_RWIN), {"win"})
+
+    def test_multiple_modifiers_all_reported(self):
+        down = {pw.VK_CONTROL, pw.VK_SHIFT}
+        self.assertEqual(pw.held_modifier_names(lambda vk: vk in down), {"ctrl", "shift"})
+
+
+class FindMatchingCustomKeybindTests(unittest.TestCase):
+    def test_no_binding_for_this_key_is_none(self):
+        result = pw.find_matching_custom_keybind(0x41, lambda vk: False, {})
+        self.assertIsNone(result)
+
+    def test_exact_modifier_match_returns_the_binding(self):
+        binding = {"action": "add_marker"}
+        bindings_by_vk = {0x72: [(frozenset({"ctrl"}), binding)]}  # VK_F3
+        result = pw.find_matching_custom_keybind(0x72, lambda vk: vk == pw.VK_CONTROL, bindings_by_vk)
+        self.assertIs(result, binding)
+
+    def test_extra_held_modifier_does_not_match(self):
+        # Ctrl+Shift+F3 must NOT also trigger a plain Ctrl+F3 binding -- same exact-match
+        # semantics RegisterHotKey itself always had.
+        binding = {"action": "add_marker"}
+        bindings_by_vk = {0x72: [(frozenset({"ctrl"}), binding)]}
+        down = {pw.VK_CONTROL, pw.VK_SHIFT}
+        result = pw.find_matching_custom_keybind(0x72, lambda vk: vk in down, bindings_by_vk)
+        self.assertIsNone(result)
+
+    def test_missing_required_modifier_does_not_match(self):
+        binding = {"action": "add_marker"}
+        bindings_by_vk = {0x72: [(frozenset({"ctrl"}), binding)]}
+        result = pw.find_matching_custom_keybind(0x72, lambda vk: False, bindings_by_vk)
+        self.assertIsNone(result)
+
+    def test_multiple_bindings_on_the_same_key_pick_the_matching_one(self):
+        ctrl_binding = {"action": "add_marker"}
+        alt_binding = {"action": "split_record_file"}
+        bindings_by_vk = {0x72: [(frozenset({"ctrl"}), ctrl_binding), (frozenset({"alt"}), alt_binding)]}
+        result = pw.find_matching_custom_keybind(0x72, lambda vk: vk == pw.VK_MENU, bindings_by_vk)
+        self.assertIs(result, alt_binding)
 
 
 class IsSpaceBarToggleEventTests(unittest.TestCase):
@@ -347,88 +384,156 @@ class IsSpaceBarToggleEventTests(unittest.TestCase):
         ))
 
 
-@unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hotkey API")
-class RunCustomKeybindListenerRegistrationRetryTests(unittest.TestCase):
-    # A self-restart doesn't guarantee the previous process's hotkey registrations are released
-    # by the time this thread starts -- confirmed live as a real bug: a keybind that lost this
-    # race on one restart stayed dead for the rest of that session with only one WARNING logged.
+@unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hook API")
+class RunCustomKeybindListenerTests(unittest.TestCase):
+    # Switched from RegisterHotKey to a global WH_KEYBOARD_LL hook after a real user report: Ctrl+F3
+    # ("Add Marker") never fired even once across many League of Legends sessions, while it worked
+    # fine in every other game -- a fullscreen-exclusive game can suppress WM_HOTKEY delivery to
+    # every other process system-wide, but a low-level keyboard hook (the same mechanism the clip
+    # editor's own space bar listener already relies on) taps the input stream at a lower level and
+    # isn't subject to that. See run_custom_keybind_listener's own docstring for the full story.
     def setUp(self):
         self.mock_user32 = unittest.mock.Mock()
-        self.mock_user32.GetMessageW.return_value = 0  # exit the message loop immediately
+        self.mock_user32.SetWindowsHookExW.return_value = 777  # a fake, truthy hook handle
+        self.mock_user32.PeekMessageW.return_value = 0  # no messages waiting
+        self.mock_user32.GetMessageW.return_value = 0  # exit the (unused-by-default) old loop
+        self.mock_user32.CallNextHookEx.return_value = 0
+        self.mock_user32.GetAsyncKeyState.return_value = 0  # nothing held by default
         self.bindings = [{"enabled": True, "action": "add_marker", "modifiers": ["ctrl"], "key": "F3"}]
         self.fire_keybind = unittest.mock.Mock()
         self.describe_keybind = unittest.mock.Mock(return_value="Ctrl+F3")
         self.notify = unittest.mock.Mock()
-        self.patchers = [
-            unittest.mock.patch.object(pw.ctypes.windll, "user32", self.mock_user32),
-            unittest.mock.patch.object(pw.time, "sleep"),
-        ]
-        for p in self.patchers:
-            p.start()
-            self.addCleanup(p.stop)
+        self.patcher = unittest.mock.patch.object(pw.ctypes.windll, "user32", self.mock_user32)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
 
-    def test_retries_and_succeeds_after_transient_failures(self):
-        self.mock_user32.RegisterHotKey.side_effect = [False, False, True]
+    def _callback(self):
+        return self.mock_user32.SetWindowsHookExW.call_args[0][1]
+
+    def test_no_enabled_bindings_installs_nothing(self):
         pw.run_custom_keybind_listener(
-            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            [{"enabled": False, "action": "add_marker", "modifiers": ["ctrl"], "key": "F3"}],
+            lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
         )
-        self.assertEqual(self.mock_user32.RegisterHotKey.call_count, 3)
+        self.mock_user32.SetWindowsHookExW.assert_not_called()
 
-    def test_gives_up_after_max_retries_and_notifies(self):
-        self.mock_user32.RegisterHotKey.return_value = False
+    def test_invalid_key_is_skipped_but_others_still_install(self):
+        bindings = [
+            {"enabled": True, "action": "add_marker", "modifiers": ["ctrl"], "key": "???"},
+            {"enabled": True, "action": "split_record_file", "modifiers": ["ctrl"], "key": "F4"},
+        ]
+        stop_event = threading.Event()
+        stop_event.set()
+        with self.assertLogs(level="WARNING"):
+            pw.run_custom_keybind_listener(
+                bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+                stop_event=stop_event,
+            )
+        self.mock_user32.SetWindowsHookExW.assert_called_once()
+
+    def test_install_failure_logs_and_notifies_without_looping(self):
+        self.mock_user32.SetWindowsHookExW.return_value = 0
         icon = unittest.mock.Mock()
         with self.assertLogs(level="WARNING"):
             pw.run_custom_keybind_listener(
                 self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
                 icon=icon, notifications_config={"enabled": True},
             )
-        self.assertEqual(self.mock_user32.RegisterHotKey.call_count, 30)
+        self.mock_user32.PeekMessageW.assert_not_called()
+        self.mock_user32.UnhookWindowsHookEx.assert_not_called()
         self.notify.assert_called_once()
 
+    def test_matching_keydown_fires_the_binding(self):
+        stop_event = threading.Event()
+        stop_event.set()  # exits the message loop immediately; only installing the hook matters
+        pw.run_custom_keybind_listener(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.GetAsyncKeyState.side_effect = (
+            lambda vk: -32768 if vk == pw.VK_CONTROL else 0  # high bit set == held
+        )
+        info = pw.KBDLLHOOKSTRUCT(vkCode=0x72)  # VK_F3
+        self._callback()(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
 
-@unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hotkey API")
-class RunCustomKeybindListenerStopEventTests(unittest.TestCase):
-    # A graceful shutdown (Settings-save restart, or Quit) should release this process's own
-    # hotkeys near-instantly via stop_event, rather than only whenever Windows notices the whole
-    # process has died -- confirmed live that the latter can take longer than even a generous
-    # retry budget on the NEW process's side, permanently losing the "Add Marker" keybind for the
-    # rest of that session. See run_custom_keybind_listener's own docstring for the full story.
-    def setUp(self):
-        self.mock_user32 = unittest.mock.Mock()
-        self.mock_user32.RegisterHotKey.return_value = True
-        self.bindings = [{"enabled": True, "action": "add_marker", "modifiers": ["ctrl"], "key": "F3"}]
-        self.fire_keybind = unittest.mock.Mock()
-        self.describe_keybind = unittest.mock.Mock(return_value="Ctrl+F3")
-        self.notify = unittest.mock.Mock()
-        self.patchers = [
-            unittest.mock.patch.object(pw.ctypes.windll, "user32", self.mock_user32),
-            unittest.mock.patch.object(pw.time, "sleep"),
-        ]
-        for p in self.patchers:
-            p.start()
-            self.addCleanup(p.stop)
+        self.fire_keybind.assert_called_once()
+        fired_binding = self.fire_keybind.call_args[0][0]
+        self.assertEqual(fired_binding["action"], "add_marker")
 
-    def test_already_set_stop_event_exits_without_blocking_on_getmessage(self):
+    def test_wrong_modifier_does_not_fire(self):
         stop_event = threading.Event()
         stop_event.set()
         pw.run_custom_keybind_listener(
             self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
             stop_event=stop_event,
         )
-        self.mock_user32.GetMessageW.assert_not_called()
-        self.mock_user32.PeekMessageW.assert_not_called()
+        self.mock_user32.GetAsyncKeyState.return_value = 0  # nothing held -- Ctrl missing
+        info = pw.KBDLLHOOKSTRUCT(vkCode=0x72)
+        self._callback()(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
+        self.fire_keybind.assert_not_called()
 
-    def test_stop_event_release_unregisters_the_hotkey(self):
+    def test_held_key_auto_repeat_only_fires_once(self):
         stop_event = threading.Event()
         stop_event.set()
         pw.run_custom_keybind_listener(
             self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
             stop_event=stop_event,
         )
-        self.mock_user32.UnregisterHotKey.assert_called_once_with(None, 1)
+        self.mock_user32.GetAsyncKeyState.side_effect = (
+            lambda vk: -32768 if vk == pw.VK_CONTROL else 0
+        )
+        callback = self._callback()
+        info = pw.KBDLLHOOKSTRUCT(vkCode=0x72)
+        callback(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
+        callback(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))  # OS auto-repeat, still held
+        callback(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
+        self.fire_keybind.assert_called_once()
+
+    def test_key_up_then_down_again_fires_twice(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw.run_custom_keybind_listener(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.GetAsyncKeyState.side_effect = (
+            lambda vk: -32768 if vk == pw.VK_CONTROL else 0
+        )
+        callback = self._callback()
+        info = pw.KBDLLHOOKSTRUCT(vkCode=0x72)
+        callback(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
+        callback(pw.HC_ACTION, pw.WM_KEYUP, ctypes.pointer(info))
+        callback(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
+        self.assertEqual(self.fire_keybind.call_count, 2)
+
+    def test_callback_exception_is_swallowed_and_still_calls_next_hook(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw.run_custom_keybind_listener(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        # A None lparam makes hook_proc's own "if n_code == HC_ACTION and lparam" guard false in a
+        # real callback, so instead this breaks find_matching_custom_keybind itself to exercise the
+        # top-level try/except around the callback body (fire_keybind runs on its own daemon
+        # thread, so an exception there could never reach this callback to test that path).
+        with unittest.mock.patch.object(pw, "find_matching_custom_keybind", side_effect=RuntimeError("boom")):
+            info = pw.KBDLLHOOKSTRUCT(vkCode=0x72)
+            with self.assertLogs(level="ERROR"):
+                result = self._callback()(pw.HC_ACTION, pw.WM_KEYDOWN, ctypes.pointer(info))
+        self.mock_user32.CallNextHookEx.assert_called_once()
+        self.assertEqual(result, 0)
+
+    def test_stop_event_unhooks_on_exit(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw.run_custom_keybind_listener(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.UnhookWindowsHookEx.assert_called_once_with(777)
 
     def test_no_stop_event_still_uses_the_old_blocking_getmessage_loop(self):
-        self.mock_user32.GetMessageW.return_value = 0
         pw.run_custom_keybind_listener(
             self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
         )

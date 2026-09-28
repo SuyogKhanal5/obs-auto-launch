@@ -183,21 +183,45 @@ def get_window_titles():
     return titles
 
 
-# --- Global hotkeys (Win32 RegisterHotKey) ---
+# --- Global hotkeys (WH_KEYBOARD_LL low-level hook) ---
 # Moved wholesale from autostart_script.py's old run_custom_keybind_listener (see
 # CROSS_PLATFORM_PLAN.md Phase 3) -- fire_keybind/describe_keybind/notify are now passed in as
 # parameters rather than referencing autostart_script.py's module-level names directly, so this
 # module never depends on it (the dependency only ever goes the other way -- see
-# platform_common.py's own docstring). MOD_NOREPEAT (added to every registration below) keeps a
-# held-down key from re-firing the action on every auto-repeat tick, which would otherwise queue
-# up a burst of duplicate split/mute/etc. calls.
-MOD_ALT = 0x0001
-MOD_CONTROL = 0x0002
-MOD_SHIFT = 0x0004
-MOD_WIN = 0x0008
-MOD_NOREPEAT = 0x4000
-WM_HOTKEY = 0x0312
-_CUSTOM_KEYBIND_MODIFIER_FLAGS = {"ctrl": MOD_CONTROL, "alt": MOD_ALT, "shift": MOD_SHIFT, "win": MOD_WIN}
+# platform_common.py's own docstring).
+#
+# Originally built on RegisterHotKey/WM_HOTKEY. Switched to the same global WH_KEYBOARD_LL hook
+# the clip editor's own space bar listener already uses (see that section below) after a real user
+# report: "Add Marker" (Ctrl+F3) never fired even once across many League of Legends sessions,
+# while it worked reliably in every other game (Balatro, REPO) -- confirmed from the app's own log
+# history, not a one-off. The signature (a registered-successfully hotkey that then never delivers
+# a single WM_HOTKEY, with literally nothing logged on each press -- not even this app's own "OBS
+# is not connected" fallback) matches a known Windows behavior: a game holding true fullscreen
+# EXCLUSIVE mode can suppress WM_HOTKEY delivery to every other process system-wide, independent of
+# whether the hotkey itself registered fine beforehand. A WH_KEYBOARD_LL hook taps the raw input
+# stream at a lower level than the window-message-queue-based WM_HOTKEY mechanism -- the same
+# mechanism OBS's own global hotkeys and most third-party macro/overlay tools rely on specifically
+# because it keeps working over exclusive fullscreen games where RegisterHotKey does not.
+#
+# This also changes the restart-race story entirely: RegisterHotKey is a single, exclusive,
+# system-wide resource per (modifiers, key) combination, so a self-restarted process could
+# genuinely lose a race against the still-terminating previous process's registration (see the old
+# 30-attempt retry loop this replaced). A low-level hook has no such exclusivity -- any number of
+# processes can each install their own, and Windows chains them all together for every keystroke --
+# so there is nothing to race for and nothing to retry.
+WM_KEYUP = 0x0101
+WM_SYSKEYUP = 0x0105
+VK_CONTROL = 0x11
+VK_SHIFT = 0x10
+VK_MENU = 0x12  # Alt
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+# Each modifier name (the vocabulary CUSTOM_KEYBIND_MODIFIER_OPTIONS/a binding's own "modifiers"
+# list already uses) maps to every VK code that counts as that modifier -- Win has a left AND right
+# key, so it's the only one with more than one.
+_CUSTOM_KEYBIND_MODIFIER_VKS = {
+    "ctrl": (VK_CONTROL,), "alt": (VK_MENU,), "shift": (VK_SHIFT,), "win": (VK_LWIN, VK_RWIN),
+}
 
 
 def vk_code_for_key(key):
@@ -212,111 +236,149 @@ def vk_code_for_key(key):
     return None
 
 
-def mod_flags_for(modifiers):
-    flags = 0
-    for m in modifiers or []:
-        flags |= _CUSTOM_KEYBIND_MODIFIER_FLAGS.get(m, 0)
-    return flags
+def held_modifier_names(is_key_down):
+    """is_key_down(vk_code) -> bool (real callers pass a GetAsyncKeyState-backed check). Returns
+    the set of modifier names (the same "ctrl"/"alt"/"shift"/"win" vocabulary a binding's own
+    "modifiers" list uses) currently held down. Pure and hook-free on purpose, same reasoning as
+    is_space_bar_toggle_event below, so the exact-match logic in find_matching_custom_keybind is
+    fully unit-testable without a real OS hook or real key state."""
+    return {name for name, vks in _CUSTOM_KEYBIND_MODIFIER_VKS.items() if any(is_key_down(vk) for vk in vks)}
+
+
+def find_matching_custom_keybind(vk_code, is_key_down, bindings_by_vk):
+    """bindings_by_vk: {vk_code: [(frozenset(modifier names), binding), ...]}, as built by
+    run_custom_keybind_listener. Returns the one binding whose modifiers EXACTLY match what's
+    currently held (same semantics RegisterHotKey itself always had -- e.g. Ctrl+Shift+F3 must
+    NOT also trigger a plain Ctrl+F3 binding), or None if nothing matches vk_code at all, or none
+    of its candidates' modifier sets match exactly."""
+    candidates = bindings_by_vk.get(vk_code)
+    if not candidates:
+        return None
+    current = held_modifier_names(is_key_down)
+    for mods, binding in candidates:
+        if mods == current:
+            return binding
+    return None
 
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
     icon=None, notifications_config=None, status=None, stop_event=None,
 ):
-    """Runs for its whole lifetime on one dedicated daemon thread: RegisterHotKey (and the
-    WM_HOTKEY messages it produces) has thread affinity, so every binding must be registered from
-    -- and received on -- the same thread. Passing hwnd=None posts WM_HOTKEY straight to this
-    thread's message queue instead of routing through a window, so no hidden window is needed.
+    """Runs for its whole lifetime on one dedicated daemon thread, same shape as
+    run_clip_editor_space_bar_listener below (see that function's own docstring for the full
+    SetWindowsHookExW/thread-affinity/message-loop rationale, and for why the ctypes callback
+    trampoline must stay referenced for the hook's entire lifetime) -- this installs ONE global
+    WH_KEYBOARD_LL hook covering every configured binding, rather than one OS-level registration
+    per binding the way RegisterHotKey needed.
+
+    Held-key de-duplication: a low-level hook keeps delivering WM_KEYDOWN on every OS auto-repeat
+    tick for as long as a key stays held, unlike RegisterHotKey's own MOD_NOREPEAT flag -- without
+    tracking which vk codes are already "down" (via the `held` set below, cleared on the matching
+    WM_KEYUP/WM_SYSKEYUP), a key held a little too long would fire its action many times over
+    (adding a burst of duplicate markers, repeatedly toggling recording, etc.).
+
+    Exact modifier matching (see find_matching_custom_keybind) is checked at the moment of the
+    matched key's OWN keydown via GetAsyncKeyState, not by also hooking the modifier keys
+    themselves -- simpler, and sufficient since a hotkey is only ever evaluated on its own
+    non-modifier key's press.
 
     stop_event: a threading.Event -- same PeekMessageW-polling pattern as
-    run_clip_editor_space_bar_listener's own stop_event handling (see that function's own
-    docstring for the full rationale), used here so THIS process's own UnregisterHotKey cleanup
-    below actually runs within ~50ms of being asked to shut down, instead of only whenever Windows
-    gets around to noticing the whole process has died. That distinction matters a lot here
-    specifically: confirmed live (repeatedly, in real use) that a plain GetMessageW loop with no
-    stop_event -- relying solely on process-death cleanup -- left a self-restarted app's new
-    process racing the OLD one for the same hotkey, and the old process's real teardown time (VLC/
-    libvlc, Tk, pystray, etc. all still unwinding) was observed to exceed even a generous 15-second
-    retry budget on the NEW process's side. Proactively releasing here removes the race entirely
-    for any graceful shutdown (a Settings-save restart, or Quit); an actual crash/force-kill still
-    falls back to Windows' own process-death cleanup, same as before. Optional (defaults to None,
-    falling back to the old plain GetMessageW loop) only so a caller that genuinely has no
-    stop_event of its own doesn't crash -- every real caller in this app always provides one."""
-    user32 = ctypes.windll.user32
-    registered = []
-    for index, binding in enumerate(bindings):
+    run_clip_editor_space_bar_listener's own stop_event handling, so this thread notices a shutdown
+    request and unhooks within ~50ms rather than only whenever Windows notices the whole process
+    has died. Optional (defaults to None, falling back to the old plain GetMessageW loop) only so a
+    caller that genuinely has no stop_event of its own doesn't crash -- every real caller in this
+    app always provides one."""
+    bindings_by_vk = {}
+    for binding in bindings:
         if not binding.get("enabled", True):
             continue
         vk = vk_code_for_key(binding.get("key", ""))
         if vk is None:
             logging.warning("Custom keybind has an invalid key %r; skipping.", binding.get("key"))
             continue
-        mods = mod_flags_for(binding.get("modifiers")) | MOD_NOREPEAT
-        hotkey_id = index + 1
-        # A self-restart (e.g. after a Settings save) doesn't post WM_QUIT to this thread, so
-        # the previous process's hotkey registrations are only released by Windows noticing that
-        # process has actually terminated -- a brief, variable-length teardown window that can
-        # still be in progress by the time the new process gets here. Without retrying, losing
-        # that race silently and permanently disables the keybind for the rest of this session
-        # (confirmed live: an "Add Marker" keybind that lost this race never worked again until
-        # the next restart, with no further sign of it beyond one cold WARNING log line).
-        # 30 attempts at 0.5s (15s ceiling), not the 5x0.3s (1.5s) originally here: confirmed live,
-        # twice in the same real session, that 1.5s genuinely isn't enough -- a restart with a
-        # clip editor open (VLC/libvlc threads still unwinding) took noticeably longer than that
-        # for the old process to actually let go, and both times the keybind silently never came
-        # back until the NEXT restart happened to win the race instead. This only ever costs
-        # anything in that exact race (a plain first launch always succeeds on attempt 1, instantly).
-        registered_ok = False
-        for _attempt in range(30):
-            if user32.RegisterHotKey(None, hotkey_id, mods, vk):
-                registered_ok = True
-                break
-            time.sleep(0.5)
-        if registered_ok:
-            registered.append((hotkey_id, binding))
-            logging.info("Registered custom keybind %s -> %s", describe_keybind(binding), binding.get("action"))
-        else:
-            logging.warning(
-                "Could not register custom keybind %s (it may already be in use by another app).",
-                describe_keybind(binding),
-            )
-            notify(
-                icon, notifications_config, "Keybind not registered",
-                f"{describe_keybind(binding)} could not be registered -- it may already be in use by "
-                "another app. This keybind won't work until the app is restarted again.",
-            )
+        mods = frozenset(m for m in (binding.get("modifiers") or []) if m in _CUSTOM_KEYBIND_MODIFIER_VKS)
+        bindings_by_vk.setdefault(vk, []).append((mods, binding))
 
-    if not registered:
+    if not bindings_by_vk:
         return
 
-    by_id = dict(registered)
+    user32 = ctypes.windll.user32
+    user32.SetWindowsHookExW.restype = wintypes.HANDLE
+    user32.SetWindowsHookExW.argtypes = [ctypes.c_int, LowLevelKeyboardProc, wintypes.HINSTANCE, wintypes.DWORD]
+    user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+    user32.CallNextHookEx.restype = ctypes.c_ssize_t
+    # c_void_p, not wintypes.LPARAM -- see run_clip_editor_space_bar_listener's own comment on the
+    # identical line below for why (the same ctypes gotcha applies here unchanged).
+    user32.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 
-    def dispatch(msg):
-        if msg.message == WM_HOTKEY:
-            binding = by_id.get(msg.wParam)
-            if binding:
-                threading.Thread(
-                    target=fire_keybind,
-                    args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
-                    daemon=True,
-                ).start()
-        user32.TranslateMessage(ctypes.byref(msg))
-        user32.DispatchMessageW(ctypes.byref(msg))
+    def is_key_down(vk):
+        return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+    held = set()
+
+    def hook_proc(n_code, wparam, lparam):
+        try:
+            if n_code == HC_ACTION and lparam:
+                info = lparam.contents
+                vk = info.vkCode
+                if wparam in (WM_KEYUP, WM_SYSKEYUP):
+                    held.discard(vk)
+                elif wparam in (WM_KEYDOWN, WM_SYSKEYDOWN) and vk not in held:
+                    held.add(vk)
+                    binding = find_matching_custom_keybind(vk, is_key_down, bindings_by_vk)
+                    if binding:
+                        threading.Thread(
+                            target=fire_keybind,
+                            args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                            daemon=True,
+                        ).start()
+        except Exception:
+            logging.exception("Custom keybind hook callback failed.")
+        try:
+            return user32.CallNextHookEx(None, n_code, wparam, lparam)
+        except Exception:
+            logging.exception("Custom keybind hook's CallNextHookEx call failed.")
+            return 0
+
+    # Kept referenced for the hook's entire lifetime (this function's own stack frame) -- see
+    # run_clip_editor_space_bar_listener's own comment on why an unreferenced trampoline crashes.
+    callback = LowLevelKeyboardProc(hook_proc)
+    hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, callback, None, 0)
+    if not hook_handle:
+        logging.warning(
+            "Could not install the custom-keybind hook (error %s) -- custom keybinds won't work "
+            "this session.", ctypes.get_last_error(),
+        )
+        notify(
+            icon, notifications_config, "Keybinds not registered",
+            "Could not install the custom-keybind hook -- your configured keybinds won't work "
+            "until the app is restarted.",
+        )
+        return
+
+    for entries in bindings_by_vk.values():
+        for _mods, binding in entries:
+            logging.info("Registered custom keybind %s -> %s", describe_keybind(binding), binding.get("action"))
 
     msg = wintypes.MSG()
     try:
         if stop_event is None:
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-                dispatch(msg)
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
         else:
             while not stop_event.is_set():
                 if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):  # PM_REMOVE
-                    dispatch(msg)
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
                 else:
                     stop_event.wait(0.05)
     finally:
-        for hotkey_id, _ in registered:
-            user32.UnregisterHotKey(None, hotkey_id)
+        user32.UnhookWindowsHookEx(hook_handle)
 
 
 # --- Clip editor space bar play/pause (global low-level keyboard hook) ---

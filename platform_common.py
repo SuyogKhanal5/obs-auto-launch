@@ -191,17 +191,17 @@ def run_custom_keybind_listener(
 ):
     """Dispatches to this OS's own full custom-keybind listener implementation -- unlike most of
     this module's other functions, the entire mechanism (registration AND its event loop) differs
-    enough per OS (RegisterHotKey/GetMessageW vs. XGrabKey/XNextEvent vs. a CGEventTap/CFRunLoop)
-    that each backend owns its whole implementation rather than sharing one generic shape here;
-    see CROSS_PLATFORM_PLAN.md Phase 3. fire_keybind/describe_keybind/notify are passed through
-    rather than imported by the backend modules themselves, so backends never depend on
-    autostart_script.py (the dependency only ever goes the other way -- see this module's own
-    docstring).
+    enough per OS (a global WH_KEYBOARD_LL hook on Windows vs. XGrabKey/XNextEvent vs. a
+    CGEventTap/CFRunLoop) that each backend owns its whole implementation rather than sharing one
+    generic shape here; see CROSS_PLATFORM_PLAN.md Phase 3. fire_keybind/describe_keybind/notify
+    are passed through rather than imported by the backend modules themselves, so backends never
+    depend on autostart_script.py (the dependency only ever goes the other way -- see this
+    module's own docstring).
 
     stop_event: only platform_windows.py's own backend currently uses this (see its docstring for
-    why -- a confirmed-live restart race that a plain process-death-triggered cleanup couldn't
-    reliably win). Every backend accepts it regardless, so this dispatcher's own call shape stays
-    identical across all 3 OSes."""
+    why -- releasing its hook near-instantly on a graceful shutdown, rather than only whenever
+    Windows notices the whole process has died). Every backend accepts it regardless, so this
+    dispatcher's own call shape stays identical across all 3 OSes."""
     return _select_backend(platform_name).run_custom_keybind_listener(
         bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
         icon=icon, notifications_config=notifications_config, status=status, stop_event=stop_event,
