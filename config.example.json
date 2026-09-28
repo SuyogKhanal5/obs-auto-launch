@@ -144,7 +144,8 @@
             "input_name": "",
             "boost_db": 0.0,
             "voice_isolation": {
-                "enabled": false
+                "enabled": false,
+                "method": "rnnoise"
             }
         },
         "process_audio_capture_sync_offset_ms": -27,

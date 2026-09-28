@@ -256,6 +256,19 @@ class PredictMicBoostOutputMulTests(unittest.TestCase):
         self.assertLessEqual(result, 1.0)
 
 
+class MicBoostVoiceIsolationSettingsTests(unittest.TestCase):
+    def test_rnnoise_has_no_other_settings(self):
+        self.assertEqual(a.mic_boost_voice_isolation_settings("rnnoise"), {"method": "rnnoise"})
+
+    def test_speex_includes_the_apps_own_lighter_suppress_level(self):
+        settings = a.mic_boost_voice_isolation_settings("speex")
+        self.assertEqual(settings["method"], "speex")
+        self.assertEqual(settings["suppress_level"], a.MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB)
+
+    def test_unknown_method_falls_back_to_rnnoise(self):
+        self.assertEqual(a.mic_boost_voice_isolation_settings("bogus"), {"method": "rnnoise"})
+
+
 class ApplyMicBoostFromConfigTests(unittest.TestCase):
     def _client(self):
         a._legacy_noise_gate_checked_inputs.clear()  # see EnsureMicBoostFilterTests._client
@@ -293,6 +306,23 @@ class ApplyMicBoostFromConfigTests(unittest.TestCase):
         voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
         self.assertTrue(voice_isolation.filter_enabled)
         self.assertEqual(voice_isolation.filter_settings["method"], "rnnoise")
+
+    def test_configured_method_is_applied(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(
+            client,
+            {
+                "mic_boost": {
+                    "enabled": True, "input_name": "Scarlet", "boost_db": 24.0,
+                    "voice_isolation": {"enabled": True, "method": "speex"},
+                },
+            },
+        )
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertEqual(voice_isolation.filter_settings["method"], "speex")
+        self.assertEqual(
+            voice_isolation.filter_settings["suppress_level"], a.MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB,
+        )
 
     def test_missing_mic_boost_key_entirely_is_a_noop(self):
         client = self._client()
@@ -438,6 +468,18 @@ class EnsureMicBoostFilterTests(unittest.TestCase):
         client.calls.clear()
         a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
         self.assertEqual(client.calls, [])
+
+    def test_switching_method_updates_settings_without_recreating(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True, voice_isolation_method="rnnoise")
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True, voice_isolation_method="speex")
+        self.assertEqual([c for c in client.calls if c[0] == "create_source_filter"], [])  # never recreated
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertEqual(voice_isolation.filter_settings["method"], "speex")
+        self.assertEqual(
+            voice_isolation.filter_settings["suppress_level"], a.MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB,
+        )
 
 
 class GetReplayBufferModeTests(unittest.TestCase):

@@ -946,17 +946,44 @@ _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME = "OBS Auto Recorder - Mic Boost Noise 
 # Input names ensure_mic_boost_filter has already checked (and cleaned up if needed) for that
 # legacy filter, this app run -- see the check itself for why this only ever needs to happen once.
 _legacy_noise_gate_checked_inputs = set()
-# OBS's own real "Noise Suppression" filter kind (confirmed live via GetSourceFilterKindList),
-# using its RNNoise method -- a small neural network trained specifically to separate voice from
-# background noise, continuously and adaptively, rather than a Noise Gate's simple hard on/off
-# threshold (replaced here: a gate either passes the WHOLE signal or mutes it outright based on a
-# single per-room threshold that needs re-calibrating whenever the environment changes, and still
-# lets through any noise loud enough to sit above that threshold alongside real speech). RNNoise
-# needs no threshold or calibration at all, and -- unlike OBS's other noise-suppression method
-# (NVIDIA's "nvafx", which needs an NVIDIA GPU and the separate NVIDIA Broadcast runtime) -- runs
-# on any machine, which matters on this branch specifically. No other settings: OBS's own UI shows
-# nothing else to tune for this method either.
-MIC_BOOST_VOICE_ISOLATION_SETTINGS = {"method": "rnnoise"}
+# OBS's own real "Noise Suppression" filter kind (confirmed live via GetSourceFilterKindList) --
+# replaces the old Noise Gate's simple hard on/off threshold (a gate either passes the WHOLE
+# signal or mutes it outright based on a single per-room threshold that needs re-calibrating
+# whenever the environment changes, and still lets through any noise loud enough to sit above that
+# threshold alongside real speech) with continuous suppression instead, needing no threshold or
+# per-room calibration at all.
+#
+# Two selectable methods, both CPU-only (OBS's third method, NVIDIA's "nvafx", needs an NVIDIA GPU
+# and the separate NVIDIA Broadcast runtime, so it's not offered here at all):
+# - "rnnoise": a small neural network, OBS's own default. Removes more noise, but confirmed live
+#   via a real user report to make voice sound noticeably muffled/processed on at least some
+#   mics -- a known, commonly-reported RNNoise characteristic, not a bug, and one it has no
+#   tunable knob for (OBS's own UI shows no other setting for this method either).
+# - "speex": the classic, older algorithm. Removes less noise, but is generally lighter-touch on
+#   voice clarity -- suppress_level (how aggressively it suppresses, in dB) IS tunable for this
+#   one; MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB is deliberately less aggressive than
+#   OBS's own default (-30dB) specifically to favor clarity over maximum noise removal, matching
+#   what was confirmed live to sound better on that same real report.
+MIC_BOOST_VOICE_ISOLATION_METHODS = ("rnnoise", "speex")
+DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD = "rnnoise"
+MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB = -15
+MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS = {
+    "rnnoise": "RNNoise (stronger noise removal, can sound muffled)",
+    "speex": "Speex (lighter touch, clearer voice, less noise removed)",
+}
+MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS_BY_LABEL = {v: k for k, v in MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS.items()}
+
+
+def mic_boost_voice_isolation_settings(method):
+    """Builds the real OBS filter settings dict for the given voice-isolation method -- rnnoise
+    takes no other settings, speex additionally needs its own suppress_level (see
+    MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB for why this app picks a specific, less
+    aggressive value rather than leaving OBS's own harsher default in place). Falls back to
+    rnnoise for anything unrecognized (e.g. a config hand-edited with a typo), same as this app's
+    established rule for a bad/unknown config value elsewhere."""
+    if method == "speex":
+        return {"method": "speex", "suppress_level": MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB}
+    return {"method": "rnnoise"}
 # Fixed compressor shape -- only output_gain (the user's own configured boost_db) varies.
 # Threshold sits comfortably below a genuinely quiet mic's own peaks (confirmed live against a
 # real recording: -25dBFS peaks on a source averaging -67dBFS) so compression actually engages on
@@ -1097,6 +1124,7 @@ def _ensure_obs_filter_settings(client, input_name, filter_name, filter_kind, se
 
 def ensure_mic_boost_filter(
     client, input_name, boost_db, voice_isolation_enabled=False,
+    voice_isolation_method=DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD,
 ):
     """Applies OBS Auto Recorder's mic-boost filter chain directly to input_name -- live, at OBS's
     own audio pipeline, so every FUTURE recording captures this source boosted from the start.
@@ -1118,8 +1146,10 @@ def ensure_mic_boost_filter(
     -- see _ensure_obs_filter_settings), this filter's own OBS-side enabled state is actively kept
     in sync on every call, since "toggleable" is the whole point of exposing it as its own
     Settings checkbox -- a user flipping it needs that to actually take effect, not just influence
-    whether the filter gets created in the first place. Its settings are otherwise fixed (RNNoise
-    has no threshold or other tunable to keep in sync, unlike the noise gate this replaced).
+    whether the filter gets created in the first place. voice_isolation_method (see
+    mic_boost_voice_isolation_settings) is likewise kept in sync via the same
+    _ensure_obs_filter_settings drift check every other filter here already uses, so switching
+    methods in Settings takes effect on the next apply without needing to delete/recreate anything.
 
     Idempotent and safe to call on every OBS-ready check: only writes a settings/enabled update
     when something has actually drifted from what's configured here, so this never resets the
@@ -1158,7 +1188,7 @@ def ensure_mic_boost_filter(
 
     voice_isolation, just_created = _ensure_obs_filter_settings(
         client, input_name, MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, "noise_suppress_filter_v2",
-        MIC_BOOST_VOICE_ISOLATION_SETTINGS,
+        mic_boost_voice_isolation_settings(voice_isolation_method),
     )
     if voice_isolation is not None:
         if just_created:
@@ -1198,6 +1228,7 @@ def apply_mic_boost_from_config(client, obs_config):
     ensure_mic_boost_filter(
         client, mic_boost_config["input_name"], mic_boost_config.get("boost_db", 0.0),
         voice_isolation_enabled=voice_isolation_config.get("enabled", False),
+        voice_isolation_method=voice_isolation_config.get("method", DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD),
     )
 
 
@@ -6193,15 +6224,33 @@ def _run_config_editor(master_root, restart_callback, on_close):
         mic_voice_isolation_enabled_var,
     )
     row += 1
+    configured_voice_isolation_method = mic_voice_isolation_config.get("method", DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD)
+    if configured_voice_isolation_method not in MIC_BOOST_VOICE_ISOLATION_METHODS:
+        configured_voice_isolation_method = DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD
+    mic_voice_isolation_method_var = tk.StringVar(
+        value=MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS[configured_voice_isolation_method]
+    )
+    tk.Label(obs_tab, text="Voice isolation method", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        obs_tab, textvariable=mic_voice_isolation_method_var,
+        values=list(MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS.values()),
+        state="readonly", width=46, style="Settings.TCombobox",
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
     tk.Label(
         obs_tab,
         text=(
-            "    Runs OBS's own RNNoise noise suppression (a small neural network trained to "
-            "separate voice from background noise) on the RAW signal before the boost above "
-            "amplifies whatever's left -- placed first in the chain regardless of when it was "
-            "added. Unlike a noise gate, it continuously reduces noise instead of hard-muting "
-            "below a threshold, so there's no per-room calibration to keep up to date. Freely "
-            "toggleable here -- unchecking it disables the filter in OBS rather than removing it."
+            "    Runs on the RAW signal before the boost above amplifies whatever's left -- "
+            "placed first in the chain regardless of when it was added. Unlike a noise gate, both "
+            "methods continuously reduce noise instead of hard-muting below a threshold, so "
+            "there's no per-room calibration to keep up to date. RNNoise (a small neural network) "
+            "removes more noise but can sound muffled/processed on some mics; Speex (the older, "
+            "classic algorithm) removes less but is generally lighter-touch on voice clarity -- "
+            "worth trying both on your own mic and picking whichever sounds better. Freely "
+            "toggleable/switchable here -- unchecking it disables the filter in OBS rather than "
+            "removing it."
         ),
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
@@ -7055,6 +7104,9 @@ def _run_config_editor(master_root, restart_callback, on_close):
             errors.append("\"Microphone input source name\" is required when Microphone Boost is enabled")
         mic_voice_isolation = mic_boost.setdefault("voice_isolation", {})
         mic_voice_isolation["enabled"] = mic_voice_isolation_enabled_var.get()
+        mic_voice_isolation["method"] = MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS_BY_LABEL.get(
+            mic_voice_isolation_method_var.get(), DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD,
+        )
         mic_boost.pop("noise_gate", None)
 
         multi_track_audio = obs.setdefault("multi_track_audio", {})
