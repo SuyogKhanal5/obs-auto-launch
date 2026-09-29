@@ -183,38 +183,41 @@ def get_window_titles():
     return titles
 
 
-# --- Global hotkeys (two selectable mechanisms) ---
+# --- Global hotkeys (three selectable mechanisms) ---
 # Moved wholesale from autostart_script.py's old run_custom_keybind_listener (see
 # CROSS_PLATFORM_PLAN.md Phase 3) -- fire_keybind/describe_keybind/notify are now passed in as
 # parameters rather than referencing autostart_script.py's module-level names directly, so this
 # module never depends on it (the dependency only ever goes the other way -- see
 # platform_common.py's own docstring).
 #
-# Originally built on RegisterHotKey/WM_HOTKEY alone. A WH_KEYBOARD_LL global low-level hook (the
-# same mechanism the clip editor's own space bar listener uses) was added as a SELECTABLE
-# alternative after a real user report: "Add Marker" (Ctrl+F3) never fired even once across many
-# League of Legends sessions, while it worked reliably in every other game (Balatro, REPO) --
-# confirmed from the app's own log history, not a one-off. The signature (a registered-
-# successfully hotkey that then never delivers a single WM_HOTKEY, with literally nothing logged
-# on each press -- not even this app's own "OBS is not connected" fallback) matches a known
-# Windows behavior: a game holding true fullscreen EXCLUSIVE mode can suppress WM_HOTKEY delivery
-# to every other process system-wide, independent of whether the hotkey itself registered fine
-# beforehand. A low-level hook taps the raw input stream at a lower level than the window-message-
-# queue-based WM_HOTKEY mechanism, so it keeps working over exclusive fullscreen games where
-# RegisterHotKey does not.
+# Three mechanisms exist, each added after a real report the previous one didn't fully cover:
 #
-# It was made a CHOICE rather than an outright replacement after a second real report from the
-# same user: perceived system-wide input lag after switching. This is a real, known risk of
-# WH_KEYBOARD_LL specifically -- Windows delivers every keystroke, system-wide, SYNCHRONOUSLY
-# through the whole hook chain before the target application (a game) ever sees it, so any delay
-# in this app's own Python callback (e.g. waiting for the GIL while another of this app's own
-# threads -- the audio-mixer overlay's own event callback is a likely culprit, since it can fire
-# many times a second -- is mid-bytecode) lands as a real, perceptible input delay in EVERY other
-# application, not just this one. RegisterHotKey never sits in that path at all: it only ever
-# receives a message for the exact bound combo, asynchronously, so it carries none of that risk.
-# Defaulting to RegisterHotKey (DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE in autostart_script.py) and
-# making the hook opt-in trades guaranteed input responsiveness for most users against working
-# keybinds in fullscreen-exclusive games specifically for whoever explicitly asks for that trade.
+# 1. register_hotkey (RegisterHotKey/WM_HOTKEY) -- the original. Never sits in another
+#    application's own input path at all (it only ever receives a message for the exact bound
+#    combo, asynchronously), so it carries no input-lag risk. But a game holding true fullscreen
+#    EXCLUSIVE mode can silently suppress its delivery system-wide -- confirmed live: "Add Marker"
+#    (Ctrl+F3) never fired even once across many League of Legends sessions, while it worked
+#    reliably in every other game (Balatro, REPO), from the app's own log history, not a one-off.
+#
+# 2. low_level_hook (a global WH_KEYBOARD_LL hook, the same mechanism the clip editor's own space
+#    bar listener uses) -- added to fix exactly that: it taps the input stream at a lower level
+#    than the window-message-queue-based WM_HOTKEY mechanism, so it keeps working over exclusive
+#    fullscreen games. But it introduced a NEW real problem, confirmed by a second live report:
+#    perceptible system-wide input lag. WH_KEYBOARD_LL is a SYNCHRONOUS chain -- Windows delivers
+#    every keystroke, system-wide, through the whole hook chain BEFORE the target application (a
+#    game) ever sees it, so any delay in this app's own Python callback (plausibly GIL contention
+#    with this app's other background threads, e.g. the audio-mixer overlay's own event callback,
+#    which can fire many times a second) lands as real input delay in every other application.
+#
+# 3. raw_input (RegisterRawInputDevices with RIDEV_INPUTSINK) -- the actual right tool for this
+#    job, confirmed against Microsoft's own docs: raw input is PURE OBSERVATION. The OS delivers a
+#    keystroke to the focused application AND, independently and in parallel (not chained/
+#    serialized), posts a copy to any process registered as an input sink -- a sink cannot block,
+#    delay, or otherwise interfere with the foreground application's own delivery, and
+#    RIDEV_INPUTSINK specifically means it still receives that copy even while some OTHER window
+#    (a fullscreen game) has focus. This is the default now: no input-lag risk AND works over
+#    exclusive fullscreen. register_hotkey/low_level_hook stay selectable as a fallback in case
+#    raw input ever fails to register on some system, or a user simply prefers the older behavior.
 WM_KEYUP = 0x0101
 WM_SYSKEYUP = 0x0105
 VK_CONTROL = 0x11
@@ -235,6 +238,52 @@ MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 _CUSTOM_KEYBIND_MODIFIER_FLAGS = {"ctrl": MOD_CONTROL, "alt": MOD_ALT, "shift": MOD_SHIFT, "win": MOD_WIN}
+# --- Raw Input (mechanism 3 above) ---
+WM_INPUT = 0x00FF
+RID_INPUT = 0x10000003
+RIM_TYPEKEYBOARD = 1
+RIDEV_INPUTSINK = 0x00000100
+RIDEV_REMOVE = 0x00000001
+HID_USAGE_PAGE_GENERIC = 0x01
+HID_USAGE_GENERIC_KEYBOARD = 0x06
+
+
+if sys.platform == "win32":
+    class RAWINPUTDEVICE(ctypes.Structure):
+        _fields_ = [
+            ("usUsagePage", wintypes.USHORT), ("usUsage", wintypes.USHORT),
+            ("dwFlags", wintypes.DWORD), ("hwndTarget", wintypes.HWND),
+        ]
+
+    class RAWINPUTHEADER(ctypes.Structure):
+        _fields_ = [
+            ("dwType", wintypes.DWORD), ("dwSize", wintypes.DWORD),
+            ("hDevice", wintypes.HANDLE), ("wParam", wintypes.WPARAM),
+        ]
+
+    class RAWKEYBOARD(ctypes.Structure):
+        _fields_ = [
+            ("MakeCode", wintypes.USHORT), ("Flags", wintypes.USHORT), ("Reserved", wintypes.USHORT),
+            ("VKey", wintypes.USHORT), ("Message", wintypes.UINT), ("ExtraInformation", wintypes.ULONG),
+        ]
+
+    # Only the keyboard-shaped variant of RAWINPUT's real union -- this app only ever registers
+    # for keyboard raw input (HID_USAGE_GENERIC_KEYBOARD), so a real RAWINPUT delivered here is
+    # never anything else; GetRawInputData's own two-call size-query pattern (see
+    # _run_custom_keybind_listener_raw_input) protects against ever reading past what it actually
+    # wrote regardless.
+    class RAWINPUT_KEYBOARD(ctypes.Structure):
+        _fields_ = [("header", RAWINPUTHEADER), ("keyboard", RAWKEYBOARD)]
+
+    WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM)
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", wintypes.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+            ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
+        ]
 
 
 def vk_code_for_key(key):
@@ -287,21 +336,21 @@ def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
     icon=None, notifications_config=None, status=None, stop_event=None, hotkey_mode=None,
 ):
-    """Dispatches to one of two mechanisms based on hotkey_mode -- see the module comment above
-    this whole section for the full tradeoff. "low_level_hook" (or any other non-"register_hotkey"
-    value) uses _run_custom_keybind_listener_low_level_hook; everything else, including None
-    (so an old/incomplete config that never set this at all gets the safe choice), uses
-    _run_custom_keybind_listener_register_hotkey."""
-    if hotkey_mode == "low_level_hook":
-        _run_custom_keybind_listener_low_level_hook(
-            bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-            icon=icon, notifications_config=notifications_config, status=status, stop_event=stop_event,
-        )
+    """Dispatches to one of three mechanisms based on hotkey_mode -- see the module comment above
+    this whole section for the full three-way tradeoff. "register_hotkey" and "low_level_hook"
+    use their own like-named implementations; everything else, including "raw_input" and None (so
+    an old/incomplete config that never set this at all still gets the best available choice),
+    uses _run_custom_keybind_listener_raw_input -- the actual default now."""
+    if hotkey_mode == "register_hotkey":
+        impl = _run_custom_keybind_listener_register_hotkey
+    elif hotkey_mode == "low_level_hook":
+        impl = _run_custom_keybind_listener_low_level_hook
     else:
-        _run_custom_keybind_listener_register_hotkey(
-            bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-            icon=icon, notifications_config=notifications_config, status=status, stop_event=stop_event,
-        )
+        impl = _run_custom_keybind_listener_raw_input
+    impl(
+        bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
+        icon=icon, notifications_config=notifications_config, status=status, stop_event=stop_event,
+    )
 
 
 def _run_custom_keybind_listener_register_hotkey(
@@ -529,6 +578,207 @@ def _run_custom_keybind_listener_low_level_hook(
                     stop_event.wait(0.05)
     finally:
         user32.UnhookWindowsHookEx(hook_handle)
+
+
+def _run_custom_keybind_listener_raw_input(
+    bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
+    icon=None, notifications_config=None, status=None, stop_event=None,
+):
+    """The default mechanism -- see the module comment above this whole section for why raw input
+    is the one that actually avoids both the register_hotkey and low_level_hook tradeoffs.
+
+    Creates a plain, ordinary top-level window on this dedicated thread -- never shown (no
+    WS_VISIBLE style, ShowWindow is never called), so there's no taskbar entry or visible presence
+    at all, but still a REAL top-level window, not a message-only one (HWND_MESSAGE): confirmed
+    live that a message-only window's raw input registration silently never delivers WM_INPUT at
+    all (no error at any step -- RegisterClassW/CreateWindowExW/RegisterRawInputDevices all report
+    success, but the keyboard sink simply never fires), while an ordinary invisible top-level
+    window works correctly. Registers it as a keyboard raw-input sink via
+    RegisterRawInputDevices(RIDEV_INPUTSINK), then runs a normal GetMessage/PeekMessage loop --
+    same overall shape as the other two mechanisms, just receiving WM_INPUT instead of WM_HOTKEY
+    or a hook callback. A window (unlike a hook or RegisterHotKey) needs a real window CLASS
+    registered first, and both class and window need to be torn back down in the same finally
+    block that unregisters the raw input device.
+
+    Held-key de-duplication and exact modifier matching work identically to
+    _run_custom_keybind_listener_low_level_hook (same `held` set, same find_matching_custom_keybind/
+    GetAsyncKeyState-based check) -- raw input's own RAWKEYBOARD.Message field carries the exact
+    same WM_KEYDOWN/WM_KEYUP/WM_SYSKEYDOWN/WM_SYSKEYUP values a hook callback would see, so all of
+    that logic is shared verbatim; only how a keystroke is actually RECEIVED differs.
+
+    stop_event: same PeekMessageW-polling pattern as the other two mechanisms."""
+    bindings_by_vk = {}
+    for binding in bindings:
+        if not binding.get("enabled", True):
+            continue
+        vk = vk_code_for_key(binding.get("key", ""))
+        if vk is None:
+            logging.warning("Custom keybind has an invalid key %r; skipping.", binding.get("key"))
+            continue
+        mods = frozenset(m for m in (binding.get("modifiers") or []) if m in _CUSTOM_KEYBIND_MODIFIER_VKS)
+        bindings_by_vk.setdefault(vk, []).append((mods, binding))
+
+    if not bindings_by_vk:
+        return
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+    user32.RegisterClassW.restype = wintypes.ATOM
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    user32.UnregisterClassW.restype = wintypes.BOOL
+    user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HANDLE, wintypes.HINSTANCE, wintypes.LPVOID,
+    ]
+    user32.DestroyWindow.restype = wintypes.BOOL
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.RegisterRawInputDevices.restype = wintypes.BOOL
+    user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT, wintypes.UINT]
+    user32.GetRawInputData.restype = wintypes.UINT
+    user32.GetRawInputData.argtypes = [
+        wintypes.HANDLE, wintypes.UINT, wintypes.LPVOID, ctypes.POINTER(wintypes.UINT), wintypes.UINT,
+    ]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+
+    def is_key_down(vk):
+        return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+    held = set()
+    header_size = ctypes.sizeof(RAWINPUTHEADER)
+
+    def handle_raw_input(lparam):
+        needed = wintypes.UINT(0)
+        user32.GetRawInputData(lparam, RID_INPUT, None, ctypes.byref(needed), header_size)
+        if not needed.value:
+            return
+        buf = (ctypes.c_byte * needed.value)()
+        got = user32.GetRawInputData(lparam, RID_INPUT, ctypes.byref(buf), ctypes.byref(needed), header_size)
+        if got != needed.value or needed.value < ctypes.sizeof(RAWINPUT_KEYBOARD):
+            return
+        raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT_KEYBOARD)).contents
+        if raw.header.dwType != RIM_TYPEKEYBOARD:
+            return
+        vk = raw.keyboard.VKey
+        if vk == 0xFF:
+            return  # documented "no mapping"/overrun marker -- not a real key
+        message = raw.keyboard.Message
+        if message in (WM_KEYUP, WM_SYSKEYUP):
+            held.discard(vk)
+        elif message in (WM_KEYDOWN, WM_SYSKEYDOWN) and vk not in held:
+            held.add(vk)
+            binding = find_matching_custom_keybind(vk, is_key_down, bindings_by_vk)
+            if binding:
+                threading.Thread(
+                    target=fire_keybind,
+                    args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                    daemon=True,
+                ).start()
+
+    def wnd_proc(hwnd, msg, wparam, lparam):
+        if msg == WM_INPUT:
+            try:
+                handle_raw_input(lparam)
+            except Exception:
+                logging.exception("Custom keybind raw-input callback failed.")
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    # Kept referenced for the window's entire lifetime (this function's own stack frame) -- same
+    # reasoning as the low-level hook's own callback trampoline (see that function's comment).
+    wnd_proc_callback = WNDPROC(wnd_proc)
+    class_name = f"OBSAutoRecorderKeybindSink{os.getpid()}"
+    wnd_class = WNDCLASSW()
+    wnd_class.style = 0
+    wnd_class.lpfnWndProc = wnd_proc_callback
+    wnd_class.cbClsExtra = 0
+    wnd_class.cbWndExtra = 0
+    wnd_class.hInstance = kernel32.GetModuleHandleW(None)
+    wnd_class.hIcon = None
+    wnd_class.hCursor = None
+    wnd_class.hbrBackground = None
+    wnd_class.lpszMenuName = None
+    wnd_class.lpszClassName = class_name
+    # ctypes.pointer(), not the lighter-weight ctypes.byref() used for the other one-off calls
+    # below -- a real pointer object (unlike byref's write-only reference) supports .contents,
+    # which the tests use to get back to the real wnd_proc callback that was actually registered.
+    if not user32.RegisterClassW(ctypes.pointer(wnd_class)):
+        logging.warning(
+            "Could not register the custom-keybind raw-input window class (error %s) -- custom "
+            "keybinds won't work this session.", ctypes.get_last_error(),
+        )
+        notify(
+            icon, notifications_config, "Keybinds not registered",
+            "Could not set up raw-input keybind capture -- your configured keybinds won't work "
+            "until the app is restarted.",
+        )
+        return
+
+    hwnd = user32.CreateWindowExW(
+        0, class_name, "OBS Auto Recorder Keybind Sink", 0, 0, 0, 0, 0,
+        None, None, wnd_class.hInstance, None,
+    )
+    if not hwnd:
+        logging.warning(
+            "Could not create the custom-keybind raw-input window (error %s) -- custom keybinds "
+            "won't work this session.", ctypes.get_last_error(),
+        )
+        notify(
+            icon, notifications_config, "Keybinds not registered",
+            "Could not set up raw-input keybind capture -- your configured keybinds won't work "
+            "until the app is restarted.",
+        )
+        user32.UnregisterClassW(class_name, wnd_class.hInstance)
+        return
+
+    device = RAWINPUTDEVICE(
+        usUsagePage=HID_USAGE_PAGE_GENERIC, usUsage=HID_USAGE_GENERIC_KEYBOARD,
+        dwFlags=RIDEV_INPUTSINK, hwndTarget=hwnd,
+    )
+    if not user32.RegisterRawInputDevices(ctypes.byref(device), 1, ctypes.sizeof(RAWINPUTDEVICE)):
+        logging.warning(
+            "Could not register for raw keyboard input (error %s) -- custom keybinds won't work "
+            "this session.", ctypes.get_last_error(),
+        )
+        notify(
+            icon, notifications_config, "Keybinds not registered",
+            "Could not register for raw keyboard input -- your configured keybinds won't work "
+            "until the app is restarted.",
+        )
+        user32.DestroyWindow(hwnd)
+        user32.UnregisterClassW(class_name, wnd_class.hInstance)
+        return
+
+    for entries in bindings_by_vk.values():
+        for _mods, binding in entries:
+            logging.info("Registered custom keybind %s -> %s", describe_keybind(binding), binding.get("action"))
+
+    msg = wintypes.MSG()
+    try:
+        if stop_event is None:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        else:
+            while not stop_event.is_set():
+                if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):  # PM_REMOVE
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                else:
+                    stop_event.wait(0.05)
+    finally:
+        removal = RAWINPUTDEVICE(
+            usUsagePage=HID_USAGE_PAGE_GENERIC, usUsage=HID_USAGE_GENERIC_KEYBOARD,
+            dwFlags=RIDEV_REMOVE, hwndTarget=None,
+        )
+        user32.RegisterRawInputDevices(ctypes.byref(removal), 1, ctypes.sizeof(RAWINPUTDEVICE))
+        user32.DestroyWindow(hwnd)
+        user32.UnregisterClassW(class_name, wnd_class.hInstance)
 
 
 # --- Clip editor space bar play/pause (global low-level keyboard hook) ---

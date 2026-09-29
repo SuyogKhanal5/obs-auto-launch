@@ -2887,23 +2887,31 @@ CUSTOM_KEYBIND_ACTIONS_BY_LABEL = {label: action for action, label in CUSTOM_KEY
 CUSTOM_KEYBIND_KEY_OPTIONS = (
     [str(d) for d in range(10)] + [chr(c) for c in range(65, 91)] + [f"F{n}" for n in range(1, 13)]
 )
-# Windows-only choice of how custom keybinds are actually delivered (see
-# platform_windows.py's own module comment above its "Global hotkeys" section for the full real-
-# world story behind this): "register_hotkey" (the default) uses Win32 RegisterHotKey, which never
-# sits in every application's own input path, so it carries no input-lag risk at all -- but a game
-# holding true fullscreen EXCLUSIVE mode can silently suppress its delivery. "low_level_hook" uses
-# a global WH_KEYBOARD_LL hook instead, which keeps working over exactly that case, but Windows
-# delivers every keystroke system-wide SYNCHRONOUSLY through it first -- confirmed via a real user
-# report of perceived input lag after switching to it, plausible because this app's own other
-# background threads (e.g. the audio-mixer overlay's own event callback) can hold Python's GIL and
-# delay this callback, and that delay lands on every keystroke in every other application, not
-# just this one. Linux/macOS have no equivalent choice (see their own run_custom_keybind_listener
-# docstrings), so this only ever actually matters on Windows.
-CUSTOM_KEYBIND_HOTKEY_MODES = ("register_hotkey", "low_level_hook")
-DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE = "register_hotkey"
+# Windows-only choice of how custom keybinds are actually delivered (see platform_windows.py's own
+# module comment above its "Global hotkeys" section for the full real-world story behind this) --
+# three mechanisms, in the order they were tried:
+# - "register_hotkey": Win32 RegisterHotKey. No input-lag risk at all (never sits in another
+#   application's own input path), but a game holding true fullscreen EXCLUSIVE mode can silently
+#   suppress its delivery -- confirmed live with League of Legends.
+# - "low_level_hook": a global WH_KEYBOARD_LL hook. Fixes the fullscreen case, but Windows delivers
+#   every keystroke system-wide SYNCHRONOUSLY through it first -- confirmed via a real user report
+#   of perceived input lag, plausible because this app's own other background threads (e.g. the
+#   audio-mixer overlay's own event callback) can hold Python's GIL and delay this callback, and
+#   that delay lands on every keystroke in every other application, not just this one.
+# - "raw_input" (the default): RegisterRawInputDevices with RIDEV_INPUTSINK. The actual right tool
+#   for this -- confirmed against Microsoft's own docs, raw input is pure observation, delivered to
+#   the foreground application AND any registered sink independently/in parallel, never chained/
+#   serialized the way a hook is, so it carries none of the low_level_hook's input-lag risk while
+#   still working over exclusive fullscreen games the same way. register_hotkey/low_level_hook stay
+#   selectable as a fallback in case raw input ever fails to register on some system.
+# Linux/macOS have no equivalent choice (see their own run_custom_keybind_listener docstrings), so
+# this only ever actually matters on Windows.
+CUSTOM_KEYBIND_HOTKEY_MODES = ("raw_input", "register_hotkey", "low_level_hook")
+DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE = "raw_input"
 CUSTOM_KEYBIND_HOTKEY_MODE_LABELS = {
-    "register_hotkey": "Standard (recommended -- no input-lag risk)",
-    "low_level_hook": "Fullscreen-compatible (works in exclusive-fullscreen games, may add input lag)",
+    "raw_input": "Raw Input (recommended -- no input-lag risk, works in fullscreen games)",
+    "register_hotkey": "Standard (no input-lag risk, but a fullscreen-exclusive game can block it)",
+    "low_level_hook": "Low-level hook (legacy fallback -- works in fullscreen games, may add input lag)",
 }
 CUSTOM_KEYBIND_HOTKEY_MODE_LABELS_BY_LABEL = {v: k for k, v in CUSTOM_KEYBIND_HOTKEY_MODE_LABELS.items()}
 
@@ -6435,18 +6443,20 @@ def _run_config_editor(master_root, restart_callback, on_close):
         ttk.Combobox(
             hotkey_mode_row, textvariable=custom_keybind_hotkey_mode_var,
             values=list(CUSTOM_KEYBIND_HOTKEY_MODE_LABELS.values()),
-            state="readonly", width=58, style="Settings.TCombobox",
+            state="readonly", width=65, style="Settings.TCombobox",
         ).pack(side="left", padx=(8, 0))
         tk.Label(
             keybinds_tab,
             text=(
-                "    Standard never adds any input-lag risk, but a game running in true fullscreen "
-                "EXCLUSIVE mode can silently block it from ever firing (confirmed with League of "
-                "Legends). Fullscreen-compatible keeps working there, but taps every keystroke "
+                "    Raw Input (the default) receives keystrokes independently and in parallel with "
+                "whatever app has focus -- including a game running in true fullscreen EXCLUSIVE "
+                "mode -- without ever sitting in its input path, so it carries no input-lag risk. "
+                "Standard (Win32 RegisterHotKey) is equally lag-free but can be silently blocked "
+                "by a fullscreen-exclusive game (confirmed with League of Legends). Low-level hook "
+                "is an older fallback that also works in fullscreen games, but taps every keystroke "
                 "system-wide before your game or any other app sees it -- confirmed via a real "
-                "report to add perceptible input lag. Only switch to it if a keybind genuinely "
-                "isn't firing in a specific fullscreen game and you're OK with that tradeoff; "
-                "switch back to Standard if you notice input feeling delayed anywhere."
+                "report to add perceptible input lag; only use it if Raw Input genuinely doesn't "
+                "work on your system."
             ),
             anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
         ).pack(fill="x", padx=10, pady=(0, 6))

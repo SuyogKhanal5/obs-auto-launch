@@ -5,6 +5,9 @@ import threading
 import unittest
 import unittest.mock
 
+if sys.platform == "win32":
+    from ctypes import wintypes
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import platform_windows as pw
 
@@ -387,38 +390,53 @@ class IsSpaceBarToggleEventTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hotkey API")
 class RunCustomKeybindListenerDispatchTests(unittest.TestCase):
     # run_custom_keybind_listener itself is just the hotkey_mode switch -- see
-    # RunCustomKeybindListenerRegisterHotkeyTests/RunCustomKeybindListenerLowLevelHookTests below
-    # for the two real implementations it picks between.
+    # RunCustomKeybindListenerRawInputTests/RunCustomKeybindListenerRegisterHotkeyTests/
+    # RunCustomKeybindListenerLowLevelHookTests below for the three real implementations it picks
+    # between.
     def setUp(self):
         self.mock_user32 = unittest.mock.Mock()
         self.mock_user32.GetMessageW.return_value = 0
         self.mock_user32.SetWindowsHookExW.return_value = 0  # fails fast, doesn't matter which path
+        self.mock_user32.RegisterClassW.return_value = 0  # likewise fails fast for raw_input's path
+        self.mock_kernel32 = unittest.mock.Mock()
+        self.mock_kernel32.GetModuleHandleW.return_value = 999
         self.bindings = [{"enabled": True, "action": "add_marker", "modifiers": ["ctrl"], "key": "F3"}]
         self.fire_keybind = unittest.mock.Mock()
         self.describe_keybind = unittest.mock.Mock(return_value="Ctrl+F3")
         self.notify = unittest.mock.Mock()
         self.patchers = [
             unittest.mock.patch.object(pw.ctypes.windll, "user32", self.mock_user32),
+            unittest.mock.patch.object(pw.ctypes.windll, "kernel32", self.mock_kernel32),
             unittest.mock.patch.object(pw.time, "sleep"),
         ]
         for p in self.patchers:
             p.start()
             self.addCleanup(p.stop)
 
-    def test_default_hotkey_mode_uses_register_hotkey(self):
+    def test_default_hotkey_mode_uses_raw_input(self):
         pw.run_custom_keybind_listener(
             self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
         )
-        self.mock_user32.RegisterHotKey.assert_called()
+        self.mock_user32.RegisterClassW.assert_called()
+        self.mock_user32.RegisterHotKey.assert_not_called()
         self.mock_user32.SetWindowsHookExW.assert_not_called()
 
-    def test_none_hotkey_mode_uses_register_hotkey(self):
-        # An old/incomplete config that never set this key at all must still get the safe choice.
+    def test_none_hotkey_mode_uses_raw_input(self):
+        # An old/incomplete config that never set this key at all must still get the best default.
         pw.run_custom_keybind_listener(
             self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
             hotkey_mode=None,
         )
+        self.mock_user32.RegisterClassW.assert_called()
+
+    def test_register_hotkey_mode_uses_register_hotkey(self):
+        pw.run_custom_keybind_listener(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            hotkey_mode="register_hotkey",
+        )
         self.mock_user32.RegisterHotKey.assert_called()
+        self.mock_user32.RegisterClassW.assert_not_called()
+        self.mock_user32.SetWindowsHookExW.assert_not_called()
 
     def test_low_level_hook_mode_uses_the_hook(self):
         pw.run_custom_keybind_listener(
@@ -427,13 +445,15 @@ class RunCustomKeybindListenerDispatchTests(unittest.TestCase):
         )
         self.mock_user32.SetWindowsHookExW.assert_called()
         self.mock_user32.RegisterHotKey.assert_not_called()
+        self.mock_user32.RegisterClassW.assert_not_called()
 
-    def test_unrecognized_hotkey_mode_falls_back_to_register_hotkey(self):
+    def test_unrecognized_hotkey_mode_falls_back_to_raw_input(self):
         pw.run_custom_keybind_listener(
             self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
             hotkey_mode="bogus",
         )
-        self.mock_user32.RegisterHotKey.assert_called()
+        self.mock_user32.RegisterClassW.assert_called()
+        self.mock_user32.RegisterHotKey.assert_not_called()
         self.mock_user32.SetWindowsHookExW.assert_not_called()
 
 
@@ -659,6 +679,232 @@ class RunCustomKeybindListenerLowLevelHookTests(unittest.TestCase):
 
     def test_no_stop_event_still_uses_the_old_blocking_getmessage_loop(self):
         pw._run_custom_keybind_listener_low_level_hook(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+        )
+        self.mock_user32.GetMessageW.assert_called_once()
+        self.mock_user32.PeekMessageW.assert_not_called()
+
+
+@unittest.skipUnless(sys.platform == "win32", "exercises the real Win32 ctypes.windll.user32 hook API")
+class RunCustomKeybindListenerRawInputTests(unittest.TestCase):
+    # The default mechanism -- see platform_windows.py's own module comment above its "Global
+    # hotkeys" section for the full three-way tradeoff. Confirmed live (a real SendInput-injected
+    # keypress, caught end-to-end through a real window/class/raw-input registration on this
+    # machine) before this was trusted as the new default -- these tests exercise the same
+    # callback logic with everything mocked, the same pattern the other two mechanisms' own tests
+    # already use.
+    def setUp(self):
+        self.mock_user32 = unittest.mock.Mock()
+        self.mock_user32.RegisterClassW.return_value = 777  # a fake, truthy ATOM
+        self.mock_user32.CreateWindowExW.return_value = 888  # a fake, truthy HWND
+        self.mock_user32.RegisterRawInputDevices.return_value = 1
+        self.mock_user32.PeekMessageW.return_value = 0
+        self.mock_user32.GetMessageW.return_value = 0
+        self.mock_user32.GetAsyncKeyState.return_value = 0
+        self.mock_user32.DefWindowProcW.return_value = 0
+        self.mock_user32.GetRawInputData.side_effect = self._raw_input_data(pw.RIM_TYPEKEYBOARD, 0x72, pw.WM_KEYDOWN)
+        self.mock_kernel32 = unittest.mock.Mock()
+        self.mock_kernel32.GetModuleHandleW.return_value = 999
+        self.bindings = [{"enabled": True, "action": "add_marker", "modifiers": ["ctrl"], "key": "F3"}]
+        self.fire_keybind = unittest.mock.Mock()
+        self.describe_keybind = unittest.mock.Mock(return_value="Ctrl+F3")
+        self.notify = unittest.mock.Mock()
+        self.patcher = unittest.mock.patch.object(pw.ctypes.windll, "user32", self.mock_user32)
+        self.kernel_patcher = unittest.mock.patch.object(pw.ctypes.windll, "kernel32", self.mock_kernel32)
+        self.patcher.start()
+        self.kernel_patcher.start()
+        self.addCleanup(self.patcher.stop)
+        self.addCleanup(self.kernel_patcher.stop)
+
+    @staticmethod
+    def _raw_input_data(dw_type, vkey, message):
+        # GetRawInputData's real two-call pattern: first with pData=None to learn the required
+        # buffer size, then again with a real buffer to fill. pData/pcbSize here are the exact
+        # same ctypes byref/pointer objects the real code passed (a Mock's side_effect receives
+        # arguments verbatim, unconverted) -- casting them to a typed POINTER and writing through
+        # is how this stands in for what the OS would have filled in for a real WM_INPUT.
+        def side_effect(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader):
+            size = ctypes.sizeof(pw.RAWINPUT_KEYBOARD)
+            if pData is None:
+                ctypes.cast(pcbSize, ctypes.POINTER(wintypes.UINT)).contents.value = size
+                return 0
+            raw = ctypes.cast(pData, ctypes.POINTER(pw.RAWINPUT_KEYBOARD)).contents
+            raw.header.dwType = dw_type
+            raw.header.dwSize = size
+            raw.keyboard.VKey = vkey
+            raw.keyboard.Message = message
+            ctypes.cast(pcbSize, ctypes.POINTER(wintypes.UINT)).contents.value = size
+            return size
+        return side_effect
+
+    def _wnd_proc(self):
+        wnd_class = self.mock_user32.RegisterClassW.call_args[0][0].contents
+        return wnd_class.lpfnWndProc
+
+    def test_no_enabled_bindings_installs_nothing(self):
+        pw._run_custom_keybind_listener_raw_input(
+            [{"enabled": False, "action": "add_marker", "modifiers": ["ctrl"], "key": "F3"}],
+            lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+        )
+        self.mock_user32.RegisterClassW.assert_not_called()
+
+    def test_invalid_key_is_skipped_but_others_still_install(self):
+        bindings = [
+            {"enabled": True, "action": "add_marker", "modifiers": ["ctrl"], "key": "???"},
+            {"enabled": True, "action": "split_record_file", "modifiers": ["ctrl"], "key": "F4"},
+        ]
+        stop_event = threading.Event()
+        stop_event.set()
+        with self.assertLogs(level="WARNING"):
+            pw._run_custom_keybind_listener_raw_input(
+                bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+                stop_event=stop_event,
+            )
+        self.mock_user32.RegisterClassW.assert_called_once()
+
+    def test_class_registration_failure_logs_and_notifies_without_looping(self):
+        self.mock_user32.RegisterClassW.return_value = 0
+        icon = unittest.mock.Mock()
+        with self.assertLogs(level="WARNING"):
+            pw._run_custom_keybind_listener_raw_input(
+                self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+                icon=icon, notifications_config={"enabled": True},
+            )
+        self.mock_user32.CreateWindowExW.assert_not_called()
+        self.notify.assert_called_once()
+
+    def test_window_creation_failure_cleans_up_the_class(self):
+        self.mock_user32.CreateWindowExW.return_value = 0
+        with self.assertLogs(level="WARNING"):
+            pw._run_custom_keybind_listener_raw_input(
+                self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            )
+        self.mock_user32.RegisterRawInputDevices.assert_not_called()
+        self.mock_user32.UnregisterClassW.assert_called_once()
+
+    def test_raw_input_registration_failure_cleans_up_window_and_class(self):
+        self.mock_user32.RegisterRawInputDevices.return_value = 0
+        with self.assertLogs(level="WARNING"):
+            pw._run_custom_keybind_listener_raw_input(
+                self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            )
+        self.mock_user32.DestroyWindow.assert_called_once()
+        self.mock_user32.UnregisterClassW.assert_called_once()
+        self.mock_user32.GetMessageW.assert_not_called()
+        self.mock_user32.PeekMessageW.assert_not_called()
+
+    def test_matching_keydown_fires_the_binding(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw._run_custom_keybind_listener_raw_input(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.GetAsyncKeyState.side_effect = lambda vk: -32768 if vk == pw.VK_CONTROL else 0
+        self._wnd_proc()(888, pw.WM_INPUT, 0, 123)
+        self.fire_keybind.assert_called_once()
+        self.assertEqual(self.fire_keybind.call_args[0][0]["action"], "add_marker")
+
+    def test_wrong_modifier_does_not_fire(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw._run_custom_keybind_listener_raw_input(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self._wnd_proc()(888, pw.WM_INPUT, 0, 123)  # Ctrl not held (GetAsyncKeyState still 0)
+        self.fire_keybind.assert_not_called()
+
+    def test_held_key_auto_repeat_only_fires_once(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw._run_custom_keybind_listener_raw_input(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.GetAsyncKeyState.side_effect = lambda vk: -32768 if vk == pw.VK_CONTROL else 0
+        wnd_proc = self._wnd_proc()
+        wnd_proc(888, pw.WM_INPUT, 0, 123)
+        wnd_proc(888, pw.WM_INPUT, 0, 123)
+        wnd_proc(888, pw.WM_INPUT, 0, 123)
+        self.fire_keybind.assert_called_once()
+
+    def test_key_up_then_down_again_fires_twice(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw._run_custom_keybind_listener_raw_input(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.GetAsyncKeyState.side_effect = lambda vk: -32768 if vk == pw.VK_CONTROL else 0
+        wnd_proc = self._wnd_proc()
+        wnd_proc(888, pw.WM_INPUT, 0, 123)
+        self.mock_user32.GetRawInputData.side_effect = self._raw_input_data(pw.RIM_TYPEKEYBOARD, 0x72, pw.WM_KEYUP)
+        wnd_proc(888, pw.WM_INPUT, 0, 123)
+        self.mock_user32.GetRawInputData.side_effect = self._raw_input_data(pw.RIM_TYPEKEYBOARD, 0x72, pw.WM_KEYDOWN)
+        wnd_proc(888, pw.WM_INPUT, 0, 123)
+        self.assertEqual(self.fire_keybind.call_count, 2)
+
+    def test_non_keyboard_raw_input_is_ignored(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        self.mock_user32.GetRawInputData.side_effect = self._raw_input_data(0, 0x72, pw.WM_KEYDOWN)  # RIM_TYPEMOUSE
+        pw._run_custom_keybind_listener_raw_input(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.GetAsyncKeyState.side_effect = lambda vk: -32768 if vk == pw.VK_CONTROL else 0
+        self._wnd_proc()(888, pw.WM_INPUT, 0, 123)
+        self.fire_keybind.assert_not_called()
+
+    def test_overrun_marker_vk_is_ignored(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        self.mock_user32.GetRawInputData.side_effect = self._raw_input_data(pw.RIM_TYPEKEYBOARD, 0xFF, pw.WM_KEYDOWN)
+        pw._run_custom_keybind_listener_raw_input(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self._wnd_proc()(888, pw.WM_INPUT, 0, 123)
+        self.fire_keybind.assert_not_called()
+
+    def test_callback_exception_is_swallowed_and_still_calls_def_window_proc(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw._run_custom_keybind_listener_raw_input(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.mock_user32.GetRawInputData.side_effect = RuntimeError("boom")
+        with self.assertLogs(level="ERROR"):
+            result = self._wnd_proc()(888, pw.WM_INPUT, 0, 123)
+        self.mock_user32.DefWindowProcW.assert_called_once_with(888, pw.WM_INPUT, 0, 123)
+        self.assertEqual(result, 0)
+
+    def test_non_input_message_still_calls_def_window_proc(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw._run_custom_keybind_listener_raw_input(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self._wnd_proc()(888, 0x0001, 0, 0)  # WM_CREATE, not WM_INPUT
+        self.mock_user32.GetRawInputData.assert_not_called()
+        self.mock_user32.DefWindowProcW.assert_called_once_with(888, 0x0001, 0, 0)
+
+    def test_stop_event_cleans_up_on_exit(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        pw._run_custom_keybind_listener_raw_input(
+            self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
+            stop_event=stop_event,
+        )
+        self.assertEqual(self.mock_user32.RegisterRawInputDevices.call_count, 2)  # register, then remove
+        self.mock_user32.DestroyWindow.assert_called_once_with(888)
+        self.mock_user32.UnregisterClassW.assert_called_once()
+
+    def test_no_stop_event_still_uses_the_old_blocking_getmessage_loop(self):
+        pw._run_custom_keybind_listener_raw_input(
             self.bindings, lambda: None, lambda: 0, self.fire_keybind, self.describe_keybind, self.notify,
         )
         self.mock_user32.GetMessageW.assert_called_once()
