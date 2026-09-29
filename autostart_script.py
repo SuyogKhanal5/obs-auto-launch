@@ -6611,8 +6611,20 @@ def open_clip_editor_window(editor_state, config, recording_state, overlay_state
             return
         logging.warning(
             "Clip editor has appeared open for over %d seconds without closing; assuming it's "
-            "stuck and allowing a new attempt.", EDITOR_STUCK_TIMEOUT_SECONDS,
+            "stuck and force-closing it before opening a new one.", EDITOR_STUCK_TIMEOUT_SECONDS,
         )
+        # Confirmed live (a real leak, not hypothetical): abandoning the old instance here instead
+        # of actually closing it left its VLC player running in the background indefinitely --
+        # cleanup() (stop playback, release the VLC instance) was never called, so it kept
+        # retrying a failing CoreAudio call every few minutes for days, and its window/NSView
+        # never went away either. force_close is the same function WM_DELETE_WINDOW/the in-app
+        # Close button already use, stashed by _run_clip_editor precisely for this path.
+        old_force_close = editor_state.get("force_close")
+        if old_force_close:
+            try:
+                old_force_close()
+            except Exception:
+                logging.exception("Could not force-close the stuck clip editor.")
 
     overlay_root = overlay_state.get("root")
     if not overlay_root:
@@ -6625,6 +6637,7 @@ def open_clip_editor_window(editor_state, config, recording_state, overlay_state
 
     def on_close():
         editor_state["open"] = False
+        editor_state["force_close"] = None
         # pystray only rebuilds the native tray menu right after a menu item is clicked (see the
         # matching comment in the watcher loop) -- without this, "Edit Clips..." stays greyed out
         # until some unrelated menu click happens to refresh it, even though the editor is long
@@ -6633,7 +6646,7 @@ def open_clip_editor_window(editor_state, config, recording_state, overlay_state
 
     def build():
         try:
-            _run_clip_editor(overlay_root, config, recording_state, on_close, icon)
+            _run_clip_editor(overlay_root, config, recording_state, on_close, icon, editor_state)
         except Exception:
             logging.exception("Clip editor crashed.")
             on_close()
@@ -6706,7 +6719,7 @@ def _open_vlc_missing_window(master_root, on_close):
     tk.Button(root, text="Close", command=root.destroy).pack(anchor="e", padx=16, pady=16)
 
 
-def _run_clip_editor(master_root, config, recording_state, on_close, icon):
+def _run_clip_editor(master_root, config, recording_state, on_close, icon, editor_state):
     clip_editor_config = config.get("clip_editor", {})
     obs_config = config.get("obs", {})
     notifications_config = config.get("notifications", {})
@@ -6808,6 +6821,17 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         logging.info("Clip editor closed.")
         cleanup()
         root.destroy()
+
+    # Exposed so open_clip_editor_window's own "stuck" bypass (opening a second editor once the
+    # first has appeared open for over EDITOR_STUCK_TIMEOUT_SECONDS without closing) can actually
+    # tear this instance down first, rather than abandoning it -- confirmed live via the real log
+    # (two separate "Opening the clip editor" sessions days apart, neither followed by a matching
+    # "Clip editor closed.") that the old assume-stuck-and-open-a-new-one behavior leaked this
+    # session's VLC player/instance and its window indefinitely: cleanup() (which stops playback
+    # and releases the VLC instance) was never called, so the leaked player kept running in the
+    # background for days, repeatedly retrying (and failing) a CoreAudio device property
+    # registration every few minutes ("AudioObjectAddPropertyListener failed" in the log).
+    editor_state["force_close"] = close_editor
 
     root.protocol("WM_DELETE_WINDOW", close_editor)
     root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
