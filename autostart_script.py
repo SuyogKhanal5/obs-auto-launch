@@ -19,7 +19,7 @@ import obsws_python as obsws
 import psutil
 import pystray
 import screeninfo
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageColor, ImageDraw, ImageTk
 
 import platform_common
 
@@ -3662,6 +3662,41 @@ WAVEFORM_BG_COLOR = "0x2b2b2b"
 # glance; this one, combined with draw=full/scale=sqrt below, reads as an actual solid waveform
 # shape instead.
 WAVEFORM_LINE_COLOR = "0x60a5fa"
+
+
+def downsample_waveform_image_peak(image, target_width):
+    """Shrinks a rendered waveform image to target_width by taking, for each destination column,
+    the peak-to-peak envelope (topmost-to-bottommost non-background pixel) across every source
+    column it covers -- unlike a generic resize (even PIL's own BILINEAR), which just samples or
+    blends a handful of source columns and silently drops the rest. That loss isn't neutral for
+    waveform data: a genuinely loud but brief passage that doesn't happen to land near a sampled
+    point gets flattened away, while an isolated transient (a mic pop, a keyboard click) that DOES
+    survive then reads as dramatically louder than everything around it -- confirmed live: at the
+    full-clip (most zoomed-out) view, a single mic pop looked louder than the rest of the speech
+    entirely, and became proportionate again only once zoomed in past the point where this
+    function's caller stops downsampling at all. Only meaningful when target_width < image.width;
+    draw_waveform_view only calls this for that case and keeps using a plain resize otherwise."""
+    import numpy as np
+    bg_rgb = ImageColor.getrgb("#" + WAVEFORM_BG_COLOR.removeprefix("0x"))
+    wave_rgb = ImageColor.getrgb("#" + WAVEFORM_LINE_COLOR.removeprefix("0x"))
+    arr = np.asarray(image.convert("RGB"))
+    height, source_width = arr.shape[0], arr.shape[1]
+    is_wave = np.any(arr != np.array(bg_rgb, dtype=arr.dtype), axis=2)
+    has_wave = is_wave.any(axis=0)
+    top = np.argmax(is_wave, axis=0)
+    bottom = height - 1 - np.argmax(is_wave[::-1, :], axis=0)
+    out = Image.new("RGB", (target_width, height), bg_rgb)
+    draw = ImageDraw.Draw(out)
+    for dest_x in range(target_width):
+        src_left = int(dest_x * source_width / target_width)
+        src_right = max(src_left + 1, int((dest_x + 1) * source_width / target_width))
+        bucket_has_wave = has_wave[src_left:src_right]
+        if not bucket_has_wave.any():
+            continue
+        bucket_top = int(top[src_left:src_right][bucket_has_wave].min())
+        bucket_bottom = int(bottom[src_left:src_right][bucket_has_wave].max())
+        draw.line((dest_x, bucket_top, dest_x, bucket_bottom), fill=wave_rgb)
+    return out
 
 
 def compute_waveform_view_crop(duration, image_width, view_start, view_end):
@@ -8025,7 +8060,16 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         crop_left, crop_right = crop
         try:
             cropped = full_image.crop((crop_left, 0, crop_right, full_image.height))
-            resized = cropped.resize((canvas_width, full_image.height), Image.BILINEAR)
+            if canvas_width < cropped.width:
+                # Downsampling -- see downsample_waveform_image_peak's own docstring for why a
+                # generic resize isn't safe here (it silently loses real peaks and exaggerates
+                # transients). Upsampling (the else branch, i.e. zoomed in past native
+                # resolution) has no lost peaks to recover this way -- a plain resize is a fine,
+                # instant placeholder there until schedule_waveform_detail_refresh's real re-render
+                # lands.
+                resized = downsample_waveform_image_peak(cropped, canvas_width)
+            else:
+                resized = cropped.resize((canvas_width, full_image.height), Image.BILINEAR)
             photo = ImageTk.PhotoImage(resized)
         except Exception:
             logging.exception("Clip editor: could not draw the waveform view.")

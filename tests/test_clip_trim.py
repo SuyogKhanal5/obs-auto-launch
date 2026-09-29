@@ -500,6 +500,64 @@ class WaveformViewNeedsHigherResolutionTests(unittest.TestCase):
         self.assertFalse(a.waveform_view_needs_higher_resolution(60, 16000, 6, 5, 1200))
 
 
+class DownsampleWaveformImagePeakTests(unittest.TestCase):
+    def _make_source(self, width=200, height=40):
+        from PIL import Image
+        bg = tuple(int(a.WAVEFORM_BG_COLOR.removeprefix("0x")[i:i + 2], 16) for i in (0, 2, 4))
+        return Image.new("RGB", (width, height), bg), bg
+
+    def _wave_rgb(self):
+        return tuple(int(a.WAVEFORM_LINE_COLOR.removeprefix("0x")[i:i + 2], 16) for i in (0, 2, 4))
+
+    def _column_heights(self, image):
+        import numpy as np
+        arr = np.asarray(image.convert("RGB"))
+        bg = tuple(int(a.WAVEFORM_BG_COLOR.removeprefix("0x")[i:i + 2], 16) for i in (0, 2, 4))
+        is_wave = (arr != bg).any(axis=2)
+        return is_wave.sum(axis=0)
+
+    def test_narrow_spike_is_not_lost_when_downsampled(self):
+        # A single full-height column (e.g. a brief transient) sitting in an otherwise-silent
+        # source bucket must still show up at full height in its destination column -- a plain
+        # resize can dilute or drop it entirely depending on where it happens to fall relative to
+        # the resize's sampling grid.
+        from PIL import ImageDraw
+        img, bg = self._make_source(width=200, height=40)
+        draw = ImageDraw.Draw(img)
+        wave = self._wave_rgb()
+        draw.line((50, 2, 50, 37), fill=wave)  # one tall column amid silence
+        out = a.downsample_waveform_image_peak(img, 20)
+        heights = self._column_heights(out)
+        dest_col = int(50 / 200 * 20)
+        self.assertGreaterEqual(heights[dest_col], 34)  # ~full height preserved, not attenuated
+
+    def test_true_amplitude_of_a_broad_region_is_preserved(self):
+        # A wide, consistently-moderate region should downsample to its own true peak height,
+        # not get inflated by an unrelated spike elsewhere in the image.
+        from PIL import ImageDraw
+        img, bg = self._make_source(width=200, height=40)
+        draw = ImageDraw.Draw(img)
+        wave = self._wave_rgb()
+        for x in range(100, 170):
+            draw.line((x, 15, x, 25), fill=wave)  # a broad, modest-height region
+        out = a.downsample_waveform_image_peak(img, 20)
+        heights = self._column_heights(out)
+        broad_dest_cols = range(int(100 / 200 * 20), int(170 / 200 * 20))
+        for col in broad_dest_cols:
+            self.assertLessEqual(heights[col], 12)  # never inflated past its own true height
+
+    def test_silent_region_stays_silent(self):
+        img, bg = self._make_source(width=200, height=40)
+        out = a.downsample_waveform_image_peak(img, 20)
+        heights = self._column_heights(out)
+        self.assertTrue((heights == 0).all())
+
+    def test_output_size_matches_target_width(self):
+        img, bg = self._make_source(width=200, height=40)
+        out = a.downsample_waveform_image_peak(img, 33)
+        self.assertEqual(out.size, (33, 40))
+
+
 class BuildTrimCommandTests(unittest.TestCase):
     def test_fast_mode_seeks_before_input_and_stream_copies(self):
         cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=False)
