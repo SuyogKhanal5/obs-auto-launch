@@ -272,13 +272,17 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None, stop_event=None,
+    icon=None, notifications_config=None, status=None, stop_event=None, hotkey_mode=None,
 ):
     """macOS counterpart of platform_windows.run_custom_keybind_listener -- see the module
     comment above for why this uses a passive CGEventTap rather than an exclusive-grab API.
     fire_keybind/describe_keybind/notify are passed in rather than imported from
     autostart_script.py to avoid backend modules depending on it (the dependency only ever goes
     the other way -- see CROSS_PLATFORM_PLAN.md §3).
+
+    hotkey_mode: accepted and ignored -- this backend has only one mechanism (a CGEventTap),
+    unlike Windows' selectable RegisterHotKey-vs-low-level-hook choice; kept in the signature
+    purely so platform_common.py's dispatcher can pass the same kwargs to every backend uniformly.
 
     stop_event: accepted only for interface parity with platform_windows.py's own backend (see its
     docstring), which needs it to dodge a confirmed-live restart race; not currently used here --

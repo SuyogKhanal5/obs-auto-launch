@@ -131,6 +131,7 @@
             "buffer_seconds": 0
         },
         "custom_keybinds": [],
+        "custom_keybind_hotkey_mode": "register_hotkey",
         "recovery": {
             "memory_limit_gb": 5,
             "cooldown_seconds": 30

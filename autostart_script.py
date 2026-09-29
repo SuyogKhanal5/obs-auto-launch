@@ -2887,6 +2887,26 @@ CUSTOM_KEYBIND_ACTIONS_BY_LABEL = {label: action for action, label in CUSTOM_KEY
 CUSTOM_KEYBIND_KEY_OPTIONS = (
     [str(d) for d in range(10)] + [chr(c) for c in range(65, 91)] + [f"F{n}" for n in range(1, 13)]
 )
+# Windows-only choice of how custom keybinds are actually delivered (see
+# platform_windows.py's own module comment above its "Global hotkeys" section for the full real-
+# world story behind this): "register_hotkey" (the default) uses Win32 RegisterHotKey, which never
+# sits in every application's own input path, so it carries no input-lag risk at all -- but a game
+# holding true fullscreen EXCLUSIVE mode can silently suppress its delivery. "low_level_hook" uses
+# a global WH_KEYBOARD_LL hook instead, which keeps working over exactly that case, but Windows
+# delivers every keystroke system-wide SYNCHRONOUSLY through it first -- confirmed via a real user
+# report of perceived input lag after switching to it, plausible because this app's own other
+# background threads (e.g. the audio-mixer overlay's own event callback) can hold Python's GIL and
+# delay this callback, and that delay lands on every keystroke in every other application, not
+# just this one. Linux/macOS have no equivalent choice (see their own run_custom_keybind_listener
+# docstrings), so this only ever actually matters on Windows.
+CUSTOM_KEYBIND_HOTKEY_MODES = ("register_hotkey", "low_level_hook")
+DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE = "register_hotkey"
+CUSTOM_KEYBIND_HOTKEY_MODE_LABELS = {
+    "register_hotkey": "Standard (recommended -- no input-lag risk)",
+    "low_level_hook": "Fullscreen-compatible (works in exclusive-fullscreen games, may add input lag)",
+}
+CUSTOM_KEYBIND_HOTKEY_MODE_LABELS_BY_LABEL = {v: k for k, v in CUSTOM_KEYBIND_HOTKEY_MODE_LABELS.items()}
+
 
 def describe_keybind(binding):
     parts = [m.capitalize() for m in binding.get("modifiers", [])]
@@ -2947,20 +2967,24 @@ def fire_custom_keybind(
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
-    stop_event=None,
+    stop_event=None, hotkey_mode=None,
 ):
-    """Thin dispatcher -- the real per-OS implementation (a global WH_KEYBOARD_LL hook on Windows,
-    XGrabKey/XNextEvent on Linux/X11, a CGEventTap/CFRunLoop on macOS; a clear logged no-op under
-    Wayland) now lives in platform_common.run_custom_keybind_listener() /
-    platform_windows.py / platform_linux.py / platform_macos.py, see
-    CROSS_PLATFORM_PLAN.md Phase 3. fire_custom_keybind/describe_keybind/notify are passed in
-    rather than imported by the backend modules, so those never depend on this one (the
-    dependency only ever goes the other way). stop_event: passed straight through so
+    """Thin dispatcher -- the real per-OS implementation (RegisterHotKey or a selectable global
+    WH_KEYBOARD_LL hook on Windows, XGrabKey/XNextEvent on Linux/X11, a CGEventTap/CFRunLoop on
+    macOS; a clear logged no-op under Wayland) now lives in
+    platform_common.run_custom_keybind_listener() / platform_windows.py / platform_linux.py /
+    platform_macos.py, see CROSS_PLATFORM_PLAN.md Phase 3. fire_custom_keybind/describe_keybind/
+    notify are passed in rather than imported by the backend modules, so those never depend on
+    this one (the dependency only ever goes the other way). stop_event: passed straight through so
     platform_windows.py's backend can release its hook the moment shutdown is requested rather
-    than waiting on process death -- see that function's own docstring for why this matters."""
+    than waiting on process death -- see that function's own docstring for why this matters.
+    hotkey_mode: passed straight through to platform_windows.py's own backend, which is currently
+    the only one that does anything with it -- see CUSTOM_KEYBIND_HOTKEY_MODE_LABELS for the real
+    input-lag-vs-fullscreen-games tradeoff behind the choice."""
     platform_common.run_custom_keybind_listener(
         bindings, get_client, get_manual_split_buffer_seconds, fire_custom_keybind, describe_keybind, notify,
         icon=icon, notifications_config=notifications_config, status=status, stop_event=stop_event,
+        hotkey_mode=hotkey_mode,
     )
 
 
@@ -6396,6 +6420,39 @@ def _run_config_editor(master_root, restart_callback, on_close):
     keybinds_tab = make_scrollable_tab(notebook, "Custom Keybinds")
     custom_keybind_rows, _ = build_custom_keybinds_editor(keybinds_tab, obs_config.get("custom_keybinds", []))
 
+    # Windows-only (see CUSTOM_KEYBIND_HOTKEY_MODE_LABELS): the mechanism choice this settles
+    # doesn't exist on Linux/macOS at all, so there's nothing meaningful to show there.
+    if sys.platform == "win32":
+        configured_hotkey_mode = obs_config.get("custom_keybind_hotkey_mode", DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE)
+        if configured_hotkey_mode not in CUSTOM_KEYBIND_HOTKEY_MODES:
+            configured_hotkey_mode = DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE
+        custom_keybind_hotkey_mode_var = tk.StringVar(
+            value=CUSTOM_KEYBIND_HOTKEY_MODE_LABELS[configured_hotkey_mode]
+        )
+        hotkey_mode_row = tk.Frame(keybinds_tab, bg=DARK_BG)
+        hotkey_mode_row.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(hotkey_mode_row, text="Hotkey delivery mode", bg=DARK_BG, fg=DARK_FG).pack(side="left")
+        ttk.Combobox(
+            hotkey_mode_row, textvariable=custom_keybind_hotkey_mode_var,
+            values=list(CUSTOM_KEYBIND_HOTKEY_MODE_LABELS.values()),
+            state="readonly", width=58, style="Settings.TCombobox",
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(
+            keybinds_tab,
+            text=(
+                "    Standard never adds any input-lag risk, but a game running in true fullscreen "
+                "EXCLUSIVE mode can silently block it from ever firing (confirmed with League of "
+                "Legends). Fullscreen-compatible keeps working there, but taps every keystroke "
+                "system-wide before your game or any other app sees it -- confirmed via a real "
+                "report to add perceptible input lag. Only switch to it if a keybind genuinely "
+                "isn't firing in a specific fullscreen game and you're OK with that tradeoff; "
+                "switch back to Standard if you notice input feeling delayed anywhere."
+            ),
+            anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+        ).pack(fill="x", padx=10, pady=(0, 6))
+    else:
+        custom_keybind_hotkey_mode_var = None
+
     multi_track_list_frame = tk.Frame(obs_tab, bg=DARK_BG)
     multi_track_list_frame.grid(row=row, column=0, columnspan=3, sticky="we")
     multi_track_rows, multi_track_add_row, multi_track_clear_rows = build_multi_track_audio_editor(
@@ -7155,6 +7212,10 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 "key": row_vars["key"].get(),
             })
         obs["custom_keybinds"] = custom_keybinds
+        if custom_keybind_hotkey_mode_var is not None:
+            obs["custom_keybind_hotkey_mode"] = CUSTOM_KEYBIND_HOTKEY_MODE_LABELS_BY_LABEL.get(
+                custom_keybind_hotkey_mode_var.get(), DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE,
+            )
 
         recovery = obs.setdefault("recovery", {})
         recovery["memory_limit_gb"] = read_float(
@@ -9642,6 +9703,7 @@ def main():
     )
     custom_keybinds = config.get("obs", {}).get("custom_keybinds", [])
     manual_split_buffer_seconds = config.get("obs", {}).get("manual_split", {}).get("buffer_seconds", 0)
+    custom_keybind_hotkey_mode = config.get("obs", {}).get("custom_keybind_hotkey_mode", DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE)
     keybind_thread = None
     if any(kb.get("enabled", True) for kb in custom_keybinds):
         keybind_thread = threading.Thread(
@@ -9650,7 +9712,7 @@ def main():
                 custom_keybinds, lambda: runtime_state.get("obs_client"), lambda: manual_split_buffer_seconds,
                 icon, config.get("notifications", {}), status,
             ),
-            kwargs={"stop_event": stop_event},
+            kwargs={"stop_event": stop_event, "hotkey_mode": custom_keybind_hotkey_mode},
             daemon=True,
         )
 
