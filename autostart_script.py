@@ -8841,10 +8841,13 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
     # Forces a re-encode targeting an explicit bitrate (see compute_target_video_bitrate_kbps)
     # instead of CRF -- e.g. so a clip comes out under a specific upload-size limit. Settings'
-    # own default target size (if any) pre-fills and pre-checks this; still freely overridable
-    # per trim.
+    # own default target size (if any) pre-fills the field below, but the checkbox itself starts
+    # unchecked either way -- sizing down is a deliberate per-trim choice (it forces the export
+    # down to just the first audio track, see the size_limit_hint_label warning below), not
+    # something that should silently apply to every export just because a default number is
+    # configured.
     default_target_size = clip_editor_config.get("default_target_size_mb", CLIP_EDITOR_DEFAULT_TARGET_SIZE_MB)
-    limit_size_var = tk.BooleanVar(value=bool(default_target_size))
+    limit_size_var = tk.BooleanVar(value=False)
     target_size_var = tk.StringVar(value=str(default_target_size) if default_target_size else "")
     tk.Checkbutton(
         range_row, text="Limit size to", variable=limit_size_var,
