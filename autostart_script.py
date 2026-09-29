@@ -13,6 +13,7 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
+from collections import OrderedDict
 from tkinter import filedialog, messagebox, ttk
 
 import obsws_python as obsws
@@ -3791,6 +3792,52 @@ def build_waveform_image_command(
         ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str,
         "-filter_complex", filter_complex, "-frames:v", "1", "-update", "1", output_path,
     ]
+
+
+# Caches each full-clip waveform render (the WAVEFORM_FULL_RENDER_WIDTH-wide image covering the
+# whole file, not a zoomed detail render -- see _run_clip_editor's own refresh_waveform) in memory,
+# keyed by (path, track_index, mtime, size) so a file that's changed on disk (re-trimmed, replaced)
+# always misses. Confirmed live (benchmarked against a real 2h16m/6.6GB recording) that this render
+# costs several seconds regardless of the requested width -- ffmpeg has to decode the WHOLE audio
+# track either way -- so reopening the SAME clip and track within the same app run (closing the
+# editor to check something, then coming back to finish trimming) skips that cost entirely instead
+# of re-paying it every time. Module-level, not part of waveform_state, specifically so it survives
+# across separate _run_clip_editor calls (each one is a fresh function scope). Capped at a handful
+# of entries -- each cached image is a few MB, and editing many different long recordings in one
+# sitting shouldn't let this grow unbounded.
+_WAVEFORM_IMAGE_CACHE_MAX_ENTRIES = 8
+_waveform_image_cache = OrderedDict()
+
+
+def _waveform_image_cache_key(path, track_index):
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (path, track_index, stat.st_mtime, stat.st_size)
+
+
+def get_cached_waveform_image(path, track_index):
+    """Returns the cached full-clip waveform PIL Image for this exact (path, track_index) if the
+    file's mtime and size still match what was cached -- else None (including if the file no
+    longer exists at all)."""
+    key = _waveform_image_cache_key(path, track_index)
+    if key is None:
+        return None
+    image = _waveform_image_cache.get(key)
+    if image is not None:
+        _waveform_image_cache.move_to_end(key)
+    return image
+
+
+def store_cached_waveform_image(path, track_index, image):
+    key = _waveform_image_cache_key(path, track_index)
+    if key is None:
+        return
+    _waveform_image_cache[key] = image
+    _waveform_image_cache.move_to_end(key)
+    while len(_waveform_image_cache) > _WAVEFORM_IMAGE_CACHE_MAX_ENTRIES:
+        _waveform_image_cache.popitem(last=False)
 
 
 def generate_waveform_image(ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width=760, height=120):
@@ -8206,10 +8253,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         if track_index < 0:
             show_waveform_placeholder("No audio track detected yet.")
             return
-        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
-        if not ffmpeg_path:
-            show_waveform_placeholder("ffmpeg isn't installed -- install it from Settings > Post-Processing first.")
-            return
+        source_path = state["path"]
 
         # Guards against a slow, stale render finishing AFTER a newer request (a different track
         # or a different file picked while the first one was still rendering) and overwriting what
@@ -8217,7 +8261,21 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         waveform_state["generation"] += 1
         waveform_state["view_generation"] += 1  # invalidates any in-flight detail render too
         this_generation = waveform_state["generation"]
-        source_path = state["path"]
+
+        cached_image = get_cached_waveform_image(source_path, track_index)
+        if cached_image is not None:
+            # Skips ffmpeg entirely -- reopening the same clip/track this app run (see
+            # get_cached_waveform_image's own docstring) shows the waveform instantly instead of
+            # re-paying the full-clip decode this render otherwise costs every single time.
+            waveform_state["full_image"] = cached_image
+            waveform_state["full_duration"] = duration
+            draw_waveform_view()
+            return
+
+        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+        if not ffmpeg_path:
+            show_waveform_placeholder("ffmpeg isn't installed -- install it from Settings > Post-Processing first.")
+            return
 
         def worker():
             tmp_path = os.path.join(tempfile.gettempdir(), f"obsautorec_waveform_{os.getpid()}_{int(time.time() * 1000)}.png")
@@ -8255,6 +8313,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 waveform_state["full_image"] = image
                 waveform_state["full_duration"] = duration
                 draw_waveform_view()
+                store_cached_waveform_image(source_path, track_index, image)
 
             try:
                 root.after(0, finish)

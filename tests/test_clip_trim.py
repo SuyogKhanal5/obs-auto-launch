@@ -558,6 +558,59 @@ class DownsampleWaveformImagePeakTests(unittest.TestCase):
         self.assertEqual(out.size, (33, 40))
 
 
+class WaveformImageCacheTests(unittest.TestCase):
+    def setUp(self):
+        a._waveform_image_cache.clear()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.path = os.path.join(self.tmpdir.name, "clip.mp4")
+        with open(self.path, "wb") as f:
+            f.write(b"fake video bytes")
+
+    def tearDown(self):
+        a._waveform_image_cache.clear()
+
+    def test_miss_when_nothing_cached(self):
+        self.assertIsNone(a.get_cached_waveform_image(self.path, 0))
+
+    def test_hit_returns_the_same_image_after_store(self):
+        from PIL import Image
+        image = Image.new("RGB", (10, 10))
+        a.store_cached_waveform_image(self.path, 0, image)
+        self.assertIs(a.get_cached_waveform_image(self.path, 0), image)
+
+    def test_different_track_index_is_a_separate_entry(self):
+        from PIL import Image
+        image0 = Image.new("RGB", (10, 10))
+        a.store_cached_waveform_image(self.path, 0, image0)
+        self.assertIsNone(a.get_cached_waveform_image(self.path, 1))
+
+    def test_miss_after_file_is_modified(self):
+        from PIL import Image
+        image = Image.new("RGB", (10, 10))
+        a.store_cached_waveform_image(self.path, 0, image)
+        with open(self.path, "wb") as f:
+            f.write(b"different bytes, different size")
+        self.assertIsNone(a.get_cached_waveform_image(self.path, 0))
+
+    def test_missing_file_is_always_a_miss(self):
+        a.store_cached_waveform_image(self.path, 0, object())
+        os.remove(self.path)
+        self.assertIsNone(a.get_cached_waveform_image(self.path, 0))
+
+    def test_oldest_entry_is_evicted_past_the_cap(self):
+        paths = []
+        for i in range(a._WAVEFORM_IMAGE_CACHE_MAX_ENTRIES + 1):
+            p = os.path.join(self.tmpdir.name, f"clip_{i}.mp4")
+            with open(p, "wb") as f:
+                f.write(b"x" * (i + 1))
+            paths.append(p)
+            a.store_cached_waveform_image(p, 0, object())
+        self.assertIsNone(a.get_cached_waveform_image(paths[0], 0))  # evicted (oldest)
+        self.assertIsNotNone(a.get_cached_waveform_image(paths[-1], 0))  # still cached (newest)
+        self.assertEqual(len(a._waveform_image_cache), a._WAVEFORM_IMAGE_CACHE_MAX_ENTRIES)
+
+
 class BuildTrimCommandTests(unittest.TestCase):
     def test_fast_mode_seeks_before_input_and_stream_copies(self):
         cmd = a.build_trim_command("ffmpeg", "in.mkv", 5, 10, "out.mkv", precise=False)
