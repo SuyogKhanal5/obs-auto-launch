@@ -1527,6 +1527,20 @@ CALIBRATION_CLICK_DURATION_SECONDS = 0.003
 CALIBRATION_TARGET_TRACK = 6
 
 
+def _import_numpy():
+    """Lazy numpy import shared by every numpy-using feature in this file -- numpy isn't imported
+    at module level so features that never touch it (most app startups) don't pay its import cost.
+    Also explicitly touches numpy._core._multiarray_tests: PyInstaller's numpy hook doesn't
+    reliably bundle this internal submodule, which numpy's own docstring-patching machinery
+    imports during its normal startup chain, so a frozen build that never explicitly references it
+    itself can raise ModuleNotFoundError the first time ANYTHING actually imports numpy -- confirmed
+    live: this broke the clip editor's waveform view entirely (silently, since draw_waveform_view
+    catches and logs the exception) in a real deployed build."""
+    import numpy as np
+    import numpy._core._multiarray_tests  # noqa: F401 -- see docstring above
+    return np
+
+
 def generate_calibration_tone(output_path):
     """Writes a short WAV of sharp broadband click impulses at known positions to output_path --
     used as run_audio_sync_calibration's test signal. Broadband noise bursts (rather than a pure
@@ -1534,7 +1548,7 @@ def generate_calibration_tone(output_path):
     here (both capture paths re-encode through OBS's own AAC encoder before this ever reads
     them back)."""
     import wave
-    import numpy as np
+    np = _import_numpy()
 
     sr = CALIBRATION_TONE_SAMPLE_RATE
     audio = np.zeros(int(sr * CALIBRATION_TONE_DURATION_SECONDS), dtype=np.float32)
@@ -1589,7 +1603,7 @@ def measure_audio_lag_ms(reference_wav_path, target_wav_path):
     matched in both signals (e.g. one input never actually received the test tone, or too much
     background noise drowned it out)."""
     import wave
-    import numpy as np
+    np = _import_numpy()
 
     def load_mono(path):
         with wave.open(path, "rb") as f:
@@ -1741,7 +1755,7 @@ def measure_waveform_lag_ms(reference_wav_path, target_wav_path, max_expected_la
     reliably-alignable content, so trusting a "measured" lag here would be worse than not
     measuring at all."""
     import wave
-    import numpy as np
+    np = _import_numpy()
 
     # Logged at INFO (not DEBUG) unconditionally -- confirmed live that a real in-app "Fix audio
     # track sync" run can return an empty/no-confidence result on a file+window where the exact
@@ -3677,7 +3691,7 @@ def downsample_waveform_image_peak(image, target_width):
     entirely, and became proportionate again only once zoomed in past the point where this
     function's caller stops downsampling at all. Only meaningful when target_width < image.width;
     draw_waveform_view only calls this for that case and keeps using a plain resize otherwise."""
-    import numpy as np
+    np = _import_numpy()
     bg_rgb = ImageColor.getrgb("#" + WAVEFORM_BG_COLOR.removeprefix("0x"))
     wave_rgb = ImageColor.getrgb("#" + WAVEFORM_LINE_COLOR.removeprefix("0x"))
     arr = np.asarray(image.convert("RGB"))
@@ -7905,6 +7919,33 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 load_file(recent_recordings[index])
 
         recent_combo.bind("<<ComboboxSelected>>", on_recent_selected)
+
+        def step_recent_recording(delta):
+            """Moves to the next-older (delta=+1) or next-newer (delta=-1) recording in the
+            Recent recordings list above, relative to whichever recording is currently open --
+            lets you work through a backlog of recent session recordings one at a time without
+            reopening the dropdown for each one. A no-op (with a short status message) at either
+            end of the list, or if the currently open file isn't part of this list at all (e.g.
+            opened via Browse from somewhere else), since there's no defined position to step
+            from."""
+            try:
+                current_index = recent_recordings.index(state["path"])
+            except ValueError:
+                status_label.config(fg=SEEKER_COLOR, text="Can't step to another recording -- this file isn't in the Recent list.")
+                return
+            new_index = current_index + delta
+            if not (0 <= new_index < len(recent_recordings)):
+                status_label.config(fg=SEEKER_COLOR, text="No older recordings." if delta > 0 else "No newer recordings.")
+                return
+            load_file(recent_recordings[new_index])
+            recent_combo.current(new_index)
+
+        dark_button(
+            open_row, text="⏮", font=("Segoe UI", 11), command=lambda: step_recent_recording(-1),
+        ).pack(side="left", padx=(8, 0))
+        dark_button(
+            open_row, text="⏭", font=("Segoe UI", 11), command=lambda: step_recent_recording(1),
+        ).pack(side="left", padx=(4, 0))
 
     audio_track_var = tk.StringVar()
     audio_track_ids = []
