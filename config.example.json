@@ -106,6 +106,7 @@
         "trim_mode": "precise",
         "default_output_format": "Same as source",
         "default_quality": "Same as source",
+        "default_target_size_mb": 20,
         "vlc_path": ""
     },
     "obs": {

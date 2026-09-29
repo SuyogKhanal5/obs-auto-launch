@@ -6931,7 +6931,9 @@ def _run_config_editor(master_root, restart_callback, on_close):
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
-    clip_target_size_var = tk.StringVar(value=str(clip_editor_config.get("default_target_size_mb") or ""))
+    clip_target_size_var = tk.StringVar(
+        value=str(clip_editor_config.get("default_target_size_mb", CLIP_EDITOR_DEFAULT_TARGET_SIZE_MB) or "")
+    )
     add_labeled_entry(clip_editor_tab, row, "Default target size (MB, blank = off)", clip_target_size_var, width=10)
     row += 1
     tk.Label(
@@ -7495,7 +7497,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
             elif target_size_value is not None:
                 errors.append("'Default target size' must be a positive number of MB")
         else:
-            clip_editor.pop("default_target_size_mb", None)
+            # Explicitly 0, not popped -- now that an absent key falls back to
+            # CLIP_EDITOR_DEFAULT_TARGET_SIZE_MB, popping it here would make "the user cleared
+            # this field to turn size limiting off" indistinguishable from "never configured,"
+            # silently reverting to the default the next time Settings opens.
+            clip_editor["default_target_size_mb"] = 0
         clip_editor["preview_quality"] = clip_preview_quality_var.get()
         clip_editor["default_output_format"] = clip_default_format_var.get()
         clip_editor["default_quality"] = clip_default_quality_var.get()
@@ -7619,6 +7625,11 @@ CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL = {v: k for k, v in CLIP_EDITOR_TRIM_MODE_
 # only exposes the former; this is the same value build_trim_command always used for its one re-
 # encode path before resolution scaling existed.
 CLIP_EDITOR_DEFAULT_CRF = 18
+# A reasonable out-of-the-box cap for a clip meant to be shared somewhere with its own upload
+# limit, rather than leaving size limiting off until a user discovers and sets it themselves.
+# Still freely changeable (or clearable, to turn size limiting off again) from Settings' own
+# "Default target size" field.
+CLIP_EDITOR_DEFAULT_TARGET_SIZE_MB = 20
 
 
 def get_quality_scale_height(quality_choice):
@@ -8832,7 +8843,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     # instead of CRF -- e.g. so a clip comes out under a specific upload-size limit. Settings'
     # own default target size (if any) pre-fills and pre-checks this; still freely overridable
     # per trim.
-    default_target_size = clip_editor_config.get("default_target_size_mb")
+    default_target_size = clip_editor_config.get("default_target_size_mb", CLIP_EDITOR_DEFAULT_TARGET_SIZE_MB)
     limit_size_var = tk.BooleanVar(value=bool(default_target_size))
     target_size_var = tk.StringVar(value=str(default_target_size) if default_target_size else "")
     tk.Checkbutton(
