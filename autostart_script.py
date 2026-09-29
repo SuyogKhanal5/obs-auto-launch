@@ -8528,15 +8528,30 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         # or scrub made while paused, snapping straight back to the playhead the instant the user
         # releases the mouse (confirmed live: panning while paused had no visible effect at all
         # until this guard was added).
+        #
+        # Also skipped entirely once the user has actually zoomed in (span meaningfully below the
+        # full clip) -- confirmed live via a real report: zooming in to inspect the waveform, then
+        # pressing play, silently panned the view away (to keep the playhead in frame) the moment
+        # playback crossed the zoomed window's own edge, which reads as "the app zooms back out on
+        # its own" even though the SPAN itself was never touched, only the scroll position -- not
+        # something a deliberate zoom-in should ever be fighting. Auto-follow stays in effect at
+        # (or near) the full-clip view, where there's no specific region being inspected to lose.
+        # Returns True if it actually changed view_state, so callers can keep the waveform image
+        # (which needs its own explicit re-crop, unlike the ruler/markers) in sync only when
+        # something genuinely moved, not on every poll tick.
         duration = state["duration"]
         if not duration or pan_state["active"] or not player.is_playing():
-            return
+            return False
         span = view_state["end"] - view_state["start"]
+        if span < duration * 0.99:
+            return False
         current = player.get_time() / 1000
         if current < view_state["start"] or current > view_state["end"]:
             new_start = max(0.0, min(current - span / 2, duration - span))
             view_state["start"] = new_start
             view_state["end"] = new_start + span
+            return True
+        return False
 
     timeline_canvas.bind("<Button-1>", lambda event: on_timeline_press(event.x))
     timeline_canvas.bind("<B1-Motion>", lambda event: on_timeline_drag(event.x))
@@ -9474,7 +9489,14 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 refresh_audio_tracks()
             if not state["markers_loaded"]:
                 refresh_markers()
-            ensure_playhead_visible()
+            if ensure_playhead_visible():
+                # The ruler/markers (draw_timeline -> draw_waveform_overlay) redraw off view_state
+                # directly on every poll tick regardless, but the waveform IMAGE itself needs its
+                # own explicit re-crop (draw_waveform_view) -- without this, a genuine auto-follow
+                # pan (see ensure_playhead_visible's own guard for when that still applies) would
+                # leave the displayed waveform image stale while its overlay markers silently jump
+                # to the new position underneath it.
+                draw_waveform_view()
             draw_timeline()
             update_play_pause_icon()
             time_label.config(
