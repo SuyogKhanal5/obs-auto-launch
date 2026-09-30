@@ -9115,8 +9115,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     }
 
     def browse_for_file():
+        # Defaults to OBS's own raw recordings folder, not wherever the OS file dialog last
+        # happened to land -- this dialog is for picking an UNEDITED recording to trim, so it
+        # should start where those actually live, not clip_editor.output_folder (where already-
+        # trimmed clips end up) or whatever directory a previous unrelated dialog remembered.
+        obs_recordings_folder = obs_config.get("output_folder")
+        initial_dir = obs_recordings_folder if obs_recordings_folder and os.path.isdir(obs_recordings_folder) else None
         path = filedialog.askopenfilename(
-            title="Open a recording", filetypes=[("Video files", "*.mp4 *.mkv *.mov *.flv *.ts *.webm *.avi"), ("All files", "*.*")],
+            title="Open a recording", initialdir=initial_dir,
+            filetypes=[("Video files", "*.mp4 *.mkv *.mov *.flv *.ts *.webm *.avi"), ("All files", "*.*")],
         )
         if path:
             load_file(path)
