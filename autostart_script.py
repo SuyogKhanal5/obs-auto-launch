@@ -8229,6 +8229,17 @@ def show_macos_tray_menu(overlay_root, menu, icon):
     render()
     popup.bind("<FocusOut>", close)
     popup.bind("<Escape>", close)
+    # <Deactivate> fires when the whole app (not just this window) loses activation -- e.g.
+    # switching to a fullscreen game's own Space, a bigger context change than the plain
+    # cross-window focus shift <FocusOut> already covers. Confirmed live: a real report of this
+    # exact popup "keeps showing up in game" -- <FocusOut> alone wasn't reliably dismissing it
+    # once a fullscreen game (its own Space, floating windows like this -topmost popup can still
+    # render above it) took over, leaving it stuck on screen for the rest of the session. A hard
+    # timeout is the actual safety net regardless of which dismissal signal a given macOS version/
+    # window-manager state does or doesn't deliver: whatever else does or doesn't fire, this popup
+    # is now guaranteed to close itself within a few seconds no matter what.
+    popup.bind("<Deactivate>", close)
+    popup.after(20000, close)
     popup.focus_force()
 
 
