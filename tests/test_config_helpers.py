@@ -1,9 +1,10 @@
+import base64
 import os
 import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -105,6 +106,55 @@ class ObsRecoveryDefaultsTests(unittest.TestCase):
 
     def test_cooldown_uses_configured_value(self):
         self.assertEqual(a.get_obs_recovery_cooldown_seconds({"recovery": {"cooldown_seconds": 5}}), 5)
+
+    def test_frozen_capture_threshold_defaults_when_unset(self):
+        self.assertEqual(
+            a.get_obs_frozen_capture_threshold_seconds({}), a.DEFAULT_OBS_FROZEN_CAPTURE_SECONDS
+        )
+
+    def test_frozen_capture_threshold_uses_configured_value(self):
+        self.assertEqual(
+            a.get_obs_frozen_capture_threshold_seconds({"recovery": {"frozen_capture_seconds": 60}}), 60
+        )
+
+
+class GetSceneScreenshotHashTests(unittest.TestCase):
+    # Confirmed live against a real OBS instance: GetSourceScreenshot accepts a scene name directly
+    # (a scene is itself a kind of source in OBS's own model) and returns a lossless PNG, so two
+    # screenshots of genuinely unchanged content hash identically with no re-encoding noise --
+    # exactly what the frozen-capture detector in _watcher_loop_impl relies on.
+    def _fake_client(self, image_data):
+        client = Mock()
+        client.get_source_screenshot.return_value = Mock(image_data=image_data)
+        return client
+
+    def test_identical_content_hashes_identically(self):
+        data_uri = "data:image/png;base64," + base64.b64encode(b"not a real png but deterministic bytes").decode()
+        client1 = self._fake_client(data_uri)
+        client2 = self._fake_client(data_uri)
+        self.assertEqual(
+            a.get_scene_screenshot_hash(client1, "Scene"),
+            a.get_scene_screenshot_hash(client2, "Scene"),
+        )
+
+    def test_different_content_hashes_differently(self):
+        data_uri_a = "data:image/png;base64," + base64.b64encode(b"frame A").decode()
+        data_uri_b = "data:image/png;base64," + base64.b64encode(b"frame B").decode()
+        self.assertNotEqual(
+            a.get_scene_screenshot_hash(self._fake_client(data_uri_a), "Scene"),
+            a.get_scene_screenshot_hash(self._fake_client(data_uri_b), "Scene"),
+        )
+
+    def test_request_failure_returns_none_not_raise(self):
+        client = Mock()
+        client.get_source_screenshot.side_effect = Exception("OBS not reachable")
+        self.assertIsNone(a.get_scene_screenshot_hash(client, "Scene"))
+
+    def test_passes_scene_name_and_small_fixed_dimensions(self):
+        data_uri = "data:image/png;base64," + base64.b64encode(b"x").decode()
+        client = self._fake_client(data_uri)
+        a.get_scene_screenshot_hash(client, "My Scene")
+        client.get_source_screenshot.assert_called_once_with("My Scene", "png", 320, 180, -1)
 
 
 class HasSufficientDiskSpaceTests(unittest.TestCase):

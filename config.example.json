@@ -131,7 +131,8 @@
         "custom_keybinds": [],
         "recovery": {
             "memory_limit_gb": 5,
-            "cooldown_seconds": 30
+            "cooldown_seconds": 30,
+            "frozen_capture_seconds": 180
         },
         "game_audio_capture": {
             "enabled": false,

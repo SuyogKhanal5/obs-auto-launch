@@ -1,5 +1,7 @@
+import base64
 import ctypes
 import glob
+import hashlib
 import json
 import logging
 import math
@@ -794,6 +796,22 @@ def connect_obs_events(config, icon, status, audio_state, recording_state):
 
 DEFAULT_OBS_RECOVERY_COOLDOWN_SECONDS = 30
 DEFAULT_OBS_MEMORY_LIMIT_GB = 5
+# Confirmed live (not a guess): macOS's ScreenCaptureKit-backed Display Capture source can get
+# stuck serving a single stale frame indefinitely -- reproduced and root-caused against a real
+# recording that turned out to be the exact same frame, byte-for-byte unchanged in content, for
+# its entire ~90-second duration (confirmed via a timestamp visible in the captured desktop
+# itself, days out of date) -- without any other symptom: OBS stayed fully "healthy" by every
+# other check this app makes the whole time (process running, WebSocket responsive). Separately
+# confirmed empirically (GetSourceScreenshot, 2-second intervals, lossless PNG so no re-encoding
+# noise) that even an otherwise-idle desktop's content changes within a few seconds under normal
+# conditions -- 180 seconds of a genuinely unchanged scene is far longer than any legitimate
+# paused/loading screen during real gameplay would plausibly hold pixel-for-pixel still, while
+# comfortably clearing that bar is exactly what the real, confirmed bug did (unchanged for days).
+DEFAULT_OBS_FROZEN_CAPTURE_SECONDS = 180
+# How often to actually take a screenshot and compare -- frequent enough to catch the real bug
+# within a few minutes of a recording starting, infrequent enough not to spam OBS's WebSocket
+# with screenshot requests every single poll_interval tick (which can be as short as 1.5s).
+FROZEN_CAPTURE_CHECK_INTERVAL_SECONDS = 30
 
 
 def get_obs_recovery_cooldown_seconds(obs_config):
@@ -802,6 +820,28 @@ def get_obs_recovery_cooldown_seconds(obs_config):
 
 def get_obs_memory_limit_bytes(obs_config):
     return obs_config.get("recovery", {}).get("memory_limit_gb", DEFAULT_OBS_MEMORY_LIMIT_GB) * 1024 ** 3
+
+
+def get_obs_frozen_capture_threshold_seconds(obs_config):
+    return obs_config.get("recovery", {}).get("frozen_capture_seconds", DEFAULT_OBS_FROZEN_CAPTURE_SECONDS)
+
+
+def get_scene_screenshot_hash(client, scene_name):
+    """A hash of the current program scene's actual rendered output, via OBS WebSocket's
+    GetSourceScreenshot -- a scene is itself a kind of source in OBS's own model, so this works
+    without this app needing to know anything about the user's own scene/source setup (which it
+    never touches -- see CROSS_PLATFORM_PLAN.md). A small, fixed size (320x180) keeps the request
+    cheap; lossless PNG (confirmed live) means two screenshots of genuinely unchanged content hash
+    identically, with no re-encoding noise to account for. Returns None on any failure (OBS not
+    reachable, no active scene, etc.) -- a transient hiccup here should never itself be treated as
+    "frozen", only a real, sustained run of identical hashes should be."""
+    try:
+        screenshot = client.get_source_screenshot(scene_name, "png", 320, 180, -1)
+        image_data = screenshot.image_data
+        b64 = image_data.split(",", 1)[1] if "," in image_data else image_data
+        return hashlib.sha256(base64.b64decode(b64)).hexdigest()
+    except Exception:
+        return None
 
 
 def ensure_obs_ready(config, processes, icon, status, audio_state, recording_state, obs_recovery_state):
@@ -3730,6 +3770,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     obs_recovery_state = {"last_attempt": 0, "last_start_failure": 0}
     obs_running_last_known = None
     audio_overlay_launch_state = {"last_attempt": 0}
+    frozen_capture_state = {"last_hash": None, "unchanged_since": None, "last_check": 0.0}
 
     # A recording this app started can be left running with nothing tracking it if the
     # previous instance was force-killed, crashed, or otherwise never reached the normal
@@ -3937,6 +3978,61 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                 reset_recording_state(recording_state)
                 status["recording"] = False
                 set_status(icon, status, "Watching")
+            elif obs_client:
+                now = time.time()
+                if now - frozen_capture_state["last_check"] >= FROZEN_CAPTURE_CHECK_INTERVAL_SECONDS:
+                    frozen_capture_state["last_check"] = now
+                    try:
+                        scene_name = obs_client.get_scene_list().current_program_scene_name
+                    except Exception:
+                        scene_name = None
+                    current_hash = get_scene_screenshot_hash(obs_client, scene_name) if scene_name else None
+                    if current_hash is None:
+                        pass  # Couldn't screenshot this round -- a transient hiccup, not "frozen".
+                    elif current_hash != frozen_capture_state["last_hash"]:
+                        frozen_capture_state["last_hash"] = current_hash
+                        frozen_capture_state["unchanged_since"] = now
+                    elif frozen_capture_state["unchanged_since"] is not None:
+                        threshold = get_obs_frozen_capture_threshold_seconds(obs_config)
+                        unchanged_for = now - frozen_capture_state["unchanged_since"]
+                        if (
+                            unchanged_for >= threshold
+                            and now - obs_recovery_state["last_attempt"] >= get_obs_recovery_cooldown_seconds(obs_config)
+                        ):
+                            obs_recovery_state["last_attempt"] = now
+                            logging.warning(
+                                "OBS's captured output hasn't changed in over %d seconds while "
+                                "recording %s -- its screen capture appears frozen (confirmed live: "
+                                "macOS's ScreenCaptureKit-backed Display Capture can get stuck "
+                                "serving a single stale frame indefinitely, surviving a sleep/wake "
+                                "cycle with no other symptom). Restarting OBS and resuming the "
+                                "recording.", threshold, active_display_name or active_name,
+                            )
+                            status["text"] = "Error - OBS capture frozen, restarting"
+                            icon.title = "OBS Auto Recorder - Error, capture frozen, restarting OBS"
+                            icon.icon = build_tray_image(ERROR_COLOR)
+                            notify(
+                                icon, notifications_config, "OBS capture frozen",
+                                f"OBS's screen capture appeared frozen for over {threshold}s -- "
+                                f"restarting OBS. The last few minutes of "
+                                f"{active_display_name or active_name} may be unusable.",
+                            )
+                            if active_replay_buffer_only:
+                                stop_replay_buffer(obs_client)
+                            else:
+                                if get_replay_buffer_mode(replay_buffer_config) == "with_recording":
+                                    stop_replay_buffer(obs_client)
+                                stop_recording(obs_client, icon, active_display_name, recording_state, config)
+                            kill_process_by_name(obs_config["process_name"])
+                            launch_obs(obs_config)
+                            processes = get_running_processes()
+                            obs_client = None
+                            active_name, active_pid, active_display_name = None, None, None
+                            active_replay_buffer_only = False
+                            reset_recording_state(recording_state)
+                            status["recording"] = False
+                            frozen_capture_state["last_hash"] = None
+                            frozen_capture_state["unchanged_since"] = None
 
         stop_event.wait(poll_interval)
 
