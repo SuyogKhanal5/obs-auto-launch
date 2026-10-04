@@ -905,15 +905,30 @@ def start_recording(client, retries=6, delay=2):
 
 WINDOW_MATCH_PRIORITY_EXE_FALLBACK = 2
 OBS_RESOURCE_NOT_FOUND_CODE = 600
+# Exe name that never matches a real window -- see set_game_audio_capture_target's force_reattach.
+REATTACH_PLACEHOLDER_PROCESS_NAME = "obs-auto-recorder-reattach.exe"
 
 
-def set_game_audio_capture_target(client, input_name, process_name):
+def set_game_audio_capture_target(client, input_name, process_name, force_reattach=False):
     """Points the game-audio-isolation input at the detected game's process, creating that
     Application Audio Capture input in OBS first if it doesn't exist yet -- so obs.game_audio_capture
     works without needing to add the OBS source by hand first, the same way the multi-track
-    quick-setup wizard self-creates sources for common apps."""
+    quick-setup wizard self-creates sources for common apps.
+
+    force_reattach makes OBS re-find the target process even when the settings are unchanged.
+    OBS only restarts a process capture when its window/priority settings actually change, and
+    only notices its target died while audio is flowing -- so an app that restarts while silent
+    (Discord auto-updating between calls) leaves the capture bound to the dead process forever,
+    recording nothing. Re-sending the same settings is a no-op, so this briefly points it at a
+    placeholder exe first to force the restart."""
     settings = {"window": f"::{process_name}", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}
     try:
+        if force_reattach:
+            placeholder = {
+                "window": f"::{REATTACH_PLACEHOLDER_PROCESS_NAME}",
+                "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK,
+            }
+            client.set_input_settings(input_name, placeholder, True)
         client.set_input_settings(input_name, settings, True)
         logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
         return
@@ -2586,12 +2601,14 @@ def sync_multi_track_audio(client, multi_track_config, process_capture_sync_offs
         # current server/channel name) -- exactly what "isolation randomly stops working" turns
         # out to be. This re-point isn't a one-time fix, it runs on every recording start, same as
         # obs.game_audio_capture already gets. The sync-offset correction rides along with it for
-        # the same reason -- see DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS.
+        # the same reason -- see DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS. force_reattach covers
+        # the other way isolation silently dies: the app restarted (e.g. Discord auto-updated)
+        # while OBS stayed open, and OBS is still bound to the dead process.
         for app_capture in multi_track_config.get("app_captures", []):
             input_name = app_capture.get("input_name")
             process_name = app_capture.get("process_name")
             if input_name and process_name:
-                set_game_audio_capture_target(client, input_name, process_name)
+                set_game_audio_capture_target(client, input_name, process_name, force_reattach=True)
                 apply_process_capture_sync_offset(client, input_name, process_capture_sync_offset_ms)
         apply_multi_track_routing(client, entries)
     except Exception:
@@ -7920,7 +7937,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         recent_combo = ttk.Combobox(
             open_row, textvariable=recent_var,
             values=[os.path.basename(p) for p in recent_recordings],
-            state="readonly", width=40, style="ClipEditor.TCombobox",
+            state="readonly", width=60, height=20, style="ClipEditor.TCombobox",
         )
         recent_combo.pack(side="left", padx=(8, 0))
 
@@ -7957,6 +7974,21 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         dark_button(
             open_row, text="⏭", font=("Segoe UI", 11), command=lambda: step_recent_recording(1),
         ).pack(side="left", padx=(4, 0))
+
+    def open_export_folder():
+        folder = clip_editor_config.get("output_folder") or os.path.dirname(state["path"] or "") or None
+        if not folder or not os.path.isdir(folder):
+            status_label.config(fg=SEEKER_COLOR, text="Export folder isn't set yet -- configure one in Settings > Clip Editor.")
+            return
+        try:
+            os.startfile(folder)
+        except OSError as exc:
+            logging.error("Could not open clip editor export folder %s: %s", folder, exc)
+            status_label.config(fg=SEEKER_COLOR, text="Could not open the export folder -- see the log for details.")
+
+    dark_button(
+        open_row, text="📤", font=("Segoe UI", 11), command=open_export_folder,
+    ).pack(side="left", padx=(8, 0))
 
     audio_track_var = tk.StringVar()
     audio_track_ids = []
@@ -9076,7 +9108,9 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 indicatoron=False, width=2, height=1,
                 bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG,
                 selectcolor=END_MARKER_COLOR,
-            ).grid(row=row, column=n + 1, padx=(14, 10), pady=2)
+            # sticky="n" lines it up with the source toggles, which sit at the top of their
+            # (taller) toggle-over-gain-entry cells -- left centered, it floats between the two.
+            ).grid(row=row, column=n + 1, sticky="n", padx=(14, 10), pady=2)
 
         default_gains = clip_editor_config.get("default_gains_db") or {}
 
@@ -9137,33 +9171,9 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             )
             return
         release_file_lock()
-        player.stop()
-        media = instance.media_new(path)
-        for option in CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS.get(preview_quality_var.get(), []):
-            media.add_option(option)
-        player.set_media(media)
-        player.audio_set_volume(volume_var.get())
-        player.play()
-        reclaim_focus_after_play()
-        acquire_file_lock(path)
 
-        # Pausing immediately after play() races VLC's own async open/buffer state -- called
-        # this early, pause() is liable to be silently dropped, leaving the clip playing all the
-        # way through instead of stopping on its first frame like a freshly-opened file should.
-        # Poll (on the Tk thread, not a VLC event callback, so there's nothing here that needs to
-        # worry about calling back into Tkinter from a non-Tk thread) until playback has actually
-        # started, then pause; gives up after ~5s so a genuinely broken file doesn't poll forever.
-        def pause_once_playing(attempts=0):
-            if not root.winfo_exists():
-                return
-            if player.get_state() == vlc_module.State.Playing:
-                player.pause()
-                update_play_pause_icon()
-            elif attempts < 50:
-                root.after(100, lambda: pause_once_playing(attempts + 1))
-
-        root.after(50, pause_once_playing)
-
+        # Instant feedback that a new file is loading, before any of VLC's own (potentially slow)
+        # work below even starts.
         state["path"] = path
         state["duration"] = 0.0
         state["tracks_loaded"] = False
@@ -9180,8 +9190,59 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         waveform_state["generation"] += 1
         show_waveform_placeholder("Loading waveform...")
         root.title(f"OBS Auto Recorder - Clip Editor - {os.path.basename(path)}")
-        logging.info("Clip editor: opened %s", os.path.basename(path))
         rebuild_routing_state(0)
+
+        # player.stop()/set_media() can genuinely block for several seconds on a long or
+        # complex recording -- confirmed live: picking a new video while one was already loaded
+        # froze the whole window long enough for Windows to kill the app as unresponsive. VLC's
+        # own teardown/open work happens off the Tk thread from here down so the window stays
+        # responsive regardless of how long it takes; load_generation guards against an earlier,
+        # still-in-flight load finishing after a newer one and clobbering it. Tk variables are
+        # read here, on the Tk thread, before handing off to the worker -- they aren't safe to
+        # read from a background thread.
+        media_options = list(CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS.get(preview_quality_var.get(), []))
+        volume = volume_var.get()
+        state["load_generation"] = state.get("load_generation", 0) + 1
+        this_load_generation = state["load_generation"]
+
+        def open_media_worker():
+            player.stop()
+            media = instance.media_new(path)
+            for option in media_options:
+                media.add_option(option)
+            player.set_media(media)
+            player.audio_set_volume(volume)
+            player.play()
+
+            def finish():
+                if state.get("load_generation") != this_load_generation or not root.winfo_exists():
+                    return
+                reclaim_focus_after_play()
+                acquire_file_lock(path)
+
+                # Pausing immediately after play() races VLC's own async open/buffer state --
+                # called this early, pause() is liable to be silently dropped, leaving the clip
+                # playing all the way through instead of stopping on its first frame like a
+                # freshly-opened file should. Poll until playback has actually started, then
+                # pause; gives up after ~5s so a genuinely broken file doesn't poll forever.
+                def pause_once_playing(attempts=0):
+                    if not root.winfo_exists() or state.get("load_generation") != this_load_generation:
+                        return
+                    if player.get_state() == vlc_module.State.Playing:
+                        player.pause()
+                        update_play_pause_icon()
+                    elif attempts < 50:
+                        root.after(100, lambda: pause_once_playing(attempts + 1))
+
+                root.after(50, pause_once_playing)
+                logging.info("Clip editor: opened %s", os.path.basename(path))
+
+            try:
+                root.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=open_media_worker, daemon=True).start()
         threading.Thread(target=probe_track_count_for_routing, args=(path,), daemon=True).start()
 
     def toggle_play_pause():
