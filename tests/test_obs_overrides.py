@@ -740,6 +740,33 @@ class SetGameAudioCaptureTargetTests(unittest.TestCase):
             a.set_game_audio_capture_target(client, "Game Audio", "Balatro.exe")  # must not raise
         self.assertNotIn("Game Audio", client.inputs)
 
+    def test_force_reattach_changes_settings_before_restoring_them(self):
+        # OBS ignores a re-send of identical settings, so a capture bound to a process that has
+        # since restarted (Discord auto-update) stays bound to the dead one. Forcing a re-attach
+        # has to make OBS see a real change first, then land on the real target.
+        settings = {"window": "::Discord.exe", "priority": a.WINDOW_MATCH_PRIORITY_EXE_FALLBACK}
+        client = FakeObsClient(inputs={
+            "Discord": {"kind": "wasapi_process_output_capture", "tracks": {}, "settings": dict(settings)},
+        })
+        a.set_game_audio_capture_target(client, "Discord", "Discord.exe", force_reattach=True)
+        sent = [c[2]["window"] for c in client.calls if c[0] == "set_input_settings"]
+        self.assertEqual(sent, [f"::{a.REATTACH_PLACEHOLDER_PROCESS_NAME}", "::Discord.exe"])
+        self.assertEqual(client.inputs["Discord"]["settings"], settings)
+
+    def test_force_reattach_still_creates_a_missing_input(self):
+        client = FakeObsClient()
+        a.set_game_audio_capture_target(client, "Discord", "Discord.exe", force_reattach=True)
+        self.assertEqual(client.inputs["Discord"]["settings"]["window"], "::Discord.exe")
+
+    def test_no_reattach_by_default(self):
+        # Game Audio is re-pointed after recording has started -- forcing a restart there would
+        # cut the start of the game-audio track, so it stays opt-in.
+        client = FakeObsClient(inputs={
+            "Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}, "settings": {}},
+        })
+        a.set_game_audio_capture_target(client, "Game Audio", "Balatro.exe")
+        self.assertEqual(len([c for c in client.calls if c[0] == "set_input_settings"]), 1)
+
 
 class ActiveSessionMarkerTests(unittest.TestCase):
     def setUp(self):

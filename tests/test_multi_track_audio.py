@@ -308,6 +308,29 @@ class SyncMultiTrackAudioAppCapturesTests(unittest.TestCase):
         a.sync_multi_track_audio(client, multi_track_config)
         self.assertEqual(client.inputs["Discord"]["settings"]["window"], "::Discord.exe")
 
+    def test_forces_reattach_even_when_settings_already_match(self):
+        # Discord restarting while OBS stays open leaves the capture bound to the dead process,
+        # and re-sending identical settings doesn't make OBS re-find it.
+        client = FakeObsClient(
+            profile_name="OBS Auto Recorder",
+            inputs={
+                "Discord": {
+                    "kind": "wasapi_process_output_capture",
+                    "tracks": {str(i): False for i in range(1, 7)},
+                    "settings": {"window": "::Discord.exe", "priority": 2},
+                },
+            },
+        )
+        multi_track_config = {
+            "enabled": True,
+            "tracks": [{"input_name": "Discord", "track": 4}],
+            "app_captures": [{"input_name": "Discord", "process_name": "Discord.exe"}],
+        }
+        a.sync_multi_track_audio(client, multi_track_config)
+        sent = [c[2].get("window") for c in client.calls if c[0] == "set_input_settings" and c[1] == "Discord"]
+        self.assertIn(f"::{a.REATTACH_PLACEHOLDER_PROCESS_NAME}", sent)
+        self.assertEqual(client.inputs["Discord"]["settings"]["window"], "::Discord.exe")
+
     def test_missing_app_capture_input_is_created_not_skipped(self):
         client = FakeObsClient(profile_name="OBS Auto Recorder")
         multi_track_config = {
