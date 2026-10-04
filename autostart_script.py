@@ -7617,7 +7617,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
 
 
 CLIP_EDITOR_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".flv", ".ts", ".webm", ".avi"}
-CLIP_EDITOR_MAX_RECENT_RECORDINGS = 30
+# High enough to just be "all of them" for any real recordings folder rather than a real cap --
+# confirmed live that 30 was too low (a real folder with 63 recordings made Previous dead-end
+# into "No older recordings" once the capped list ran out, 33 genuinely older files still sitting
+# right there on disk). Still bounded, not unlimited, so a folder with years of uncleaned
+# recordings can't make this list (and the dropdown built from it) grow without any limit at all.
+CLIP_EDITOR_MAX_RECENT_RECORDINGS = 500
 # First entry means "keep the source file's own extension" -- do_trim() checks for it by identity
 # rather than treating it as a real container, so it must stay first.
 CLIP_EDITOR_OUTPUT_FORMATS = ["Same as source", ".mp4", ".mkv", ".mov", ".avi", ".webm"]
