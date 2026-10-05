@@ -11,6 +11,12 @@
             "process_name": "javaw.exe",
             "title_contains": "minecraft",
             "display_name": "Minecraft"
+        },
+        {
+            "process_name": "GeForceNOW",
+            "title_contains": "on GeForce NOW",
+            "display_name": "GeForce NOW",
+            "use_title_as_display_name": true
         }
     ],
     "poll_interval_seconds": 1.5,

@@ -182,6 +182,21 @@ Editing `config.json` never requires rebuilding `OBSAutoRecorder.exe` — it's a
 
 `display_name` is optional and controls the game name used in the recording filename and log messages; without it, the process name is used instead. This costs a little extra overhead per poll (a window-title scan), so it's only used as a fallback after `watched_games`, Steam detection, and Epic detection all miss.
 
+**`watched_windows` example** (GeForce NOW — cloud-streamed games have no local process of their own to detect, but GeForce NOW's own window title changes from the generic `"GeForce NOW"` while idling at its menu to `"<game> on GeForce NOW"` the moment a game actually loads):
+
+```json
+"watched_windows": [
+    {
+        "process_name": "GeForceNOW",
+        "title_contains": "on GeForce NOW",
+        "display_name": "GeForce NOW",
+        "use_title_as_display_name": true
+    }
+]
+```
+
+This does two things a plain `display_name` can't: it only starts recording once a game is actually loaded (not while browsing GeForce NOW's own menu, since the title doesn't match until then), and `use_title_as_display_name` recovers the *specific* game's name from the title for the recording filename — "Destiny 2 on GeForce NOW" becomes "Destiny 2" — rather than labeling every session with one fixed name regardless of which game was actually played. Recording also stops correctly when you back out to GeForce NOW's own menu after a game, even though the GeForce NOW process itself keeps running (only its title reverts) — a case a Minecraft-style entry doesn't need to handle, since `javaw.exe` really does exit when the game closes.
+
 ### 3. Get the app running
 
 **Option A — use the prebuilt build directly** (no installer, e.g. for a portable/USB setup):

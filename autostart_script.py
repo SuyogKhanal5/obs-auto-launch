@@ -141,14 +141,32 @@ def default_overlay_monitor_index(monitors):
 
 
 def get_running_processes():
+    # process_iter(["name", "exe"]) (the previous implementation) resolves those attrs eagerly as
+    # part of advancing the iterator itself -- confirmed live (a real crash) that this happens
+    # OUTSIDE any try/except in this function's own loop body, so a per-process error there took
+    # the whole watcher thread down with it rather than just skipping that one process. The
+    # specific crash: a macOS process name 15+ characters long (e.g. a sandboxed app's own helper
+    # process, "GeForceNOW Helper (Renderer)") makes psutil's Process.name() internally fall back
+    # to self.cmdline() to get the untruncated name (see psutil's own source) -- and for a
+    # process macOS's hardened runtime restricts PROCARGS2 access to, that raised a raw
+    # SystemError wrapping a PermissionError, a type psutil's own internal try/except around that
+    # fallback (AccessDenied/ZombieProcess only) doesn't catch either, let alone this function's.
+    # Iterating bare Process objects instead and calling .name()/.exe() explicitly moves that
+    # risky resolution inside a try/except this function actually controls, catching SystemError
+    # too so one inaccessible process can never crash the whole scan again.
     processes = []
-    for proc in psutil.process_iter(["name", "exe"]):
+    for proc in psutil.process_iter():
         try:
-            name = proc.info.get("name")
-            if name:
-                processes.append((name, proc.info.get("exe") or "", proc.pid))
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+            name = proc.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError, PermissionError):
+            continue
+        if not name:
+            continue
+        try:
+            exe = proc.exe()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError, PermissionError):
+            exe = ""
+        processes.append((name, exe, proc.pid))
     return processes
 
 
@@ -161,6 +179,18 @@ def get_window_titles():
     error) when this isn't supported in the current session at all -- e.g. a Wayland desktop,
     which has no unprivileged cross-compositor API for this."""
     return platform_common.get_window_titles()
+
+
+def watched_window_still_matches(pid, entry):
+    """True if entry's title_contains needle still appears in pid's current window titles --
+    used to detect a watched_windows session ending WITHOUT its process ever exiting. Confirmed
+    live: GeForce NOW's own process keeps running when you back out to its menu after a game,
+    only its window's title reverts from "<game> on GeForce NOW" back to the generic
+    "GeForce NOW" -- is_process_running alone (correct for Minecraft's javaw.exe, which really
+    does exit when the game closes) would otherwise never notice and just keep "recording"
+    straight through menu-browsing until the whole app is quit."""
+    needle = entry["title_contains"].lower()
+    return any(needle in t.lower() for t in get_window_titles().get(pid, []))
 
 
 def get_steam_install_path():
@@ -360,19 +390,36 @@ def find_game_by_install_dir(exe_path, manifest_games):
     return None
 
 
+def extract_display_name_from_title(title, needle):
+    """Everything in title before needle's first (case-insensitive) occurrence, trimmed --
+    confirmed live against a real GeForce NOW session that its window title changes from the
+    generic "GeForce NOW" (while idling at its own menu) to "<actual game> on GeForce NOW" the
+    moment a game actually loads, so title_contains="on GeForce NOW" both scopes detection to
+    real gameplay (not menu-browsing) AND, via this function, recovers the specific game's own
+    name for display/recording-filename purposes -- something a static configured display_name
+    can't do, since the game played changes session to session. Returns None (falls back to
+    whatever display_name is configured, if any) if needle isn't actually found in title, or if
+    everything before it is blank."""
+    idx = title.lower().find(needle.lower())
+    if idx == -1:
+        return None
+    extracted = title[:idx].strip()
+    return extracted or None
+
+
 def find_target_process(
     watched_games, root_common_dirs, root_exclude_keywords, manifest_games, watched_windows, processes
 ):
     for name, exe, pid in processes:
         if name.lower() in watched_games:
-            return name, exe, pid, None
+            return name, exe, pid, None, None
     for name, exe, pid in processes:
         if is_exe_under_dirs(exe, root_common_dirs, root_exclude_keywords):
-            return name, exe, pid, None
+            return name, exe, pid, None, None
     for name, exe, pid in processes:
         manifest_display_name = find_game_by_install_dir(exe, manifest_games)
         if manifest_display_name:
-            return name, exe, pid, manifest_display_name
+            return name, exe, pid, manifest_display_name, None
     if watched_windows:
         window_titles = get_window_titles()
         for name, exe, pid in processes:
@@ -381,9 +428,18 @@ def find_target_process(
                 if name_lower != entry["process_name"].lower():
                     continue
                 needle = entry["title_contains"].lower()
-                if any(needle in t.lower() for t in window_titles.get(pid, [])):
-                    return name, exe, pid, entry.get("display_name")
-    return None, None, None, None
+                matched_title = next(
+                    (t for t in window_titles.get(pid, []) if needle in t.lower()), None
+                )
+                if matched_title is None:
+                    continue
+                display_name = entry.get("display_name")
+                if entry.get("use_title_as_display_name"):
+                    extracted = extract_display_name_from_title(matched_title, entry["title_contains"])
+                    if extracted:
+                        display_name = extracted
+                return name, exe, pid, display_name, entry
+    return None, None, None, None, None
 
 
 INVALID_FILENAME_CHARS = '<>:"/\\|?*'
@@ -3772,6 +3828,10 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     active_pid = None
     active_display_name = None
     active_replay_buffer_only = False
+    # Set only when the active session was detected via a watched_windows rule (e.g. GeForce
+    # NOW) -- see the "is this session still active" check below for why that needs to also
+    # re-verify the title match on every tick, unlike a normal watched-process session.
+    active_window_entry = None
     obs_recovery_state = {"last_attempt": 0, "last_start_failure": 0}
     obs_running_last_known = None
     audio_overlay_launch_state = {"last_attempt": 0}
@@ -3880,7 +3940,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                     processes = get_running_processes()
                     set_status(icon, status, "Watching")
 
-            name, exe, pid, display_override = find_target_process(
+            name, exe, pid, display_override, window_entry = find_target_process(
                 watched_games, root_common_dirs, root_exclude_keywords, manifest_games, watched_windows, processes
             )
             if name:
@@ -3937,6 +3997,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                     active_name, active_pid = name, pid
                     active_display_name = display_name
                     active_replay_buffer_only = replay_buffer_only
+                    active_window_entry = window_entry
                     recording_state["display_name"] = active_display_name
                     # "recording" here specifically means a continuous file is being written --
                     # replay-buffer-only mode never does that, so it's left False (avoids e.g. the
@@ -3967,8 +4028,27 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
             elif status["text"].startswith("Error"):
                 set_status(icon, status, "Watching")
         else:
-            if not is_process_running(active_pid):
-                logging.info("%s has exited.", active_display_name or active_name)
+            process_exited = not is_process_running(active_pid)
+            # A watched_windows session (e.g. GeForce NOW) can end without its process ever
+            # exiting -- confirmed live: backing out to GeForce NOW's own menu after a game
+            # leaves the GeForceNOW process itself running, only its window's title reverts from
+            # "<game> on GeForce NOW" back to the generic "GeForce NOW". Checking only
+            # is_process_running (as every other detection path correctly can -- Minecraft's own
+            # javaw.exe really does exit when the game closes) would otherwise keep "recording"
+            # straight through menu-browsing after the game ends, until the whole app is quit.
+            window_no_longer_matches = (
+                not process_exited
+                and active_window_entry is not None
+                and not watched_window_still_matches(active_pid, active_window_entry)
+            )
+            if process_exited or window_no_longer_matches:
+                if process_exited:
+                    logging.info("%s has exited.", active_display_name or active_name)
+                else:
+                    logging.info(
+                        "%s's window no longer matches (likely returned to a menu); stopping.",
+                        active_display_name or active_name,
+                    )
                 if obs_client:
                     if active_replay_buffer_only:
                         stop_replay_buffer(obs_client)
@@ -3980,6 +4060,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                             notify(icon, notifications_config, "Recording stopped", active_display_name or active_name)
                 active_name, active_pid, active_display_name = None, None, None
                 active_replay_buffer_only = False
+                active_window_entry = None
                 reset_recording_state(recording_state)
                 status["recording"] = False
                 set_status(icon, status, "Watching")
@@ -4034,6 +4115,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                             obs_client = None
                             active_name, active_pid, active_display_name = None, None, None
                             active_replay_buffer_only = False
+                            active_window_entry = None
                             reset_recording_state(recording_state)
                             status["recording"] = False
                             frozen_capture_state["last_hash"] = None

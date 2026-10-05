@@ -183,6 +183,82 @@ class SetStartupShortcutEnabledTests(unittest.TestCase):
         )
 
 
+class GetRunningProcessesTests(unittest.TestCase):
+    # Confirmed live (a real crash): process_iter(["name", "exe"]) -- the previous
+    # implementation -- resolves those attrs eagerly as part of advancing the iterator itself,
+    # outside any try/except this function's own loop body could reach. The specific trigger: a
+    # macOS process name 15+ characters long makes psutil's own Process.name() fall back to
+    # self.cmdline() internally, which raised a raw SystemError (wrapping a PermissionError from
+    # a sysctl(KERN_PROCARGS2) call macOS's hardened runtime denied) for a real sandboxed helper
+    # process -- a type neither psutil's own internal try/except nor the old code here caught.
+    def _fake_proc(self, name=None, exe="", pid=1, name_error=None, exe_error=None):
+        proc = Mock()
+        proc.pid = pid
+        if name_error:
+            proc.name.side_effect = name_error
+        else:
+            proc.name.return_value = name
+        if exe_error:
+            proc.exe.side_effect = exe_error
+        else:
+            proc.exe.return_value = exe
+        return proc
+
+    def test_normal_processes_are_collected(self):
+        procs = [
+            self._fake_proc(name="OBS", exe="/Applications/OBS.app/Contents/MacOS/OBS", pid=100),
+            self._fake_proc(name="Balatro", exe="/Users/x/Balatro.app/Contents/MacOS/love", pid=200),
+        ]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(
+            result,
+            [
+                ("OBS", "/Applications/OBS.app/Contents/MacOS/OBS", 100),
+                ("Balatro", "/Users/x/Balatro.app/Contents/MacOS/love", 200),
+            ],
+        )
+
+    def test_system_error_resolving_name_skips_that_process_not_the_whole_scan(self):
+        # The exact exception type confirmed live: a raw SystemError, not psutil.AccessDenied.
+        procs = [
+            self._fake_proc(name="OBS", exe="/Applications/OBS.app/Contents/MacOS/OBS", pid=100),
+            self._fake_proc(name_error=SystemError("boom"), pid=200),
+            self._fake_proc(name="Balatro", exe="/Users/x/Balatro.app/Contents/MacOS/love", pid=300),
+        ]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(
+            result,
+            [
+                ("OBS", "/Applications/OBS.app/Contents/MacOS/OBS", 100),
+                ("Balatro", "/Users/x/Balatro.app/Contents/MacOS/love", 300),
+            ],
+        )
+
+    def test_permission_error_resolving_exe_keeps_the_process_with_empty_exe(self):
+        procs = [self._fake_proc(name="Sandboxed Helper (GPU)", exe_error=PermissionError("boom"), pid=100)]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("Sandboxed Helper (GPU)", "", 100)])
+
+    def test_psutil_typed_exceptions_still_handled(self):
+        procs = [
+            self._fake_proc(name_error=a.psutil.NoSuchProcess(pid=1), pid=1),
+            self._fake_proc(name_error=a.psutil.AccessDenied(pid=2), pid=2),
+            self._fake_proc(name="OBS", exe="/x/OBS", pid=3),
+        ]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("OBS", "/x/OBS", 3)])
+
+    def test_blank_name_is_skipped(self):
+        procs = [self._fake_proc(name="", pid=1), self._fake_proc(name="OBS", exe="/x/OBS", pid=2)]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("OBS", "/x/OBS", 2)])
+
+
 class HasSufficientDiskSpaceTests(unittest.TestCase):
     def test_disabled_guard_always_passes(self):
         self.assertTrue(a.has_sufficient_disk_space({"enabled": False}, "C:\\"))
