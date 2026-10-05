@@ -20,9 +20,52 @@ class CommonAudioAppsDataTests(unittest.TestCase):
         names = [app["name"] for app in a.COMMON_AUDIO_APPS]
         self.assertEqual(len(names), len(set(names)))
 
-    def test_every_app_has_a_process_name(self):
+    def test_every_app_has_at_least_one_platform_process_name(self):
         for app in a.COMMON_AUDIO_APPS:
-            self.assertTrue(app["process_name"].lower().endswith(".exe"), app["name"])
+            self.assertTrue(app["process_names"], app["name"])
+
+    def test_windows_process_names_end_in_exe(self):
+        for app in a.COMMON_AUDIO_APPS:
+            win_name = app["process_names"].get("win32")
+            if win_name is not None:
+                self.assertTrue(win_name.lower().endswith(".exe"), app["name"])
+
+    def test_macos_process_names_never_end_in_exe(self):
+        for app in a.COMMON_AUDIO_APPS:
+            mac_name = app["process_names"].get("darwin")
+            if mac_name is not None:
+                self.assertFalse(mac_name.lower().endswith(".exe"), app["name"])
+
+    def test_safari_is_macos_only(self):
+        safari = next(app for app in a.COMMON_AUDIO_APPS if app["name"] == "Safari")
+        self.assertEqual(set(safari["process_names"]), {"darwin"})
+
+
+class ResolveCommonAudioAppsTests(unittest.TestCase):
+    def test_windows_gets_exe_names_and_no_safari(self):
+        resolved = a.resolve_common_audio_apps(platform_name="win32")
+        by_name = {app["name"]: app["process_name"] for app in resolved}
+        self.assertEqual(by_name["Discord"], "Discord.exe")
+        self.assertEqual(by_name["Chrome"], "chrome.exe")
+        self.assertNotIn("Safari", by_name)
+
+    def test_macos_gets_bundle_names_including_safari(self):
+        resolved = a.resolve_common_audio_apps(platform_name="darwin")
+        by_name = {app["name"]: app["process_name"] for app in resolved}
+        self.assertEqual(by_name["Discord"], "Discord")
+        self.assertEqual(by_name["Safari"], "Safari")
+        self.assertEqual(by_name["Zoom"], "zoom.us")
+
+    def test_linux_offers_nothing_since_no_capture_kind_exists(self):
+        # Matches CROSS_PLATFORM_PLAN.md §6.1's confirmed negative finding: Linux has no
+        # per-app audio capture kind at all, so there's nothing a quick-setup checkbox here
+        # could ever actually do.
+        self.assertEqual(a.resolve_common_audio_apps(platform_name="linux"), [])
+
+    def test_resolved_entries_have_the_flat_shape_downstream_code_expects(self):
+        resolved = a.resolve_common_audio_apps(platform_name="win32")
+        for app in resolved:
+            self.assertEqual(set(app), {"name", "process_name", "category"})
 
 
 class ComputeQuickSetupTracksTests(unittest.TestCase):
@@ -48,8 +91,9 @@ class ComputeQuickSetupTracksTests(unittest.TestCase):
             "Scarlet": {"kind": "wasapi_input_capture", "tracks": {str(i): False for i in range(1, 7)}},
             "Discord": {"kind": "wasapi_process_output_capture", "tracks": {str(i): False for i in range(1, 7)}},
         })
-        self.discord = next(app for app in a.COMMON_AUDIO_APPS if app["name"] == "Discord")
-        self.spotify = next(app for app in a.COMMON_AUDIO_APPS if app["name"] == "Spotify")
+        resolved = a.resolve_common_audio_apps(platform_name="win32")
+        self.discord = next(app for app in resolved if app["name"] == "Discord")
+        self.spotify = next(app for app in resolved if app["name"] == "Spotify")
 
     def test_desktop_and_mic_route_to_tracks_one_and_two(self):
         tracks, created, app_captures = a.compute_quick_setup_tracks(self.client, "Desktop Audio", "Scarlet", None, [])
@@ -96,7 +140,7 @@ class ComputeQuickSetupTracksTests(unittest.TestCase):
         self.assertEqual(settings["window"], "::Spotify.exe")
 
     def test_full_scheme_matches_the_six_track_layout(self):
-        chrome = next(app for app in a.COMMON_AUDIO_APPS if app["name"] == "Chrome")
+        chrome = next(app for app in a.resolve_common_audio_apps(platform_name="win32") if app["name"] == "Chrome")
         tracks, created, app_captures = a.compute_quick_setup_tracks(
             self.client, "Desktop Audio", "Scarlet", "Game Audio", [self.discord, self.spotify, chrome]
         )

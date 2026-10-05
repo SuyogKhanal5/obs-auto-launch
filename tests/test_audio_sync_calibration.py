@@ -400,11 +400,32 @@ class MeasureClipAudioSyncShiftsMsTests(unittest.TestCase):
 
 
 class RunAudioSyncCalibrationSafetyTests(unittest.TestCase):
+    # run_audio_sync_calibration's own orchestration is OS-agnostic -- mocking
+    # platform_common's two dispatch functions with Windows-shaped return values (same approach
+    # as SetGameAudioCaptureTargetTests) makes these tests exercise that orchestration
+    # identically regardless of which real OS runs them, per CROSS_PLATFORM_PLAN.md §3.2. ffplay
+    # itself is looked up via platform_common.find_ffplay_executable (also OS-aware -- no
+    # hardcoded ".exe"), so the fake ffmpeg/ffplay pair uses plain, extension-less names here.
+    def setUp(self):
+        patcher1 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_kind", return_value="wasapi_process_output_capture",
+        )
+        patcher2 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_settings",
+            side_effect=lambda process_name, exe_path: {
+                "window": f"::{process_name}", "priority": a.WINDOW_MATCH_PRIORITY_EXE_FALLBACK,
+            },
+        )
+        patcher1.start()
+        patcher2.start()
+        self.addCleanup(patcher1.stop)
+        self.addCleanup(patcher2.stop)
+
     def test_refuses_to_run_while_obs_is_already_recording(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ffmpeg_path = os.path.join(tmp, "ffmpeg.exe")
+            ffmpeg_path = os.path.join(tmp, "ffmpeg")
             open(ffmpeg_path, "w").close()
-            open(os.path.join(tmp, "ffplay.exe"), "w").close()
+            open(os.path.join(tmp, "ffplay"), "w").close()
             client = FakeObsClient(inputs={"Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}}})
             client.recording_active = True
             with self.assertLogs(level="WARNING"):
@@ -414,14 +435,65 @@ class RunAudioSyncCalibrationSafetyTests(unittest.TestCase):
 
     def test_missing_ffplay_returns_none_without_touching_obs(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ffmpeg_path = os.path.join(tmp, "ffmpeg.exe")
+            ffmpeg_path = os.path.join(tmp, "ffmpeg")
             open(ffmpeg_path, "w").close()
-            # deliberately no ffplay.exe written alongside it
+            # deliberately no ffplay written alongside it
             client = FakeObsClient(inputs={"Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}}})
             with self.assertLogs(level="WARNING"):
                 result = a.run_audio_sync_calibration(client, ffmpeg_path, "Game Audio")
         self.assertIsNone(result)
         self.assertEqual(client.calls, [])
+
+    def test_no_confirmed_capture_kind_on_this_os_returns_none_without_touching_obs(self):
+        # e.g. Linux, per §6.1's confirmed negative finding -- there's nothing to calibrate
+        # against at all, so this should bail out before even looking for ffplay.
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value=None):
+            with tempfile.TemporaryDirectory() as tmp:
+                ffmpeg_path = os.path.join(tmp, "ffmpeg")
+                open(ffmpeg_path, "w").close()
+                open(os.path.join(tmp, "ffplay"), "w").close()
+                client = FakeObsClient(inputs={"Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}}})
+                with self.assertLogs(level="WARNING"):
+                    result = a.run_audio_sync_calibration(client, ffmpeg_path, "Game Audio")
+        self.assertIsNone(result)
+        self.assertEqual(client.calls, [])
+
+    def test_unresolvable_capture_settings_returns_none_without_touching_obs(self):
+        # macOS's confirmed shape: a bare ffplay binary (no .app bundle) can't resolve to a
+        # bundle identifier, so process_audio_capture_settings legitimately returns None even
+        # though a capture kind exists on this OS.
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", return_value=None):
+            with tempfile.TemporaryDirectory() as tmp:
+                ffmpeg_path = os.path.join(tmp, "ffmpeg")
+                open(ffmpeg_path, "w").close()
+                open(os.path.join(tmp, "ffplay"), "w").close()
+                client = FakeObsClient(inputs={"Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}}})
+                with self.assertLogs(level="WARNING"):
+                    result = a.run_audio_sync_calibration(client, ffmpeg_path, "Game Audio")
+        self.assertIsNone(result)
+        self.assertEqual(client.calls, [])
+
+    def test_points_target_input_at_the_dispatched_capture_settings(self):
+        # The actual settings dict written to OBS must come from platform_common's dispatch, not
+        # a hardcoded Windows-only {"window": "::ffplay.exe", ...} literal.
+        with tempfile.TemporaryDirectory() as tmp:
+            ffmpeg_path = os.path.join(tmp, "ffmpeg")
+            open(ffmpeg_path, "w").close()
+            open(os.path.join(tmp, "ffplay"), "w").close()
+            client = FakeObsClient(inputs={
+                "Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}},
+                "Desktop Audio": {"kind": "wasapi_output_capture", "tracks": {"2": True}},
+            })
+            with patch.object(a, "subprocess") as fake_subprocess, \
+                    patch.object(a, "time"), \
+                    patch.object(a, "generate_calibration_tone"):
+                fake_proc = unittest.mock.MagicMock()
+                fake_proc.poll.return_value = 0
+                fake_subprocess.Popen.return_value = fake_proc
+                a.run_audio_sync_calibration(client, ffmpeg_path, "Game Audio")
+        expected_settings = {"window": "::ffplay", "priority": a.WINDOW_MATCH_PRIORITY_EXE_FALLBACK}
+        set_settings_calls = [c for c in client.calls if c[0] == "set_input_settings" and c[1] == "Game Audio"]
+        self.assertIn(("set_input_settings", "Game Audio", expected_settings, True), set_settings_calls)
 
 
 if __name__ == "__main__":

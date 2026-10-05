@@ -139,6 +139,39 @@ class FindFfprobeExecutableTests(unittest.TestCase):
         self.assertEqual(result, r"C:\tools\ffprobe.exe")
 
 
+class FindFfplayExecutableTests(unittest.TestCase):
+    # Same shape as FindFfprobeExecutableTests -- find_ffplay_executable exists specifically to
+    # fix a real bug found on real Mac hardware: run_audio_sync_calibration used to hardcode
+    # "ffplay.exe", which doesn't exist on macOS/Linux (plain "ffplay", no extension).
+    @unittest.skipUnless(os.name == "nt", "exercises real Windows (ntpath) path-splitting semantics")
+    def test_windows_style_exe_suffix_preserved(self):
+        with unittest.mock.patch("os.path.isfile", return_value=True):
+            result = pc.find_ffplay_executable(r"C:\ffmpeg\bin\ffmpeg.exe")
+        self.assertEqual(result, r"C:\ffmpeg\bin\ffplay.exe")
+
+    def test_no_extension_preserved(self):
+        with unittest.mock.patch("os.path.isfile", return_value=True):
+            result = pc.find_ffplay_executable("/usr/bin/ffmpeg")
+        self.assertEqual(result, os.path.join("/usr/bin", "ffplay"))
+
+    def test_returns_none_when_ffplay_missing(self):
+        with unittest.mock.patch("os.path.isfile", return_value=False):
+            self.assertIsNone(pc.find_ffplay_executable("/usr/bin/ffmpeg"))
+
+    def test_unusual_ffmpeg_name_falls_back_to_os_default_on_linux(self):
+        with unittest.mock.patch.object(pc.sys, "platform", "linux"):
+            with unittest.mock.patch("os.path.isfile", return_value=True):
+                result = pc.find_ffplay_executable("/usr/bin/my-custom-build")
+        self.assertEqual(result, os.path.join("/usr/bin", "ffplay"))
+
+    @unittest.skipUnless(os.name == "nt", "exercises real Windows (ntpath) path-splitting semantics")
+    def test_unusual_ffmpeg_name_falls_back_to_os_default_on_windows(self):
+        with unittest.mock.patch.object(pc.sys, "platform", "win32"):
+            with unittest.mock.patch("os.path.isfile", return_value=True):
+                result = pc.find_ffplay_executable(r"C:\tools\my-custom-build.exe")
+        self.assertEqual(result, r"C:\tools\ffplay.exe")
+
+
 class LibvlcFilenameTests(unittest.TestCase):
     def test_windows(self):
         self.assertEqual(pc.libvlc_filename(platform_name="win32"), "libvlc.dll")

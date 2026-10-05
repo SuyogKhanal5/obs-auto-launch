@@ -1691,12 +1691,28 @@ def run_audio_sync_calibration(client, ffmpeg_path, target_input_name, reference
 
     Returns the measured offset in ms to apply to target_input_name (negative -- how much
     earlier it needs to shift to line back up with reference_input_name), or None if calibration
-    couldn't complete (ffplay not found, OBS not reachable, or too few clicks detected to be
-    confident). Restores every OBS setting it touches -- record directory, target_input_name's
-    window/priority, its sync offset, and its track routing -- before returning either way."""
-    ffplay_path = os.path.join(os.path.dirname(ffmpeg_path), "ffplay.exe")
-    if not os.path.isfile(ffplay_path):
-        logging.warning("Audio sync calibration: ffplay.exe not found next to ffmpeg; skipping.")
+    couldn't complete (ffplay not found, this OS's per-app audio capture can't be retargeted at
+    a plain spawned process, OBS not reachable, or too few clicks detected to be confident).
+    Restores every OBS setting it touches -- record directory, target_input_name's capture
+    settings, its sync offset, and its track routing -- before returning either way."""
+    if not platform_common.process_audio_capture_kind():
+        logging.warning(
+            "Audio sync calibration: this OS has no confirmed per-app audio capture kind to "
+            "calibrate against; skipping."
+        )
+        return None
+    ffplay_path = platform_common.find_ffplay_executable(ffmpeg_path)
+    if not ffplay_path:
+        logging.warning("Audio sync calibration: ffplay not found next to ffmpeg; skipping.")
+        return None
+    ffplay_capture_settings = platform_common.process_audio_capture_settings("ffplay", ffplay_path)
+    if ffplay_capture_settings is None:
+        logging.warning(
+            "Audio sync calibration: this OS's per-app audio capture can't be pointed at a "
+            "plain ffplay process (e.g. macOS needs a real .app bundle identifier, which a "
+            "bare command-line ffplay binary doesn't have); skipping. The configured/default "
+            "offset will keep being applied instead."
+        )
         return None
 
     try:
@@ -1731,9 +1747,7 @@ def run_audio_sync_calibration(client, ffmpeg_path, target_input_name, reference
     proc = None
     measured_ms = None
     try:
-        client.set_input_settings(
-            target_input_name, {"window": "::ffplay.exe", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}, True,
-        )
+        client.set_input_settings(target_input_name, ffplay_capture_settings, True)
         client.set_input_audio_sync_offset(target_input_name, 0)
         target_tracks = {str(i): (i == CALIBRATION_TARGET_TRACK) for i in range(1, 7)}
         client.set_input_audio_tracks(target_input_name, target_tracks)
@@ -2140,14 +2154,27 @@ def sync_multi_track_output_settings(client, entries, profile_name):
     return True
 
 
+# Whole-device audio capture kinds, one set per device type, covering every OS this app
+# actually ports to -- confirmed directly against a real OBS instance on each OS (Windows:
+# wasapi_*; macOS: coreaudio_*, confirmed live against this very machine's own "Mic/Aux" input
+# while investigating a real "default mic not detected in Quick Setup" report, see
+# CROSS_PLATFORM_PLAN.md; Linux: pulse_*/alsa_input_capture, confirmed via the §6.1 CI spike).
+# Used wherever this app needs to recognize "some real desktop-audio/microphone device input",
+# e.g. the Quick Setup wizard's desktop/mic dropdowns -- a single hardcoded "wasapi_..." string
+# equality check here is exactly the bug that made Quick Setup's microphone dropdown always come
+# up empty on macOS, even though the real mic input was right there in OBS under a different
+# (also real, also confirmed) kind name.
+DESKTOP_AUDIO_CAPTURE_KINDS = {"wasapi_output_capture", "coreaudio_output_capture", "pulse_output_capture"}
+MIC_AUDIO_CAPTURE_KINDS = {
+    "wasapi_input_capture", "coreaudio_input_capture", "pulse_input_capture", "alsa_input_capture",
+}
+
 # Input kinds whose track routing this feature manages. Used to clear stale routing left over
 # on an input that used to be listed in obs.multi_track_audio.tracks and no longer is -- without
 # this, removing a mapping in Settings has no effect in OBS, since SetInputAudioTracks is only
 # ever called for inputs actually listed. Deliberately narrow (not every input kind) so a device
 # with no business being track-routed (e.g. a pure video source) is never touched.
-AUDIO_TRACK_MANAGED_KINDS = {
-    "wasapi_output_capture",  # Desktop Audio
-    "wasapi_input_capture",  # Mic/Aux and other microphone devices
+AUDIO_TRACK_MANAGED_KINDS = DESKTOP_AUDIO_CAPTURE_KINDS | MIC_AUDIO_CAPTURE_KINDS | {
     "wasapi_process_output_capture",  # Application Audio Capture (Discord, Spotify, browsers, ...) -- Windows
     "sck_audio_capture",  # Application Audio Capture -- macOS counterpart, see CROSS_PLATFORM_PLAN.md §6.1
 }
@@ -5006,21 +5033,52 @@ def build_custom_keybinds_editor(parent, initial_rows):
 # scheme the app's own author ended up hand-building: voice chat on one track, music on another,
 # browsers on a third. Not exhaustive -- anything not listed can still be added by hand via
 # "+ Add Track Mapping", this just covers what most people actually run.
+#
+# process_names is keyed by sys.platform ("win32"/"darwin") -- a running process's own name is
+# nothing like portable across OSes (Discord is "Discord.exe" on Windows but plain "Discord" on
+# macOS; Zoom is "zoom.us" on macOS, not "Zoom.exe" at all) -- confirmed for every app actually
+# installed on a real Mac during this port by reading its own .app bundle's CFBundleExecutable
+# directly (Discord/Spotify/Firefox/Apple Music/Safari), not guessed; Chrome/Edge/Slack use
+# their well-documented, stable bundle executable names (not independently installed on that
+# same machine to also confirm against). Deliberately no "linux" key anywhere: per
+# CROSS_PLATFORM_PLAN.md §6.1's confirmed negative finding, Linux has no per-app audio capture
+# kind at all, so a Linux process name here could never actually be used for anything -- see
+# resolve_common_audio_apps.
 COMMON_AUDIO_APPS = [
-    {"name": "Discord", "process_name": "Discord.exe", "category": "Voice Chat"},
-    {"name": "Slack", "process_name": "slack.exe", "category": "Voice Chat"},
-    {"name": "Zoom", "process_name": "Zoom.exe", "category": "Voice Chat"},
-    {"name": "Spotify", "process_name": "Spotify.exe", "category": "Music"},
-    {"name": "Apple Music", "process_name": "AppleMusic.exe", "category": "Music"},
+    {"name": "Discord", "process_names": {"win32": "Discord.exe", "darwin": "Discord"}, "category": "Voice Chat"},
+    {"name": "Slack", "process_names": {"win32": "slack.exe", "darwin": "Slack"}, "category": "Voice Chat"},
+    {"name": "Zoom", "process_names": {"win32": "Zoom.exe", "darwin": "zoom.us"}, "category": "Voice Chat"},
+    {"name": "Spotify", "process_names": {"win32": "Spotify.exe", "darwin": "Spotify"}, "category": "Music"},
+    {"name": "Apple Music", "process_names": {"win32": "AppleMusic.exe", "darwin": "Music"}, "category": "Music"},
     # YouTube Music deliberately excluded: it runs as a browser tab for most people, not a
     # standalone process, so it's already covered by the Browser category -- listing it
     # separately either does nothing (no such process to capture) or double-captures the same
     # audio once a browser is also selected.
-    {"name": "Chrome", "process_name": "chrome.exe", "category": "Browser"},
-    {"name": "Firefox", "process_name": "firefox.exe", "category": "Browser"},
-    {"name": "Edge", "process_name": "msedge.exe", "category": "Browser"},
+    {"name": "Chrome", "process_names": {"win32": "chrome.exe", "darwin": "Google Chrome"}, "category": "Browser"},
+    {"name": "Firefox", "process_names": {"win32": "firefox.exe", "darwin": "firefox"}, "category": "Browser"},
+    {"name": "Edge", "process_names": {"win32": "msedge.exe", "darwin": "Microsoft Edge"}, "category": "Browser"},
+    # Safari has no Windows build at all, so it's macOS-only -- the exact thing
+    # resolve_common_audio_apps's per-OS filtering exists for.
+    {"name": "Safari", "process_names": {"darwin": "Safari"}, "category": "Browser"},
 ]
 QUICK_SETUP_CATEGORY_TRACKS = {"Voice Chat": 4, "Music": 5, "Browser": 6}
+
+
+def resolve_common_audio_apps(platform_name=None):
+    """Filters/resolves COMMON_AUDIO_APPS down to the apps actually offered as quick-setup
+    checkboxes on this OS, each with a flat "process_name" key already resolved for it -- the
+    same shape compute_quick_setup_tracks and every other caller already expect, so they don't
+    need to know process_names is a per-OS dict at all. An app with no entry for this OS (Safari
+    anywhere but macOS, or literally anything on Linux) is left out entirely, rather than offered
+    with a process name that's guaranteed not to match anything real."""
+    platform_name = platform_name or sys.platform
+    resolved = []
+    for app in COMMON_AUDIO_APPS:
+        process_name = app["process_names"].get(platform_name)
+        if not process_name:
+            continue
+        resolved.append({"name": app["name"], "process_name": process_name, "category": app["category"]})
+    return resolved
 
 
 def compute_quick_setup_tracks(client, desktop_name, mic_name, game_audio_name, selected_apps):
@@ -5109,10 +5167,10 @@ def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_ap
         client.disconnect()
 
     desktop_options = ["(none)"] + sorted(
-        (n for n, k in inputs.items() if k == "wasapi_output_capture"), key=str.lower
+        (n for n, k in inputs.items() if k in DESKTOP_AUDIO_CAPTURE_KINDS), key=str.lower
     )
     mic_options = ["(none)"] + sorted(
-        (n for n, k in inputs.items() if k == "wasapi_input_capture"), key=str.lower
+        (n for n, k in inputs.items() if k in MIC_AUDIO_CAPTURE_KINDS), key=str.lower
     )
 
     dialog = tk.Toplevel(parent)
@@ -5164,7 +5222,7 @@ def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_ap
         )
         apps_row = tk.Frame(dialog)
         apps_row.pack(fill="x", padx=10)
-        for app in COMMON_AUDIO_APPS:
+        for app in resolve_common_audio_apps():
             if app["category"] != category:
                 continue
             var = tk.BooleanVar(value=False)
@@ -5669,7 +5727,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 messagebox.showwarning(
                     "Calibration inconclusive",
                     "Could not confidently measure the sync offset, so the current value was left "
-                    "unchanged. Make sure OBS is idle and ffplay.exe is installed alongside ffmpeg, "
+                    "unchanged. Make sure OBS is idle and ffplay is installed alongside ffmpeg, "
                     "then try again -- check the log for details.",
                     parent=obs_tab,
                 )

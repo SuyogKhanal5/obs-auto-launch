@@ -97,6 +97,21 @@ def find_ffprobe_executable(ffmpeg_path):
     return ffprobe_path if os.path.isfile(ffprobe_path) else None
 
 
+def find_ffplay_executable(ffmpeg_path):
+    """Given a resolved ffmpeg binary path, returns the ffplay binary expected to sit alongside
+    it -- same derive-from-ffmpeg's-own-name approach as find_ffprobe_executable above, for the
+    same reason: correct on Windows (ffmpeg.exe -> ffplay.exe) and Linux/macOS (ffmpeg -> ffplay,
+    no extension) alike, instead of a hardcoded "ffplay.exe" that's only ever right on Windows."""
+    ffmpeg_dir = os.path.dirname(ffmpeg_path)
+    ffmpeg_name = os.path.basename(ffmpeg_path)
+    if ffmpeg_name.lower().startswith("ffmpeg"):
+        ffplay_name = "ffplay" + ffmpeg_name[len("ffmpeg"):]
+    else:
+        ffplay_name = "ffplay.exe" if sys.platform == "win32" else "ffplay"
+    ffplay_path = os.path.join(ffmpeg_dir, ffplay_name)
+    return ffplay_path if os.path.isfile(ffplay_path) else None
+
+
 def libvlc_filename(platform_name=None):
     """The filename python-vlc's underlying libvlc shared library has on this OS -- "libvlc.dll"
     on Windows, "libvlc.so.5" on Linux, "libvlc.dylib" on macOS. Exposed on its own (not just
