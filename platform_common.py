@@ -383,3 +383,12 @@ def open_path(path, platform_name=None):
     Windows), caught and logged by the tray menu's own error handling, so from the user's side it
     looked exactly like the menu item silently doing nothing."""
     return _select_backend(platform_name).open_path(path)
+
+
+def open_screen_recording_settings(platform_name=None):
+    """Opens the OS's own Screen Recording privacy settings, macOS only -- see
+    platform_macos.open_screen_recording_settings's own docstring for why this exists (OBS, not
+    this app, needs that permission, and there's no API to check or grant it on another app's
+    behalf) and exactly what URL it opens. No-op everywhere else: Windows and Linux have no
+    equivalent OS-level screen-recording consent system an app needs to be granted into."""
+    return _select_backend(platform_name).open_screen_recording_settings()

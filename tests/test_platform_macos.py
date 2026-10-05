@@ -415,6 +415,12 @@ class EmbedVideoPlayerTests(unittest.TestCase):
 
 
 def make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=True):
+    # accessibility_trusted is accepted (rather than only on make_fake_application_services
+    # below) purely so every existing call site reads the same way it always has -- AXIsProcess
+    # Trusted/AXIsProcessTrustedWithOptions are NOT actually part of Quartz at all (confirmed
+    # live -- see accessibility_permission_granted's own docstring), so this fake intentionally
+    # no longer defines them; real code reaching for them on the real Quartz module would get a
+    # real AttributeError, exactly like it did before that bug was found and fixed.
     fake = unittest.mock.MagicMock()
     fake.kCGEventFlagMaskControl = 0x40000
     fake.kCGEventFlagMaskAlternate = 0x80000
@@ -426,11 +432,19 @@ def make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=True):
     fake.kCGEventKeyDown = 10
     fake.kCGKeyboardEventKeycode = 9
     fake.kCFRunLoopCommonModes = "kCFRunLoopCommonModes"
-    fake.kAXTrustedCheckOptionPrompt = "AXTrustedCheckOptionPrompt"
-    fake.AXIsProcessTrusted.return_value = accessibility_trusted
     fake.CGEventMaskBit.side_effect = lambda event_type: 1 << event_type
     fake.CGEventTapCreate.return_value = object() if tap_creation_succeeds else None
     fake.CFRunLoopGetCurrent.return_value = "run_loop"
+    del fake.AXIsProcessTrusted
+    del fake.AXIsProcessTrustedWithOptions
+    del fake.kAXTrustedCheckOptionPrompt
+    return fake
+
+
+def make_fake_application_services(accessibility_trusted=True):
+    fake = unittest.mock.MagicMock()
+    fake.kAXTrustedCheckOptionPrompt = "AXTrustedCheckOptionPrompt"
+    fake.AXIsProcessTrusted.return_value = accessibility_trusted
     return fake
 
 
@@ -452,45 +466,48 @@ class MacosKeycodeForKeyTests(unittest.TestCase):
 
 
 class AccessibilityPermissionGrantedTests(unittest.TestCase):
+    # AXIsProcessTrusted lives in ApplicationServices, not Quartz (confirmed live -- see
+    # accessibility_permission_granted's own docstring) -- these patch ApplicationServices
+    # directly, matching what the real code actually imports.
     def test_missing_pyobjc_returns_false(self):
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": None}):
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": None}):
             self.assertFalse(pmac.accessibility_permission_granted())
 
     def test_granted(self):
-        fake_quartz = make_fake_quartz(accessibility_trusted=True)
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             self.assertTrue(pmac.accessibility_permission_granted())
 
     def test_not_granted(self):
-        fake_quartz = make_fake_quartz(accessibility_trusted=False)
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services(accessibility_trusted=False)
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             self.assertFalse(pmac.accessibility_permission_granted())
 
     def test_exception_returns_false_not_raised(self):
-        fake_quartz = make_fake_quartz()
-        fake_quartz.AXIsProcessTrusted.side_effect = RuntimeError("boom")
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services()
+        fake_application_services.AXIsProcessTrusted.side_effect = RuntimeError("boom")
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             with self.assertLogs(level="ERROR"):
                 self.assertFalse(pmac.accessibility_permission_granted())
 
 
 class RequestAccessibilityPermissionTests(unittest.TestCase):
     def test_missing_pyobjc_is_a_no_op(self):
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": None}):
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": None}):
             pmac.request_accessibility_permission()  # must not raise
 
     def test_prompts_via_ax_is_process_trusted_with_options(self):
-        fake_quartz = make_fake_quartz()
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services()
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             pmac.request_accessibility_permission()
-        fake_quartz.AXIsProcessTrustedWithOptions.assert_called_once_with(
-            {fake_quartz.kAXTrustedCheckOptionPrompt: True}
+        fake_application_services.AXIsProcessTrustedWithOptions.assert_called_once_with(
+            {fake_application_services.kAXTrustedCheckOptionPrompt: True}
         )
 
     def test_exception_is_swallowed(self):
-        fake_quartz = make_fake_quartz()
-        fake_quartz.AXIsProcessTrustedWithOptions.side_effect = RuntimeError("boom")
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services()
+        fake_application_services.AXIsProcessTrustedWithOptions.side_effect = RuntimeError("boom")
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             with self.assertLogs(level="ERROR"):
                 pmac.request_accessibility_permission()  # must not raise
 
@@ -507,21 +524,23 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
 
     def test_permission_not_granted_requests_and_notifies(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=False)
+        fake_application_services = make_fake_application_services(accessibility_trusted=False)
         notify = unittest.mock.Mock()
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with self.assertLogs(level="WARNING"):
                 pmac.run_custom_keybind_listener(
                     [{"enabled": True, "key": "S", "modifiers": []}], get_client=lambda: None,
                     get_manual_split_buffer_seconds=lambda: 0, fire_keybind=unittest.mock.Mock(),
                     describe_keybind=unittest.mock.Mock(), notify=notify,
                 )
-        fake_quartz.AXIsProcessTrustedWithOptions.assert_called_once()
+        fake_application_services.AXIsProcessTrustedWithOptions.assert_called_once()
         notify.assert_called_once()
         fake_quartz.CGEventTapCreate.assert_not_called()
 
     def test_invalid_key_is_skipped_and_no_tap_is_created(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with self.assertLogs(level="WARNING"):
                 pmac.run_custom_keybind_listener(
                     [{"enabled": True, "key": "NotAKey", "modifiers": []}], get_client=lambda: None,
@@ -532,11 +551,12 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
 
     def test_fires_matching_binding_on_a_dedicated_thread(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         binding = {"enabled": True, "key": "S", "modifiers": ["ctrl"], "action": "save_replay_buffer"}
         fire_keybind = unittest.mock.Mock()
         fake_thread = unittest.mock.MagicMock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with unittest.mock.patch.object(pmac.threading, "Thread", return_value=fake_thread) as mock_thread_cls:
                 pmac.run_custom_keybind_listener(
                     [binding], get_client="get_client", get_manual_split_buffer_seconds="get_seconds",
@@ -566,10 +586,11 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
 
     def test_non_matching_key_press_does_not_fire(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         binding = {"enabled": True, "key": "S", "modifiers": ["ctrl"], "action": "save_replay_buffer"}
         fire_keybind = unittest.mock.Mock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with unittest.mock.patch.object(pmac.threading, "Thread") as mock_thread_cls:
                 pmac.run_custom_keybind_listener(
                     [binding], get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
@@ -585,8 +606,9 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
 
     def test_tap_creation_failure_is_logged_not_raised(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=False)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         binding = {"enabled": True, "key": "S", "modifiers": []}
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with self.assertLogs(level="WARNING"):
                 pmac.run_custom_keybind_listener(
                     [binding], get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
@@ -606,7 +628,8 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
 
     def test_permission_not_granted_is_logged_not_raised(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=False)
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services(accessibility_trusted=False)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with self.assertLogs(level="WARNING"):
                 pmac.run_clip_editor_space_bar_listener(
                     None, unittest.mock.Mock(), unittest.mock.Mock(),
@@ -615,12 +638,13 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
 
     def test_toggles_when_this_process_is_frontmost(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         fake_frontmost_app = unittest.mock.Mock()
         fake_frontmost_app.processIdentifier.return_value = os.getpid()
         fake_quartz.NSWorkspace.sharedWorkspace.return_value.frontmostApplication.return_value = fake_frontmost_app
         on_toggle = unittest.mock.Mock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             pmac.run_clip_editor_space_bar_listener(None, on_toggle, unittest.mock.Mock())
 
         tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
@@ -631,12 +655,13 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
 
     def test_does_not_toggle_when_a_different_process_is_frontmost(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         fake_frontmost_app = unittest.mock.Mock()
         fake_frontmost_app.processIdentifier.return_value = os.getpid() + 1
         fake_quartz.NSWorkspace.sharedWorkspace.return_value.frontmostApplication.return_value = fake_frontmost_app
         on_toggle = unittest.mock.Mock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             pmac.run_clip_editor_space_bar_listener(None, on_toggle, unittest.mock.Mock())
 
         tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
@@ -647,9 +672,10 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
 
     def test_non_space_key_does_not_toggle(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         on_toggle = unittest.mock.Mock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             pmac.run_clip_editor_space_bar_listener(None, on_toggle, unittest.mock.Mock())
 
         tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
@@ -665,6 +691,7 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
         # synchronously instead, making the effect of stop_event already being set deterministic
         # to observe here.
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         stop_event = threading.Event()
         stop_event.set()
 
@@ -672,7 +699,7 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
             target()
             return unittest.mock.MagicMock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with unittest.mock.patch.object(pmac.threading, "Thread", side_effect=run_target_synchronously):
                 pmac.run_clip_editor_space_bar_listener(None, unittest.mock.Mock(), stop_event)
 
@@ -844,6 +871,22 @@ class OpenPathTests(unittest.TestCase):
         with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
             pmac.open_path("/some/path")
         mock_run.assert_called_once_with(["open", "/some/path"])
+
+
+class OpenScreenRecordingSettingsTests(unittest.TestCase):
+    # Confirmed live (real macOS 15.8.1): this exact URL opens System Settings directly to the
+    # Screen & System Audio Recording pane, not just the general Privacy & Security page.
+    def test_opens_the_screen_recording_settings_pane(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            pmac.open_screen_recording_settings()
+        mock_run.assert_called_once_with(
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"]
+        )
+
+    def test_failure_is_logged_not_raised(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run", side_effect=OSError("boom")):
+            with self.assertLogs(level="WARNING"):
+                pmac.open_screen_recording_settings()  # must not raise
 
 
 if __name__ == "__main__":

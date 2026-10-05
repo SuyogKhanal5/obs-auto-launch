@@ -542,5 +542,10 @@ class OpenPathTests(unittest.TestCase):
         mock_run.assert_called_once_with(["xdg-open", "/some/path"])
 
 
+class OpenScreenRecordingSettingsTests(unittest.TestCase):
+    def test_is_a_no_op(self):
+        pl.open_screen_recording_settings()  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

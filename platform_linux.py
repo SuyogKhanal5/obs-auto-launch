@@ -607,3 +607,11 @@ def open_path(path):
     command, present on essentially every Linux desktop environment (GNOME, KDE, XFCE, etc. all
     ship or depend on it), the closest Linux equivalent to os.startfile()/macOS's `open`."""
     subprocess.run(["xdg-open", path])
+
+
+def open_screen_recording_settings():
+    """No-op -- Linux has no equivalent OS-level screen-recording consent system an app needs to
+    be granted into (a Wayland portal's own per-session capture prompt is the closest analogue,
+    but it's handled entirely by the portal/compositor, not something this app could deep-link
+    to); only accepted for signature parity with the macOS backend, which does real work here."""
+    pass

@@ -596,6 +596,30 @@ def main():
 
     refresh_obs_status()
 
+    # macOS only: OBS can't capture anything at all without Screen Recording permission, granted
+    # per-app by the user in System Settings -- there's no API for this app (or this installer)
+    # to check or grant it on OBS's behalf (see platform_macos.open_screen_recording_settings's
+    # own docstring for why). Surfaced here, during install, rather than leaving the user to only
+    # discover it's missing after a recording silently captures nothing -- a real, confirmed
+    # failure mode distinct from this (see CROSS_PLATFORM_PLAN.md's frozen-capture finding), but
+    # with the exact same symptom from the user's side: OBS runs, nothing useful gets recorded.
+    if sys.platform == "darwin":
+        screen_recording_row = tk.Frame(obs_page, bg=PAGE_BG)
+        screen_recording_row.pack(fill="x", pady=(12, 0))
+        tk.Label(
+            screen_recording_row,
+            text=(
+                "macOS also requires OBS to be granted Screen Recording permission before it can "
+                "capture anything. Open OBS once after installing -- macOS should prompt you "
+                "automatically -- or grant it directly below."
+            ),
+            bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
+        ).pack(fill="x", pady=(0, 6))
+        tk.Button(
+            screen_recording_row, text="Open Screen Recording Settings",
+            command=platform_common.open_screen_recording_settings,
+        ).pack(anchor="w")
+
     # ---------- Quick options ----------
     options_page = page_frame()
     register("options", options_page)

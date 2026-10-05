@@ -657,3 +657,10 @@ def open_path(path):
     """os.startfile() -- Windows' own "open with whatever's registered for this file type"
     mechanism, the one every other backend's open_path() is emulating via a subprocess."""
     os.startfile(path)
+
+
+def open_screen_recording_settings():
+    """No-op -- Windows has no equivalent OS-level screen-recording consent system an app needs
+    to be granted into; only accepted for signature parity with the macOS backend, which does
+    real work here."""
+    pass

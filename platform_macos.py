@@ -181,13 +181,24 @@ def accessibility_permission_granted():
     """True if this process currently holds Accessibility permission -- required before
     CGEventTapCreate will do anything at all (it returns None silently otherwise, which is why
     this is checked and reported explicitly up front rather than left to look like an unexplained
-    dead hotkey)."""
+    dead hotkey).
+
+    Confirmed live that AXIsProcessTrusted is NOT exposed under the Quartz module at all despite
+    living in the same Accessibility/CoreGraphics conceptual family -- it's declared in
+    ApplicationServices (HIServices.framework), a separate pyobjc binding
+    (pyobjc-framework-ApplicationServices, added to requirements.txt alongside this fix). The old
+    Quartz.AXIsProcessTrusted() call raised AttributeError on every single real invocation this
+    was exercised against -- caught by the try/except below and logged, so it silently always
+    reported "not granted" instead of ever actually working, and the unit tests never caught it
+    because they mocked Quartz as a plain MagicMock, which auto-creates any attribute accessed
+    (including ones the real module doesn't have) rather than failing the way the real import
+    does."""
     try:
-        import Quartz
+        import ApplicationServices
     except ImportError:
         return False
     try:
-        return bool(Quartz.AXIsProcessTrusted())
+        return bool(ApplicationServices.AXIsProcessTrusted())
     except Exception:
         logging.exception("Could not check macOS Accessibility permission status.")
         return False
@@ -198,13 +209,18 @@ def request_accessibility_permission():
     features" prompt, which deep-links to the right System Settings pane. Safe to call more than
     once -- macOS only actually shows the dialog the first time it's asked for a given app; after
     a decision has been recorded, granting it later requires the user to do so manually in System
-    Settings (there's no way for this app to re-trigger the dialog itself)."""
+    Settings (there's no way for this app to re-trigger the dialog itself).
+
+    See accessibility_permission_granted's own docstring for why this imports ApplicationServices
+    rather than Quartz -- the same real, confirmed bug applied here too."""
     try:
-        import Quartz
+        import ApplicationServices
     except ImportError:
         return
     try:
-        Quartz.AXIsProcessTrustedWithOptions({Quartz.kAXTrustedCheckOptionPrompt: True})
+        ApplicationServices.AXIsProcessTrustedWithOptions(
+            {ApplicationServices.kAXTrustedCheckOptionPrompt: True}
+        )
     except Exception:
         logging.exception("Could not show the macOS Accessibility permission prompt.")
 
@@ -745,3 +761,24 @@ def open_path(path):
     (no such function outside Windows), silently swallowed by the tray menu's own error handling,
     so clicking either looked exactly like nothing happened at all."""
     subprocess.run(["open", path])
+
+
+def open_screen_recording_settings():
+    """Deep-links straight to System Settings' own Screen & System Audio Recording pane --
+    confirmed live (real macOS 15.8.1) that this exact URL opens that specific pane, not just the
+    general Privacy & Security page the user would then have to find it from.
+
+    There is deliberately no way to check or grant this from here: Screen Recording (TCC) access
+    is decided per *app* by the user, in System Settings, and OBS -- not this app -- is the one
+    that actually needs it (it's the one capturing the screen; this app only starts/stops OBS's
+    recording over its WebSocket API, it never touches a display itself). CGPreflight/
+    CGRequestScreenCaptureAccess (real, confirmed-available Quartz functions) only report on and
+    prompt for *this calling process's own* access, which is a different, irrelevant permission
+    here -- there's no public API for one app to check or trigger another app's TCC prompt. This
+    is a navigation convenience only: pointing the user at the right place, once, during install,
+    rather than leaving them to discover on their own -- after a failed recording, or not at all
+    -- that this permission is what's missing."""
+    try:
+        subprocess.run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"])
+    except Exception as exc:
+        logging.warning("Could not open Screen Recording settings: %s", exc)
