@@ -199,6 +199,28 @@ class AutostartTests(unittest.TestCase):
             self.assertTrue(pmac.disable_autostart())
         self.assertFalse(pmac.is_autostart_enabled())
 
+    def test_extra_args_appended_to_program_arguments(self):
+        # Running from source: target_path is just the Python interpreter, with the script's own
+        # path passed as extra_args -- the same shape set_startup_shortcut_enabled uses in that
+        # case (see its own docstring). launchd execs ProgramArguments directly, no shell
+        # involved, so this is just a plain list append, no quoting to worry about.
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0)
+            self.assertTrue(
+                pmac.enable_autostart(
+                    "/usr/bin/python3", "/Users/test/obs-auto-launch",
+                    extra_args=["/Users/test/obs-auto-launch/autostart_script.py"],
+                )
+            )
+        plist_path = pmac._launch_agent_plist_path()
+        with open(plist_path, "rb") as f:
+            import plistlib
+            plist = plistlib.load(f)
+        self.assertEqual(
+            plist["ProgramArguments"],
+            ["/usr/bin/python3", "/Users/test/obs-auto-launch/autostart_script.py"],
+        )
+
     def test_disable_when_never_enabled_is_a_no_op(self):
         self.assertTrue(pmac.disable_autostart())
 

@@ -512,16 +512,21 @@ def is_startup_shortcut_enabled():
 
 
 def set_startup_shortcut_enabled(enabled):
-    """Enables/disables autostart for THIS running app (sys.executable) -- see
-    is_startup_shortcut_enabled's own docstring for where the real per-OS work happens. Only
-    works from a built/frozen executable (nothing standalone to point an autostart entry at when
-    running from source -- sys.executable would just be the Python interpreter itself)."""
+    """Enables/disables autostart for THIS running app -- see is_startup_shortcut_enabled's own
+    docstring for where the real per-OS work happens. A frozen/built app's sys.executable is
+    directly runnable on its own, so that's the whole command. Running from source, sys.executable
+    is just the Python interpreter -- nothing to point an autostart entry at by itself -- so this
+    also passes this script's own path as an extra argument (the identical
+    [sys.executable, abspath(__file__)] shape do_restart() already uses to relaunch this app from
+    source) and SCRIPT_DIR as the working directory (sys.executable's own directory, the default
+    otherwise, would be wherever the interpreter binary happens to live, not this app's folder --
+    irrelevant to CONFIG_PATH, which is resolved from __file__ rather than the process's working
+    directory, but still the more correct value to put here)."""
     if not enabled:
         return platform_common.disable_autostart()
-    if not getattr(sys, "frozen", False):
-        logging.warning("Cannot enable autostart while running from source; use the built app.")
-        return False
-    return platform_common.enable_autostart()
+    if getattr(sys, "frozen", False):
+        return platform_common.enable_autostart()
+    return platform_common.enable_autostart(working_dir=SCRIPT_DIR, extra_args=[os.path.abspath(__file__)])
 
 
 def launch_obs(obs_config):

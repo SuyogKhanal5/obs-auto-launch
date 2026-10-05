@@ -211,16 +211,23 @@ def is_autostart_enabled(platform_name=None):
     return _select_backend(platform_name).is_autostart_enabled()
 
 
-def enable_autostart(target_path=None, working_dir=None, platform_name=None):
+def enable_autostart(target_path=None, working_dir=None, extra_args=None, platform_name=None):
     """Configures this app to launch automatically at login. target_path/working_dir default to
     sys.executable and its own directory (this app enabling autostart for itself, e.g. from its
     own Settings toggle) -- pass them explicitly when a DIFFERENT process needs to enable it for
     an app it just installed elsewhere (e.g. installer.py, a separate running process from the
     app it just wrote to disk). Returns False (logged) rather than raising on any failure --
-    autostart has always been opt-in, best-effort, never something this app hard-requires."""
+    autostart has always been opt-in, best-effort, never something this app hard-requires.
+
+    extra_args: command-line arguments appended after target_path -- needed when target_path
+    alone isn't a directly-runnable program, e.g. running from source, where target_path is just
+    the Python interpreter and the actual script path has to be passed as its own argument (the
+    same [sys.executable, abspath(__file__)] shape autostart_script.py's own do_restart() already
+    uses to relaunch itself). None (the default) means "target_path alone is the whole command",
+    matching every existing caller's behavior unchanged."""
     target_path = target_path or sys.executable
     working_dir = working_dir or os.path.dirname(target_path)
-    return _select_backend(platform_name).enable_autostart(target_path, working_dir)
+    return _select_backend(platform_name).enable_autostart(target_path, working_dir, extra_args)
 
 
 def disable_autostart(platform_name=None):

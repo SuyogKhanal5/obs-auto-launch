@@ -347,18 +347,23 @@ def is_autostart_enabled():
     return os.path.isfile(_launch_agent_plist_path())
 
 
-def enable_autostart(target_path, working_dir):
+def enable_autostart(target_path, working_dir, extra_args=None):
     """Writes a per-user LaunchAgent .plist and loads it via launchctl -- no elevation needed,
     unlike a system-level LaunchDaemon, since this only ever needs to run in the logged-in user's
     own session. RunAtLoad makes launchd start it once immediately at login (matching "start at
     login" as understood on Windows/Linux); KeepAlive is deliberately NOT set, since this should
-    run once at login like a normal app, not be relaunched by launchd every time it exits."""
+    run once at login like a normal app, not be relaunched by launchd every time it exits.
+
+    extra_args (e.g. the script path when running from source, target_path then being just the
+    Python interpreter) are appended to ProgramArguments as their own separate list entries --
+    launchd execs that list directly, no shell involved, so there's no quoting to worry about
+    the way a shell command line would need."""
     import plistlib
 
     path = _launch_agent_plist_path()
     plist = {
         "Label": _LAUNCH_AGENT_LABEL,
-        "ProgramArguments": [target_path],
+        "ProgramArguments": [target_path, *(extra_args or [])],
         "WorkingDirectory": working_dir,
         "RunAtLoad": True,
     }

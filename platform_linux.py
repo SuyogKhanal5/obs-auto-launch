@@ -388,17 +388,22 @@ def is_autostart_enabled():
     return os.path.isfile(_autostart_desktop_path())
 
 
-def enable_autostart(target_path, working_dir):
+def enable_autostart(target_path, working_dir, extra_args=None):
     """Writes a .desktop file to the XDG autostart directory -- every mainstream Linux desktop
     environment (GNOME, KDE, XFCE, ...) launches every entry there once at login, no elevation
-    needed since it's entirely under the user's own home directory."""
+    needed since it's entirely under the user's own home directory.
+
+    extra_args (e.g. the script path when running from source, target_path then being just the
+    Python interpreter) are appended as their own separately-quoted tokens on the same Exec=
+    line -- needed since target_path alone isn't a directly-runnable program in that case."""
     path = _autostart_desktop_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # Exec's value is a single already-quoted command line per the XDG desktop-entry spec,
         # not a shell string -- a target path containing a space (a real possibility under e.g.
         # ~/.local/share/OBS Auto Recorder) needs its own quoting here, not shell-style escaping.
-        exec_value = f'"{target_path}"'
+        exec_parts = [f'"{target_path}"'] + [f'"{arg}"' for arg in (extra_args or [])]
+        exec_value = " ".join(exec_parts)
         content = (
             "[Desktop Entry]\n"
             "Type=Application\n"

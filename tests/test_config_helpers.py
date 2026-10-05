@@ -157,6 +157,32 @@ class GetSceneScreenshotHashTests(unittest.TestCase):
         client.get_source_screenshot.assert_called_once_with("My Scene", "png", 320, 180, -1)
 
 
+class SetStartupShortcutEnabledTests(unittest.TestCase):
+    # Confirmed live (a real report: "app did not open on restart automatically") that this
+    # install was running from source the whole time -- sys.frozen is only True in a built/
+    # PyInstaller app -- so the old "refuse outright when not frozen" behavior meant autostart
+    # could never actually be registered here no matter what the user did in Settings, with only
+    # a log-file warning (never surfaced in the UI) as any indication why.
+    def test_disable_always_dispatches_regardless_of_frozen_state(self):
+        with patch.object(a.platform_common, "disable_autostart", return_value=True) as mock_disable:
+            self.assertTrue(a.set_startup_shortcut_enabled(False))
+        mock_disable.assert_called_once_with()
+
+    def test_enable_when_frozen_uses_sys_executable_alone(self):
+        with patch.object(a.sys, "frozen", True, create=True):
+            with patch.object(a.platform_common, "enable_autostart", return_value=True) as mock_enable:
+                self.assertTrue(a.set_startup_shortcut_enabled(True))
+        mock_enable.assert_called_once_with()
+
+    def test_enable_when_running_from_source_passes_script_path_as_extra_arg(self):
+        with patch.object(a.sys, "frozen", False, create=True):
+            with patch.object(a.platform_common, "enable_autostart", return_value=True) as mock_enable:
+                self.assertTrue(a.set_startup_shortcut_enabled(True))
+        mock_enable.assert_called_once_with(
+            working_dir=a.SCRIPT_DIR, extra_args=[os.path.abspath(a.__file__)]
+        )
+
+
 class HasSufficientDiskSpaceTests(unittest.TestCase):
     def test_disabled_guard_always_passes(self):
         self.assertTrue(a.has_sufficient_disk_space({"enabled": False}, "C:\\"))

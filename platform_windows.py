@@ -326,16 +326,25 @@ def _ps_single_quote(value):
     return "'" + value.replace("'", "''") + "'"
 
 
-def create_shortcut(link_path, target, working_dir):
+def create_shortcut(link_path, target, working_dir, extra_args=None):
     try:
         os.makedirs(os.path.dirname(link_path), exist_ok=True)
     except OSError:
         pass
+    # A .lnk's own Arguments property is a single command-line string (the same way a user would
+    # type them after the target on a command line), not a list -- each arg gets Windows-style
+    # double-quoting (safe even for ones with no spaces) so e.g. a from-source script path
+    # containing a space still comes through as one argument, not split apart.
+    arguments_line = ""
+    if extra_args:
+        quoted_args = " ".join('"' + str(arg).replace('"', '""') + '"' for arg in extra_args)
+        arguments_line = f"$Shortcut.Arguments = {_ps_single_quote(quoted_args)}; "
     ps_script = (
         "$WshShell = New-Object -ComObject WScript.Shell; "
         f"$Shortcut = $WshShell.CreateShortcut({_ps_single_quote(link_path)}); "
         f"$Shortcut.TargetPath = {_ps_single_quote(target)}; "
         f"$Shortcut.WorkingDirectory = {_ps_single_quote(working_dir)}; "
+        + arguments_line +
         "$Shortcut.Save()"
     )
     try:
@@ -366,12 +375,12 @@ def is_autostart_enabled():
     return bool(path and os.path.isfile(path))
 
 
-def enable_autostart(target_path, working_dir):
+def enable_autostart(target_path, working_dir, extra_args=None):
     path = get_startup_shortcut_path()
     if not path:
         logging.warning("Could not resolve the Startup folder; cannot manage the startup shortcut.")
         return False
-    if create_shortcut(path, target_path, working_dir):
+    if create_shortcut(path, target_path, working_dir, extra_args=extra_args):
         logging.info("Created startup shortcut at %s", path)
         return True
     logging.error("Failed to create startup shortcut at %s", path)

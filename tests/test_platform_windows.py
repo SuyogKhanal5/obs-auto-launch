@@ -171,6 +171,27 @@ class InstallOptionalDependencyTests(unittest.TestCase):
         self.assertIsNotNone(reason)
 
 
+class CreateShortcutTests(unittest.TestCase):
+    def test_omits_arguments_property_when_no_extra_args(self):
+        with unittest.mock.patch.object(pw, "subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = unittest.mock.Mock(returncode=0)
+            pw.create_shortcut(r"C:\Startup\x.lnk", r"C:\App\app.exe", r"C:\App")
+        ps_script = mock_subprocess.run.call_args[0][0][-1]
+        self.assertNotIn("Arguments", ps_script)
+
+    def test_sets_arguments_property_when_extra_args_given(self):
+        # Running from source: target is the interpreter, extra_args carries the script path --
+        # the .lnk's own Arguments property takes the rest of the command line as one string.
+        with unittest.mock.patch.object(pw, "subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = unittest.mock.Mock(returncode=0)
+            pw.create_shortcut(
+                r"C:\Startup\x.lnk", r"C:\Python\python.exe", r"C:\App", extra_args=[r"C:\App\app.py"]
+            )
+        ps_script = mock_subprocess.run.call_args[0][0][-1]
+        self.assertIn("Arguments", ps_script)
+        self.assertIn(r"C:\App\app.py", ps_script)
+
+
 class AutostartTests(unittest.TestCase):
     def test_disabled_when_no_shortcut_file(self):
         with unittest.mock.patch.dict(pw.os.environ, {"APPDATA": r"C:\Users\Test\AppData\Roaming"}, clear=False):
@@ -187,7 +208,19 @@ class AutostartTests(unittest.TestCase):
         with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=startup_path):
             with unittest.mock.patch.object(pw, "create_shortcut", return_value=True) as mock_create:
                 self.assertTrue(pw.enable_autostart(r"C:\App\app.exe", r"C:\App"))
-        mock_create.assert_called_once_with(startup_path, r"C:\App\app.exe", r"C:\App")
+        mock_create.assert_called_once_with(startup_path, r"C:\App\app.exe", r"C:\App", extra_args=None)
+
+    def test_enable_passes_extra_args_through(self):
+        # Running from source: target_path is the interpreter, extra_args carries the script path.
+        startup_path = r"C:\Startup\x.lnk"
+        with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=startup_path):
+            with unittest.mock.patch.object(pw, "create_shortcut", return_value=True) as mock_create:
+                self.assertTrue(
+                    pw.enable_autostart(r"C:\Python\python.exe", r"C:\App", extra_args=[r"C:\App\app.py"])
+                )
+        mock_create.assert_called_once_with(
+            startup_path, r"C:\Python\python.exe", r"C:\App", extra_args=[r"C:\App\app.py"]
+        )
 
     def test_enable_returns_false_when_startup_path_unresolvable(self):
         with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=None):

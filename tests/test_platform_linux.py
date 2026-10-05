@@ -231,6 +231,18 @@ class AutostartTests(unittest.TestCase):
         with unittest.mock.patch.object(pl.os, "makedirs", side_effect=OSError("boom")):
             self.assertFalse(pl.enable_autostart("/opt/app/app", "/opt/app"))
 
+    def test_extra_args_appended_to_exec_line(self):
+        # Running from source: target_path is just the Python interpreter, with the script's own
+        # path passed as extra_args -- the same shape set_startup_shortcut_enabled uses in that
+        # case. Each token is quoted separately per the XDG desktop-entry spec.
+        self.assertTrue(
+            pl.enable_autostart("/usr/bin/python3", "/opt/app", extra_args=["/opt/app/autostart_script.py"])
+        )
+        desktop_path = os.path.join(self.tmp_dir, "autostart", "OBSAutoRecorder.desktop")
+        with open(desktop_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn('Exec="/usr/bin/python3" "/opt/app/autostart_script.py"', content)
+
 
 class EmbedVideoPlayerTests(unittest.TestCase):
     def test_calls_set_xwindow_with_widgets_winfo_id(self):

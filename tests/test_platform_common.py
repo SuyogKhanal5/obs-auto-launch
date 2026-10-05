@@ -201,17 +201,29 @@ class EnableAutostartTests(unittest.TestCase):
         with unittest.mock.patch.object(pc.sys, "executable", "/usr/bin/myapp"):
             with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
                 pc.enable_autostart(platform_name="linux")
-        mock_select.return_value.enable_autostart.assert_called_once_with("/usr/bin/myapp", "/usr/bin")
+        mock_select.return_value.enable_autostart.assert_called_once_with("/usr/bin/myapp", "/usr/bin", None)
 
     def test_uses_explicit_target_and_working_dir(self):
         with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
             pc.enable_autostart(target_path="/opt/app/app", working_dir="/opt/app", platform_name="linux")
-        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app")
+        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app", None)
 
     def test_working_dir_derived_from_target_path_when_omitted(self):
         with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
             pc.enable_autostart(target_path="/opt/app/app", platform_name="linux")
-        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app")
+        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app", None)
+
+    def test_passes_extra_args_through_to_backend(self):
+        # Running from source: target_path is just the interpreter, extra_args carries the
+        # script's own path -- the same shape set_startup_shortcut_enabled uses in that case.
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.enable_autostart(
+                target_path="/usr/bin/python3", working_dir="/opt/app",
+                extra_args=["/opt/app/autostart_script.py"], platform_name="linux",
+            )
+        mock_select.return_value.enable_autostart.assert_called_once_with(
+            "/usr/bin/python3", "/opt/app", ["/opt/app/autostart_script.py"],
+        )
 
 
 class DisableAutostartTests(unittest.TestCase):
