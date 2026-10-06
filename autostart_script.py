@@ -1121,16 +1121,28 @@ def compute_process_capture_tracks(obs_config):
 
 
 def compute_reference_track(obs_config, reference_input_name="Desktop Audio"):
-    """Returns the OBS track number reference_input_name is routed to in
-    obs.multi_track_audio.tracks, or None if it isn't configured there at all -- the same
-    reference run_audio_sync_calibration and apply_process_capture_sync_offset already correct
-    every process-capture input against. Used to know which track in an existing clip actually
-    holds the "ground truth" audio to measure a process-capture track's real lag against."""
+    """Returns the OBS track number to treat as "ground truth" audio when the clip editor's "Fix
+    audio track sync" measures a process-capture track's real lag against it (see
+    compute_process_capture_tracks) -- reference_input_name ("Desktop Audio") wins if it's
+    configured, matching the same reference run_audio_sync_calibration and
+    apply_process_capture_sync_offset already correct every process-capture input against.
+    Otherwise falls back to the lowest-numbered track that isn't itself a process-capture track.
+    Found as a real gap on macOS: a setup with no device-loopback "Desktop Audio" source
+    configured at all (not uncommon there -- macOS has no native system-audio loopback without a
+    third-party virtual audio driver like BlackHole) used to leave this feature entirely
+    disabled, even with a perfectly good plain-device track (e.g. a mic) available to measure
+    against instead. Returns None only if multi_track_audio.tracks has nothing configured, or
+    every configured track is itself a process-capture track (nothing non-process-capture to
+    measure against at all)."""
     entries = normalize_track_entries(obs_config.get("multi_track_audio", {}).get("tracks"))
+    if not entries:
+        return None
     for name, track in entries:
         if name == reference_input_name:
             return track
-    return None
+    process_capture_tracks = set(compute_process_capture_tracks(obs_config))
+    non_process_tracks = sorted({track for _, track in entries if track not in process_capture_tracks})
+    return non_process_tracks[0] if non_process_tracks else None
 
 
 def track_name_hints(obs_config):

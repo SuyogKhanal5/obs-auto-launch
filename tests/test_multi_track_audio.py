@@ -129,6 +129,56 @@ class ComputeReferenceTrackTests(unittest.TestCase):
         obs_config = {"multi_track_audio": {"tracks": [{"input_name": "Line In", "track": 4}]}}
         self.assertEqual(a.compute_reference_track(obs_config, reference_input_name="Line In"), 4)
 
+    def test_falls_back_to_a_non_process_capture_track_when_no_desktop_audio_configured(self):
+        # Found as a real gap on macOS: a setup with no "Desktop Audio" input at all (no native
+        # system-audio loopback without a third-party virtual driver there) used to leave this
+        # entirely unusable even with a perfectly good plain-device track (Mic/Aux) available.
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "Discord", "track": 4},
+                ],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
+            },
+        }
+        self.assertEqual(a.compute_reference_track(obs_config), 1)
+
+    def test_fallback_prefers_the_lowest_numbered_non_process_capture_track(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Mic/Aux", "track": 2},
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "Discord", "track": 4},
+                ],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
+            },
+        }
+        self.assertEqual(a.compute_reference_track(obs_config), 1)
+
+    def test_returns_none_when_every_configured_track_is_a_process_capture_track(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [{"input_name": "Discord", "track": 4}],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
+            },
+        }
+        self.assertIsNone(a.compute_reference_track(obs_config))
+
+    def test_desktop_audio_still_wins_over_the_fallback_when_both_exist(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Desktop Audio", "track": 2},
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "Discord", "track": 4},
+                ],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
+            },
+        }
+        self.assertEqual(a.compute_reference_track(obs_config), 2)
+
 
 class TrackNameHintsTests(unittest.TestCase):
     def test_maps_track_numbers_to_input_names(self):
