@@ -35,6 +35,7 @@ class FakeObsClient:
         self.inputs = inputs or {}
         self.calls = []
         self.recording_active = False
+        self.record_duration_ms = 0
 
     def _profile(self):
         return self.profiles[self.current_profile]
@@ -125,7 +126,7 @@ class FakeObsClient:
         return SimpleNamespace(input_audio_sync_offset=self.inputs[name].get("sync_offset", 0))
 
     def get_record_status(self):
-        return SimpleNamespace(output_active=self.recording_active)
+        return SimpleNamespace(output_active=self.recording_active, output_duration=self.record_duration_ms)
 
     def set_input_audio_sync_offset(self, name, offset):
         if name not in self.inputs:

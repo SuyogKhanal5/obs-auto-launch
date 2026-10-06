@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -61,49 +62,6 @@ class ApplyRecordingFormatTests(unittest.TestCase):
         self.assertEqual(a.get_profile_parameter_value(client, "AdvOut", "RecFormat2"), "some_future_format_code")
 
 
-class WantsMarkersTests(unittest.TestCase):
-    def test_no_keybinds_returns_false(self):
-        self.assertFalse(a.wants_markers([]))
-        self.assertFalse(a.wants_markers(None))
-
-    def test_enabled_add_marker_keybind_returns_true(self):
-        self.assertTrue(a.wants_markers([{"enabled": True, "action": "add_marker"}]))
-
-    def test_disabled_add_marker_keybind_returns_false(self):
-        self.assertFalse(a.wants_markers([{"enabled": False, "action": "add_marker"}]))
-
-    def test_missing_enabled_key_defaults_to_true(self):
-        self.assertTrue(a.wants_markers([{"action": "add_marker"}]))
-
-    def test_other_actions_do_not_count(self):
-        self.assertFalse(a.wants_markers([{"enabled": True, "action": "split_record_file"}]))
-
-
-class EnsureHybridMp4ForMarkersTests(unittest.TestCase):
-    def test_sets_format_and_reports_restart_needed(self):
-        client = FakeObsClient()
-        needs_restart = a.ensure_hybrid_mp4_for_markers(client)
-        self.assertEqual(a.get_profile_parameter_value(client, "AdvOut", "RecFormat2"), "hybrid_mp4")
-        self.assertTrue(needs_restart)
-
-    def test_already_hybrid_mp4_does_not_rewrite_or_need_restart(self):
-        client = FakeObsClient()
-        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
-        client.calls.clear()
-        needs_restart = a.ensure_hybrid_mp4_for_markers(client)
-        self.assertEqual(client.calls, [])
-        self.assertFalse(needs_restart)
-
-    def test_never_raises_when_client_errors(self):
-        class RaisingClient(FakeObsClient):
-            def set_profile_parameter(self, category, name, value):
-                raise RuntimeError("boom")
-
-        client = RaisingClient()
-        needs_restart = a.ensure_hybrid_mp4_for_markers(client)  # must not raise
-        self.assertFalse(needs_restart)
-
-
 class GetReplayBufferModeTests(unittest.TestCase):
     def test_explicit_mode_wins(self):
         self.assertEqual(a.get_replay_buffer_mode({"mode": "only", "enabled": False}), "only")
@@ -120,34 +78,69 @@ class GetReplayBufferModeTests(unittest.TestCase):
 
 
 class AddRecordingMarkerTests(unittest.TestCase):
-    def test_success_calls_create_record_chapter(self):
+    # add_recording_marker's primary mechanism is its own recording_state["markers"] list (read
+    # from OBS's own GetRecordStatus elapsed time, not tied to recording format at all) --
+    # CreateRecordChapter is only ever a best-effort bonus now, never required for success. See
+    # CROSS_PLATFORM_PLAN.md §5.21 for why that forcing was removed.
+    def test_success_appends_elapsed_seconds_to_recording_state(self):
         client = FakeObsClient()
-        result = a.add_recording_marker(client)
+        client.record_duration_ms = 12500
+        recording_state = {}
+        result = a.add_recording_marker(client, recording_state=recording_state)
         self.assertTrue(result)
+        self.assertEqual(recording_state["markers"], [12.5])
+
+    def test_multiple_markers_accumulate_in_order(self):
+        client = FakeObsClient()
+        recording_state = {}
+        client.record_duration_ms = 1000
+        a.add_recording_marker(client, recording_state=recording_state)
+        client.record_duration_ms = 5000
+        a.add_recording_marker(client, recording_state=recording_state)
+        self.assertEqual(recording_state["markers"], [1.0, 5.0])
+
+    def test_none_recording_state_does_not_raise(self):
+        client = FakeObsClient()
+        result = a.add_recording_marker(client, recording_state=None)
+        self.assertTrue(result)
+
+    def test_also_attempts_a_native_obs_chapter_on_a_best_effort_basis(self):
+        client = FakeObsClient()
+        a.add_recording_marker(client, recording_state={})
         self.assertIn(("create_record_chapter", None), client.calls)
 
-    def test_unsupported_format_toasts_and_returns_false(self):
+    def test_unsupported_format_is_non_fatal(self):
+        # A non-Hybrid-MP4 recording is the common case now that markers don't need that format
+        # at all -- CreateRecordChapter failing this way must not affect the overall result.
         class RejectingClient(FakeObsClient):
             def create_record_chapter(self, chapter_name=None):
                 raise a.obsws.error.OBSSDKRequestError("CreateRecordChapter", a.OBS_CHAPTER_NOT_SUPPORTED_CODE, "")
 
         client = RejectingClient()
-        with unittest.mock.patch.object(a, "notify") as mock_notify:
-            result = a.add_recording_marker(client, icon=None, notifications_config={"enabled": True})
-        self.assertFalse(result)
-        mock_notify.assert_called_once()
-        self.assertIn("format", mock_notify.call_args[0][3].lower())
+        recording_state = {}
+        result = a.add_recording_marker(client, recording_state=recording_state)
+        self.assertTrue(result)
+        self.assertEqual(recording_state["markers"], [0.0])
 
-    def test_other_error_does_not_toast(self):
+    def test_other_create_record_chapter_error_is_also_non_fatal(self):
         class RejectingClient(FakeObsClient):
             def create_record_chapter(self, chapter_name=None):
                 raise a.obsws.error.OBSSDKRequestError("CreateRecordChapter", 500, "")
 
         client = RejectingClient()
-        with unittest.mock.patch.object(a, "notify") as mock_notify:
-            result = a.add_recording_marker(client)
+        result = a.add_recording_marker(client, recording_state={})
+        self.assertTrue(result)
+
+    def test_cannot_read_record_status_returns_false_without_recording_a_marker(self):
+        class BrokenClient(FakeObsClient):
+            def get_record_status(self):
+                raise RuntimeError("boom")
+
+        client = BrokenClient()
+        recording_state = {}
+        result = a.add_recording_marker(client, recording_state=recording_state)
         self.assertFalse(result)
-        mock_notify.assert_not_called()
+        self.assertNotIn("markers", recording_state)
 
     def test_success_flashes_the_tray_icon_when_icon_and_status_given(self):
         # Same "something just happened" flash as a manual split or a replay-buffer save --
@@ -417,6 +410,48 @@ class ActiveSessionMarkerTests(unittest.TestCase):
 
     def test_clear_does_not_raise_when_no_marker_exists(self):
         a.clear_active_session_marker()  # must not raise
+
+
+class RecordingMarkersSidecarTests(unittest.TestCase):
+    # write_recording_markers/read_recording_markers back the clip editor's own marker display
+    # (see refresh_markers) independently of OBS's recording format -- see
+    # CROSS_PLATFORM_PLAN.md §5.21.
+    def setUp(self):
+        self._tmp_ctx = tempfile.TemporaryDirectory()
+        self.recording_path = os.path.join(self._tmp_ctx.name, "Balatro - 2026-10-06 09-53-29.mov")
+        self.addCleanup(self._tmp_ctx.cleanup)
+
+    def test_sidecar_path_appends_suffix(self):
+        self.assertEqual(a.marker_sidecar_path(self.recording_path), self.recording_path + ".markers.json")
+
+    def test_read_returns_none_when_no_sidecar_written(self):
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
+
+    def test_write_then_read_round_trips_sorted_markers(self):
+        a.write_recording_markers(self.recording_path, [47.0, 12.5, 103.2])
+        self.assertEqual(a.read_recording_markers(self.recording_path), [12.5, 47.0, 103.2])
+
+    def test_empty_markers_list_writes_no_sidecar_at_all(self):
+        a.write_recording_markers(self.recording_path, [])
+        self.assertFalse(os.path.isfile(a.marker_sidecar_path(self.recording_path)))
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
+
+    def test_none_markers_does_not_raise(self):
+        a.write_recording_markers(self.recording_path, None)  # must not raise
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
+
+    def test_none_recording_path_does_not_raise(self):
+        a.write_recording_markers(None, [1.0])  # must not raise
+
+    def test_corrupt_sidecar_returns_none_instead_of_raising(self):
+        with open(a.marker_sidecar_path(self.recording_path), "w", encoding="utf-8") as f:
+            f.write("not valid json")
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
+
+    def test_non_numeric_markers_returns_none_instead_of_raising(self):
+        with open(a.marker_sidecar_path(self.recording_path), "w", encoding="utf-8") as f:
+            json.dump({"markers": ["not", "numbers"]}, f)
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
 
 
 class ResolveRecordingResolutionTests(unittest.TestCase):

@@ -293,7 +293,7 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None,
+    icon=None, notifications_config=None, status=None, recording_state=None,
 ):
     """macOS counterpart of platform_windows.run_custom_keybind_listener -- see the module
     comment above for why this uses a passive CGEventTap rather than an exclusive-grab API.
@@ -334,7 +334,10 @@ def run_custom_keybind_listener(
                 if binding:
                     threading.Thread(
                         target=fire_keybind,
-                        args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                        args=(
+                            binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config,
+                            status, recording_state,
+                        ),
                         daemon=True,
                     ).start()
         except Exception:

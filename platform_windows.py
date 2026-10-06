@@ -221,7 +221,7 @@ def mod_flags_for(modifiers):
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None,
+    icon=None, notifications_config=None, status=None, recording_state=None,
 ):
     """Runs for its whole lifetime on one dedicated daemon thread: RegisterHotKey (and the
     WM_HOTKEY messages it produces) has thread affinity, so every binding must be registered from
@@ -277,7 +277,10 @@ def run_custom_keybind_listener(
                 if binding:
                     threading.Thread(
                         target=fire_keybind,
-                        args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                        args=(
+                            binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config,
+                            status, recording_state,
+                        ),
                         daemon=True,
                     ).start()
             user32.TranslateMessage(ctypes.byref(msg))

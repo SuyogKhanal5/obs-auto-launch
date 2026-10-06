@@ -562,6 +562,7 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
                     [binding], get_client="get_client", get_manual_split_buffer_seconds="get_seconds",
                     fire_keybind=fire_keybind, describe_keybind=unittest.mock.Mock(return_value="Ctrl+S"),
                     notify=unittest.mock.Mock(), icon="icon", notifications_config="notif_cfg", status="status",
+                    recording_state="rec_state",
                 )
 
                 fake_quartz.CGEventTapCreate.assert_called_once()
@@ -578,7 +579,7 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
                 self.assertIs(result, fake_event)
                 mock_thread_cls.assert_called_once_with(
                     target=fire_keybind,
-                    args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status"),
+                    args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status", "rec_state"),
                     daemon=True,
                 )
                 fake_thread.start.assert_called_once()

@@ -431,12 +431,13 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
                             [binding], get_client="get_client", get_manual_split_buffer_seconds="get_seconds",
                             fire_keybind=fire_keybind, describe_keybind=describe_keybind, notify=notify,
                             icon="icon", notifications_config="notif_cfg", status="status",
+                            recording_state="rec_state",
                         )
 
         fake_root.grab_key.assert_called_once_with(39, 0x4, True, 0x1, 0x1)
         mock_thread_cls.assert_called_once_with(
             target=fire_keybind,
-            args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status"),
+            args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status", "rec_state"),
             daemon=True,
         )
         fake_thread.start.assert_called_once()

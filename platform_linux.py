@@ -282,7 +282,7 @@ def unregister_global_hotkey(display, root, handle):
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None,
+    icon=None, notifications_config=None, status=None, recording_state=None,
 ):
     """X11 counterpart of platform_windows.run_custom_keybind_listener -- registers every enabled
     binding via XGrabKey, then blocks in an XNextEvent loop on this same thread for the
@@ -344,7 +344,10 @@ def run_custom_keybind_listener(
                 if binding:
                     threading.Thread(
                         target=fire_keybind,
-                        args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                        args=(
+                            binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config,
+                            status, recording_state,
+                        ),
                         daemon=True,
                     ).start()
         finally:

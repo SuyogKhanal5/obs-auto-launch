@@ -252,6 +252,17 @@ class SyncMultiTrackOutputSettingsTests(unittest.TestCase):
             with self.assertLogs(level="WARNING"):
                 a.sync_multi_track_output_settings(self.client, [("Mic", 1)], "P")
 
+    def test_warns_on_hybrid_mp4(self):
+        # Confirmed live (CROSS_PLATFORM_PLAN.md §5.21) on a real OBS 30.2.3 instance: despite
+        # its name, hybrid_mp4 only ever embeds ONE audio track in the output file, the same
+        # broken behavior as plain mp4 -- it must warn exactly like mp4 does, not be treated as
+        # mkv-safe.
+        self.client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
+        self.client.set_profile_parameter("Output", "Mode", "Advanced")
+        with self.assertLogs(level="WARNING") as cm:
+            a.sync_multi_track_output_settings(self.client, [("Mic", 1)], "P")
+        self.assertTrue(any("recording format" in msg for msg in cm.output))
+
 
 class EnsureDedicatedProfileTests(unittest.TestCase):
     def test_creates_profile_and_clones_settings_from_source(self):

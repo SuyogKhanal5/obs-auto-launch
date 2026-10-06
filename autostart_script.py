@@ -931,26 +931,16 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
     if not client:
         return None, None
 
-    # A profile-parameter write alone can't make OBS's replay buffer -- or the recording format
-    # markers need -- actually available in the *current* session (see
-    # apply_replay_buffer_settings / ensure_hybrid_mp4_for_markers); OBS only picks either up by
-    # reading its profile fresh at startup. Both checks run up front so one restart covers
-    # whichever actually needed a write, instead of restarting twice.
-    markers_wanted = wants_markers(obs_config.get("custom_keybinds"))
+    # A profile-parameter write alone can't make OBS's replay buffer actually available in the
+    # *current* session (see apply_replay_buffer_settings) -- OBS only picks it up by reading its
+    # profile fresh at startup.
     replay_buffer_restart_needed = apply_replay_buffer_settings(client, obs_config.get("replay_buffer", {}))
-    marker_restart_needed = ensure_hybrid_mp4_for_markers(client) if markers_wanted else False
 
-    if replay_buffer_restart_needed or marker_restart_needed:
-        reasons = []
-        if replay_buffer_restart_needed:
-            reasons.append("replay buffer settings")
-        if marker_restart_needed:
-            reasons.append("recording format (Hybrid MP4, required for markers)")
-        reason_text = " and ".join(reasons)
-        logging.info("%s changed -- restarting OBS so the change actually takes effect.", reason_text.capitalize())
+    if replay_buffer_restart_needed:
+        logging.info("Replay buffer settings changed -- restarting OBS so the change actually takes effect.")
         notify(
             icon, config.get("notifications", {}), "OBS restarted",
-            f"{reason_text.capitalize()} changed; OBS was restarted so they'd take effect.",
+            "Replay buffer settings changed; OBS was restarted so they'd take effect.",
         )
         try:
             client.disconnect()
@@ -970,16 +960,7 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
     )
     apply_output_folder(client, obs_config.get("output_folder"))
     apply_recording_resolution(client, obs_config)
-    if markers_wanted:
-        configured_format = obs_config.get("recording_format")
-        if configured_format and configured_format != "hybrid_mp4":
-            logging.info(
-                "Ignoring configured recording format '%s' -- the \"Add Marker\" keybind is "
-                "enabled, and OBS only supports chapter markers with Hybrid MP4.", configured_format,
-            )
-        ensure_hybrid_mp4_for_markers(client)
-    else:
-        apply_recording_format(client, obs_config.get("recording_format"))
+    apply_recording_format(client, obs_config.get("recording_format"))
     event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
     return client, event_client
 
@@ -1920,34 +1901,6 @@ def apply_recording_resolution(client, obs_config):
         logging.error("Could not set OBS's recording resolution to %dx%d: %s", target_width, target_height, exc)
 
 
-def wants_markers(custom_keybinds_config):
-    return any(
-        kb.get("enabled", True) and kb.get("action") == "add_marker" for kb in (custom_keybinds_config or [])
-    )
-
-
-def ensure_hybrid_mp4_for_markers(client):
-    """Chapter markers (this app's "Add Marker" keybind -> OBS's CreateRecordChapter) only work
-    when the recording format is Hybrid MP4 -- confirmed via python-vlc's own docstring and live
-    testing (every other format fails with OBS_CHAPTER_NOT_SUPPORTED_CODE). Forces that format,
-    overriding obs.recording_format if it's set to anything else, since markers simply don't work
-    otherwise. Returns True when a write actually happened -- same "OBS needs a restart to pick
-    this up" limitation as apply_replay_buffer_settings, so callers restart OBS when this does."""
-    current = (
-        get_profile_parameter_value(client, "AdvOut", "RecFormat2")
-        or get_profile_parameter_value(client, "AdvOut", "RecFormat")
-    )
-    if current == "hybrid_mp4":
-        return False
-    try:
-        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
-        logging.info("Set OBS's recording format to Hybrid MP4 (required for the \"Add Marker\" keybind).")
-        return True
-    except Exception as exc:
-        logging.warning("Could not set OBS's recording format to Hybrid MP4 for markers: %s", exc)
-        return False
-
-
 def apply_replay_buffer_settings(client, replay_buffer_config):
     """Best-effort override of OBS's own Replay Buffer settings (Settings -> Output -> Replay
     Buffer) for whichever profile is currently active -- so choosing a replay buffer mode/length
@@ -1991,8 +1944,12 @@ def apply_replay_buffer_settings(client, replay_buffer_config):
 DEFAULT_MULTI_TRACK_PROFILE_NAME = "OBS Auto Recorder"
 # Formats OBS has reliably muxed every enabled recording track into. Others (mp4, mov, flv, ...)
 # have historically only embedded track 1 in some OBS versions -- routing still happens either way,
-# this is just used to decide whether to warn about it.
-MULTI_TRACK_SAFE_FORMATS = {"mkv", "fragmented_mkv", "hybrid_mp4"}
+# this is just used to decide whether to warn about it. hybrid_mp4 deliberately isn't here even
+# though it's MP4-based: confirmed live (CROSS_PLATFORM_PLAN.md §5.21) that it only ever embeds
+# ONE audio track into the output regardless of how many are configured/routed in OBS, on a real
+# OBS 30.2.3 instance -- the exact same single-track-only behavior as plain mp4/mov, not the
+# mkv-like multi-track-safe behavior its name might suggest.
+MULTI_TRACK_SAFE_FORMATS = {"mkv", "fragmented_mkv"}
 
 
 def normalize_track_entries(tracks_config):
@@ -2451,50 +2408,60 @@ def save_replay_buffer(client):
         logging.error("Could not save replay buffer: %s", exc)
 
 
-# Confirmed live: OBS only supports CreateRecordChapter (this app's "Add Marker" keybind) when
-# the recording format is Hybrid MP4 -- every other format fails with this code (shared with
-# OBS_SPLIT_NOT_ENABLED_CODE numerically, but a separate name here since the two checks apply to
-# entirely different requests and just happen to reuse the same generic "unsupported" code).
+# OBS only supports its own CreateRecordChapter request when the recording format is Hybrid MP4
+# (shared numerically with OBS_SPLIT_NOT_ENABLED_CODE, but named separately here since the two
+# checks apply to entirely different requests and just happen to reuse the same generic
+# "unsupported" code) -- confirmed live, and the reason markers used to force the whole recording
+# onto Hybrid MP4. That forcing was removed (see add_recording_marker) after confirming live that
+# Hybrid MP4 has its own, separate problem: it only ever embeds ONE audio track into the output
+# file no matter how many are configured/routed in OBS, making it fundamentally incompatible with
+# multi-track audio (CROSS_PLATFORM_PLAN.md §5.21). CreateRecordChapter is still attempted below
+# on a pure best-effort basis (free native-chapter support for Premiere/etc. on whatever
+# recordings happen to already be Hybrid MP4), but its failure is no longer treated as this
+# feature failing at all, since this app's own clip editor never relies on it.
 OBS_CHAPTER_NOT_SUPPORTED_CODE = 702
-OBS_CHAPTER_NOT_SUPPORTED_HINT = (
-    "Markers aren't supported by this recording's video format -- OBS only supports them with "
-    "Hybrid MP4. Enabling the \"Add Marker\" custom keybind in Settings already forces this "
-    "format and restarts OBS to apply it; if you still see this, OBS may not have restarted yet."
-)
 
 
-def add_recording_marker(client, icon=None, notifications_config=None, status=None):
+def add_recording_marker(client, icon=None, notifications_config=None, status=None, recording_state=None):
+    """Records a marker at the recording's current elapsed time (via OBS's own GetRecordStatus,
+    so it's correct even across a pause/resume) into recording_state["markers"] -- this app's own,
+    format-independent marker mechanism, read by the clip editor and written out as a sidecar
+    file alongside the finished recording by stop_recording (see write_recording_markers). Also
+    tries OBS's own CreateRecordChapter on a best-effort basis (see OBS_CHAPTER_NOT_SUPPORTED_CODE
+    above for why its failure is expected and ignored on anything but Hybrid MP4)."""
     try:
-        client.create_record_chapter()
-        logging.info("Added a marker to the current recording.")
-        # Same flash treatment as a manual split or a replay-buffer save -- from the user's
-        # point of view, all three are "something just landed/happened, here's confirmation".
-        # Unlike those two, there's no OBS event for this (CreateRecordChapter doesn't emit
-        # one), so the flash has to be fired right here at the point of success instead.
-        if icon is not None and status is not None:
-            status["flash_until"] = time.time() + SPLIT_FLASH_SECONDS
-            icon.icon = build_tray_image(current_color(status))
-
-            def revert():
-                icon.icon = build_tray_image(current_color(status))
-
-            timer = threading.Timer(SPLIT_FLASH_SECONDS, revert)
-            timer.daemon = True
-            timer.start()
-        return True
-    except obsws.error.OBSSDKRequestError as exc:
-        if exc.code == OBS_CHAPTER_NOT_SUPPORTED_CODE:
-            logging.error("Could not add marker: %s", OBS_CHAPTER_NOT_SUPPORTED_HINT)
-            notify(
-                icon, notifications_config, "Marker not added",
-                "Markers don't work with this recording's video format -- only Hybrid MP4 supports them.",
-            )
-        else:
-            logging.error("Could not add marker: %s", exc)
-        return False
+        offset_seconds = client.get_record_status().output_duration / 1000.0
     except Exception as exc:
         logging.error("Could not add marker: %s", exc)
         return False
+
+    if recording_state is not None:
+        recording_state.setdefault("markers", []).append(offset_seconds)
+    logging.info("Added a marker to the current recording (at %.1fs).", offset_seconds)
+
+    try:
+        client.create_record_chapter()
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code != OBS_CHAPTER_NOT_SUPPORTED_CODE:
+            logging.debug("Could not add a native OBS chapter marker (non-fatal): %s", exc)
+    except Exception as exc:
+        logging.debug("Could not add a native OBS chapter marker (non-fatal): %s", exc)
+
+    # Same flash treatment as a manual split or a replay-buffer save -- from the user's point of
+    # view, all three are "something just landed/happened, here's confirmation". Unlike those
+    # two, there's no OBS event for this, so the flash has to be fired right here at the point of
+    # success instead.
+    if icon is not None and status is not None:
+        status["flash_until"] = time.time() + SPLIT_FLASH_SECONDS
+        icon.icon = build_tray_image(current_color(status))
+
+        def revert():
+            icon.icon = build_tray_image(current_color(status))
+
+        timer = threading.Timer(SPLIT_FLASH_SECONDS, revert)
+        timer.daemon = True
+        timer.start()
+    return True
 
 
 OBS_SPLIT_NOT_ENABLED_CODE = 702
@@ -2578,12 +2545,13 @@ def describe_keybind(binding):
 
 def perform_keybind_action(
     client, action, manual_split_buffer_seconds=0, icon=None, notifications_config=None, status=None,
+    recording_state=None,
 ):
     try:
         if action == "split_record_file":
             trigger_buffered_split(client, manual_split_buffer_seconds)
         elif action == "add_marker":
-            if not add_recording_marker(client, icon, notifications_config, status):
+            if not add_recording_marker(client, icon, notifications_config, status, recording_state):
                 # add_recording_marker already logged the specific reason (and toasted it, if the
                 # format is the culprit) -- returning here skips the misleading "performed" log.
                 return
@@ -2617,6 +2585,7 @@ def perform_keybind_action(
 
 def fire_custom_keybind(
     binding, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
+    recording_state=None,
 ):
     client = get_client()
     if not client:
@@ -2624,11 +2593,13 @@ def fire_custom_keybind(
         return
     perform_keybind_action(
         client, binding.get("action"), get_manual_split_buffer_seconds(), icon, notifications_config, status,
+        recording_state,
     )
 
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
+    recording_state=None,
 ):
     """Thin dispatcher -- the real per-OS implementation (RegisterHotKey/GetMessageW on Windows,
     XGrabKey/XNextEvent on Linux/X11, a CGEventTap/CFRunLoop on macOS; a clear logged no-op under
@@ -2636,10 +2607,12 @@ def run_custom_keybind_listener(
     platform_windows.py / platform_linux.py / platform_macos.py, see
     CROSS_PLATFORM_PLAN.md Phase 3. fire_custom_keybind/describe_keybind/notify are passed in
     rather than imported by the backend modules, so those never depend on this one (the
-    dependency only ever goes the other way)."""
+    dependency only ever goes the other way). recording_state lets add_recording_marker record a
+    marker's timestamp -- see its own docstring for why that's no longer tied to OBS's own
+    chapter mechanism at all."""
     platform_common.run_custom_keybind_listener(
         bindings, get_client, get_manual_split_buffer_seconds, fire_custom_keybind, describe_keybind, notify,
-        icon=icon, notifications_config=notifications_config, status=status,
+        icon=icon, notifications_config=notifications_config, status=status, recording_state=recording_state,
     )
 
 
@@ -3720,6 +3693,7 @@ def stop_recording(client, icon, game_display_name=None, recording_state=None, c
     new_path = rename_with_game_prefix(output_path, game_display_name, split_part, silent, subfolders_enabled)
     if recording_state is not None and new_path:
         recording_state.setdefault("segment_files", []).append(new_path)
+        write_recording_markers(new_path, recording_state.get("markers"))
 
     maybe_transcode(new_path, config.get("post_record_transcode", {}), icon, notifications_config)
     maybe_apply_audio_sync_shift(new_path, config.get("audio_sync_shift", {}), icon, notifications_config)
@@ -3757,6 +3731,42 @@ def clear_active_session_marker():
         logging.exception("Could not clear active-recording marker.")
 
 
+def marker_sidecar_path(recording_path):
+    return recording_path + ".markers.json"
+
+
+def write_recording_markers(recording_path, markers):
+    """Persists the "Add Marker" keybind's timestamps (collected in recording_state["markers"]
+    over the course of one recording) to a small sidecar file next to the finished recording, so
+    the clip editor can show them regardless of recording format -- this app no longer relies on
+    OBS's own CreateRecordChapter/Hybrid-MP4-only chapter mechanism for this at all (see
+    add_recording_marker). A no-op when there are no markers, so a recording nobody marked up
+    doesn't grow a stray sidecar file."""
+    if not recording_path or not markers:
+        return
+    try:
+        with open(marker_sidecar_path(recording_path), "w", encoding="utf-8") as f:
+            json.dump({"markers": markers}, f)
+    except Exception:
+        logging.exception("Could not write marker sidecar for %s.", recording_path)
+
+
+def read_recording_markers(recording_path):
+    """Returns the sorted marker timestamps (seconds) written by write_recording_markers for
+    recording_path, or None if there's no sidecar file at all -- lets the clip editor fall back
+    to reading a legacy recording's own embedded Hybrid MP4 chapters instead (see
+    refresh_markers), rather than treating "no sidecar" the same as "confirmed zero markers"."""
+    try:
+        with open(marker_sidecar_path(recording_path), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    try:
+        return sorted(float(m) for m in data.get("markers", []))
+    except (TypeError, ValueError):
+        return None
+
+
 def read_active_session_marker():
     try:
         with open(ACTIVE_SESSION_MARKER_PATH, "r", encoding="utf-8") as f:
@@ -3776,6 +3786,7 @@ def reset_recording_state(recording_state):
     recording_state["heard_any_audio"] = False
     recording_state["last_audio_peak_time"] = None
     recording_state["silent_warning_sent"] = False
+    recording_state["markers"] = []
 
 
 def watcher_loop(icon, status, audio_state, recording_state, runtime_state, stop_event):
@@ -5577,9 +5588,10 @@ def _run_config_editor(master_root, restart_callback, on_close):
     tk.Label(
         obs_tab,
         text=(
-            "    Leave blank to use whatever OBS already has set. mkv/hybrid_mp4 are the "
-            "reliable choices if multi-track audio is on; you can also type in any other format "
-            "code OBS supports."
+            "    Leave blank to use whatever OBS already has set. mkv (or fragmented_mkv) is the "
+            "reliable choice if multi-track audio is on -- confirmed live that hybrid_mp4 only "
+            "ever embeds one audio track no matter how many are configured. You can also type in "
+            "any other format code OBS supports."
         ),
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
@@ -7327,10 +7339,21 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 )
 
     def refresh_markers():
-        # OBS chapter markers ("markers" in the app's own terminology) -- only ever present on a
-        # Hybrid MP4 recording; get_full_chapter_descriptions returns None until VLC has finished
-        # parsing the media (mirrors the audio-track-count pattern above), so this is retried from
-        # poll() until it stops being None rather than assumed to succeed on the first call.
+        # Markers ("Add Marker" keybind) are tracked by this app itself now, independently of
+        # OBS's own recording format (see add_recording_marker/write_recording_markers) -- a
+        # sidecar file next to the recording is the primary, authoritative source, read first.
+        sidecar_markers = read_recording_markers(state["path"]) if state["path"] else None
+        if sidecar_markers is not None:
+            state["markers"] = sidecar_markers
+            state["markers_loaded"] = True
+            draw_timeline()
+            return
+
+        # Legacy fallback for a recording made before this app tracked its own markers: OBS's
+        # native chapters only ever existed on a Hybrid MP4 recording; get_full_chapter_descriptions
+        # returns None until VLC has finished parsing the media (mirrors the audio-track-count
+        # pattern above), so this is retried from poll() until it stops being None rather than
+        # assumed to succeed on the first call.
         try:
             descriptions = player.get_full_chapter_descriptions(-1)
         except Exception:
@@ -8787,7 +8810,7 @@ def main():
             target=run_custom_keybind_listener,
             args=(
                 custom_keybinds, lambda: runtime_state.get("obs_client"), lambda: manual_split_buffer_seconds,
-                icon, config.get("notifications", {}), status,
+                icon, config.get("notifications", {}), status, recording_state,
             ),
             daemon=True,
         )

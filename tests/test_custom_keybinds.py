@@ -91,12 +91,12 @@ class RunCustomKeybindListenerDispatchTests(unittest.TestCase):
             a.run_custom_keybind_listener(
                 [{"enabled": True, "key": "S", "modifiers": []}], get_client="get_client",
                 get_manual_split_buffer_seconds="get_seconds", icon="icon",
-                notifications_config="notif_cfg", status="status",
+                notifications_config="notif_cfg", status="status", recording_state="rec_state",
             )
         mock_run.assert_called_once_with(
             [{"enabled": True, "key": "S", "modifiers": []}], "get_client", "get_seconds",
             a.fire_custom_keybind, a.describe_keybind, a.notify,
-            icon="icon", notifications_config="notif_cfg", status="status",
+            icon="icon", notifications_config="notif_cfg", status="status", recording_state="rec_state",
         )
 
 

@@ -202,7 +202,7 @@ def global_hotkeys_supported(platform_name=None):
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None, platform_name=None,
+    icon=None, notifications_config=None, status=None, recording_state=None, platform_name=None,
 ):
     """Dispatches to this OS's own full custom-keybind listener implementation -- unlike most of
     this module's other functions, the entire mechanism (registration AND its event loop) differs
@@ -211,10 +211,12 @@ def run_custom_keybind_listener(
     see CROSS_PLATFORM_PLAN.md Phase 3. fire_keybind/describe_keybind/notify are passed through
     rather than imported by the backend modules themselves, so backends never depend on
     autostart_script.py (the dependency only ever goes the other way -- see this module's own
-    docstring)."""
+    docstring). recording_state is passed through unexamined -- only add_recording_marker (via
+    fire_keybind) ever reads it, to record a marker's timestamp independently of OBS's own
+    chapter mechanism; see autostart_script.py's add_recording_marker."""
     return _select_backend(platform_name).run_custom_keybind_listener(
         bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-        icon=icon, notifications_config=notifications_config, status=status,
+        icon=icon, notifications_config=notifications_config, status=status, recording_state=recording_state,
     )
 
 
