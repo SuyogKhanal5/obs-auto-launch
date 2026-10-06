@@ -34,7 +34,43 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
 def load_config():
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+    ensure_game_audio_track(config)
+    return config
+
+
+# Quick Setup's slot for game audio (desktop+mic 1, mic 2, game 3, voice 4, music 5, browser 6).
+GAME_AUDIO_DEFAULT_TRACK = 3
+
+
+def ensure_game_audio_track(config):
+    """With game audio isolation and multi-track audio both on, makes sure the Game Audio input
+    has a track in multi_track_audio.tracks -- otherwise routing treats it as unmapped and strips
+    it off every track, so game audio silently never reaches the recording. Uses track 3 if
+    nothing else is on it, else the lowest free track; leaves the config alone if all six are
+    taken. Mutates and returns config."""
+    obs_config = config.get("obs", {})
+    game_audio_config = obs_config.get("game_audio_capture", {})
+    multi_track_config = obs_config.get("multi_track_audio", {})
+    if not game_audio_config.get("enabled") or not multi_track_config.get("enabled"):
+        return config
+    input_name = game_audio_config.get("input_name") or "Game Audio"
+    tracks = multi_track_config.setdefault("tracks", [])
+    if any(t.get("input_name") == input_name for t in tracks):
+        return config
+    used = {t.get("track") for t in tracks}
+    free = [GAME_AUDIO_DEFAULT_TRACK] if GAME_AUDIO_DEFAULT_TRACK not in used else [
+        n for n in range(1, 7) if n not in used
+    ]
+    if not free:
+        logging.warning(
+            "Game audio isolation is on, but all 6 recording tracks are already in use -- add "
+            "'%s' to a track in Settings > Multi-Track Audio for it to be recorded.", input_name,
+        )
+        return config
+    tracks.append({"input_name": input_name, "track": free[0]})
+    logging.info("Added '%s' to multi-track audio on track %d (game audio isolation is on).", input_name, free[0])
+    return config
 
 
 MAX_LOG_LINES = 10000
@@ -954,6 +990,7 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
         if not client:
             return None, None
 
+    ensure_game_audio_input_exists(client, obs_config.get("game_audio_capture", {}))
     sync_multi_track_audio(
         client, obs_config.get("multi_track_audio", {}),
         obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
@@ -1009,6 +1046,27 @@ def resolve_process_audio_capture(process_name):
     exe_path = next((exe for name, exe, _pid in get_running_processes() if name == process_name), None)
     settings = platform_common.process_audio_capture_settings(process_name, exe_path)
     return kind, settings
+
+
+def ensure_game_audio_input_exists(client, game_audio_config):
+    """Creates the game audio isolation input in OBS (untargeted -- set_game_audio_capture_target
+    points it at the game once one is detected) if it doesn't exist yet, so it's already there
+    when multi-track routing runs instead of first appearing mid-recording on OBS's default of
+    every track."""
+    if not game_audio_config.get("enabled"):
+        return
+    kind = platform_common.process_audio_capture_kind()
+    if not kind:
+        return
+    input_name = game_audio_config.get("input_name") or "Game Audio"
+    try:
+        if input_name in {i["inputName"] for i in client.get_input_list().inputs}:
+            return
+        scene = client.get_current_program_scene().current_program_scene_name
+        client.create_input(scene, input_name, kind, {}, True)
+        logging.info("Created game audio input '%s' in OBS.", input_name)
+    except Exception as exc:
+        logging.warning("Could not create game audio input '%s' in OBS: %s", input_name, exc)
 
 
 def set_game_audio_capture_target(client, input_name, process_name):
@@ -6730,6 +6788,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
         else:
             clip_editor.pop("vlc_path", None)
 
+        ensure_game_audio_track(new_config)
         return new_config, errors
 
     def do_save(and_restart):
@@ -8608,10 +8667,14 @@ def main():
             log_path = os.path.join(SCRIPT_DIR, log_path)
         handlers.append(LineCappedFileHandler(log_path))
 
+    # force=True: load_config() above can already log (ensure_game_audio_track), and a
+    # module-level logging call with no handlers yet installs a default stderr one -- without
+    # force, basicConfig then silently does nothing and the log file is never written.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=handlers,
+        force=True,
     )
     cleanup_orphaned_pyinstaller_temp_dirs()
 

@@ -506,3 +506,96 @@ class ReapplyMultiTrackRoutingTests(unittest.TestCase):
         client = self.make_client()
         a.reapply_multi_track_routing(client, {"enabled": True, "tracks": []})
         self.assertEqual(client.inputs["Game Audio"]["tracks"], self.ALL)
+
+
+class EnsureGameAudioTrackTests(unittest.TestCase):
+    def make_config(self, tracks, game_enabled=True, multi_enabled=True, input_name="Game Audio"):
+        return {"obs": {
+            "game_audio_capture": {"enabled": game_enabled, "input_name": input_name},
+            "multi_track_audio": {"enabled": multi_enabled, "tracks": tracks},
+        }}
+
+    def tracks_of(self, config):
+        return config["obs"]["multi_track_audio"]["tracks"]
+
+    def test_adds_game_audio_on_track_three(self):
+        config = self.make_config([{"input_name": "Mic/Aux", "track": 1}, {"input_name": "Discord", "track": 4}])
+        a.ensure_game_audio_track(config)
+        self.assertIn({"input_name": "Game Audio", "track": 3}, self.tracks_of(config))
+
+    def test_leaves_an_existing_mapping_alone(self):
+        config = self.make_config([{"input_name": "Game Audio", "track": 5}])
+        a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), [{"input_name": "Game Audio", "track": 5}])
+
+    def test_uses_the_configured_input_name(self):
+        config = self.make_config([], input_name="Isolated Game")
+        a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), [{"input_name": "Isolated Game", "track": 3}])
+
+    def test_falls_back_to_lowest_free_track_when_three_is_taken(self):
+        config = self.make_config([
+            {"input_name": "Mic/Aux", "track": 1}, {"input_name": "Line In", "track": 3},
+        ])
+        a.ensure_game_audio_track(config)
+        self.assertIn({"input_name": "Game Audio", "track": 2}, self.tracks_of(config))
+
+    def test_all_tracks_taken_leaves_config_unchanged(self):
+        tracks = [{"input_name": f"Input {n}", "track": n} for n in range(1, 7)]
+        config = self.make_config(list(tracks))
+        with self.assertLogs(level="WARNING"):
+            a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), tracks)
+
+    def test_noop_when_game_audio_disabled(self):
+        config = self.make_config([], game_enabled=False)
+        a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), [])
+
+    def test_noop_when_multi_track_disabled(self):
+        config = self.make_config([], multi_enabled=False)
+        a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), [])
+
+    def test_load_config_applies_it(self):
+        import json
+        import tempfile
+        config = self.make_config([{"input_name": "Mic/Aux", "track": 1}])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(config, f)
+            with unittest.mock.patch.object(a, "CONFIG_PATH", path):
+                loaded = a.load_config()
+        self.assertIn({"input_name": "Game Audio", "track": 3}, self.tracks_of(loaded))
+
+
+class EnsureGameAudioInputExistsTests(unittest.TestCase):
+    def setUp(self):
+        patcher = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_creates_missing_input_in_current_scene(self):
+        client = FakeObsClient(current_scene="Scene")
+        a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
+        self.assertEqual(client.inputs["Game Audio"]["kind"], "sck_audio_capture")
+        self.assertIn(("create_input", "Scene", "Game Audio", "sck_audio_capture", {}), client.calls)
+
+    def test_leaves_an_existing_input_alone(self):
+        client = FakeObsClient(inputs={"Game Audio": {"kind": "sck_audio_capture", "tracks": {}}})
+        a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
+        self.assertNotIn("create_input", [c[0] for c in client.calls])
+
+    def test_noop_when_disabled(self):
+        client = FakeObsClient()
+        a.ensure_game_audio_input_exists(client, {"enabled": False})
+        self.assertEqual(client.inputs, {})
+
+    def test_noop_on_an_os_without_per_app_capture(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value=None):
+            a.ensure_game_audio_input_exists(client, {"enabled": True})
+        self.assertEqual(client.inputs, {})
