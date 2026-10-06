@@ -1120,29 +1120,51 @@ def compute_process_capture_tracks(obs_config):
     return sorted({track for name, track in entries if name in process_capture_names})
 
 
-def compute_reference_track(obs_config, reference_input_name="Desktop Audio"):
+def compute_reference_track(obs_config, reference_input_name="Desktop Audio", input_kinds=None):
     """Returns the OBS track number to treat as "ground truth" audio when the clip editor's "Fix
     audio track sync" measures a process-capture track's real lag against it (see
     compute_process_capture_tracks) -- reference_input_name ("Desktop Audio") wins if it's
     configured, matching the same reference run_audio_sync_calibration and
     apply_process_capture_sync_offset already correct every process-capture input against.
-    Otherwise falls back to the lowest-numbered track that isn't itself a process-capture track.
-    Found as a real gap on macOS: a setup with no device-loopback "Desktop Audio" source
-    configured at all (not uncommon there -- macOS has no native system-audio loopback without a
-    third-party virtual audio driver like BlackHole) used to leave this feature entirely
-    disabled, even with a perfectly good plain-device track (e.g. a mic) available to measure
-    against instead. Returns None only if multi_track_audio.tracks has nothing configured, or
-    every configured track is itself a process-capture track (nothing non-process-capture to
-    measure against at all)."""
+
+    Otherwise picks the lowest-numbered non-process-capture track, preferring one input_kinds (a
+    live {input_name: input_kind} map, e.g. from resolve_input_kinds) confirms is a genuine
+    device-output/desktop-audio-style capture (DESKTOP_AUDIO_CAPTURE_KINDS -- on macOS this
+    includes "screen_capture", confirmed live to always carry system audio; see that set's own
+    comment) over anything else, e.g. a microphone. This matters: a mic is also "not a
+    process-capture track", but it captures a completely different, uncorrelated acoustic signal
+    (the user's voice/room sound) from what a process-capture track contains, so
+    cross-correlating the two would measure noise, not real lag -- measure_waveform_lag_ms's own
+    confidence threshold already guards against that actively corrupting anything (an
+    unconfident measurement is simply skipped, falling back to whatever offset was already
+    configured), but a verified desktop/screen-capture track is a strictly better reference
+    whenever one is known to exist. input_kinds=None (e.g. OBS was unreachable when the clip
+    editor opened) falls back to the plain lowest-numbered non-process-capture track exactly as
+    before this preference existed.
+
+    Returns None only if multi_track_audio.tracks has nothing configured, or every configured
+    track is itself a process-capture track (nothing non-process-capture to measure against at
+    all)."""
     entries = normalize_track_entries(obs_config.get("multi_track_audio", {}).get("tracks"))
     if not entries:
         return None
     for name, track in entries:
         if name == reference_input_name:
             return track
+
     process_capture_tracks = set(compute_process_capture_tracks(obs_config))
-    non_process_tracks = sorted({track for _, track in entries if track not in process_capture_tracks})
-    return non_process_tracks[0] if non_process_tracks else None
+    candidates = [(name, track) for name, track in entries if track not in process_capture_tracks]
+    if not candidates:
+        return None
+
+    if input_kinds:
+        desktop_tracks = sorted(
+            {track for name, track in candidates if input_kinds.get(name) in DESKTOP_AUDIO_CAPTURE_KINDS}
+        )
+        if desktop_tracks:
+            return desktop_tracks[0]
+
+    return sorted({track for _, track in candidates})[0]
 
 
 def track_name_hints(obs_config):
@@ -2133,7 +2155,19 @@ def sync_multi_track_output_settings(client, entries, profile_name):
 # equality check here is exactly the bug that made Quick Setup's microphone dropdown always come
 # up empty on macOS, even though the real mic input was right there in OBS under a different
 # (also real, also confirmed) kind name.
-DESKTOP_AUDIO_CAPTURE_KINDS = {"wasapi_output_capture", "coreaudio_output_capture", "pulse_output_capture"}
+DESKTOP_AUDIO_CAPTURE_KINDS = {
+    "wasapi_output_capture", "coreaudio_output_capture", "pulse_output_capture",
+    # macOS-only, confirmed live: GetInputDefaultSettings for "screen_capture" has no
+    # audio-related field at all -- ScreenCaptureKit bundles system audio into it
+    # unconditionally, with no separate toggle. In practice this is the de facto way most Mac
+    # OBS setups get "desktop audio" into a recording at all, since macOS has no native
+    # system-audio loopback device the way wasapi_output_capture/coreaudio_output_capture
+    # assume -- confirmed via a real user's own OBS instance, which has no coreaudio_output_capture
+    # input configured at all, only a "macOS Screen Capture" (screen_capture) source. This kind
+    # string is macOS-specific (Windows/Linux use entirely different kind names for screen
+    # capture), so it can never falsely match on those OSes.
+    "screen_capture",
+}
 MIC_AUDIO_CAPTURE_KINDS = {
     "wasapi_input_capture", "coreaudio_input_capture", "pulse_input_capture", "alsa_input_capture",
 }
@@ -6848,6 +6882,25 @@ def resolve_recent_recordings_folder(obs_config):
         client.disconnect()
 
 
+def resolve_input_kinds(obs_config):
+    """Best-effort live {input_name: input_kind} map for every input OBS currently has -- lets
+    compute_reference_track tell a genuine device-output/desktop-audio capture apart from a
+    microphone (see its own docstring and DESKTOP_AUDIO_CAPTURE_KINDS). Same short,
+    single-attempt connection shape as resolve_recent_recordings_folder, for the same reason --
+    this runs synchronously while the clip editor's own UI is being built. Returns {} on any
+    failure (OBS unreachable, etc.); compute_reference_track treats that exactly like "kind
+    unknown" and falls back to its older, kind-blind heuristic rather than refusing to work."""
+    client = connect_obs(obs_config.get("websocket"), retries=1, delay=0)
+    if not client:
+        return {}
+    try:
+        return {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
+    except Exception:
+        return {}
+    finally:
+        client.disconnect()
+
+
 def list_recent_recordings(folder, limit=CLIP_EDITOR_MAX_RECENT_RECORDINGS):
     """Lists up to `limit` video files under folder, newest first -- recursive, since
     organize_into_game_subfolders nests recordings one level deeper per game."""
@@ -7765,7 +7818,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
     audio_tracks_row = tk.Frame(root, bg=EDITOR_BG)
     audio_tracks_row.pack(fill="x", padx=10, pady=4)
     fix_sync_tracks = compute_process_capture_tracks(obs_config)
-    fix_sync_reference_track = compute_reference_track(obs_config)
+    fix_sync_reference_track = compute_reference_track(obs_config, input_kinds=resolve_input_kinds(obs_config))
     fix_sync_var = tk.BooleanVar(value=False)
     fix_sync_checkbox = tk.Checkbutton(
         audio_tracks_row, text="Fix audio track sync", variable=fix_sync_var,

@@ -179,6 +179,82 @@ class ComputeReferenceTrackTests(unittest.TestCase):
         }
         self.assertEqual(a.compute_reference_track(obs_config), 2)
 
+    def test_input_kinds_prefers_a_confirmed_desktop_audio_kind_over_a_mic(self):
+        # A mic is also "not a process-capture track", but it captures a completely different,
+        # uncorrelated signal from a process-capture track -- a verified desktop/screen-capture
+        # kind (e.g. macOS's "screen_capture", confirmed live to always carry system audio) is a
+        # strictly better reference whenever one is known to exist.
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "macOS Screen Capture", "track": 2},
+                    {"input_name": "Discord", "track": 4},
+                ],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
+            },
+        }
+        input_kinds = {"Mic/Aux": "coreaudio_input_capture", "macOS Screen Capture": "screen_capture"}
+        self.assertEqual(a.compute_reference_track(obs_config, input_kinds=input_kinds), 2)
+
+    def test_no_input_kinds_falls_back_to_lowest_numbered_non_process_track(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "macOS Screen Capture", "track": 2},
+                    {"input_name": "Discord", "track": 4},
+                ],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
+            },
+        }
+        self.assertEqual(a.compute_reference_track(obs_config, input_kinds=None), 1)
+
+    def test_input_kinds_with_no_desktop_kind_candidate_falls_back_too(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "Discord", "track": 4},
+                ],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
+            },
+        }
+        input_kinds = {"Mic/Aux": "coreaudio_input_capture"}
+        self.assertEqual(a.compute_reference_track(obs_config, input_kinds=input_kinds), 1)
+
+
+class ResolveInputKindsTests(unittest.TestCase):
+    def test_returns_name_to_kind_map(self):
+        client = FakeObsClient(inputs={
+            "Mic/Aux": {"kind": "coreaudio_input_capture", "tracks": {}},
+            "macOS Screen Capture": {"kind": "screen_capture", "tracks": {}},
+        })
+        with unittest.mock.patch.object(a, "connect_obs", return_value=client):
+            result = a.resolve_input_kinds({"websocket": {}})
+        self.assertEqual(
+            result, {"Mic/Aux": "coreaudio_input_capture", "macOS Screen Capture": "screen_capture"},
+        )
+
+    def test_returns_empty_dict_when_obs_unreachable(self):
+        with unittest.mock.patch.object(a, "connect_obs", return_value=None):
+            result = a.resolve_input_kinds({"websocket": {}})
+        self.assertEqual(result, {})
+
+    def test_returns_empty_dict_on_failure_instead_of_raising(self):
+        class BrokenClient(FakeObsClient):
+            def get_input_list(self, kind=None):
+                raise RuntimeError("boom")
+
+        with unittest.mock.patch.object(a, "connect_obs", return_value=BrokenClient()):
+            result = a.resolve_input_kinds({"websocket": {}})
+        self.assertEqual(result, {})
+
+    def test_connects_with_a_single_fast_attempt(self):
+        with unittest.mock.patch.object(a, "connect_obs", return_value=None) as mock_connect:
+            a.resolve_input_kinds({"websocket": {"host": "localhost"}})
+        mock_connect.assert_called_once_with({"host": "localhost"}, retries=1, delay=0)
+
 
 class TrackNameHintsTests(unittest.TestCase):
     def test_maps_track_numbers_to_input_names(self):
