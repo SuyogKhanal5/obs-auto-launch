@@ -129,99 +129,67 @@ class ComputeReferenceTrackTests(unittest.TestCase):
         obs_config = {"multi_track_audio": {"tracks": [{"input_name": "Line In", "track": 4}]}}
         self.assertEqual(a.compute_reference_track(obs_config, reference_input_name="Line In"), 4)
 
-    def test_falls_back_to_a_non_process_capture_track_when_no_desktop_audio_configured(self):
-        # Found as a real gap on macOS: a setup with no "Desktop Audio" input at all (no native
-        # system-audio loopback without a third-party virtual driver there) used to leave this
-        # entirely unusable even with a perfectly good plain-device track (Mic/Aux) available.
+    def test_never_falls_back_to_a_mic(self):
+        # The sync fix aligns process-capture tracks to desktop audio by cross-correlating the
+        # same sound captured two ways -- a mic doesn't carry that sound, so it's never a valid
+        # reference, kinds known or not.
         obs_config = {
             "multi_track_audio": {
                 "tracks": [
                     {"input_name": "Mic/Aux", "track": 1},
                     {"input_name": "Discord", "track": 4},
                 ],
-                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
-            },
-        }
-        self.assertEqual(a.compute_reference_track(obs_config), 1)
-
-    def test_fallback_prefers_the_lowest_numbered_non_process_capture_track(self):
-        obs_config = {
-            "multi_track_audio": {
-                "tracks": [
-                    {"input_name": "Mic/Aux", "track": 2},
-                    {"input_name": "Mic/Aux", "track": 1},
-                    {"input_name": "Discord", "track": 4},
-                ],
-                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
-            },
-        }
-        self.assertEqual(a.compute_reference_track(obs_config), 1)
-
-    def test_returns_none_when_every_configured_track_is_a_process_capture_track(self):
-        obs_config = {
-            "multi_track_audio": {
-                "tracks": [{"input_name": "Discord", "track": 4}],
                 "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
             },
         }
         self.assertIsNone(a.compute_reference_track(obs_config))
+        self.assertIsNone(a.compute_reference_track(
+            obs_config, input_kinds={"Mic/Aux": "coreaudio_input_capture"},
+        ))
 
-    def test_desktop_audio_still_wins_over_the_fallback_when_both_exist(self):
+    def test_macos_screen_capture_is_the_reference_via_input_kinds(self):
         obs_config = {
             "multi_track_audio": {
                 "tracks": [
-                    {"input_name": "Desktop Audio", "track": 2},
+                    {"input_name": "macOS Screen Capture", "track": 1},
                     {"input_name": "Mic/Aux", "track": 1},
-                    {"input_name": "Discord", "track": 4},
-                ],
-                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
-            },
-        }
-        self.assertEqual(a.compute_reference_track(obs_config), 2)
-
-    def test_input_kinds_prefers_a_confirmed_desktop_audio_kind_over_a_mic(self):
-        # A mic is also "not a process-capture track", but it captures a completely different,
-        # uncorrelated signal from a process-capture track -- a verified desktop/screen-capture
-        # kind (e.g. macOS's "screen_capture", confirmed live to always carry system audio) is a
-        # strictly better reference whenever one is known to exist.
-        obs_config = {
-            "multi_track_audio": {
-                "tracks": [
-                    {"input_name": "Mic/Aux", "track": 1},
-                    {"input_name": "macOS Screen Capture", "track": 2},
+                    {"input_name": "Mic/Aux", "track": 2},
                     {"input_name": "Discord", "track": 4},
                 ],
                 "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
             },
         }
         input_kinds = {"Mic/Aux": "coreaudio_input_capture", "macOS Screen Capture": "screen_capture"}
-        self.assertEqual(a.compute_reference_track(obs_config, input_kinds=input_kinds), 2)
-
-    def test_no_input_kinds_falls_back_to_lowest_numbered_non_process_track(self):
-        obs_config = {
-            "multi_track_audio": {
-                "tracks": [
-                    {"input_name": "Mic/Aux", "track": 1},
-                    {"input_name": "macOS Screen Capture", "track": 2},
-                    {"input_name": "Discord", "track": 4},
-                ],
-                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
-            },
-        }
-        self.assertEqual(a.compute_reference_track(obs_config, input_kinds=None), 1)
-
-    def test_input_kinds_with_no_desktop_kind_candidate_falls_back_too(self):
-        obs_config = {
-            "multi_track_audio": {
-                "tracks": [
-                    {"input_name": "Mic/Aux", "track": 1},
-                    {"input_name": "Discord", "track": 4},
-                ],
-                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
-            },
-        }
-        input_kinds = {"Mic/Aux": "coreaudio_input_capture"}
         self.assertEqual(a.compute_reference_track(obs_config, input_kinds=input_kinds), 1)
+
+    def test_desktop_kind_needs_live_kinds_to_be_recognized(self):
+        # Without input_kinds there's no way to know "macOS Screen Capture" is desktop audio --
+        # only the literal reference_input_name can be matched offline.
+        obs_config = {"multi_track_audio": {"tracks": [{"input_name": "macOS Screen Capture", "track": 1}]}}
+        self.assertIsNone(a.compute_reference_track(obs_config, input_kinds=None))
+
+    def test_desktop_audio_by_name_wins_without_live_kinds(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "Desktop Audio", "track": 2},
+                ],
+            },
+        }
+        self.assertEqual(a.compute_reference_track(obs_config), 2)
+
+    def test_lowest_desktop_kind_track_wins_when_several(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Loopback", "track": 3},
+                    {"input_name": "macOS Screen Capture", "track": 2},
+                ],
+            },
+        }
+        input_kinds = {"Loopback": "coreaudio_output_capture", "macOS Screen Capture": "screen_capture"}
+        self.assertEqual(a.compute_reference_track(obs_config, input_kinds=input_kinds), 2)
 
 
 class ResolveInputKindsTests(unittest.TestCase):
@@ -507,3 +475,34 @@ class SyncMultiTrackAudioAppCapturesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReapplyMultiTrackRoutingTests(unittest.TestCase):
+    # A Game Audio input created mid-recording (set_game_audio_capture_target runs only once the
+    # game is known, after ensure_obs_ready's routing pass) starts on every track by OBS's
+    # default -- confirmed live, bleeding game audio into every isolated track.
+    ALL = {str(i): True for i in range(1, 7)}
+
+    def make_client(self):
+        return FakeObsClient(inputs={
+            "Game Audio": {"kind": "sck_audio_capture", "tracks": dict(self.ALL)},
+            "Discord": {"kind": "sck_audio_capture", "tracks": {**{str(i): False for i in range(1, 7)}, "4": True}},
+        })
+
+    def test_routes_a_freshly_created_input_to_its_configured_track(self):
+        client = self.make_client()
+        a.reapply_multi_track_routing(client, {
+            "enabled": True,
+            "tracks": [{"input_name": "Game Audio", "track": 3}, {"input_name": "Discord", "track": 4}],
+        })
+        self.assertEqual([k for k, v in client.inputs["Game Audio"]["tracks"].items() if v], ["3"])
+
+    def test_noop_when_multi_track_disabled(self):
+        client = self.make_client()
+        a.reapply_multi_track_routing(client, {"enabled": False, "tracks": [{"input_name": "Game Audio", "track": 3}]})
+        self.assertEqual(client.inputs["Game Audio"]["tracks"], self.ALL)
+
+    def test_noop_when_no_tracks_configured(self):
+        client = self.make_client()
+        a.reapply_multi_track_routing(client, {"enabled": True, "tracks": []})
+        self.assertEqual(client.inputs["Game Audio"]["tracks"], self.ALL)

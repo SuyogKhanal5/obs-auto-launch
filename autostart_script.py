@@ -1121,50 +1121,29 @@ def compute_process_capture_tracks(obs_config):
 
 
 def compute_reference_track(obs_config, reference_input_name="Desktop Audio", input_kinds=None):
-    """Returns the OBS track number to treat as "ground truth" audio when the clip editor's "Fix
-    audio track sync" measures a process-capture track's real lag against it (see
-    compute_process_capture_tracks) -- reference_input_name ("Desktop Audio") wins if it's
-    configured, matching the same reference run_audio_sync_calibration and
-    apply_process_capture_sync_offset already correct every process-capture input against.
+    """Returns the track holding desktop audio -- the "ground truth" the clip editor's "Fix audio
+    track sync" aligns every process-capture track to. That's either a track routed from an
+    input named reference_input_name, or (via input_kinds, a live {input_name: input_kind} map
+    from resolve_input_kinds) one whose input is a desktop-audio kind -- on macOS that's usually
+    "macOS Screen Capture", since screen_capture carries system audio and there's no native
+    loopback device.
 
-    Otherwise picks the lowest-numbered non-process-capture track, preferring one input_kinds (a
-    live {input_name: input_kind} map, e.g. from resolve_input_kinds) confirms is a genuine
-    device-output/desktop-audio-style capture (DESKTOP_AUDIO_CAPTURE_KINDS -- on macOS this
-    includes "screen_capture", confirmed live to always carry system audio; see that set's own
-    comment) over anything else, e.g. a microphone. This matters: a mic is also "not a
-    process-capture track", but it captures a completely different, uncorrelated acoustic signal
-    (the user's voice/room sound) from what a process-capture track contains, so
-    cross-correlating the two would measure noise, not real lag -- measure_waveform_lag_ms's own
-    confidence threshold already guards against that actively corrupting anything (an
-    unconfident measurement is simply skipped, falling back to whatever offset was already
-    configured), but a verified desktop/screen-capture track is a strictly better reference
-    whenever one is known to exist. input_kinds=None (e.g. OBS was unreachable when the clip
-    editor opened) falls back to the plain lowest-numbered non-process-capture track exactly as
-    before this preference existed.
-
-    Returns None only if multi_track_audio.tracks has nothing configured, or every configured
-    track is itself a process-capture track (nothing non-process-capture to measure against at
-    all)."""
+    Deliberately never falls back to some other track like a mic: the measurement cross-
+    correlates the same sound captured two ways, and a mic doesn't carry the sound a
+    process-capture track does. Returns None (the checkbox stays disabled) when no desktop-audio
+    track can be identified."""
     entries = normalize_track_entries(obs_config.get("multi_track_audio", {}).get("tracks"))
-    if not entries:
-        return None
     for name, track in entries:
         if name == reference_input_name:
             return track
-
-    process_capture_tracks = set(compute_process_capture_tracks(obs_config))
-    candidates = [(name, track) for name, track in entries if track not in process_capture_tracks]
-    if not candidates:
+    if not input_kinds:
         return None
-
-    if input_kinds:
-        desktop_tracks = sorted(
-            {track for name, track in candidates if input_kinds.get(name) in DESKTOP_AUDIO_CAPTURE_KINDS}
-        )
-        if desktop_tracks:
-            return desktop_tracks[0]
-
-    return sorted({track for _, track in candidates})[0]
+    process_capture_tracks = set(compute_process_capture_tracks(obs_config))
+    desktop_tracks = sorted({
+        track for name, track in entries
+        if track not in process_capture_tracks and input_kinds.get(name) in DESKTOP_AUDIO_CAPTURE_KINDS
+    })
+    return desktop_tracks[0] if desktop_tracks else None
 
 
 def track_name_hints(obs_config):
@@ -2266,6 +2245,18 @@ def sync_multi_track_audio(client, multi_track_config, process_capture_sync_offs
         apply_multi_track_routing(client, entries)
     except Exception:
         logging.exception("Unexpected error while syncing multi-track audio settings.")
+
+
+def reapply_multi_track_routing(client, multi_track_config):
+    if not multi_track_config.get("enabled"):
+        return
+    entries = normalize_track_entries(multi_track_config.get("tracks"))
+    if not entries:
+        return
+    try:
+        apply_multi_track_routing(client, entries)
+    except Exception:
+        logging.exception("Unexpected error while re-applying multi-track routing.")
 
 
 DEFAULT_DISK_SPACE_MINIMUM_GB = 10
@@ -4102,6 +4093,11 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                             obs_client, game_audio_config["input_name"],
                             obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
                         )
+                        # Routing already ran in ensure_obs_ready, before the game was known -- a
+                        # Game Audio input created just now would otherwise keep OBS's default of
+                        # every track for this whole recording (confirmed live), bleeding game
+                        # audio into the Discord/Spotify/browser tracks.
+                        reapply_multi_track_routing(obs_client, obs_config.get("multi_track_audio", {}))
                 else:
                     obs_recovery_state["last_start_failure"] = now
                     logging.error("Could not get OBS ready to record; will keep retrying while %s runs.", exe or name)
@@ -7834,8 +7830,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         ).pack(side="left")
     else:
         fix_sync_checkbox.config(state="disabled")
+        reason = (
+            "needs a desktop audio track in Multi-Track Audio" if fix_sync_tracks
+            else "not configured in Settings"
+        )
         tk.Label(
-            audio_tracks_row, text="  (not configured in Settings)", bg=EDITOR_BG, fg=MUTED_TEXT_COLOR,
+            audio_tracks_row, text=f"  ({reason})", bg=EDITOR_BG, fg=MUTED_TEXT_COLOR,
         ).pack(side="left")
 
     # --- Track Routing: consolidate multiple source tracks into fewer output tracks (e.g. mix
