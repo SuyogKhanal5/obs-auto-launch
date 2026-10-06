@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
+from tests.fakes import FakeObsClient
 
 
 class ParseTimestampTests(unittest.TestCase):
@@ -944,6 +945,58 @@ class ListRecentRecordingsTests(unittest.TestCase):
                 open(path, "w").close()
                 os.utime(path, (1000 + i, 1000 + i))
             self.assertEqual(len(a.list_recent_recordings(tmp, limit=3)), 3)
+
+
+class ResolveRecentRecordingsFolderTests(unittest.TestCase):
+    # Found as a real bug: obs.output_folder only exists as an override, and most users (this
+    # app's own real user included) never set it -- without this fallback to OBS's own live
+    # record_directory, list_recent_recordings(None) always returns [], and the clip editor's
+    # "recent recordings" dropdown is never even created at all, no matter how many real
+    # recordings exist (see _run_clip_editor's `if recent_recordings:` guard).
+    def test_explicit_output_folder_wins_without_connecting_to_obs(self):
+        with patch.object(a, "connect_obs") as mock_connect:
+            result = a.resolve_recent_recordings_folder({"output_folder": r"D:\Clips", "websocket": {}})
+        self.assertEqual(result, r"D:\Clips")
+        mock_connect.assert_not_called()
+
+    def test_falls_back_to_obs_live_record_directory(self):
+        client = FakeObsClient()
+        client.set_record_directory("/Users/someone/Movies")
+        with patch.object(a, "connect_obs", return_value=client):
+            result = a.resolve_recent_recordings_folder({"output_folder": None, "websocket": {}})
+        self.assertEqual(result, "/Users/someone/Movies")
+        self.assertIn(("disconnect",), client.calls)
+
+    def test_blank_output_folder_also_falls_back(self):
+        client = FakeObsClient()
+        client.set_record_directory("/Users/someone/Movies")
+        with patch.object(a, "connect_obs", return_value=client):
+            result = a.resolve_recent_recordings_folder({"output_folder": "", "websocket": {}})
+        self.assertEqual(result, "/Users/someone/Movies")
+
+    def test_returns_none_when_obs_unreachable(self):
+        with patch.object(a, "connect_obs", return_value=None):
+            result = a.resolve_recent_recordings_folder({"output_folder": None, "websocket": {}})
+        self.assertIsNone(result)
+
+    def test_returns_none_when_obs_raises_rather_than_propagating(self):
+        class BrokenClient(FakeObsClient):
+            def get_record_directory(self):
+                raise RuntimeError("boom")
+
+        client = BrokenClient()
+        with patch.object(a, "connect_obs", return_value=client):
+            result = a.resolve_recent_recordings_folder({"output_folder": None, "websocket": {}})
+        self.assertIsNone(result)
+        self.assertIn(("disconnect",), client.calls)
+
+    def test_connects_with_a_single_fast_attempt_not_the_slow_default_retry_window(self):
+        # The editor's own UI construction runs on this call synchronously -- it must never block
+        # for connect_obs's default ~10s retry window just because OBS happens to be unreachable
+        # right when the editor opens.
+        with patch.object(a, "connect_obs", return_value=None) as mock_connect:
+            a.resolve_recent_recordings_folder({"output_folder": None, "websocket": {"host": "localhost"}})
+        mock_connect.assert_called_once_with({"host": "localhost"}, retries=1, delay=0)
 
 
 class RunFfmpegWithProgressTests(unittest.TestCase):

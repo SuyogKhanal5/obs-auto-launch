@@ -6812,6 +6812,30 @@ def get_quality_scale_height(quality_choice):
     return CLIP_EDITOR_QUALITY_HEIGHTS.get(quality_choice)
 
 
+def resolve_recent_recordings_folder(obs_config):
+    """Falls back to OBS's own live recording directory when obs.output_folder isn't explicitly
+    configured. output_folder only ever exists as an override for pointing recordings somewhere
+    OTHER than wherever OBS's active profile already records to -- most users never set it at
+    all -- so without this fallback, list_recent_recordings(None) always returns [], and the clip
+    editor's "recent recordings" dropdown never even gets created (see _run_clip_editor) no
+    matter how many real recordings exist. Best-effort: a short, single-attempt connection (the
+    editor's own UI construction would otherwise block for connect_obs's default ~10s retry
+    window if OBS happens to not be reachable right now), returning None on any failure so the
+    dropdown just doesn't appear rather than the whole editor hanging or crashing to open it."""
+    configured = obs_config.get("output_folder")
+    if configured:
+        return configured
+    client = connect_obs(obs_config.get("websocket"), retries=1, delay=0)
+    if not client:
+        return None
+    try:
+        return client.get_record_directory().record_directory
+    except Exception:
+        return None
+    finally:
+        client.disconnect()
+
+
 def list_recent_recordings(folder, limit=CLIP_EDITOR_MAX_RECENT_RECORDINGS):
     """Lists up to `limit` video files under folder, newest first -- recursive, since
     organize_into_game_subfolders nests recordings one level deeper per game."""
@@ -7115,7 +7139,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         open_row, text="📂", font=("Segoe UI", 11), command=lambda: browse_for_file(),
     ).pack(side="left")
 
-    recent_recordings = list_recent_recordings(config.get("obs", {}).get("output_folder"))
+    recent_recordings = list_recent_recordings(resolve_recent_recordings_folder(config.get("obs", {})))
     recent_var = tk.StringVar()
     if recent_recordings:
         recent_combo = ttk.Combobox(
