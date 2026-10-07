@@ -3569,11 +3569,15 @@ def build_audio_routing_filter_args(
     different treatment depending on which output track it ends up in -- a per-source-only gain
     couldn't express that. A missing or 0 entry means no change for that pair.
 
-    mono_sources: SOURCE track numbers to downmix to mono (an equal-power average of all input
-    channels, matching what OBS's own "Downmix Mono" source flag does) before any shifting, gain,
-    or mixing below -- e.g. forcing a dedicated clean-mic track to mono regardless of which
+    mono_sources: SOURCE track numbers to force to dual-mono -- stereo output with both channels
+    set to the same equal-power average of the input channels (matching what OBS's own "Downmix
+    Mono" source flag does), NOT a true single-channel stream. Applied before any shifting, gain,
+    or mixing below. e.g. forcing a dedicated clean-mic track to mono regardless of which
     destination(s) it's routed to, rather than per (destination, source) like gains_db, since a
-    source being mono isn't a property that should ever differ by destination.
+    source being mono isn't a property that should ever differ by destination. Deliberately keeps
+    the channel COUNT unchanged (2, not 1) -- confirmed live that actually reducing it shifted
+    every later track's channel indexing for anything reading this file with a fixed per-track
+    channel count assumption.
 
     Returns ([], []) if the result would be a pure identity passthrough with nothing muted,
     shifted, gained, or forced mono -- the caller falls back to its own plain "-map 0:a" wildcard
@@ -3623,11 +3627,14 @@ def build_audio_routing_filter_args(
             else:
                 steps.append(f"atrim=start={abs(shift_ms) / 1000:.6f},asetpts=PTS-STARTPTS")
         if s in mono_sources:
-            # Matches OBS's own "Downmix Mono" source flag: an equal-power average of every input
-            # channel, not just picking one -- a real stereo mic (signal on both channels) and a
-            # mono mic captured as stereo (signal on only one, silence on the other) both land at
-            # a sane, predictable level this way, without needing to know which channel is which.
-            steps.append("pan=mono|c0=0.5*c0+0.5*c1")
+            # Dual-mono (2 output channels, both carrying the same equal-power average of the
+            # input channels), NOT a true 1-channel reduction -- confirmed live that collapsing to
+            # a real mono stream shifted every LATER track's channel indexing for whatever reads
+            # this file with a fixed per-track channel count assumption (OBS's own audio pipeline
+            # works this same dual-mono way internally, never varying a source's channel count).
+            # A single real channel count across every track avoids that shift entirely, while c0
+            # and c1 being identical sounds indistinguishable from true mono either way.
+            steps.append("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1")
         if steps:
             filter_parts.append(f"[0:a:{i}]{','.join(steps)}[{label}]")
         else:
