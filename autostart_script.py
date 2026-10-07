@@ -29,97 +29,6 @@ if getattr(sys, "frozen", False):
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
-# obs-websocket has no request that can set a source's "Downmix Mono" flag (confirmed against the
-# published protocol spec -- SetInputSettings/SetInputAudioTracks/etc. all stop short of it), and
-# setting it by hand in OBS's own Advanced Audio Properties doesn't survive this app switching OBS
-# profiles, since that flag lives on the source object a profile switch recreates. The only real
-# fix is to keep re-applying it from OBS's own side: FORCE_MONO_SCRIPT_PATH is a small Lua script
-# (OBS ships Lua built in -- no separate Python interpreter to configure, unlike obspython) that
-# this app generates and the user adds to OBS once (Tools > Scripts > +); FORCE_MONO_INPUTS_PATH
-# is the plain list of input names it re-reads on a timer, kept in sync with Settings' own "Force
-# Inputs to Mono" field by write_force_mono_inputs_file below.
-FORCE_MONO_SCRIPT_FILENAME = "obs_force_mono.lua"
-FORCE_MONO_SCRIPT_PATH = os.path.join(SCRIPT_DIR, FORCE_MONO_SCRIPT_FILENAME)
-FORCE_MONO_INPUTS_FILENAME = "force_mono_inputs.txt"
-FORCE_MONO_INPUTS_PATH = os.path.join(SCRIPT_DIR, FORCE_MONO_INPUTS_FILENAME)
-FORCE_MONO_SCRIPT_CONTENTS = '''obs = obslua
-local bit = require("bit")
-
-local FORCE_MONO_FLAG = bit.lshift(1, 1)  -- OBS_SOURCE_FLAG_FORCE_MONO
-
-local function script_dir_path(filename)
-    return script_path() .. filename
-end
-
-local function read_input_names()
-    local names = {}
-    local f = io.open(script_dir_path("force_mono_inputs.txt"), "r")
-    if f == nil then
-        return names
-    end
-    for line in f:lines() do
-        local trimmed = line:match("^%s*(.-)%s*$")
-        if trimmed ~= "" then
-            table.insert(names, trimmed)
-        end
-    end
-    f:close()
-    return names
-end
-
-local function apply_force_mono()
-    for _, name in ipairs(read_input_names()) do
-        local source = obs.obs_get_source_by_name(name)
-        if source ~= nil then
-            local flags = obs.obs_source_get_flags(source)
-            if bit.band(flags, FORCE_MONO_FLAG) == 0 then
-                obs.obs_source_set_flags(source, bit.bor(flags, FORCE_MONO_FLAG))
-            end
-            obs.obs_source_release(source)
-        end
-    end
-end
-
-function script_description()
-    return "OBS Auto Recorder: keeps the inputs listed in force_mono_inputs.txt (next to this " ..
-        "script) forced to mono -- re-applied on a timer so it survives OBS Auto Recorder " ..
-        "switching profiles. Edit the list from OBS Auto Recorder's own Settings (Force Inputs " ..
-        "to Mono), not here."
-end
-
-function script_load(settings)
-    obs.timer_add(apply_force_mono, 2000)
-end
-
-function script_unload()
-    obs.timer_remove(apply_force_mono)
-end
-'''
-
-
-def write_force_mono_script():
-    """(Re)writes the Lua script OBS runs to keep configured inputs forced to mono -- always
-    overwritten with the current version so an app update also updates whatever's already been
-    added in OBS (Tools > Scripts just runs whatever's at the path it was given, no separate
-    update step of its own)."""
-    try:
-        with open(FORCE_MONO_SCRIPT_PATH, "w", encoding="utf-8", newline="\n") as f:
-            f.write(FORCE_MONO_SCRIPT_CONTENTS)
-    except OSError as exc:
-        logging.warning("Could not write the force-mono OBS script to %s: %s", FORCE_MONO_SCRIPT_PATH, exc)
-
-
-def write_force_mono_inputs_file(input_names):
-    """Keeps FORCE_MONO_INPUTS_PATH (the plain-text list the Lua script above re-reads on its own
-    timer) in sync with obs.force_mono_inputs -- called at startup and whenever Settings saves, so
-    a config change takes effect within that script's own ~2s poll interval without needing OBS
-    itself restarted."""
-    try:
-        with open(FORCE_MONO_INPUTS_PATH, "w", encoding="utf-8", newline="\n") as f:
-            for name in input_names:
-                f.write(name + "\n")
-    except OSError as exc:
-        logging.warning("Could not write the force-mono inputs list to %s: %s", FORCE_MONO_INPUTS_PATH, exc)
 
 
 def load_config():
@@ -6569,26 +6478,6 @@ def _run_config_editor(master_root, restart_callback, on_close):
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
 
-    add_section_label(obs_tab, row, "Force Inputs to Mono")
-    row += 1
-    force_mono_inputs_var = tk.StringVar(value=", ".join(obs_config.get("force_mono_inputs", [])))
-    add_labeled_entry(obs_tab, row, "Input names (comma-separated)", force_mono_inputs_var)
-    row += 1
-    tk.Label(
-        obs_tab,
-        text=(
-            "    OBS's WebSocket API has no request that can set a source's \"Downmix Mono\" flag "
-            "(confirmed against its own protocol spec), and setting it by hand in Advanced Audio "
-            "Properties doesn't survive this app switching OBS profiles -- the flag lives on the "
-            "source object a profile switch recreates. This instead installs a small OBS script "
-            f"({FORCE_MONO_SCRIPT_FILENAME}, generated next to this app) that keeps re-applying it. "
-            "One-time setup in OBS: Tools > Scripts > + > browse to that file, in this app's own "
-            "install folder. After that, this list is all you ever need to edit again."
-        ),
-        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
-    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
-    row += 1
-
     multi_track_config = obs_config.get("multi_track_audio", {})
     # Keyed by input name so re-running Quick Setup (or hand-editing tracks afterward) never
     # loses a previously-recorded app -> process mapping; collect_config() below reads this back
@@ -7487,10 +7376,6 @@ def _run_config_editor(master_root, restart_callback, on_close):
         mic_eq["mid_db"] = read_float(mic_eq_mid_var, "EQ mid", mic_eq.get("mid_db", MIC_BOOST_EQ_PRESET_MID_DB))
         mic_eq["high_db"] = read_float(mic_eq_high_var, "EQ high", mic_eq.get("high_db", MIC_BOOST_EQ_PRESET_HIGH_DB))
         mic_boost.pop("noise_gate", None)
-
-        force_mono_inputs = [name.strip() for name in force_mono_inputs_var.get().split(",") if name.strip()]
-        obs["force_mono_inputs"] = force_mono_inputs
-        write_force_mono_inputs_file(force_mono_inputs)
 
         multi_track_audio = obs.setdefault("multi_track_audio", {})
         multi_track_audio["enabled"] = multi_track_enabled_var.get()
@@ -9862,8 +9747,6 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
 
 def main():
     config = load_config()
-    write_force_mono_script()
-    write_force_mono_inputs_file(config.get("obs", {}).get("force_mono_inputs", []))
 
     handlers = []
     if sys.stderr is not None:

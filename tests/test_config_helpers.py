@@ -317,41 +317,5 @@ class ResolveDefaultOverlayMonitorIndexTests(unittest.TestCase):
         self.assertIsNone(a.resolve_default_overlay_monitor_index([], overlay_config))
 
 
-class ForceMonoFilesTests(unittest.TestCase):
-    def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmpdir.cleanup)
-        self.script_patch = patch.object(a, "FORCE_MONO_SCRIPT_PATH", os.path.join(self.tmpdir.name, "obs_force_mono.lua"))
-        self.inputs_patch = patch.object(a, "FORCE_MONO_INPUTS_PATH", os.path.join(self.tmpdir.name, "force_mono_inputs.txt"))
-        self.script_patch.start()
-        self.inputs_patch.start()
-        self.addCleanup(self.script_patch.stop)
-        self.addCleanup(self.inputs_patch.stop)
-
-    def test_write_force_mono_script_creates_a_lua_file_with_balanced_blocks(self):
-        a.write_force_mono_script()
-        contents = open(a.FORCE_MONO_SCRIPT_PATH, encoding="utf-8").read()
-        self.assertIn("script_load", contents)
-        self.assertIn("script_unload", contents)
-        self.assertIn("OBS_SOURCE_FLAG_FORCE_MONO", contents)
-        self.assertEqual(contents.count("("), contents.count(")"))
-
-    def test_write_force_mono_inputs_file_writes_one_name_per_line(self):
-        a.write_force_mono_inputs_file(["Scarlet Clean", "Another Input"])
-        contents = open(a.FORCE_MONO_INPUTS_PATH, encoding="utf-8").read()
-        self.assertEqual(contents, "Scarlet Clean\nAnother Input\n")
-
-    def test_write_force_mono_inputs_file_handles_an_empty_list(self):
-        a.write_force_mono_inputs_file([])
-        contents = open(a.FORCE_MONO_INPUTS_PATH, encoding="utf-8").read()
-        self.assertEqual(contents, "")
-
-    def test_write_force_mono_inputs_file_overwrites_a_shorter_new_list(self):
-        a.write_force_mono_inputs_file(["First", "Second", "Third"])
-        a.write_force_mono_inputs_file(["Only"])
-        contents = open(a.FORCE_MONO_INPUTS_PATH, encoding="utf-8").read()
-        self.assertEqual(contents, "Only\n")
-
-
 if __name__ == "__main__":
     unittest.main()
