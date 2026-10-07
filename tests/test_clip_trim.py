@@ -306,6 +306,41 @@ class BuildAudioRoutingFilterArgsTests(unittest.TestCase):
             ([], []),
         )
 
+    def test_mono_source_inserts_pan_filter_before_mixing(self):
+        filter_args, _map_args = a.build_audio_routing_filter_args(2, routing={1: [1]}, mono_sources={1})
+        filter_complex = filter_args[1]
+        self.assertIn("[0:a:0]pan=mono|c0=0.5*c0+0.5*c1[asrc1]", filter_complex)
+
+    def test_mono_and_shift_both_apply_to_the_same_source_in_one_chain(self):
+        filter_args, _map_args = a.build_audio_routing_filter_args(
+            2, routing={1: [1]}, shift_ms_by_track={1: 27}, mono_sources={1},
+        )
+        filter_complex = filter_args[1]
+        self.assertIn("[0:a:0]adelay=27:all=1,pan=mono|c0=0.5*c0+0.5*c1[asrc1]", filter_complex)
+
+    def test_mono_alone_is_not_a_no_op_even_with_identity_routing(self):
+        filter_args, map_args = a.build_audio_routing_filter_args(2, mono_sources={2})
+        self.assertNotEqual((filter_args, map_args), ([], []))
+        filter_complex = filter_args[1]
+        self.assertIn("[0:a:1]pan=mono|c0=0.5*c0+0.5*c1[asrc2]", filter_complex)
+        self.assertIn("[0:a:0]anull[asrc1]", filter_complex)
+
+    def test_mono_for_a_nonexistent_source_is_a_no_op(self):
+        # Track 5 doesn't exist on a 2-stream file, so marking it mono shouldn't force a real
+        # filter graph -- same "irrelevant setting" principle as
+        # test_gain_for_an_unrouted_source_is_ignored above.
+        self.assertEqual(
+            a.build_audio_routing_filter_args(2, mono_sources={5}),
+            ([], []),
+        )
+
+    def test_mono_applies_once_even_when_the_source_feeds_multiple_destinations(self):
+        filter_args, _map_args = a.build_audio_routing_filter_args(
+            2, routing={1: [1], 2: [1]}, mono_sources={1},
+        )
+        filter_complex = filter_args[1]
+        self.assertEqual(filter_complex.count("pan=mono"), 1)
+
 
 class ProbeAudioStreamCountTests(unittest.TestCase):
     def test_returns_none_when_ffprobe_not_found_next_to_ffmpeg(self):

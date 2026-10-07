@@ -3534,6 +3534,7 @@ def build_audio_track_filter_args(audio_stream_count, shift_ms_by_track=None, mu
 
 def build_audio_routing_filter_args(
     audio_stream_count, routing=None, muted_destinations=None, shift_ms_by_track=None, gains_db=None,
+    mono_sources=None,
 ):
     """Builds (-filter_complex ..., -map ... -map ...) args for the clip editor's Track Routing
     dialog -- lets a user consolidate multiple source tracks into fewer output tracks (e.g. mix
@@ -3568,11 +3569,19 @@ def build_audio_routing_filter_args(
     different treatment depending on which output track it ends up in -- a per-source-only gain
     couldn't express that. A missing or 0 entry means no change for that pair.
 
+    mono_sources: SOURCE track numbers to downmix to mono (an equal-power average of all input
+    channels, matching what OBS's own "Downmix Mono" source flag does) before any shifting, gain,
+    or mixing below -- e.g. forcing a dedicated clean-mic track to mono regardless of which
+    destination(s) it's routed to, rather than per (destination, source) like gains_db, since a
+    source being mono isn't a property that should ever differ by destination.
+
     Returns ([], []) if the result would be a pure identity passthrough with nothing muted,
-    shifted, or gained -- the caller falls back to its own plain "-map 0:a" wildcard (eligible for
-    a fast stream copy) in that case, same as build_audio_track_filter_args always has."""
+    shifted, gained, or forced mono -- the caller falls back to its own plain "-map 0:a" wildcard
+    (eligible for a fast stream copy) in that case, same as build_audio_track_filter_args always
+    has."""
     if not audio_stream_count:
         return [], []
+    mono_sources = set(mono_sources or [])
     identity_routing = {t: [t] for t in range(1, audio_stream_count + 1)}
     routing = routing if routing is not None else identity_routing
     muted_destinations = set(muted_destinations or [])
@@ -3582,7 +3591,13 @@ def build_audio_routing_filter_args(
         gains_db.get(dest, {}).get(s) for dest, sources in routing.items() for s in sources
     )
 
-    if not muted_destinations and not shift_by_source and not has_gains and routing == identity_routing:
+    referenced_mono_sources = mono_sources & {
+        s for sources in routing.values() for s in sources if 1 <= s <= audio_stream_count
+    }
+    if (
+        not muted_destinations and not shift_by_source and not has_gains
+        and not referenced_mono_sources and routing == identity_routing
+    ):
         return [], []
 
     referenced_sources = sorted({
@@ -3591,21 +3606,30 @@ def build_audio_routing_filter_args(
     if not referenced_sources:
         return [], []
 
-    # Stage 1: per-source filters (shift only -- destination muting happens after mixing, in
-    # stage 2 below, so it silences the COMBINED result of everything routed there rather than
-    # just one contributing source; gain happens in stage 2 too, and specifically NOT here,
-    # since gain can differ per destination for the very same source -- a single per-source
+    # Stage 1: per-source filters (shift and forced-mono only -- destination muting happens after
+    # mixing, in stage 2 below, so it silences the COMBINED result of everything routed there
+    # rather than just one contributing source; gain happens in stage 2 too, and specifically NOT
+    # here, since gain can differ per destination for the very same source -- a single per-source
     # filter here couldn't express "boost this source on destination 1 but not destination 2").
     filter_parts = []
     for s in referenced_sources:
         i = s - 1
         label = f"asrc{s}"
+        steps = []
         if s in shift_by_source:
             shift_ms = shift_by_source[s]
             if shift_ms > 0:
-                filter_parts.append(f"[0:a:{i}]adelay={int(round(shift_ms))}:all=1[{label}]")
+                steps.append(f"adelay={int(round(shift_ms))}:all=1")
             else:
-                filter_parts.append(f"[0:a:{i}]atrim=start={abs(shift_ms) / 1000:.6f},asetpts=PTS-STARTPTS[{label}]")
+                steps.append(f"atrim=start={abs(shift_ms) / 1000:.6f},asetpts=PTS-STARTPTS")
+        if s in mono_sources:
+            # Matches OBS's own "Downmix Mono" source flag: an equal-power average of every input
+            # channel, not just picking one -- a real stereo mic (signal on both channels) and a
+            # mono mic captured as stereo (signal on only one, silence on the other) both land at
+            # a sane, predictable level this way, without needing to know which channel is which.
+            steps.append("pan=mono|c0=0.5*c0+0.5*c1")
+        if steps:
+            filter_parts.append(f"[0:a:{i}]{','.join(steps)}[{label}]")
         else:
             filter_parts.append(f"[0:a:{i}]anull[{label}]")
 
@@ -3897,7 +3921,7 @@ def generate_waveform_image(ffmpeg_path, input_path, start_seconds, end_seconds,
 def build_trim_command(
     ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False, crf=None,
     scale_height=None, audio_shift_ms_by_track=None, audio_stream_count=None,
-    audio_routing=None, muted_destinations=None, gains_db=None,
+    audio_routing=None, muted_destinations=None, gains_db=None, mono_sources=None,
 ):
     """Builds the ffmpeg argv to cut [start_seconds, end_seconds) out of input_path. Always uses
     -t (duration) rather than -to (absolute end time) even though both express the same cut --
@@ -3931,18 +3955,19 @@ def build_trim_command(
     own ms amount (a per-track dict, since real process-capture tracks were confirmed live to
     each lag Desktop Audio by a genuinely different amount) to fix a clip whose isolated audio
     track(s) still sound a few ms out of sync with the rest. audio_routing/muted_destinations/
-    gains_db: the clip editor's Track Routing dialog -- consolidate multiple source tracks into
-    fewer output tracks, drop a source entirely, mute an output track, and/or boost/attenuate one
-    source's gain into one specific output track; see build_audio_routing_filter_args, which this
-    delegates to (and which also applies audio_shift_ms_by_track to the right SOURCE tracks before
-    any consolidation mixes them together). Requires audio_stream_count (e.g. from
-    probe_audio_stream_count) to correctly re-map every track; using any of this forces the AUDIO
-    side to re-encode (a filter graph can't be stream-copied) but never touches video's own
-    copy-vs-re-encode decision above."""
+    gains_db/mono_sources: the clip editor's Track Routing dialog -- consolidate multiple source
+    tracks into fewer output tracks, drop a source entirely, mute an output track, boost/attenuate
+    one source's gain into one specific output track, and/or force a source to mono; see
+    build_audio_routing_filter_args, which this delegates to (and which also applies
+    audio_shift_ms_by_track to the right SOURCE tracks before any consolidation mixes them
+    together). Requires audio_stream_count (e.g. from probe_audio_stream_count) to correctly
+    re-map every track; using any of this forces the AUDIO side to re-encode (a filter graph can't
+    be stream-copied) but never touches video's own copy-vs-re-encode decision above."""
     start_str = format_timestamp(start_seconds)
     duration_str = format_timestamp(end_seconds - start_seconds)
     filter_complex_args, shifted_audio_map_args = build_audio_routing_filter_args(
         audio_stream_count, audio_routing, muted_destinations, audio_shift_ms_by_track, gains_db,
+        mono_sources,
     )
     filtering_audio = bool(filter_complex_args)
     # Only video and audio -- not "-map 0" for every stream. OBS's Hybrid MP4 recordings carry
@@ -4162,14 +4187,14 @@ def trim_clip(
     input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
     delete_original=False, icon=None, notifications_config=None, crf=None, scale_height=None,
     target_size_mb=None, audio_shift_ms_by_track=None, audio_routing=None, muted_destinations=None,
-    gains_db=None, progress_callback=None, cancel_event=None,
+    gains_db=None, mono_sources=None, progress_callback=None, cancel_event=None,
 ):
     """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
     way transcode_recording's callers do. Verifies the output file actually exists and has a
     nonzero size before reporting success or deleting the source; never deletes on a failed or
     suspicious-looking trim, same rule transcode_recording already follows.
 
-    audio_shift_ms_by_track/audio_routing/muted_destinations/gains_db: see
+    audio_shift_ms_by_track/audio_routing/muted_destinations/gains_db/mono_sources: see
     build_audio_routing_filter_args. Only probes the source's real audio track count (an extra
     ffprobe subprocess) when any of them is actually requested -- the common case (none) pays
     nothing extra. Not supported together with target_size_mb: a size-targeted export already
@@ -4198,9 +4223,9 @@ def trim_clip(
 
     passlog_prefix = None
     if target_size_mb:
-        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db:
+        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db or mono_sources:
             logging.warning(
-                "Clip editor: ignoring the audio sync shift/routing/mute/gain for %s -- a "
+                "Clip editor: ignoring the audio sync shift/routing/mute/gain/mono for %s -- a "
                 "size-targeted export only keeps the first audio track, so there's nothing left "
                 "to apply it to.",
                 basename,
@@ -4252,16 +4277,17 @@ def trim_clip(
         logging.info("Trimming %s (pass 2/2): %s", basename, " ".join(cmd))
     else:
         audio_stream_count = None
-        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db:
+        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db or mono_sources:
             audio_stream_count = probe_audio_stream_count(ffmpeg_path, input_path)
             if not audio_stream_count:
                 logging.warning(
                     "Clip editor: could not determine %s's audio track count -- skipping the "
-                    "requested audio sync shift/routing/mute/gain.", basename,
+                    "requested audio sync shift/routing/mute/gain/mono.", basename,
                 )
         cmd = build_trim_command(
             ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise, crf, scale_height,
             audio_shift_ms_by_track, audio_stream_count, audio_routing, muted_destinations, gains_db,
+            mono_sources,
         )
         phase_text = "Encoding clip"
         logging.info("Trimming %s: %s", basename, " ".join(cmd))
@@ -7090,6 +7116,23 @@ def _run_config_editor(master_root, restart_callback, on_close):
             ).grid(row=row, column=src, padx=1, pady=1)
         row += 1
 
+    default_mono_sources_config = clip_editor_config.get("default_mono_sources") or []
+    default_mono_sources_var = tk.StringVar(value=", ".join(str(t) for t in default_mono_sources_config))
+    add_labeled_entry(clip_editor_tab, row, "Default mono source tracks (comma-separated)", default_mono_sources_var)
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Pre-checks the Track Routing dialog's own \"Mono\" row for these SOURCE track "
+            "numbers whenever it's opened -- still freely changeable per trim from there. "
+            "Downmixes that source to mono (ffmpeg-side, baked into the exported file, the same "
+            "equal-power average OBS's own \"Downmix Mono\" does) before it's routed anywhere, "
+            "regardless of which output track(s) it ends up in."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
     add_section_label(clip_editor_tab, row, "Video Preview (VLC)")
     row += 1
 
@@ -7506,6 +7549,21 @@ def _run_config_editor(master_root, restart_callback, on_close):
             clip_editor["default_gains_db"] = default_gains_out
         else:
             clip_editor.pop("default_gains_db", None)
+        default_mono_sources_out = []
+        for text in default_mono_sources_var.get().split(","):
+            text = text.strip()
+            if not text:
+                continue
+            try:
+                track_num = int(text)
+            except ValueError:
+                errors.append(f"'Default mono source tracks': '{text}' must be a whole track number")
+                continue
+            default_mono_sources_out.append(track_num)
+        if default_mono_sources_out:
+            clip_editor["default_mono_sources"] = default_mono_sources_out
+        else:
+            clip_editor.pop("default_mono_sources", None)
         clip_editor["trim_mode"] = CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL.get(trim_mode_var.get(), "precise")
         if clip_target_size_var.get().strip():
             target_size_value = read_float(clip_target_size_var, "Default target size", None)
@@ -9011,6 +9069,13 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             }
             for dest in range(1, track_count + 1)
         }
+        # Pre-fills from Settings > Clip Editor > "Default mono source tracks" -- a flat list of
+        # SOURCE track numbers, unlike gain_vars above, since being mono isn't a per-destination
+        # property (see build_audio_routing_filter_args' own mono_sources docstring).
+        default_mono_sources = set(clip_editor_config.get("default_mono_sources") or [])
+        routing_state["mono_vars"] = {
+            src: tk.BooleanVar(value=(src in default_mono_sources)) for src in range(1, track_count + 1)
+        }
         track_routing_button.config(state="normal" if track_count else "disabled")
 
     def probe_track_count_for_routing(path):
@@ -9077,8 +9142,24 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             row=header_row, column=n + 1, padx=(14, 10)
         )
 
+        mono_row = header_row + 1
+        tk.Label(dialog, text="Mono:", bg=EDITOR_BG, fg=EDITOR_FG, anchor="w").grid(
+            row=mono_row, column=0, sticky="w", padx=(10, 4), pady=(2, 8)
+        )
+        for src in range(1, n + 1):
+            # Downmixes this SOURCE to mono (ffmpeg-side, baked into the exported file) before
+            # it's routed/mixed below -- a property of the source itself, not any one
+            # destination, so it's its own row rather than living inside each dest/src cell the
+            # way gain does.
+            tk.Checkbutton(
+                dialog, variable=routing_state["mono_vars"][src],
+                indicatoron=False, width=2, height=1,
+                bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG,
+                selectcolor=START_MARKER_COLOR,
+            ).grid(row=mono_row, column=src, pady=(2, 8), padx=1)
+
         for dest in range(1, n + 1):
-            row = header_row + dest
+            row = mono_row + dest
             tk.Label(dialog, text=f"Output {dest}:", bg=EDITOR_BG, fg=EDITOR_FG, anchor="w").grid(
                 row=row, column=0, sticky="w", padx=(10, 4), pady=2
             )
@@ -9118,6 +9199,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             ).grid(row=row, column=n + 1, sticky="n", padx=(14, 10), pady=2)
 
         default_gains = clip_editor_config.get("default_gains_db") or {}
+        default_mono_sources = set(clip_editor_config.get("default_mono_sources") or [])
 
         def reset_to_defaults():
             for dest in range(1, n + 1):
@@ -9127,8 +9209,10 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                         str(default_gains.get(str(dest), {}).get(str(src)) or "")
                     )
                 routing_state["mute_vars"][dest].set(False)
+            for src in range(1, n + 1):
+                routing_state["mono_vars"][src].set(src in default_mono_sources)
 
-        button_row = header_row + n + 1
+        button_row = mono_row + n + 1
         dark_button(dialog, text="Reset to defaults", command=reset_to_defaults).grid(
             row=button_row, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 10)
         )
@@ -9473,6 +9557,11 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 return
             if gains:
                 gains_db = gains
+        mono_sources = None
+        if n:
+            mono = {src for src, var in routing_state["mono_vars"].items() if var.get()}
+            if mono:
+                mono_sources = mono
         source_path = state["path"]
 
         # Measures a representative window starting at the trim's own start point -- but NOT
@@ -9645,7 +9734,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 notifications_config=notifications_config, scale_height=scale_height,
                 target_size_mb=target_size_mb, audio_routing=audio_routing,
                 muted_destinations=muted_destinations, audio_shift_ms_by_track=audio_shift_ms_by_track,
-                gains_db=gains_db, progress_callback=on_trim_progress, cancel_event=cancel_event,
+                gains_db=gains_db, mono_sources=mono_sources, progress_callback=on_trim_progress, cancel_event=cancel_event,
             )
 
             def finish():
@@ -9661,6 +9750,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 if success:
                     size_limit_note = " (audio: track 1 only, size-limited)" if target_size_mb else ""
                     status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}{size_limit_note}")
+                    if target_size_mb:
+                        # "Limit size to" otherwise just stays checked indefinitely -- confirmed
+                        # live that it silently carried over into several LATER, unrelated trims
+                        # in the same editor session, each one quietly losing every audio track
+                        # but the first with no new indication why (the hint label next to the
+                        # checkbox only helps if it's actually still in view). Resetting it right
+                        # after a successful size-limited export makes that a one-shot, deliberate
+                        # choice instead of a silent standing mode.
+                        limit_size_var.set(False)
                 elif cancel_event.is_set():
                     status_label.config(fg=END_MARKER_COLOR, text="Trim cancelled.")
                 else:
