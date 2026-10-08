@@ -1,5 +1,5 @@
 ### Clip Editor
-- Fixed the app freezing (and getting killed by Windows as unresponsive) when opening a new video while one was already loaded. VLC's own stop/open work could block the UI thread for several seconds on a long or complex recording; it now runs off the main thread, verified live that the window stays responsive loading two large recordings back-to-back.
-- Raised the Recent recordings cap from 30 to 500 -- Previous was dead-ending into "No older recordings" on any folder with more than 30 files, even though older ones were still right there on disk.
+- Added the ability to force a source track to mono in Track Routing (and a matching Settings > Clip Editor default) -- applied entirely in this app's own ffmpeg export, so it doesn't depend on OBS state surviving a profile switch. Uses dual-mono (both channels carrying the same merged signal, channel count unchanged) rather than a true single-channel reduction, which would otherwise shift every later track's channel indexing for anything reading the file with a fixed per-track channel count assumption.
+- Fixed "Limit size to" silently staying checked across unrelated later trims, each one quietly losing every audio track but the first with no fresh indication why -- it now resets after a successful size-limited export.
 
-Covered by the automated test suite (756 tests); the freeze fix was additionally verified live with a responsiveness check against real, large recordings.
+Covered by the automated test suite (761 tests); the mono feature was additionally verified live end-to-end against a real multi-track recording (ffprobe confirmed every track keeps its original channel count, and the forced track's two channels measured as bit-identical).
