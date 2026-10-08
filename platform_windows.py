@@ -54,6 +54,16 @@ DEFAULT_OBS_PATHS = [
 ]
 
 
+def is_this_app_frontmost():
+    """Always True: only macOS's custom tray popup asks this."""
+    return True
+
+
+def display_top_inset_pixels(pixel_width, pixel_height):
+    """0: only macOS built-in displays have a notch strip to crop."""
+    return 0
+
+
 def obs_launch_command(path, launch_args):
     return [path, *launch_args]
 

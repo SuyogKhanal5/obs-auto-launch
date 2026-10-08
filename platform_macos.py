@@ -32,6 +32,48 @@ def ffmpeg_candidates():
     ]
 
 
+def is_this_app_frontmost():
+    """True if this app's own process is the frontmost app."""
+    try:
+        import AppKit
+        with _QUARTZ_LOOKUP_LOCK:
+            workspace = AppKit.NSWorkspace.sharedWorkspace()
+        frontmost = workspace.frontmostApplication()
+        return frontmost is not None and frontmost.processIdentifier() == os.getpid()
+    except Exception:
+        return True  # unknown -- don't act on it
+
+
+def display_top_inset_pixels(pixel_width, pixel_height):
+    """How many pixel rows at the top of a captured display a fullscreen game leaves black, for
+    the screen whose pixel size is pixel_width x pixel_height -- the area beside a built-in
+    display's camera notch. Confirmed live on a 14" MacBook Pro: the captured frame is black
+    (apart from menu-bar items drawn over it) down to roughly the menu bar's height, a bit more
+    than the notch safe-area inset alone (32pt vs. ~37pt), so this uses the larger of the two
+    -- over-cropping a row or two of game beats leaving a thin black line. 0 for a screen with no
+    notch, or if the screen can't be identified unambiguously (two screens of the same size)."""
+    try:
+        import AppKit
+        matches = []
+        for screen in AppKit.NSScreen.screens():
+            scale = screen.backingScaleFactor()
+            frame = screen.frame()
+            if (round(frame.size.width * scale), round(frame.size.height * scale)) == (pixel_width, pixel_height):
+                matches.append(screen)
+        if len(matches) != 1:
+            return 0
+        screen = matches[0]
+        safe_top = screen.safeAreaInsets().top
+        if safe_top <= 0:
+            return 0
+        frame, visible = screen.frame(), screen.visibleFrame()
+        menu_bar = (frame.origin.y + frame.size.height) - (visible.origin.y + visible.size.height)
+        return int(round(max(safe_top, menu_bar) * screen.backingScaleFactor()))
+    except Exception as exc:
+        logging.warning("Could not read the display's notch area: %s", exc)
+        return 0
+
+
 def obs_launch_command(path, launch_args):
     """Launches OBS through LaunchServices (`open`) rather than as this app's child process.
     Confirmed live: started as a child, macOS attributes OBS's screen capture to this app --

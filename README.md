@@ -145,6 +145,8 @@ Edit `config.json`:
 | `obs.launch_args` | Extra command-line args OBS is launched with |
 | `obs.startup_wait_seconds` | How long to wait after launching OBS before trying to connect |
 | `obs.output_folder` | Recording output folder to enforce in OBS (created automatically if missing). Leave unset/blank to leave OBS's own recording folder setting alone |
+| `obs.screen_fit` | How a full-screen capture is laid out in recordings: `match_screen` (default — the canvas takes the screen's own shape, so there are no black bars and nothing is cut off), `letterbox` (16:9 with side bars), `fill` (16:9, top and bottom cropped), or `off` (leave OBS's layout alone). On a MacBook with a notch, the black strip fullscreen games leave beside it is cropped in every mode except `off`. Currently applies to macOS's display capture source |
+| `obs.recording_resolution` | What recordings are encoded at: `Match canvas (no scaling)`, a preset (`1080p`, `720p`, `480p` — these keep the canvas's shape), or any size such as `2560x1600` |
 | `obs.recording_format` | Recording container format to enforce in OBS, using OBS's own internal format code (`mp4`, `mkv`, `mov`, `hybrid_mp4`, `fragmented_mp4`, `fragmented_mov`, `flv`, `ts`, `hls`, or any other code your OBS version supports). Leave unset/blank to leave OBS's own format setting alone |
 | `obs.websocket.host` / `port` / `password` | Must match OBS's WebSocket Server Settings |
 | `obs.auto_split.enabled` | Set to `true` if you've enabled OBS's **Automatically split file** option (see below), so its splits aren't mislabeled as manual |

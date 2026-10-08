@@ -80,6 +80,19 @@ class CloseObsBetweenSessionsTests(unittest.TestCase):
         self.assertFalse(a.close_obs_between_sessions(Broken(), overlay_enabled=False))
         self.mock_quit.assert_not_called()
 
+    def test_clears_the_crash_marker_once_obs_has_exited(self):
+        with unittest.mock.patch.object(a, "get_running_processes", return_value=[]), \
+                unittest.mock.patch.object(a, "clear_obs_crash_sentinel") as mock_clear:
+            self.assertTrue(a.close_obs_between_sessions(FakeObsClient(), False, "OBS"))
+        mock_clear.assert_called_once()
+
+    def test_leaves_the_marker_if_obs_never_exits(self):
+        with unittest.mock.patch.object(a, "get_running_processes", return_value=[("OBS", "", 1)]), \
+                unittest.mock.patch.object(a, "OBS_QUIT_WAIT_SECONDS", 0), \
+                unittest.mock.patch.object(a, "clear_obs_crash_sentinel") as mock_clear:
+            a.close_obs_between_sessions(FakeObsClient(), False, "OBS")
+        mock_clear.assert_not_called()
+
     def test_client_kept_when_the_os_does_not_close_obs(self):
         self.mock_quit.return_value = False
         client = FakeObsClient()

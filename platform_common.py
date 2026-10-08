@@ -49,6 +49,16 @@ def hide_console_subprocess_kwargs():
     return {}
 
 
+def is_this_app_frontmost(platform_name=None):
+    return _select_backend(platform_name).is_this_app_frontmost()
+
+
+def display_top_inset_pixels(pixel_width, pixel_height, platform_name=None):
+    """Rows at the top of a captured display (of that pixel size) that fullscreen games leave
+    black -- a notched Mac's menu-bar strip; 0 everywhere else."""
+    return _select_backend(platform_name).display_top_inset_pixels(pixel_width, pixel_height)
+
+
 def obs_launch_command(path, launch_args, platform_name=None):
     """The command that starts OBS at path with launch_args on this OS."""
     return _select_backend(platform_name).obs_launch_command(path, list(launch_args or []))

@@ -145,6 +145,7 @@
             "enabled": false,
             "input_name": "Game Audio"
         },
+        "screen_fit": "match_screen",
         "process_audio_capture_sync_offset_ms": -27,
         "multi_track_audio": {
             "enabled": false,

@@ -670,9 +670,10 @@ def obs_outputs_idle(client):
 # How long after a game session ends to keep trying to close OBS (it has to finish stopping
 # the recording first) before leaving it open -- e.g. if the user started streaming meanwhile.
 OBS_IDLE_CLOSE_WINDOW_SECONDS = 60
+OBS_QUIT_WAIT_SECONDS = 10
 
 
-def close_obs_between_sessions(client, overlay_enabled):
+def close_obs_between_sessions(client, overlay_enabled, process_name=None):
     """On macOS, closes OBS once a game session ends -- while OBS is open its ScreenCaptureKit
     sources keep the menu-bar screen-sharing indicator on even with nothing being recorded.
     Skipped while the audio mixer overlay needs OBS's meters, and whenever OBS is busy. No-op
@@ -685,6 +686,15 @@ def close_obs_between_sessions(client, overlay_enabled):
         client.disconnect()
     except Exception:
         pass
+    # Confirmed live: OBS treats an AppleScript quit as unclean and leaves its crash marker, so
+    # opening OBS by hand afterwards stopped at the "Run in Safe Mode?" prompt. This exit was
+    # requested, not a crash -- clear the marker once the process is actually gone.
+    if process_name:
+        deadline = time.time() + OBS_QUIT_WAIT_SECONDS
+        while is_obs_running(process_name, get_running_processes()) and time.time() < deadline:
+            time.sleep(0.5)
+        if not is_obs_running(process_name, get_running_processes()):
+            clear_obs_crash_sentinel()
     logging.info("Closed OBS until the next game starts (no screen sharing while idle).")
     return True
 
@@ -1034,6 +1044,7 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
         obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
     )
     apply_output_folder(client, obs_config.get("output_folder"))
+    apply_screen_fit(client, obs_config)
     apply_recording_resolution(client, obs_config)
     apply_recording_format(client, obs_config.get("recording_format"))
     event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
@@ -1976,6 +1987,99 @@ def apply_recording_format(client, recording_format):
 
 OBS_RESOLUTION_OPTIONS = ["Match canvas (no scaling)", "1080p", "720p", "480p"]
 
+# How a full-display capture is fit into the recording (obs.screen_fit). "match_screen" sets the
+# canvas to the display's own shape so nothing is cut off and there are no bars; the others
+# keep a 16:9 canvas. Confirmed live on a 14" MacBook Pro: a 3024x1964 display scaled to fill a
+# 1920x1080 canvas's width lost the bottom ~13% of the game, and the notch strip recorded as a
+# black band across the top.
+SCREEN_FIT_LABELS = {
+    "match_screen": "Match screen shape (no bars, nothing cut off)",
+    "letterbox": "16:9 with side bars",
+    "fill": "16:9 filled (top and bottom cropped)",
+    "off": "Don't change OBS's layout",
+}
+SCREEN_FIT_BY_LABEL = {label: key for key, label in SCREEN_FIT_LABELS.items()}
+DEFAULT_SCREEN_FIT = "match_screen"
+SCREEN_FIT_CANVAS_WIDTH = 1920
+SCREEN_FIT_SOURCE_WAIT_SECONDS = 5
+# OBS's macOS display capture (ScreenCaptureKit); its "type" setting 0 means a whole display.
+DISPLAY_CAPTURE_KIND = "screen_capture"
+OBS_ALIGN_TOP_LEFT = 5  # OBS_ALIGN_LEFT | OBS_ALIGN_TOP
+OBS_ALIGN_CENTER = 0
+
+
+def compute_screen_fit(source_width, source_height, crop_top, mode):
+    """Returns ((canvas_width, canvas_height), scene_item_transform) fitting a display capture of
+    source_width x source_height -- minus crop_top rows (the notch strip, see
+    platform_common.display_top_inset_pixels) -- into the canvas according to mode."""
+    content_height = source_height - crop_top
+    if mode == "match_screen":
+        canvas = (SCREEN_FIT_CANVAS_WIDTH, round(SCREEN_FIT_CANVAS_WIDTH * content_height / source_width / 2) * 2)
+    else:
+        canvas = (SCREEN_FIT_CANVAS_WIDTH, round(SCREEN_FIT_CANVAS_WIDTH * 9 / 16 / 2) * 2)
+    transform = {
+        "cropTop": crop_top, "cropBottom": 0, "cropLeft": 0, "cropRight": 0,
+        "boundsType": "OBS_BOUNDS_SCALE_OUTER" if mode == "fill" else "OBS_BOUNDS_SCALE_INNER",
+        "boundsWidth": float(canvas[0]), "boundsHeight": float(canvas[1]),
+        "boundsAlignment": OBS_ALIGN_CENTER, "alignment": OBS_ALIGN_TOP_LEFT,
+        "positionX": 0.0, "positionY": 0.0, "rotation": 0.0,
+    }
+    return canvas, transform
+
+
+def apply_screen_fit(client, obs_config):
+    """Fits the current scene's whole-display capture into the canvas per obs.screen_fit (see
+    SCREEN_FIT_LABELS), cropping a notched Mac's black strip, and sets the canvas size to match.
+    Runs before apply_recording_resolution, which then scales the output from the new canvas.
+    Leaves everything alone for "off", or when there's no single display capture to fit."""
+    mode = obs_config.get("screen_fit", DEFAULT_SCREEN_FIT)
+    if mode not in SCREEN_FIT_LABELS or mode == "off":
+        return
+    try:
+        scene = client.get_current_program_scene().current_program_scene_name
+        captures = []
+        for item in client.get_scene_item_list(scene).scene_items:
+            if item.get("inputKind") != DISPLAY_CAPTURE_KIND:
+                continue
+            settings = client.get_input_settings(item["sourceName"]).input_settings
+            if settings.get("type", 0) == 0:
+                captures.append(item)
+        if len(captures) != 1:
+            return
+        item_id = captures[0]["sceneItemId"]
+        # OBS is launched fresh for each session on macOS (see close_obs_between_sessions), and a
+        # just-started capture reports a 0x0 size until its first frame arrives.
+        deadline = time.time() + SCREEN_FIT_SOURCE_WAIT_SECONDS
+        while True:
+            current = client.get_scene_item_transform(scene, item_id).scene_item_transform
+            source_width, source_height = int(current["sourceWidth"]), int(current["sourceHeight"])
+            if source_width and source_height:
+                break
+            if time.time() >= deadline:
+                logging.warning(
+                    "The screen capture isn't producing frames yet (screen locked or asleep?); "
+                    "left the recording layout unchanged this time."
+                )
+                return
+            time.sleep(0.5)
+        crop_top = platform_common.display_top_inset_pixels(source_width, source_height)
+        (canvas_width, canvas_height), transform = compute_screen_fit(source_width, source_height, crop_top, mode)
+
+        video = client.get_video_settings()
+        if (video.base_width, video.base_height) != (canvas_width, canvas_height):
+            client.set_video_settings(
+                video.fps_numerator, video.fps_denominator,
+                canvas_width, canvas_height, canvas_width, canvas_height,
+            )
+            logging.info(
+                "Set OBS's canvas to %dx%d to fit the %dx%d display (%s, %d notch rows cropped).",
+                canvas_width, canvas_height, source_width, source_height, mode, crop_top,
+            )
+        if any(current.get(key) != value for key, value in transform.items()):
+            client.set_scene_item_transform(scene, item_id, transform)
+    except Exception as exc:
+        logging.warning("Could not fit the screen capture into the recording: %s", exc)
+
 
 def resolve_recording_resolution(base_width, base_height, resolution_choice):
     """Resolves an OBS_RESOLUTION_OPTIONS choice to an explicit (width, height) output
@@ -1985,6 +2089,11 @@ def resolve_recording_resolution(base_width, base_height, resolution_choice):
     aspect ratio, scaling width from CLIP_EDITOR_QUALITY_HEIGHTS' height and rounding to the
     nearest even number, same convention build_trim_command's -2 scale filter already uses,
     since libx264 (what OBS's own encoders are built on too) requires even dimensions."""
+    custom = re.fullmatch(r"\s*(\d+)\s*[xX×]\s*(\d+)\s*", resolution_choice or "")
+    if custom:
+        # Any size the user types in, e.g. "2560x1600" -- rounded to even, which encoders need.
+        width, height = (max(2, int(n) // 2 * 2) for n in custom.groups())
+        return width, height
     height = CLIP_EDITOR_QUALITY_HEIGHTS.get(resolution_choice)
     if height is None or not base_width or not base_height:
         return base_width, base_height
@@ -4084,7 +4193,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
             if obs_close_pending_since is not None:
                 if not obs_client or time.time() - obs_close_pending_since > OBS_IDLE_CLOSE_WINDOW_SECONDS:
                     obs_close_pending_since = None
-                elif close_obs_between_sessions(obs_client, audio_state.get("enabled")):
+                elif close_obs_between_sessions(obs_client, audio_state.get("enabled"), obs_config["process_name"]):
                     obs_close_pending_since = None
                     if obs_event_client:
                         try:
@@ -4524,6 +4633,9 @@ def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
             root.destroy()
             return
         try:
+            tray_menu_request = overlay_state.pop("tray_menu_request", None)
+            if tray_menu_request:
+                show_macos_tray_menu(root, *tray_menu_request)
             poll_dot()
             poll_meters()
         except Exception:
@@ -5785,24 +5897,42 @@ def _run_config_editor(master_root, restart_callback, on_close):
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
+    screen_fit_var = tk.StringVar(
+        value=SCREEN_FIT_LABELS.get(obs_config.get("screen_fit", DEFAULT_SCREEN_FIT), SCREEN_FIT_LABELS[DEFAULT_SCREEN_FIT])
+    )
+    tk.Label(obs_tab, text="Fit screen into recording", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        obs_tab, textvariable=screen_fit_var, values=list(SCREEN_FIT_LABELS.values()),
+        state="readonly", width=40, style="Settings.TCombobox",
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    How a full-screen capture is laid out in the recording. Matching the screen's "
+            "shape avoids black bars and cut-off edges; on a MacBook with a notch, the black strip "
+            "beside the notch is cropped off either way."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
     configured_resolution = obs_config.get("recording_resolution") or OBS_RESOLUTION_OPTIONS[0]
-    if configured_resolution not in OBS_RESOLUTION_OPTIONS:
-        configured_resolution = OBS_RESOLUTION_OPTIONS[0]
     recording_resolution_var = tk.StringVar(value=configured_resolution)
     tk.Label(obs_tab, text="Recording resolution", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
         row=row, column=0, sticky="w", padx=(10, 6), pady=4
     )
     ttk.Combobox(
         obs_tab, textvariable=recording_resolution_var, values=OBS_RESOLUTION_OPTIONS,
-        state="readonly", width=24, style="Settings.TCombobox",
+        width=24, style="Settings.TCombobox",
     ).grid(row=row, column=1, sticky="w", pady=4)
     row += 1
     tk.Label(
         obs_tab,
         text=(
-            "    OBS's actual Output (Scaled) Resolution -- this is what a recording is really "
-            "encoded at, independent of the canvas size. A named preset keeps the canvas's own "
-            "aspect ratio."
+            "    What a recording is actually encoded at. A preset keeps the canvas's own shape; "
+            "or type any size, e.g. 2560x1600."
         ),
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
@@ -6704,7 +6834,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
         # output = canvas resolution) rather than a "leave OBS's own value untouched" sentinel,
         # unlike recording_format's blank-Entry default. Once Settings has been saved once, this
         # is honored on every subsequent launch, same as every other field in this dialog.
-        obs["recording_resolution"] = recording_resolution_var.get()
+        resolution_value = recording_resolution_var.get().strip()
+        if resolution_value in OBS_RESOLUTION_OPTIONS or re.fullmatch(r"\d+\s*[xX×]\s*\d+", resolution_value):
+            obs["recording_resolution"] = resolution_value
+        else:
+            errors.append("'Recording resolution' must be a preset or a size like 2560x1600")
+        obs["screen_fit"] = SCREEN_FIT_BY_LABEL.get(screen_fit_var.get(), DEFAULT_SCREEN_FIT)
 
         ws = obs.setdefault("websocket", {})
         ws["host"] = ws_host_var.get().strip() or "localhost"
@@ -8676,6 +8811,10 @@ _MENU_HOVER_BG = "#3d6fd6"
 _MENU_SEPARATOR_COLOR = "#555555"
 
 
+TRAY_MENU_POINTER_AWAY_SECONDS = 1.5
+TRAY_MENU_WATCH_INTERVAL_MS = 250
+
+
 def show_macos_tray_menu(overlay_root, menu, icon):
     """Renders a pystray.Menu as a plain Tk popup at the current mouse position, instead of a
     native NSMenu. Submenus (this app only ever nests one level deep -- Overlay Monitor's list of
@@ -8765,6 +8904,40 @@ def show_macos_tray_menu(overlay_root, menu, icon):
     popup.bind("<Deactivate>", close)
     popup.after(20000, close)
     popup.focus_force()
+
+    # Neither <FocusOut> nor <Deactivate> fires reliably for this borderless popup -- confirmed
+    # live, it stayed over a fullscreen game after a click on the menu-bar icon (which slides down
+    # over fullscreen apps). So also close it once another app comes to the front (after this one
+    # has been), or once the pointer has been off it for a moment.
+    watch_state = {"was_frontmost": False, "outside_since": None}
+
+    def watch():
+        try:
+            if not popup.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if platform_common.is_this_app_frontmost():
+            watch_state["was_frontmost"] = True
+        elif watch_state["was_frontmost"]:
+            close()
+            return
+        px, py = popup.winfo_pointerxy()
+        inside = (
+            popup.winfo_rootx() <= px <= popup.winfo_rootx() + popup.winfo_width()
+            and popup.winfo_rooty() <= py <= popup.winfo_rooty() + popup.winfo_height()
+        )
+        now = time.time()
+        if inside:
+            watch_state["outside_since"] = None
+        elif watch_state["outside_since"] is None:
+            watch_state["outside_since"] = now
+        elif now - watch_state["outside_since"] >= TRAY_MENU_POINTER_AWAY_SECONDS:
+            close()
+            return
+        popup.after(TRAY_MENU_WATCH_INTERVAL_MS, watch)
+
+    popup.after(TRAY_MENU_WATCH_INTERVAL_MS, watch)
 
 
 def main():
@@ -9023,7 +9196,12 @@ def main():
             there's nothing to refresh, and skipping it avoids yet another AppKit call
             (_update_menu's own status_item.setMenu_(...)) from a non-main thread."""
             def __call__(self):
-                show_macos_tray_menu(overlay_state.get("root"), menu, self)
+                # Runs inside AppKit's status-item callback, in the middle of Tk's own event
+                # processing. Building Tk widgets from here left tkinter's thread-state
+                # bookkeeping inconsistent, and a later event on the popup aborted the process
+                # ("PyEval_RestoreThread ... thread state is NULL" in a Tk binding, confirmed
+                # live). So only flag the request; the overlay's own poll opens the popup.
+                overlay_state["tray_menu_request"] = (menu, self)
 
             @property
             def icon(self):
