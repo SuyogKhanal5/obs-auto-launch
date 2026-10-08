@@ -137,6 +137,7 @@ Edit `config.json`:
 | `post_record_transcode.suffix` | Appended to the filename (before the extension) for the transcoded output, so it doesn't collide with the original |
 | `post_record_transcode.delete_original` | Delete the original recording once the transcode succeeds |
 | `clip_editor.output_folder` | Where trimmed clips are saved (see [Optional: clip editor](#optional-clip-editor)). Leave blank to save next to the source recording |
+| `clip_editor.markers_folder` | Where the "Add Marker" keybind's markers are saved (a small `<recording>.markers.json` file per recording, which the clip editor reads to show them on the timeline). Leave blank to save them next to each recording; markers saved before you change this are still found there |
 | `clip_editor.delete_original_after_trim` | Delete the source recording once a trim succeeds. Never deletes on a failed trim |
 | `clip_editor.vlc_path` | Override which VLC install the clip editor uses, if you have more than one. Leave blank to auto-detect |
 | `obs.process_name` | Process name to watch for/kill when managing OBS, e.g. `"obs64.exe"` on Windows (`"obs"` on Linux, `"OBS"` on macOS — whichever your install actually uses) — only needs changing for a non-standard OBS build |

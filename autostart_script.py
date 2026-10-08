@@ -3839,7 +3839,9 @@ def stop_recording(client, icon, game_display_name=None, recording_state=None, c
     new_path = rename_with_game_prefix(output_path, game_display_name, split_part, silent, subfolders_enabled)
     if recording_state is not None and new_path:
         recording_state.setdefault("segment_files", []).append(new_path)
-        write_recording_markers(new_path, recording_state.get("markers"))
+        write_recording_markers(
+            new_path, recording_state.get("markers"), config.get("clip_editor", {}).get("markers_folder"),
+        )
 
     maybe_transcode(new_path, config.get("post_record_transcode", {}), icon, notifications_config)
     maybe_apply_audio_sync_shift(new_path, config.get("audio_sync_shift", {}), icon, notifications_config)
@@ -3877,40 +3879,53 @@ def clear_active_session_marker():
         logging.exception("Could not clear active-recording marker.")
 
 
-def marker_sidecar_path(recording_path):
+def marker_sidecar_path(recording_path, markers_folder=None):
+    """Where a recording's markers file lives: in markers_folder (clip_editor.markers_folder) if
+    one is configured, otherwise right next to the recording."""
+    if markers_folder:
+        return os.path.join(markers_folder, os.path.basename(recording_path) + ".markers.json")
     return recording_path + ".markers.json"
 
 
-def write_recording_markers(recording_path, markers):
+def write_recording_markers(recording_path, markers, markers_folder=None):
     """Persists the "Add Marker" keybind's timestamps (collected in recording_state["markers"]
-    over the course of one recording) to a small sidecar file next to the finished recording, so
-    the clip editor can show them regardless of recording format -- this app no longer relies on
+    over the course of one recording) to a small sidecar file -- see marker_sidecar_path -- so
+    the clip editor can show them regardless of recording format; this app no longer relies on
     OBS's own CreateRecordChapter/Hybrid-MP4-only chapter mechanism for this at all (see
     add_recording_marker). A no-op when there are no markers, so a recording nobody marked up
     doesn't grow a stray sidecar file."""
     if not recording_path or not markers:
         return
+    path = marker_sidecar_path(recording_path, markers_folder)
     try:
-        with open(marker_sidecar_path(recording_path), "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump({"markers": markers}, f)
     except Exception:
         logging.exception("Could not write marker sidecar for %s.", recording_path)
 
 
-def read_recording_markers(recording_path):
+def read_recording_markers(recording_path, markers_folder=None):
     """Returns the sorted marker timestamps (seconds) written by write_recording_markers for
     recording_path, or None if there's no sidecar file at all -- lets the clip editor fall back
     to reading a legacy recording's own embedded Hybrid MP4 chapters instead (see
-    refresh_markers), rather than treating "no sidecar" the same as "confirmed zero markers"."""
-    try:
-        with open(marker_sidecar_path(recording_path), "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return None
-    try:
-        return sorted(float(m) for m in data.get("markers", []))
-    except (TypeError, ValueError):
-        return None
+    refresh_markers), rather than treating "no sidecar" the same as "confirmed zero markers".
+    Checks markers_folder first, then next to the recording, so markers saved before the folder
+    setting was changed still show up."""
+    candidates = [marker_sidecar_path(recording_path, markers_folder)]
+    if markers_folder:
+        candidates.append(marker_sidecar_path(recording_path))
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        try:
+            return sorted(float(m) for m in data.get("markers", []))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def read_active_session_marker():
@@ -6346,6 +6361,21 @@ def _run_config_editor(master_root, restart_callback, on_close):
     clip_editor_tab.columnconfigure(1, weight=1)
     clip_editor_config = config.get("clip_editor", {})
     row = 0
+    add_section_label(clip_editor_tab, row, "Markers")
+    row += 1
+    markers_folder_var = tk.StringVar(value=clip_editor_config.get("markers_folder", "") or "")
+    add_labeled_entry(clip_editor_tab, row, "Markers folder (optional)", markers_folder_var)
+    add_browse_button(clip_editor_tab, row, markers_folder_var, mode="dir")
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Where the \"Add Marker\" keybind's markers are saved (one small .markers.json file "
+            "per recording). Leave blank to save them next to each recording."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
     add_section_label(clip_editor_tab, row, "Trimmed Clip Output")
     row += 1
     clip_output_folder_var = tk.StringVar(value=clip_editor_config.get("output_folder", "") or "")
@@ -6842,6 +6872,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
             clip_editor["output_folder"] = clip_output_folder_value
         else:
             clip_editor.pop("output_folder", None)
+        markers_folder_value = markers_folder_var.get().strip()
+        if markers_folder_value:
+            clip_editor["markers_folder"] = markers_folder_value
+        else:
+            clip_editor.pop("markers_folder", None)
         clip_editor["output_suffix"] = clip_output_suffix_var.get()
         clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
         clip_editor["trim_mode"] = CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL.get(trim_mode_var.get(), "precise")
@@ -7560,7 +7595,10 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         # Markers ("Add Marker" keybind) are tracked by this app itself now, independently of
         # OBS's own recording format (see add_recording_marker/write_recording_markers) -- a
         # sidecar file next to the recording is the primary, authoritative source, read first.
-        sidecar_markers = read_recording_markers(state["path"]) if state["path"] else None
+        sidecar_markers = (
+            read_recording_markers(state["path"], clip_editor_config.get("markers_folder"))
+            if state["path"] else None
+        )
         if sidecar_markers is not None:
             state["markers"] = sidecar_markers
             state["markers_loaded"] = True

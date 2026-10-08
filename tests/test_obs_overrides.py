@@ -467,6 +467,40 @@ class RecordingMarkersSidecarTests(unittest.TestCase):
         self.assertIsNone(a.read_recording_markers(self.recording_path))
 
 
+class MarkersFolderTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.recordings = os.path.join(self._tmp.name, "Movies")
+        self.markers = os.path.join(self._tmp.name, "Markers")
+        os.makedirs(self.recordings)
+        self.recording = os.path.join(self.recordings, "Balatro - 2026-10-08 13-27-41.mkv")
+
+    def test_configured_folder_holds_the_file_named_after_the_recording(self):
+        self.assertEqual(
+            a.marker_sidecar_path(self.recording, self.markers),
+            os.path.join(self.markers, "Balatro - 2026-10-08 13-27-41.mkv.markers.json"),
+        )
+
+    def test_writes_into_the_configured_folder_creating_it(self):
+        a.write_recording_markers(self.recording, [5.0], self.markers)
+        self.assertTrue(os.path.isfile(a.marker_sidecar_path(self.recording, self.markers)))
+        self.assertFalse(os.path.isfile(a.marker_sidecar_path(self.recording)))
+        self.assertEqual(a.read_recording_markers(self.recording, self.markers), [5.0])
+
+    def test_reads_markers_saved_next_to_the_recording_before_the_folder_was_set(self):
+        a.write_recording_markers(self.recording, [3.0, 1.0])
+        self.assertEqual(a.read_recording_markers(self.recording, self.markers), [1.0, 3.0])
+
+    def test_configured_folder_wins_over_an_older_file_next_to_the_recording(self):
+        a.write_recording_markers(self.recording, [1.0])
+        a.write_recording_markers(self.recording, [9.0], self.markers)
+        self.assertEqual(a.read_recording_markers(self.recording, self.markers), [9.0])
+
+    def test_none_when_neither_exists(self):
+        self.assertIsNone(a.read_recording_markers(self.recording, self.markers))
+
+
 class ResolveRecordingResolutionTests(unittest.TestCase):
     def test_match_canvas_returns_base_resolution_unchanged(self):
         self.assertEqual(a.resolve_recording_resolution(1920, 1080, "Match canvas (no scaling)"), (1920, 1080))

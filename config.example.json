@@ -105,6 +105,7 @@
     },
     "clip_editor": {
         "output_folder": "",
+        "markers_folder": "",
         "output_suffix": "_trimmed",
         "delete_original_after_trim": false,
         "trim_mode": "precise",
