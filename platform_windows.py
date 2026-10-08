@@ -627,6 +627,10 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
 
 PROCESS_AUDIO_CAPTURE_KIND = "wasapi_process_output_capture"
 
+# An untargeted input's defaults already capture nothing here -- no placeholder needed (see
+# platform_macos.PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS for why macOS needs one).
+PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS = None
+
 # OBS's own "match priority" enum for a wasapi_process_output_capture "window" field: 2 means
 # "match executable only" (no title/class needed), the fallback used when only a process name is
 # known. Deliberately a plain local constant, not a shared import from autostart_script.py's own

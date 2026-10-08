@@ -585,6 +585,30 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
                 fake_thread.start.assert_called_once()
         fake_quartz.CFRunLoopRun.assert_called_once()
 
+    def test_callback_does_no_lazy_quartz_lookups(self):
+        # pyobjc's lazy name resolution isn't thread-safe: two taps' callbacks resolving the same
+        # function on one keypress raised KeyError (confirmed live). Every name the callback uses
+        # must already be resolved at setup -- removing them afterward must not matter.
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
+        binding = {"enabled": True, "key": "S", "modifiers": ["ctrl"], "action": "save_replay_buffer"}
+        fire_keybind = unittest.mock.Mock()
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
+            with unittest.mock.patch.object(pmac.threading, "Thread") as mock_thread_cls:
+                pmac.run_custom_keybind_listener(
+                    [binding], get_client="get_client", get_manual_split_buffer_seconds="get_seconds",
+                    fire_keybind=fire_keybind, describe_keybind=unittest.mock.Mock(return_value="Ctrl+S"),
+                    notify=unittest.mock.Mock(),
+                )
+                tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
+                fake_quartz.CGEventGetIntegerValueField.return_value = pmac.macos_keycode_for_key("S")
+                fake_quartz.CGEventGetFlags.return_value = fake_quartz.kCGEventFlagMaskControl
+                key_down = fake_quartz.kCGEventKeyDown
+                for name in ("CGEventGetIntegerValueField", "CGEventGetFlags", "kCGKeyboardEventKeycode", "kCGEventKeyDown"):
+                    delattr(fake_quartz, name)
+                tap_callback(None, key_down, unittest.mock.Mock(), None)
+                mock_thread_cls.assert_called_once()
+
     def test_non_matching_key_press_does_not_fire(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
         fake_application_services = make_fake_application_services(accessibility_trusted=True)

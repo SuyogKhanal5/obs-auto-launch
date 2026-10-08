@@ -578,10 +578,21 @@ class EnsureGameAudioInputExistsTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_creates_missing_input_in_current_scene(self):
+    def test_creates_missing_input_in_current_scene_capturing_nothing(self):
         client = FakeObsClient(current_scene="Scene")
-        a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
+        with unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_placeholder_settings", return_value={"type": 1},
+        ):
+            a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
         self.assertEqual(client.inputs["Game Audio"]["kind"], "sck_audio_capture")
+        self.assertIn(("create_input", "Scene", "Game Audio", "sck_audio_capture", {"type": 1}), client.calls)
+
+    def test_creates_with_empty_settings_where_no_placeholder_is_needed(self):
+        client = FakeObsClient(current_scene="Scene")
+        with unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_placeholder_settings", return_value=None,
+        ):
+            a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
         self.assertIn(("create_input", "Scene", "Game Audio", "sck_audio_capture", {}), client.calls)
 
     def test_leaves_an_existing_input_alone(self):
@@ -599,3 +610,54 @@ class EnsureGameAudioInputExistsTests(unittest.TestCase):
         with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value=None):
             a.ensure_game_audio_input_exists(client, {"enabled": True})
         self.assertEqual(client.inputs, {})
+
+
+class UntargetedAppAudioCaptureTests(unittest.TestCase):
+    # Confirmed live on macOS: sck_audio_capture's default type 0 is "Desktop Audio Capture", so a
+    # never-targeted "Safari" input recorded the whole system mix -- Spotify on the browser track.
+    def setUp(self):
+        patchers = [
+            unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"),
+            unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", return_value=None),
+            unittest.mock.patch.object(
+                a.platform_common, "process_audio_capture_placeholder_settings", return_value={"type": 1},
+            ),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_unresolvable_target_resets_input_to_capture_nothing(self):
+        client = FakeObsClient(inputs={"Safari": {"kind": "sck_audio_capture", "tracks": {}, "settings": {}}})
+        with self.assertLogs(level="WARNING"):
+            a.set_game_audio_capture_target(client, "Safari", "Safari")
+        self.assertEqual(client.inputs["Safari"]["settings"], {"type": 1})
+
+    def test_reset_keeps_a_previous_target(self):
+        client = FakeObsClient(inputs={"Safari": {
+            "kind": "sck_audio_capture", "tracks": {},
+            "settings": {"type": 1, "application": "com.apple.Safari"},
+        }})
+        with self.assertLogs(level="WARNING"):
+            a.set_game_audio_capture_target(client, "Safari", "Safari")
+        self.assertEqual(client.inputs["Safari"]["settings"], {"type": 1, "application": "com.apple.Safari"})
+
+    def test_quick_setup_creates_a_not_running_app_capturing_nothing(self):
+        client = FakeObsClient()
+        safari = {"name": "Safari", "process_name": "Safari", "category": "Browser"}
+        a.compute_quick_setup_tracks(client, None, None, None, [safari])
+        self.assertEqual(client.inputs["Safari"]["settings"], {"type": 1})
+
+
+class ProcessAudioCapturePlaceholderTests(unittest.TestCase):
+    def test_macos_uses_application_mode(self):
+        self.assertEqual(a.platform_common.process_audio_capture_placeholder_settings("darwin"), {"type": 1})
+
+    def test_other_oses_need_none(self):
+        self.assertIsNone(a.platform_common.process_audio_capture_placeholder_settings("win32"))
+        self.assertIsNone(a.platform_common.process_audio_capture_placeholder_settings("linux"))
+
+    def test_returns_a_copy(self):
+        first = a.platform_common.process_audio_capture_placeholder_settings("darwin")
+        first["application"] = "x"
+        self.assertEqual(a.platform_common.process_audio_capture_placeholder_settings("darwin"), {"type": 1})

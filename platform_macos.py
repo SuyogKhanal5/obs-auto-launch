@@ -236,6 +236,24 @@ def _macos_mod_flags_for(modifiers, Quartz):
     return mask
 
 
+# pyobjc resolves Quartz names lazily on first attribute access, and that resolution isn't
+# thread-safe: one keypress fires the custom-keybind tap and the clip editor's space bar tap
+# at the same moment, each on its own thread, and the two racing first lookups of
+# CGEventGetIntegerValueField raised KeyError inside pyobjc (confirmed live). Resolving
+# everything the callbacks use once, under a lock, at listener setup avoids that entirely.
+_QUARTZ_LOOKUP_LOCK = threading.Lock()
+
+
+def _resolve_event_tap_names(Quartz):
+    with _QUARTZ_LOOKUP_LOCK:
+        return {
+            "key_down": Quartz.kCGEventKeyDown,
+            "keycode_field": Quartz.kCGKeyboardEventKeycode,
+            "get_field": Quartz.CGEventGetIntegerValueField,
+            "get_flags": Quartz.CGEventGetFlags,
+        }
+
+
 def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_event=None):
     """Shared by run_custom_keybind_listener and run_clip_editor_space_bar_listener below --
     both need the exact same CGEventTapCreate/CFRunLoop wiring, differing only in which keydowns
@@ -325,11 +343,13 @@ def run_custom_keybind_listener(
         | Quartz.kCGEventFlagMaskShift | Quartz.kCGEventFlagMaskCommand
     )
 
+    names = _resolve_event_tap_names(Quartz)
+
     def tap_callback(proxy, event_type, event, refcon):
         try:
-            if event_type == Quartz.kCGEventKeyDown:
-                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
-                mask = Quartz.CGEventGetFlags(event) & relevant_flags_mask
+            if event_type == names["key_down"]:
+                keycode = names["get_field"](event, names["keycode_field"])
+                mask = names["get_flags"](event) & relevant_flags_mask
                 binding = lookup.get((keycode, mask))
                 if binding:
                     threading.Thread(
@@ -614,18 +634,21 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
         return
 
     this_pid = os.getpid()
+    names = _resolve_event_tap_names(Quartz)
+    with _QUARTZ_LOOKUP_LOCK:
+        workspace_cls = Quartz.NSWorkspace
 
     def is_this_app_frontmost():
         try:
-            frontmost = Quartz.NSWorkspace.sharedWorkspace().frontmostApplication()
+            frontmost = workspace_cls.sharedWorkspace().frontmostApplication()
             return frontmost is not None and frontmost.processIdentifier() == this_pid
         except Exception:
             return False
 
     def tap_callback(proxy, event_type, event, refcon):
         try:
-            if event_type == Quartz.kCGEventKeyDown:
-                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+            if event_type == names["key_down"]:
+                keycode = names["get_field"](event, names["keycode_field"])
                 if keycode == MACOS_SPACE_KEYCODE and is_this_app_frontmost():
                     on_toggle()
         except Exception:
@@ -685,6 +708,13 @@ def resolve_bundle_identifier(exe_path):
         if parent == path:
             return None
         path = parent
+
+
+# Settings for an app-audio input with no target yet (app not running). sck_audio_capture's own
+# default is type 0, "Desktop Audio Capture" -- the whole system mix -- so an untargeted input
+# left on defaults records everything (confirmed live: a never-targeted "Safari" input put
+# Spotify on the browser track). Application mode with no application records silence.
+PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS = {"type": SCK_AUDIO_CAPTURE_TYPE_APPLICATION}
 
 
 def process_audio_capture_settings(process_name, exe_path):

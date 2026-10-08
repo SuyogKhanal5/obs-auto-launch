@@ -56,8 +56,14 @@ class PerformKeybindActionTests(unittest.TestCase):
         # this catches a new action being added to the picker but never implemented.
         for action in a.CUSTOM_KEYBIND_ACTIONS:
             client = FakeObsClient()
-            a.perform_keybind_action(client, action)
-            self.assertTrue(client.calls, f"action '{action}' did not call anything on the client")
+            recording_state = {}
+            a.perform_keybind_action(client, action, recording_state=recording_state)
+            # add_marker's effect is this app's own marker list (OBS is only written to on Hybrid
+            # MP4 -- see add_recording_marker); every other action writes to OBS.
+            self.assertTrue(
+                client.calls or recording_state.get("markers"),
+                f"action '{action}' had no effect",
+            )
 
 
 class FireCustomKeybindTests(unittest.TestCase):

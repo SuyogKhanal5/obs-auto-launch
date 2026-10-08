@@ -357,6 +357,14 @@ def process_audio_capture_settings(process_name, exe_path, platform_name=None):
     return _select_backend(platform_name).process_audio_capture_settings(process_name, exe_path)
 
 
+def process_audio_capture_placeholder_settings(platform_name=None):
+    """Settings to give a process_audio_capture_kind() input that has no target yet, so it
+    records nothing instead of whatever its defaults capture -- or None if this OS's defaults
+    already capture nothing. Only macOS needs one; see its backend's own constant."""
+    placeholder = _select_backend(platform_name).PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS
+    return dict(placeholder) if placeholder else None
+
+
 def gui_requires_main_thread(platform_name=None):
     """True if this OS's GUI toolkit must run only on the real process main thread -- AppKit's
     hard requirement on macOS. Confirmed live: this app's Tk GUI (the overlay, and everything

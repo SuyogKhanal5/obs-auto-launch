@@ -104,10 +104,21 @@ class AddRecordingMarkerTests(unittest.TestCase):
         result = a.add_recording_marker(client, recording_state=None)
         self.assertTrue(result)
 
-    def test_also_attempts_a_native_obs_chapter_on_a_best_effort_basis(self):
+    def test_also_adds_a_native_obs_chapter_on_hybrid_mp4(self):
         client = FakeObsClient()
+        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
         a.add_recording_marker(client, recording_state={})
         self.assertIn(("create_record_chapter", None), client.calls)
+
+    def test_skips_the_native_chapter_on_other_formats(self):
+        # OBS rejects it anywhere else, and obsws_python logs that rejection as an ERROR with a
+        # traceback on every marker before it can be caught.
+        client = FakeObsClient()
+        client.set_profile_parameter("AdvOut", "RecFormat2", "mkv")
+        recording_state = {}
+        self.assertTrue(a.add_recording_marker(client, recording_state=recording_state))
+        self.assertNotIn(("create_record_chapter", None), client.calls)
+        self.assertEqual(recording_state["markers"], [0.0])
 
     def test_unsupported_format_is_non_fatal(self):
         # A non-Hybrid-MP4 recording is the common case now that markers don't need that format
@@ -117,6 +128,7 @@ class AddRecordingMarkerTests(unittest.TestCase):
                 raise a.obsws.error.OBSSDKRequestError("CreateRecordChapter", a.OBS_CHAPTER_NOT_SUPPORTED_CODE, "")
 
         client = RejectingClient()
+        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
         recording_state = {}
         result = a.add_recording_marker(client, recording_state=recording_state)
         self.assertTrue(result)
@@ -128,6 +140,7 @@ class AddRecordingMarkerTests(unittest.TestCase):
                 raise a.obsws.error.OBSSDKRequestError("CreateRecordChapter", 500, "")
 
         client = RejectingClient()
+        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
         result = a.add_recording_marker(client, recording_state={})
         self.assertTrue(result)
 

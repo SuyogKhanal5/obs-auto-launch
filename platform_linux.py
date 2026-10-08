@@ -582,6 +582,7 @@ def run_clip_editor_space_bar_listener(editor_window_id, on_toggle, stop_event):
 # config. None here means "confirmed this OS can't do it", exactly like process_audio_capture_kind
 # itself documents -- don't reintroduce a guessed kind string without a fresh empirical spike.
 PROCESS_AUDIO_CAPTURE_KIND = None
+PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS = None
 
 
 def process_audio_capture_settings(process_name, exe_path):

@@ -1063,7 +1063,8 @@ def ensure_game_audio_input_exists(client, game_audio_config):
         if input_name in {i["inputName"] for i in client.get_input_list().inputs}:
             return
         scene = client.get_current_program_scene().current_program_scene_name
-        client.create_input(scene, input_name, kind, {}, True)
+        settings = platform_common.process_audio_capture_placeholder_settings() or {}
+        client.create_input(scene, input_name, kind, settings, True)
         logging.info("Created game audio input '%s' in OBS.", input_name)
     except Exception as exc:
         logging.warning("Could not create game audio input '%s' in OBS: %s", input_name, exc)
@@ -1082,9 +1083,18 @@ def set_game_audio_capture_target(client, input_name, process_name):
         )
         return
     if settings is None:
+        # Make sure an input still on capture-everything defaults (e.g. created before its app
+        # ever ran) records nothing rather than the whole desktop mix. Overlay keeps any
+        # previous target, which is harmless while that app isn't running.
+        placeholder = platform_common.process_audio_capture_placeholder_settings()
+        if placeholder:
+            try:
+                client.set_input_settings(input_name, placeholder, True)
+            except Exception:
+                pass
         logging.warning(
             "Could not resolve an audio-capture target for %s (not currently running, or its "
-            "app isn't in a normal bundle); '%s' was left unchanged.", process_name, input_name,
+            "app isn't in a normal bundle); '%s' won't capture anything this time.", process_name, input_name,
         )
         return
     try:
@@ -2535,7 +2545,10 @@ def add_recording_marker(client, icon=None, notifications_config=None, status=No
     logging.info("Added a marker to the current recording (at %.1fs).", offset_seconds)
 
     try:
-        client.create_record_chapter()
+        # Only worth asking on Hybrid MP4 -- anywhere else obsws_python logs the 702 rejection as
+        # an ERROR with a full traceback before we can catch it, on every single marker.
+        if get_profile_parameter_value(client, "AdvOut", "RecFormat2") == "hybrid_mp4":
+            client.create_record_chapter()
     except obsws.error.OBSSDKRequestError as exc:
         if exc.code != OBS_CHAPTER_NOT_SUPPORTED_CODE:
             logging.debug("Could not add a native OBS chapter marker (non-fatal): %s", exc)
@@ -4128,6 +4141,11 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                 )
                 if session_started:
                     active_name, active_pid = name, pid
+                    # Freeze detection measures "unchanged for N seconds" within this session --
+                    # left over from a previous one, a first screenshot matching that session's
+                    # last frame read as frozen since then (confirmed live: fired 2s into a
+                    # recording, claiming no change for over 180s).
+                    frozen_capture_state.update(last_hash=None, unchanged_since=None, last_check=0.0)
                     active_display_name = display_name
                     active_replay_buffer_only = replay_buffer_only
                     active_window_entry = window_entry
@@ -5231,12 +5249,14 @@ def compute_quick_setup_tracks(client, desktop_name, mic_name, game_audio_name, 
             kind, settings = resolve_process_audio_capture(app["process_name"])
             if kind:
                 # settings is None when the app isn't running yet (macOS can't resolve a bundle
-                # identifier without a live process to read it from) -- created anyway with the
-                # kind's own bare defaults so it exists in OBS at all; set_game_audio_capture_target
+                # identifier without a live process to read it from) -- created anyway, set to
+                # capture nothing (never the kind's bare defaults: on macOS those capture the
+                # whole desktop mix), so it exists in OBS at all; set_game_audio_capture_target
                 # re-points it for real the next time this app is actually detected running (the
                 # same self-healing re-point obs.game_audio_capture already gets on every recording
                 # start), rather than leaving the user to add the source by hand themselves.
-                client.create_input(scene, name, kind, settings or {}, True)
+                fallback = platform_common.process_audio_capture_placeholder_settings() or {}
+                client.create_input(scene, name, kind, settings or fallback, True)
                 created.append(name)
             else:
                 logging.warning(
