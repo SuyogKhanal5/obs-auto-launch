@@ -41,6 +41,16 @@ _FLATPAK_OBS_PATHS = [
 ]
 
 
+def obs_launch_command(path, launch_args):
+    return [path, *launch_args]
+
+
+def quit_obs_gracefully():
+    """No-op: only macOS shows a screen-sharing indicator while OBS idles, so only there is OBS
+    closed between game sessions."""
+    return False
+
+
 def find_obs_executable():
     """OBS on Linux is normally either a native package (obs on PATH, already covered by
     platform_common's shutil.which check before this ever runs) or a Flatpak -- Flatpak is

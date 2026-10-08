@@ -644,10 +644,48 @@ def launch_obs(obs_config):
     clear_obs_crash_sentinel()
     logging.info("OBS not running, launching from %s", path)
     subprocess.Popen(
-        [path] + obs_config.get("launch_args", []),
+        platform_common.obs_launch_command(path, obs_config.get("launch_args", [])),
         cwd=os.path.dirname(path),
     )
     time.sleep(obs_config.get("startup_wait_seconds", 8))
+    return True
+
+
+def obs_outputs_idle(client):
+    """True only if OBS is confirmed not recording, streaming, or running a replay buffer --
+    anything unknown counts as busy, so OBS is never closed out from under something."""
+    try:
+        if client.get_record_status().output_active or client.get_stream_status().output_active:
+            return False
+    except Exception:
+        return False
+    try:
+        return not client.get_replay_buffer_status().output_active
+    except obsws.error.OBSSDKRequestError:
+        return True  # no replay buffer configured at all
+    except Exception:
+        return False
+
+
+# How long after a game session ends to keep trying to close OBS (it has to finish stopping
+# the recording first) before leaving it open -- e.g. if the user started streaming meanwhile.
+OBS_IDLE_CLOSE_WINDOW_SECONDS = 60
+
+
+def close_obs_between_sessions(client, overlay_enabled):
+    """On macOS, closes OBS once a game session ends -- while OBS is open its ScreenCaptureKit
+    sources keep the menu-bar screen-sharing indicator on even with nothing being recorded.
+    Skipped while the audio mixer overlay needs OBS's meters, and whenever OBS is busy. No-op
+    on other OSes. Returns True if OBS was asked to quit."""
+    if overlay_enabled or not obs_outputs_idle(client):
+        return False
+    if not platform_common.quit_obs_gracefully():
+        return False
+    try:
+        client.disconnect()
+    except Exception:
+        pass
+    logging.info("Closed OBS until the next game starts (no screen sharing while idle).")
     return True
 
 
@@ -3982,6 +4020,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     obs_running_last_known = None
     audio_overlay_launch_state = {"last_attempt": 0}
     frozen_capture_state = {"last_hash": None, "unchanged_since": None, "last_check": 0.0}
+    obs_close_pending_since = None  # set when a session ends; see close_obs_between_sessions
 
     # A recording this app started can be left running with nothing tracking it if the
     # previous instance was force-killed, crashed, or otherwise never reached the normal
@@ -4027,6 +4066,18 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
         enforce_storage_budget(storage_config, obs_config, recording_state, icon, notifications_config)
 
         if active_name is None:
+            if obs_close_pending_since is not None:
+                if not obs_client or time.time() - obs_close_pending_since > OBS_IDLE_CLOSE_WINDOW_SECONDS:
+                    obs_close_pending_since = None
+                elif close_obs_between_sessions(obs_client, audio_state.get("enabled")):
+                    obs_close_pending_since = None
+                    if obs_event_client:
+                        try:
+                            obs_event_client.disconnect()
+                        except Exception:
+                            pass
+                    obs_client, obs_event_client = None, None
+                    runtime_state["obs_client"] = None
             # The recording-driven obs_event_client (established below once a watched game is
             # detected) also feeds the audio-mixer overlay, but while idle nothing has
             # established a connection yet -- without this, the overlay would show "No active
@@ -4220,6 +4271,9 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                 reset_recording_state(recording_state)
                 status["recording"] = False
                 set_status(icon, status, "Watching")
+                # Retried from the idle branch below: StopRecord finishes asynchronously, so
+                # right here OBS still reports the recording as active (confirmed live).
+                obs_close_pending_since = time.time()
             elif obs_client:
                 now = time.time()
                 if now - frozen_capture_state["last_check"] >= FROZEN_CAPTURE_CHECK_INTERVAL_SECONDS:
@@ -8696,6 +8750,11 @@ def main():
         handlers=handlers,
         force=True,
     )
+    # obsws_python logs every rejected request as an ERROR with a full traceback -- including the
+    # ones this app expects and handles itself (no replay buffer, chapters on non-Hybrid-MP4) --
+    # and its client logs the WebSocket password in plain text at INFO on every connection.
+    logging.getLogger("obsws_python.reqs").setLevel(logging.CRITICAL)
+    logging.getLogger("obsws_python.baseclient").setLevel(logging.WARNING)
     cleanup_orphaned_pyinstaller_temp_dirs()
 
     status = {"text": "Starting...", "recording": False}

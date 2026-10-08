@@ -49,6 +49,17 @@ def hide_console_subprocess_kwargs():
     return {}
 
 
+def obs_launch_command(path, launch_args, platform_name=None):
+    """The command that starts OBS at path with launch_args on this OS."""
+    return _select_backend(platform_name).obs_launch_command(path, list(launch_args or []))
+
+
+def quit_obs_gracefully(platform_name=None):
+    """Asks OBS to quit normally where that's wanted between game sessions (macOS only); returns
+    False where it's a no-op."""
+    return _select_backend(platform_name).quit_obs_gracefully()
+
+
 def find_obs_executable(configured_path=None, platform_name=None):
     """Best-effort search for an OBS Studio install on this machine. An explicit configured_path
     that still exists always wins as-is; otherwise falls back to this OS's own discovery

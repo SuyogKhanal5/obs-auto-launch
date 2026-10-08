@@ -128,6 +128,14 @@ class FakeObsClient:
     def get_record_status(self):
         return SimpleNamespace(output_active=self.recording_active, output_duration=self.record_duration_ms)
 
+    def get_stream_status(self):
+        return SimpleNamespace(output_active=getattr(self, "streaming_active", False))
+
+    def get_replay_buffer_status(self):
+        if not getattr(self, "replay_buffer_available", True):
+            raise OBSSDKRequestError("GetReplayBufferStatus", 604, "Replay buffer is not available.")
+        return SimpleNamespace(output_active=getattr(self, "replay_buffer_active", False))
+
     def set_input_audio_sync_offset(self, name, offset):
         if name not in self.inputs:
             raise OBSSDKRequestError(

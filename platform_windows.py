@@ -54,6 +54,16 @@ DEFAULT_OBS_PATHS = [
 ]
 
 
+def obs_launch_command(path, launch_args):
+    return [path, *launch_args]
+
+
+def quit_obs_gracefully():
+    """No-op: only macOS shows a screen-sharing indicator while OBS idles, so only there is OBS
+    closed between game sessions."""
+    return False
+
+
 def find_obs_executable():
     """Moved unchanged from installer.py's old find_obs_exe()."""
     for path in DEFAULT_OBS_PATHS:

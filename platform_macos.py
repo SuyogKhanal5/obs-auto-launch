@@ -32,6 +32,40 @@ def ffmpeg_candidates():
     ]
 
 
+def obs_launch_command(path, launch_args):
+    """Launches OBS through LaunchServices (`open`) rather than as this app's child process.
+    Confirmed live: started as a child, macOS attributes OBS's screen capture to this app --
+    the menu-bar sharing indicator lists "Python", clicking its Stop Sharing targets this app
+    (and crashed it), and OBS's Screen Recording permission is charged to the wrong app. -g keeps
+    OBS from taking focus from a fullscreen game. Falls back to a direct launch for an executable
+    that isn't inside an .app bundle."""
+    bundle = path
+    while bundle and bundle != os.path.dirname(bundle):
+        if bundle.endswith(".app"):
+            return ["open", "-g", "-a", bundle, "--args", *launch_args]
+        bundle = os.path.dirname(bundle)
+    return [path, *launch_args]
+
+
+OBS_BUNDLE_ID = "com.obsproject.obs-studio"
+
+
+def quit_obs_gracefully():
+    """Asks OBS to quit the normal way (never a kill, which leaves OBS's unclean-shutdown marker
+    and its "Run in Safe Mode?" prompt behind). Closing OBS while no game is running is the only
+    way to clear macOS's screen-sharing indicator -- confirmed live, hiding its capture sources
+    leaves their ScreenCaptureKit streams running. Returns True if the request was delivered."""
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'tell application id "{OBS_BUNDLE_ID}" to quit'],
+            capture_output=True, timeout=20,
+        )
+        return True
+    except Exception as exc:
+        logging.warning("Could not ask OBS to quit: %s", exc)
+        return False
+
+
 def find_obs_executable():
     """OBS on macOS ships as a .app bundle, not a bare PATH-findable binary -- shutil.which
     (tried first by platform_common.find_obs_executable) won't find it at all. The actual
