@@ -514,12 +514,12 @@ class ResolveRecordingResolutionTests(unittest.TestCase):
     def test_720p_preset_scales_width_from_canvas_aspect_ratio(self):
         self.assertEqual(a.resolve_recording_resolution(1920, 1080, "720p"), (1280, 720))
 
-    def test_ultrawide_canvas_still_rounds_width_to_even(self):
-        # 3440x1440 at height 720 -> width 1720.0 exactly, but exercised with a canvas whose
-        # ratio doesn't divide evenly to confirm the even-rounding actually does something.
+    def test_ultrawide_canvas_rounds_width_to_a_multiple_of_4(self):
+        # A canvas whose ratio doesn't divide evenly, to confirm the rounding actually does
+        # something -- OBS itself rounds output sizes to multiples of 4.
         width, height = a.resolve_recording_resolution(3441, 1440, "720p")
         self.assertEqual(height, 720)
-        self.assertEqual(width % 2, 0)
+        self.assertEqual(width % 4, 0)
 
 
 class ApplyRecordingResolutionTests(unittest.TestCase):

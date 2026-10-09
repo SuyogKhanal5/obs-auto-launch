@@ -146,11 +146,15 @@ class CustomRecordingResolutionTests(unittest.TestCase):
     def test_typed_size_is_used_as_is(self):
         self.assertEqual(a.resolve_recording_resolution(1920, 1198, "2560x1600"), (2560, 1600))
 
-    def test_typed_size_is_rounded_to_even(self):
-        self.assertEqual(a.resolve_recording_resolution(1920, 1198, " 1281 X 801 "), (1280, 800))
+    def test_typed_size_is_rounded_down_to_a_multiple_of_4_like_obs(self):
+        self.assertEqual(a.resolve_recording_resolution(1920, 1198, " 1283 X 803 "), (1280, 800))
 
     def test_presets_keep_the_canvas_shape(self):
-        self.assertEqual(a.resolve_recording_resolution(1920, 1198, "480p"), (770, 480))
+        self.assertEqual(a.resolve_recording_resolution(1920, 1198, "480p"), (768, 480))
+
+    def test_preset_matches_what_obs_actually_records(self):
+        # Confirmed live: 1920x1080 canvas at 480p recorded 852x480, 1920x1198 recorded 768x480.
+        self.assertEqual(a.resolve_recording_resolution(1920, 1080, "480p"), (852, 480))
 
 
 class DisplayTopInsetOtherOsesTests(unittest.TestCase):

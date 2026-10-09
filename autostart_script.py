@@ -2151,15 +2151,18 @@ def resolve_recording_resolution(base_width, base_height, resolution_choice):
     aspect ratio, scaling width from CLIP_EDITOR_QUALITY_HEIGHTS' height and rounding to the
     nearest even number, same convention build_trim_command's -2 scale filter already uses,
     since libx264 (what OBS's own encoders are built on too) requires even dimensions."""
+    # OBS itself rounds output dimensions to a multiple of 4 (confirmed live: asking for 770x480
+    # recorded 768x480, and 854x480 recorded 852x480), so sizes are computed that way here too --
+    # otherwise the requested size never matches what OBS reports back, and it's rewritten on
+    # every recording start.
     custom = re.fullmatch(r"\s*(\d+)\s*[xX×]\s*(\d+)\s*", resolution_choice or "")
     if custom:
-        # Any size the user types in, e.g. "2560x1600" -- rounded to even, which encoders need.
-        width, height = (max(2, int(n) // 2 * 2) for n in custom.groups())
+        width, height = (max(4, int(n) // 4 * 4) for n in custom.groups())
         return width, height
     height = CLIP_EDITOR_QUALITY_HEIGHTS.get(resolution_choice)
     if height is None or not base_width or not base_height:
         return base_width, base_height
-    width = round(base_width * height / base_height / 2) * 2
+    width = int(base_width * height / base_height) // 4 * 4
     return width, height
 
 
