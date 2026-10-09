@@ -54,6 +54,11 @@ DEFAULT_OBS_PATHS = [
 ]
 
 
+def prepare_calibration_player(ffplay_path, work_dir):
+    """ffplay itself -- this OS's per-app capture can target it directly."""
+    return ffplay_path
+
+
 def is_this_app_frontmost():
     """Always True: only macOS's custom tray popup asks this."""
     return True

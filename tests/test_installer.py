@@ -190,3 +190,47 @@ class EnsureFfmpegTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MacTemplateConfigTests(unittest.TestCase):
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def load(self, name):
+        with open(os.path.join(self.REPO, name), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_mac_template_has_every_key_the_general_one_has(self):
+        def keys(d, prefix=""):
+            out = set()
+            for k, v in d.items():
+                out.add(prefix + k)
+                if isinstance(v, dict):
+                    out |= keys(v, prefix + k + ".")
+            return out
+        missing = keys(self.load("config.example.json")) - keys(self.load("config.example.mac.json"))
+        self.assertEqual(missing, set())
+
+    def test_mac_template_uses_mac_values(self):
+        mac = self.load("config.example.mac.json")
+        self.assertEqual(mac["obs"]["process_name"], "OBS")
+        self.assertTrue(mac["obs"]["path"].startswith("/Applications/OBS.app"))
+        self.assertFalse(any(g.lower().endswith(".exe") for g in mac["watched_games"]))
+        self.assertFalse(any(len(d) == 1 for d in mac["steam"]["allowed_drives"]))
+        self.assertIn({"input_name": "macOS Screen Capture", "track": 1}, mac["obs"]["multi_track_audio"]["tracks"])
+
+    def test_mac_template_builds_a_config(self):
+        config = installer.build_config(self.load("config.example.mac.json"), None, "pw", base_options())
+        self.assertEqual(config["obs"]["websocket"]["password"], "pw")
+
+    def test_installer_picks_the_mac_template_on_macos(self):
+        with patch.object(installer.sys, "platform", "darwin"), \
+                patch.object(installer, "resource_path", side_effect=lambda name: os.path.join(self.REPO, name)):
+            self.assertTrue(installer.template_config_path().endswith("config.example.mac.json"))
+        with patch.object(installer.sys, "platform", "win32"), \
+                patch.object(installer, "resource_path", side_effect=lambda name: os.path.join(self.REPO, name)):
+            self.assertTrue(installer.template_config_path().endswith("config.example.json"))
+
+    def test_falls_back_when_the_mac_template_is_missing(self):
+        with patch.object(installer.sys, "platform", "darwin"), \
+                patch.object(installer, "resource_path", side_effect=lambda name: os.path.join("/nonexistent", name)):
+            self.assertTrue(installer.template_config_path().endswith("config.example.json"))

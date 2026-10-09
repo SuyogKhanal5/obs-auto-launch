@@ -1,0 +1,185 @@
+{
+    "watched_games": [],
+    "watched_windows": [
+        {
+            "process_name": "GeForceNOW",
+            "title_contains": "on GeForce NOW",
+            "display_name": "GeForce NOW",
+            "use_title_as_display_name": true
+        }
+    ],
+    "poll_interval_seconds": 1.5,
+    "organize_into_game_subfolders": false,
+    "overlay": {
+        "default_monitor_label": "",
+        "start_with_overlay": false
+    },
+    "steam": {
+        "enabled": true,
+        "allowed_drives": [],
+        "exclude_keywords": [
+            "_commonredist",
+            "easyanticheat",
+            "battleye",
+            "vc_redist",
+            "directx",
+            "dxsetup",
+            "unins0",
+            "crashreport",
+            "crashhandler",
+            "unitycrashhandler",
+            "steamworks",
+            "wallpaper_engine"
+        ]
+    },
+    "epic": {
+        "enabled": true,
+        "exclude_keywords": [
+            "unreal engine",
+            "epic online services"
+        ]
+    },
+    "gog": {
+        "enabled": true,
+        "exclude_keywords": []
+    },
+    "xbox": {
+        "enabled": false,
+        "install_dirs": [],
+        "exclude_keywords": []
+    },
+    "battlenet": {
+        "enabled": false,
+        "install_dirs": [],
+        "exclude_keywords": []
+    },
+    "disk_space_guard": {
+        "enabled": false,
+        "minimum_free_gb": 10
+    },
+    "cleanup": {
+        "delete_short_clips": {
+            "enabled": false,
+            "minimum_seconds": 20
+        },
+        "flag_silent_recordings": {
+            "enabled": false,
+            "peak_threshold": 0.02,
+            "warn_after_seconds": 30
+        }
+    },
+    "storage_management": {
+        "enabled": false,
+        "reserved_free_gb": 20,
+        "watch_folder": ""
+    },
+    "notifications": {
+        "enabled": false
+    },
+    "post_record_transcode": {
+        "enabled": false,
+        "ffmpeg_path": "ffmpeg",
+        "args": [
+            "-map",
+            "0",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "23",
+            "-preset",
+            "veryfast",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k"
+        ],
+        "output_extension": "",
+        "suffix": "_compressed",
+        "delete_original": false
+    },
+    "audio_sync_shift": {
+        "enabled": false,
+        "ffmpeg_path": "ffmpeg",
+        "tracks": [],
+        "shift_ms": 0,
+        "suffix": "_synced",
+        "delete_original": false
+    },
+    "clip_editor": {
+        "output_folder": "",
+        "markers_folder": "",
+        "output_suffix": "_trimmed",
+        "delete_original_after_trim": false,
+        "trim_mode": "precise",
+        "default_output_format": "Same as source",
+        "default_quality": "Same as source",
+        "vlc_path": ""
+    },
+    "obs": {
+        "process_name": "OBS",
+        "path": "/Applications/OBS.app/Contents/MacOS/OBS",
+        "launch_args": [
+            "--minimize-to-tray"
+        ],
+        "startup_wait_seconds": 15,
+        "websocket": {
+            "host": "localhost",
+            "port": 4455,
+            "password": "YOUR_OBS_WEBSOCKET_PASSWORD"
+        },
+        "auto_split": {
+            "enabled": false,
+            "by": "time",
+            "minutes": 20,
+            "tolerance_seconds": 8,
+            "megabytes": 4096,
+            "tolerance_megabytes": 50
+        },
+        "manual_split": {
+            "enabled": false,
+            "buffer_seconds": 0
+        },
+        "custom_keybinds": [],
+        "recovery": {
+            "memory_limit_gb": 5,
+            "cooldown_seconds": 30,
+            "frozen_capture_seconds": 180
+        },
+        "game_audio_capture": {
+            "enabled": false,
+            "input_name": "Game Audio"
+        },
+        "screen_fit": "match_screen",
+        "process_audio_capture_sync_offset_ms": 0,
+        "multi_track_audio": {
+            "enabled": false,
+            "profile_name": "OBS Auto Recorder",
+            "tracks": [
+                {
+                    "input_name": "macOS Screen Capture",
+                    "track": 1
+                },
+                {
+                    "input_name": "Mic/Aux",
+                    "track": 1
+                },
+                {
+                    "input_name": "Mic/Aux",
+                    "track": 2
+                },
+                {
+                    "input_name": "Game Audio",
+                    "track": 3
+                }
+            ],
+            "app_captures": []
+        },
+        "replay_buffer": {
+            "mode": "off",
+            "max_seconds": 30
+        },
+        "keep_running_between_sessions": false,
+        "recording_format": "mkv"
+    },
+    "log_file": "autostart_script.log"
+}

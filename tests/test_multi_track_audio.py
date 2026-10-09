@@ -661,3 +661,72 @@ class ProcessAudioCapturePlaceholderTests(unittest.TestCase):
         first = a.platform_common.process_audio_capture_placeholder_settings("darwin")
         first["application"] = "x"
         self.assertEqual(a.platform_common.process_audio_capture_placeholder_settings("darwin"), {"type": 1})
+
+
+class MacAppCaptureRefreshTests(unittest.TestCase):
+    # Confirmed live: OBS's sck_audio_capture only finds apps that were running when it last
+    # listed them -- re-pointing at a since-launched app recorded silence until its app list was
+    # re-read. Reading it, clearing the target, then re-pointing captured the app (-8.9 dB).
+    def setUp(self):
+        for target, value in (
+            ("process_audio_capture_kind", "sck_audio_capture"),
+            ("process_audio_capture_settings", {"type": 1, "application": "com.hnc.Discord"}),
+        ):
+            p = unittest.mock.patch.object(a.platform_common, target, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_refreshes_the_app_list_and_clears_before_pointing(self):
+        client = FakeObsClient(inputs={"Discord": {"kind": "sck_audio_capture", "tracks": {}, "settings": {}}})
+        a.set_game_audio_capture_target(client, "Discord", "Discord")
+        names = [c[0] for c in client.calls]
+        self.assertEqual(names, ["get_input_properties_list_property_items", "set_input_settings", "set_input_settings"])
+        self.assertEqual(client.calls[1][2], {"application": ""})
+        self.assertEqual(client.inputs["Discord"]["settings"], {"type": 1, "application": "com.hnc.Discord"})
+
+    def test_missing_input_is_still_created(self):
+        client = FakeObsClient()
+        a.set_game_audio_capture_target(client, "Discord", "Discord")
+        self.assertEqual(client.inputs["Discord"]["settings"], {"type": 1, "application": "com.hnc.Discord"})
+
+
+class PointNewlyRunningAppCapturesTests(unittest.TestCase):
+    CONFIG = {
+        "enabled": True,
+        "app_captures": [
+            {"input_name": "Discord", "process_name": "Discord"},
+            {"input_name": "Safari", "process_name": "Safari"},
+        ],
+    }
+
+    def run_check(self, previously_running, processes):
+        with unittest.mock.patch.object(a, "set_game_audio_capture_target") as mock_point, \
+                unittest.mock.patch.object(a, "apply_process_capture_sync_offset"):
+            running = a.point_newly_running_app_captures(
+                FakeObsClient(), self.CONFIG, previously_running, processes, -27,
+            )
+        return running, [c.args[1] for c in mock_point.call_args_list]
+
+    def test_points_an_app_that_started_mid_recording(self):
+        running, pointed = self.run_check({"Discord"}, [("Discord", "", 1), ("Safari", "", 2)])
+        self.assertEqual(pointed, ["Safari"])
+        self.assertEqual(running, {"Discord", "Safari"})
+
+    def test_nothing_new_means_no_writes(self):
+        running, pointed = self.run_check({"Discord"}, [("Discord", "", 1), ("Finder", "", 3)])
+        self.assertEqual(pointed, [])
+        self.assertEqual(running, {"Discord"})
+
+    def test_an_app_that_quit_and_relaunched_is_pointed_again(self):
+        running, _ = self.run_check({"Discord", "Safari"}, [("Discord", "", 1)])
+        self.assertEqual(running, {"Discord"})
+        _, pointed = self.run_check(running, [("Discord", "", 1), ("Safari", "", 4)])
+        self.assertEqual(pointed, ["Safari"])
+
+    def test_disabled_multi_track_does_nothing(self):
+        with unittest.mock.patch.object(a, "set_game_audio_capture_target") as mock_point:
+            running = a.point_newly_running_app_captures(
+                FakeObsClient(), dict(self.CONFIG, enabled=False), set(), [("Safari", "", 2)], -27,
+            )
+        self.assertEqual(running, set())
+        mock_point.assert_not_called()

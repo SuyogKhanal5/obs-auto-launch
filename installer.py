@@ -225,6 +225,17 @@ def try_configure_obs_websocket(password):
         return False, str(exc)
 
 
+def template_config_path():
+    """The example config new installs start from -- macOS has its own (OBS's Mac process name
+    and path, its screen-capture desktop audio on track 1, no Windows-only launchers or .exe
+    game names); falls back to the general one if it wasn't bundled."""
+    if sys.platform == "darwin":
+        mac = resource_path("config.example.mac.json")
+        if os.path.isfile(mac):
+            return mac
+    return resource_path("config.example.json")
+
+
 def build_config(template, obs_path, password, options):
     config = json.loads(json.dumps(template))
     watched_games = []
@@ -292,7 +303,7 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
     obs_ws_reason = None
     if write_config:
         on_progress("Writing your settings...")
-        with open(resource_path("config.example.json"), "r", encoding="utf-8") as f:
+        with open(template_config_path(), "r", encoding="utf-8") as f:
             template = json.load(f)
         password = secrets.token_urlsafe(12)
         config = build_config(template, obs_path, password, options)

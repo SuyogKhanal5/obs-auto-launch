@@ -498,3 +498,75 @@ class RunAudioSyncCalibrationSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CalibrationPlayerTests(unittest.TestCase):
+    def test_macos_wraps_ffplay_in_a_bundle_with_its_own_id(self):
+        import platform_macos as pmac
+        with tempfile.TemporaryDirectory() as tmp:
+            ffplay = os.path.join(tmp, "ffplay")
+            with open(ffplay, "wb") as f:
+                f.write(b"binary")
+            work = os.path.join(tmp, "work")
+            os.makedirs(work)
+            with patch.object(pmac.subprocess, "run"):
+                player = pmac.prepare_calibration_player(ffplay, work)
+            self.assertTrue(player.endswith(".app/Contents/MacOS/ffplay"))
+            self.assertTrue(os.path.isfile(player))
+            self.assertEqual(pmac.resolve_bundle_identifier(player), pmac.CALIBRATION_PLAYER_BUNDLE_ID)
+
+    def test_other_oses_use_ffplay_directly(self):
+        import platform_linux as pl
+        import platform_windows as pw
+        self.assertEqual(pw.prepare_calibration_player(r"C:\ff\ffplay.exe", "x"), r"C:\ff\ffplay.exe")
+        self.assertEqual(pl.prepare_calibration_player("/usr/bin/ffplay", "x"), "/usr/bin/ffplay")
+
+
+class RunAudioSyncCalibrationOrderTests(unittest.TestCase):
+    def make_client(self, reference="Desktop Audio", reference_kind="wasapi_output_capture"):
+        return FakeObsClient(inputs={
+            "Game Audio": {"kind": "sck_audio_capture", "tracks": {}},
+            reference: {"kind": reference_kind, "tracks": {"1": True}},
+        })
+
+    def run_calibration(self, client, kind, player_name="ffplay"):
+        events = []
+        real_set = client.set_input_settings
+
+        def recording_set(name, settings, overlay):
+            events.append(("point", dict(settings)))
+            return real_set(name, settings, overlay)
+
+        client.set_input_settings = recording_set
+        with tempfile.TemporaryDirectory() as tmp:
+            ffmpeg = os.path.join(tmp, "ffmpeg")
+            open(ffmpeg, "w").close()
+            open(os.path.join(tmp, player_name), "w").close()
+            with patch.object(a.platform_common, "process_audio_capture_kind", return_value=kind), \
+                    patch.object(a.platform_common, "find_ffplay_executable", return_value=os.path.join(tmp, player_name)), \
+                    patch.object(a.platform_common, "prepare_calibration_player", side_effect=lambda path, work: path), \
+                    patch.object(a.platform_common, "process_audio_capture_settings",
+                                 side_effect=lambda name, path: {"target": name}) as mock_settings, \
+                    patch.object(a, "subprocess") as fake_subprocess, patch.object(a, "time"), \
+                    patch.object(a, "generate_calibration_tone"):
+                fake_subprocess.Popen.side_effect = lambda *args, **kw: events.append(("player",)) or unittest.mock.MagicMock(poll=lambda: 0)
+                a.run_audio_sync_calibration(client, ffmpeg, "Game Audio")
+        return events, mock_settings
+
+    def test_macos_starts_the_player_before_pointing_at_it(self):
+        events, _ = self.run_calibration(self.make_client(), "sck_audio_capture")
+        first_point = next(i for i, e in enumerate(events) if e[0] == "point" and e[1] == {"target": "ffplay"})
+        self.assertLess(events.index(("player",)), first_point)
+
+    def test_windows_points_before_starting_and_uses_the_exe_name(self):
+        events, mock_settings = self.run_calibration(self.make_client(), "wasapi_process_output_capture", "ffplay.exe")
+        first_point = next(i for i, e in enumerate(events) if e[0] == "point" and e[1] == {"target": "ffplay.exe"})
+        self.assertLess(first_point, events.index(("player",)))
+        self.assertEqual(mock_settings.call_args[0][0], "ffplay.exe")
+
+    def test_falls_back_to_a_desktop_audio_kind_reference(self):
+        client = self.make_client(reference="macOS Screen Capture", reference_kind="screen_capture")
+        with self.assertLogs(level="WARNING") as logs:
+            self.run_calibration(client, "sck_audio_capture")
+        self.assertFalse(any("could not read current OBS state" in line for line in logs.output))
+        self.assertIn(("start_record",), client.calls)

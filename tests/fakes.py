@@ -151,6 +151,14 @@ class FakeObsClient:
             )
         return SimpleNamespace(input_settings=dict(self.inputs[name].get("settings", {})))
 
+    def get_input_properties_list_property_items(self, name, prop):
+        if name not in self.inputs:
+            raise OBSSDKRequestError(
+                "GetInputPropertiesListPropertyItems", RESOURCE_NOT_FOUND_CODE, f"No source was found by the name of `{name}`"
+            )
+        self.calls.append(("get_input_properties_list_property_items", name, prop))
+        return SimpleNamespace(property_items=[])
+
     def set_input_settings(self, name, settings, overlay):
         if name not in self.inputs:
             raise OBSSDKRequestError(

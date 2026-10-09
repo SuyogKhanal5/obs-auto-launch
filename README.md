@@ -93,11 +93,12 @@ In OBS: **Tools → WebSocket Server Settings**
 
 ### 2. Configure
 
-Get `config.example.json` — it's attached to each [Release](../../releases/latest) alongside the app, or you can grab it from this repo. Put it next to the app and rename your copy to `config.json`:
+Get `config.example.json` (or `config.example.mac.json` on a Mac — it has OBS's Mac path, no Windows-only launchers or `.exe` game names, and "macOS Screen Capture" as desktop audio) — both are attached to each [Release](../../releases/latest) alongside the app, or you can grab them from this repo. Put it next to the app and rename your copy to `config.json`:
 
 ```
 copy config.example.json config.json      # Windows
-cp config.example.json config.json        # Linux/macOS
+cp config.example.json config.json        # Linux
+cp config.example.mac.json config.json    # macOS
 ```
 
 Edit `config.json`:

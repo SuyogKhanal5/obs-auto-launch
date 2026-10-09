@@ -32,6 +32,35 @@ def ffmpeg_candidates():
     ]
 
 
+CALIBRATION_PLAYER_BUNDLE_ID = "com.obsautorecorder.calibrationtone"
+
+
+def prepare_calibration_player(ffplay_path, work_dir):
+    """Wraps ffplay in a throwaway .app bundle inside work_dir and returns the executable to run.
+    OBS's per-app capture targets apps only by bundle identifier, and a plain ffplay has none --
+    confirmed live, OBS lists it with an empty id and can't be pointed at it. Bundled, it's
+    listed as its own app and captured normally (confirmed: -16.6 dB on the target track).
+    Falls back to ffplay_path itself if the bundle can't be built."""
+    try:
+        app = os.path.join(work_dir, "OBS Auto Recorder Calibration.app")
+        macos_dir = os.path.join(app, "Contents", "MacOS")
+        os.makedirs(macos_dir, exist_ok=True)
+        player = os.path.join(macos_dir, "ffplay")
+        shutil.copy2(os.path.realpath(ffplay_path), player)
+        with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump({
+                "CFBundleIdentifier": CALIBRATION_PLAYER_BUNDLE_ID,
+                "CFBundleExecutable": "ffplay",
+                "CFBundleName": "OBS Auto Recorder Calibration",
+                "CFBundlePackageType": "APPL",
+            }, f)
+        subprocess.run(["codesign", "--force", "-s", "-", app], capture_output=True, timeout=30)
+        return player
+    except Exception as exc:
+        logging.warning("Could not prepare the calibration player: %s", exc)
+        return ffplay_path
+
+
 def is_this_app_frontmost():
     """True if this app's own process is the frontmost app."""
     try:

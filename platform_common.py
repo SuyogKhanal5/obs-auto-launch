@@ -49,6 +49,12 @@ def hide_console_subprocess_kwargs():
     return {}
 
 
+def prepare_calibration_player(ffplay_path, work_dir, platform_name=None):
+    """The ffplay executable to play the audio-sync calibration tone with -- wrapped in an app
+    bundle on macOS, where OBS can only capture apps that have a bundle identifier."""
+    return _select_backend(platform_name).prepare_calibration_player(ffplay_path, work_dir)
+
+
 def is_this_app_frontmost(platform_name=None):
     return _select_backend(platform_name).is_this_app_frontmost()
 

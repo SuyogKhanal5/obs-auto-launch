@@ -1119,6 +1119,10 @@ def ensure_game_audio_input_exists(client, game_audio_config):
         logging.warning("Could not create game audio input '%s' in OBS: %s", input_name, exc)
 
 
+# Per-app capture kinds whose list of capturable apps OBS caches; see set_game_audio_capture_target.
+PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND = {"sck_audio_capture": "application"}
+
+
 def set_game_audio_capture_target(client, input_name, process_name):
     """Points the game-audio-isolation input at the detected game's process, creating that
     Application Audio Capture input in OBS first if it doesn't exist yet -- so obs.game_audio_capture
@@ -1146,7 +1150,15 @@ def set_game_audio_capture_target(client, input_name, process_name):
             "app isn't in a normal bundle); '%s' won't capture anything this time.", process_name, input_name,
         )
         return
+    refresh_property = PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND.get(kind)
     try:
+        if refresh_property:
+            # OBS only finds apps that were running when the source last listed them (confirmed
+            # live: a source pointed at an app launched after that recorded silence, even after
+            # re-applying its settings). Reading the source's app list rebuilds it, and clearing
+            # the target first makes the write below a real change that restarts the capture.
+            client.get_input_properties_list_property_items(input_name, refresh_property)
+            client.set_input_settings(input_name, {refresh_property: ""}, True)
         client.set_input_settings(input_name, settings, True)
         logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
         return
@@ -1169,6 +1181,29 @@ def set_game_audio_capture_target(client, input_name, process_name):
         )
     except Exception as exc:
         logging.warning("Could not create '%s' audio capture input in OBS: %s", input_name, exc)
+
+
+def running_app_capture_processes(multi_track_config, processes):
+    """The multi_track_audio.app_captures process names that are running right now."""
+    if not multi_track_config.get("enabled"):
+        return set()
+    wanted = {ac.get("process_name") for ac in multi_track_config.get("app_captures", []) if ac.get("process_name")}
+    return {name for name, _exe, _pid in processes if name in wanted}
+
+
+def point_newly_running_app_captures(client, multi_track_config, previously_running, processes, offset_ms):
+    """Points each app capture whose app has started since previously_running at it, so an app
+    opened partway through a recording (e.g. Discord joined mid-game) is captured from then on
+    instead of only from the next recording. Returns the current running set to pass back next
+    time -- an app that quits and relaunches is picked up again."""
+    running = running_app_capture_processes(multi_track_config, processes)
+    for process_name in sorted(running - previously_running):
+        for app_capture in multi_track_config.get("app_captures", []):
+            if app_capture.get("process_name") == process_name and app_capture.get("input_name"):
+                logging.info("%s started during the recording; pointing '%s' at it.", process_name, app_capture["input_name"])
+                set_game_audio_capture_target(client, app_capture["input_name"], process_name)
+                apply_process_capture_sync_offset(client, app_capture["input_name"], offset_ms)
+    return running
 
 
 # Confirmed live via a controlled cross-correlation test: a real-world sound captured
@@ -1816,16 +1851,6 @@ def run_audio_sync_calibration(client, ffmpeg_path, target_input_name, reference
     if not ffplay_path:
         logging.warning("Audio sync calibration: ffplay not found next to ffmpeg; skipping.")
         return None
-    ffplay_capture_settings = platform_common.process_audio_capture_settings("ffplay", ffplay_path)
-    if ffplay_capture_settings is None:
-        logging.warning(
-            "Audio sync calibration: this OS's per-app audio capture can't be pointed at a "
-            "plain ffplay process (e.g. macOS needs a real .app bundle identifier, which a "
-            "bare command-line ffplay binary doesn't have); skipping. The configured/default "
-            "offset will keep being applied instead."
-        )
-        return None
-
     try:
         if client.get_record_status().output_active:
             logging.warning("Audio sync calibration: refusing to run while OBS is already recording.")
@@ -1840,33 +1865,70 @@ def run_audio_sync_calibration(client, ffmpeg_path, target_input_name, reference
         generate_calibration_tone(tone_path)
     except Exception as exc:
         logging.warning("Audio sync calibration: could not generate the test tone: %s", exc)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+    # macOS: a bundled copy, since OBS can only capture apps with a bundle id (see
+    # platform_macos.prepare_calibration_player). Its own file name is the process name a
+    # Windows exe-match needs ("ffplay.exe", not "ffplay").
+    player_path = platform_common.prepare_calibration_player(ffplay_path, tmp_dir)
+    kind = platform_common.process_audio_capture_kind()
+    ffplay_capture_settings = platform_common.process_audio_capture_settings(
+        os.path.basename(player_path), player_path,
+    )
+    if ffplay_capture_settings is None:
+        logging.warning(
+            "Audio sync calibration: this OS's per-app audio capture can't be pointed at the "
+            "test-tone player; skipping. The configured/default offset will keep being applied."
+        )
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
     try:
         orig_dir = client.get_record_directory().record_directory
+        input_kinds = {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
+        if reference_input_name not in input_kinds:
+            # e.g. macOS, where desktop audio usually comes from the screen capture source
+            # rather than an input named "Desktop Audio" (see DESKTOP_AUDIO_CAPTURE_KINDS).
+            reference_input_name = next(
+                (name for name, k in input_kinds.items() if k in DESKTOP_AUDIO_CAPTURE_KINDS), reference_input_name,
+            )
         orig_target_settings = client.get_input_settings(target_input_name).input_settings
         orig_target_offset = client.get_input_audio_sync_offset(target_input_name).input_audio_sync_offset
         orig_target_tracks = client.get_input_audio_tracks(target_input_name).input_audio_tracks
         ref_track = next((i for i in range(1, 7) if client.get_input_audio_tracks(reference_input_name).input_audio_tracks.get(str(i))), None)
     except Exception as exc:
         logging.warning("Audio sync calibration: could not read current OBS state: %s", exc)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
     if ref_track is None:
         logging.warning("Audio sync calibration: '%s' isn't routed to any track.", reference_input_name)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
+    # macOS's capture only sees apps already running when it's pointed (see
+    # PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND), so there the player starts first; the
+    # tone's first click is at 1s and there are 18, so the ~1s this costs only drops one or two.
+    refresh_property = PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND.get(kind)
     proc = None
     measured_ms = None
     try:
-        client.set_input_settings(target_input_name, ffplay_capture_settings, True)
+        if not refresh_property:
+            client.set_input_settings(target_input_name, ffplay_capture_settings, True)
         client.set_input_audio_sync_offset(target_input_name, 0)
         target_tracks = {str(i): (i == CALIBRATION_TARGET_TRACK) for i in range(1, 7)}
         client.set_input_audio_tracks(target_input_name, target_tracks)
         client.set_record_directory(tmp_dir)
         client.start_record()
         time.sleep(1.0)
-        proc = subprocess.Popen([ffplay_path, "-autoexit", "-loglevel", "quiet", tone_path])
-        time.sleep(1.5)  # let the window actually appear before ffplay starts playing
+        proc = subprocess.Popen([player_path, "-autoexit", "-loglevel", "quiet", tone_path])
+        if refresh_property:
+            time.sleep(0.8)
+            client.get_input_properties_list_property_items(target_input_name, refresh_property)
+            client.set_input_settings(target_input_name, {refresh_property: ""}, True)
+            client.set_input_settings(target_input_name, ffplay_capture_settings, True)
+        else:
+            time.sleep(1.5)  # let the window actually appear before ffplay starts playing
         proc.wait(timeout=CALIBRATION_TONE_DURATION_SECONDS + 10)
         time.sleep(1.0)
     except Exception as exc:
@@ -4145,6 +4207,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     audio_overlay_launch_state = {"last_attempt": 0}
     frozen_capture_state = {"last_hash": None, "unchanged_since": None, "last_check": 0.0}
     obs_close_pending_since = None  # set when a session ends; see close_obs_between_sessions
+    app_captures_running = set()  # see point_newly_running_app_captures
 
     # A recording this app started can be left running with nothing tracking it if the
     # previous instance was force-killed, crashed, or otherwise never reached the normal
@@ -4191,7 +4254,11 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
 
         if active_name is None:
             if obs_close_pending_since is not None:
-                if not obs_client or time.time() - obs_close_pending_since > OBS_IDLE_CLOSE_WINDOW_SECONDS:
+                if (
+                    not obs_client
+                    or obs_config.get("keep_running_between_sessions", False)
+                    or time.time() - obs_close_pending_since > OBS_IDLE_CLOSE_WINDOW_SECONDS
+                ):
                     obs_close_pending_since = None
                 elif close_obs_between_sessions(obs_client, audio_state.get("enabled"), obs_config["process_name"]):
                     obs_close_pending_since = None
@@ -4321,6 +4388,10 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                     # last frame read as frozen since then (confirmed live: fired 2s into a
                     # recording, claiming no change for over 180s).
                     frozen_capture_state.update(last_hash=None, unchanged_since=None, last_check=0.0)
+                    # sync_multi_track_audio (in ensure_obs_ready) just pointed everything running now.
+                    app_captures_running = running_app_capture_processes(
+                        obs_config.get("multi_track_audio", {}), processes,
+                    )
                     active_display_name = display_name
                     active_replay_buffer_only = replay_buffer_only
                     active_window_entry = window_entry
@@ -4399,6 +4470,11 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                 # right here OBS still reports the recording as active (confirmed live).
                 obs_close_pending_since = time.time()
             elif obs_client:
+                if not active_replay_buffer_only:
+                    app_captures_running = point_newly_running_app_captures(
+                        obs_client, obs_config.get("multi_track_audio", {}), app_captures_running, processes,
+                        obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
+                    )
                 now = time.time()
                 if now - frozen_capture_state["last_check"] >= FROZEN_CAPTURE_CHECK_INTERVAL_SECONDS:
                     frozen_capture_state["last_check"] = now
@@ -6009,6 +6085,21 @@ def _run_config_editor(master_root, restart_callback, on_close):
     )
     add_labeled_entry(obs_tab, row, "Restart cooldown (seconds)", recovery_cooldown_var)
     row += 1
+    keep_obs_running_var = tk.BooleanVar(value=obs_config.get("keep_running_between_sessions", False))
+    if sys.platform == "darwin":
+        add_checkbox(obs_tab, row, "Keep OBS open between games", keep_obs_running_var)
+        row += 1
+        tk.Label(
+            obs_tab,
+            text=(
+                "    Off (default): OBS closes when a game ends, so macOS's purple screen-sharing "
+                "button goes away -- but the first ~15 seconds of each game aren't recorded while "
+                "OBS starts. On: recording starts almost immediately, and the purple button stays "
+                "in the menu bar whenever OBS is open."
+            ),
+            anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+        row += 1
 
     game_audio_config = obs_config.get("game_audio_capture", {})
     add_section_label(obs_tab, row, "Game Audio Isolation")
@@ -6894,6 +6985,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             recovery.get("cooldown_seconds", DEFAULT_OBS_RECOVERY_COOLDOWN_SECONDS),
         )
 
+        obs["keep_running_between_sessions"] = keep_obs_running_var.get()
         game_audio = obs.setdefault("game_audio_capture", {})
         game_audio["enabled"] = game_audio_enabled_var.get()
         game_audio["input_name"] = game_audio_input_var.get().strip() or "Game Audio"
@@ -8392,6 +8484,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         # after that fix had supposedly shipped. Excluding it explicitly (not just omitting it
         # from the tuple) is what actually works.
         widget = root.focus_get()
+        # macOS's key hook can only tell that this app is in front, not which of its windows
+        # (see platform_macos.run_clip_editor_space_bar_listener) -- so space also toggled
+        # playback while typing in Settings. Tk does know which of its windows has focus.
+        if widget is not None and widget.winfo_toplevel() is not root:
+            logging.info("Clip editor: space bar ignored -- another window of this app has focus.")
+            return
         if isinstance(widget, (tk.Entry, ttk.Entry)) and not isinstance(widget, ttk.Combobox):
             logging.info("Clip editor: space bar ignored -- %r currently has focus.", widget)
             return

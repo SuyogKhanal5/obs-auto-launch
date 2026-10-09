@@ -149,7 +149,7 @@ jobs:
 
       - name: Build installer binary (macOS)
         if: runner.os == 'macOS'
-        run: pyinstaller --onefile --name "OBSAutoRecorderInstaller-macos-${MACOS_ARCH}" --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder-app.zip:." --add-data "${{ github.workspace }}/config.example.json:." installer.py
+        run: pyinstaller --onefile --name "OBSAutoRecorderInstaller-macos-${MACOS_ARCH}" --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder-app.zip:." --add-data "${{ github.workspace }}/config.example.json:." --add-data "${{ github.workspace }}/config.example.mac.json:." installer.py
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -165,6 +165,7 @@ jobs:
             dist/OBSAutoRecorder-macos-*.dmg
             dist/OBSAutoRecorderInstaller-macos-*
             config.example.json
+            config.example.mac.json
 
   release:
     needs: build
@@ -194,9 +195,9 @@ jobs:
         # be overwritten (or removed) before the next tag, not accumulated release-over-release.
         run: |
           if [ -f RELEASE_NOTES.md ]; then
-            gh release create "${{ github.ref_name }}" release-assets/* config.example.json --title "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
+            gh release create "${{ github.ref_name }}" release-assets/* config.example.json config.example.mac.json --title "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
           else
-            gh release create "${{ github.ref_name }}" release-assets/* config.example.json --title "${{ github.ref_name }}" --generate-notes
+            gh release create "${{ github.ref_name }}" release-assets/* config.example.json config.example.mac.json --title "${{ github.ref_name }}" --generate-notes
           fi
 
       - name: Publish rolling "latest" build (main branch)
@@ -207,7 +208,7 @@ jobs:
           git tag -f latest
           git push origin latest --force
           gh release delete latest --yes || true
-          gh release create latest release-assets/* config.example.json \
+          gh release create latest release-assets/* config.example.json config.example.mac.json \
             --title "Latest build (main)" \
             --notes "Automatically built from the latest commit on main (${{ github.sha }}). May be less stable than a tagged release." \
             --prerelease
