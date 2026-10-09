@@ -511,7 +511,7 @@ class CalibrationPlayerTests(unittest.TestCase):
             os.makedirs(work)
             with patch.object(pmac.subprocess, "run"):
                 player = pmac.prepare_calibration_player(ffplay, work)
-            self.assertTrue(player.endswith(".app/Contents/MacOS/ffplay"))
+            self.assertTrue(player.endswith(os.path.join(".app", "Contents", "MacOS", "ffplay")))
             self.assertTrue(os.path.isfile(player))
             self.assertEqual(pmac.resolve_bundle_identifier(player), pmac.CALIBRATION_PLAYER_BUNDLE_ID)
 
