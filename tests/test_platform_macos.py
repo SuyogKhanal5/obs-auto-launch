@@ -916,3 +916,13 @@ class OpenScreenRecordingSettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpenAccessibilitySettingsTests(unittest.TestCase):
+    def test_opens_the_accessibility_privacy_pane(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            pmac.open_accessibility_settings()
+        self.assertEqual(
+            mock_run.call_args[0][0],
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+        )

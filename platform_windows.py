@@ -691,6 +691,11 @@ def open_path(path):
     os.startfile(path)
 
 
+def open_accessibility_settings():
+    """No-op -- only macOS gates global key listening behind a per-app permission."""
+    pass
+
+
 def open_screen_recording_settings():
     """No-op -- Windows has no equivalent OS-level screen-recording consent system an app needs
     to be granted into; only accepted for signature parity with the macOS backend, which does

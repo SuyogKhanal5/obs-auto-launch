@@ -2941,13 +2941,28 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
     platform_common.run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_event)
 
 
-def notify(icon, notifications_config, title, message):
+# Confirmed live on macOS: notification banners are hidden while a fullscreen game is in front
+# AND while its Space is closing -- a banner sent ~0.3s after the game quit never appeared, one
+# sent 5s later did. Notifications fired the moment a game exits are delayed by this much there.
+MACOS_POST_GAME_NOTIFICATION_DELAY_SECONDS = 4
+
+
+def notify(icon, notifications_config, title, message, after_game_exit=False):
     if not (notifications_config or {}).get("enabled"):
         return
-    try:
-        icon.notify(message, title)
-    except Exception as exc:
-        logging.debug("Notification failed: %s", exc)
+
+    def show():
+        try:
+            icon.notify(message, title)
+        except Exception as exc:
+            logging.warning("Could not show the '%s' notification: %s", title, exc)
+
+    if after_game_exit and sys.platform == "darwin":
+        timer = threading.Timer(MACOS_POST_GAME_NOTIFICATION_DELAY_SECONDS, show)
+        timer.daemon = True
+        timer.start()
+    else:
+        show()
 
 
 def delete_recording_files(paths):
@@ -4000,6 +4015,7 @@ def stop_recording(client, icon, game_display_name=None, recording_state=None, c
             notify(
                 icon, notifications_config, "Short clip deleted",
                 f"Recording of {game_display_name or 'game'} was under {minimum_seconds}s; deleted.",
+                after_game_exit=True,
             )
             return False
 
@@ -4459,7 +4475,10 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                             stop_replay_buffer(obs_client)
                         kept = stop_recording(obs_client, icon, active_display_name, recording_state, config)
                         if kept:
-                            notify(icon, notifications_config, "Recording stopped", active_display_name or active_name)
+                            notify(
+                                icon, notifications_config, "Recording stopped", active_display_name or active_name,
+                                after_game_exit=True,
+                            )
                 active_name, active_pid, active_display_name = None, None, None
                 active_replay_buffer_only = False
                 active_window_entry = None

@@ -901,6 +901,20 @@ def open_path(path):
     subprocess.run(["open", path])
 
 
+def open_accessibility_settings():
+    """Deep-links to System Settings' Accessibility pane, where this app has to be allowed for its
+    custom keybinds and the clip editor's space bar to see key presses (see
+    accessibility_permission_granted). Like Screen Recording, it's granted per app by the user;
+    the installed app also asks on first use."""
+    try:
+        subprocess.run(
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+            check=False,
+        )
+    except Exception as exc:
+        logging.warning("Could not open Accessibility settings: %s", exc)
+
+
 def open_screen_recording_settings():
     """Deep-links straight to System Settings' own Screen & System Audio Recording pane --
     confirmed live (real macOS 15.8.1) that this exact URL opens that specific pane, not just the

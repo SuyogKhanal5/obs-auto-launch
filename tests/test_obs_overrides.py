@@ -588,3 +588,38 @@ class ApplyProcessCaptureSyncOffsetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NotifyTests(unittest.TestCase):
+    def test_disabled_notifications_do_nothing(self):
+        icon = unittest.mock.Mock()
+        a.notify(icon, {"enabled": False}, "t", "m")
+        icon.notify.assert_not_called()
+
+    def test_shown_immediately_by_default(self):
+        icon = unittest.mock.Mock()
+        a.notify(icon, {"enabled": True}, "Recording started", "Balatro")
+        icon.notify.assert_called_once_with("Balatro", "Recording started")
+
+    def test_post_game_notification_is_delayed_on_macos(self):
+        # Confirmed live: macOS hides banners while a fullscreen game's Space is closing.
+        icon = unittest.mock.Mock()
+        with unittest.mock.patch.object(a.sys, "platform", "darwin"), \
+                unittest.mock.patch.object(a.threading, "Timer") as mock_timer:
+            a.notify(icon, {"enabled": True}, "Recording stopped", "Balatro", after_game_exit=True)
+        icon.notify.assert_not_called()
+        self.assertEqual(mock_timer.call_args[0][0], a.MACOS_POST_GAME_NOTIFICATION_DELAY_SECONDS)
+        mock_timer.call_args[0][1]()
+        icon.notify.assert_called_once_with("Balatro", "Recording stopped")
+
+    def test_post_game_notification_is_immediate_elsewhere(self):
+        icon = unittest.mock.Mock()
+        with unittest.mock.patch.object(a.sys, "platform", "win32"):
+            a.notify(icon, {"enabled": True}, "Recording stopped", "Balatro", after_game_exit=True)
+        icon.notify.assert_called_once()
+
+    def test_failures_are_logged_as_warnings(self):
+        icon = unittest.mock.Mock()
+        icon.notify.side_effect = RuntimeError("boom")
+        with self.assertLogs(level="WARNING"):
+            a.notify(icon, {"enabled": True}, "t", "m")

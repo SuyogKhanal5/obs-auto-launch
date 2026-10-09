@@ -630,6 +630,19 @@ def main():
             screen_recording_row, text="Open Screen Recording Settings",
             command=platform_common.open_screen_recording_settings,
         ).pack(anchor="w")
+        tk.Label(
+            screen_recording_row,
+            text=(
+                "OBS Auto Recorder itself needs Accessibility permission for custom keybinds "
+                "(e.g. Add Marker) and the clip editor's space bar. It asks the first time a "
+                "keybind is used, or you can allow \"OBS Auto Recorder\" now."
+            ),
+            bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
+        ).pack(fill="x", pady=(12, 6))
+        tk.Button(
+            screen_recording_row, text="Open Accessibility Settings",
+            command=platform_common.open_accessibility_settings,
+        ).pack(anchor="w")
 
     # ---------- Quick options ----------
     options_page = page_frame()

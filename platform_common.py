@@ -437,6 +437,11 @@ def open_path(path, platform_name=None):
     return _select_backend(platform_name).open_path(path)
 
 
+def open_accessibility_settings(platform_name=None):
+    """Opens macOS's Accessibility privacy pane (needed for custom keybinds); no-op elsewhere."""
+    return _select_backend(platform_name).open_accessibility_settings()
+
+
 def open_screen_recording_settings(platform_name=None):
     """Opens the OS's own Screen Recording privacy settings, macOS only -- see
     platform_macos.open_screen_recording_settings's own docstring for why this exists (OBS, not
