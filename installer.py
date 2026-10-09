@@ -284,10 +284,12 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
     on_progress("Copying application files...")
     if sys.platform == "darwin":
         # The .app bundle is embedded as a zip, not a plain data directory -- see
-        # APP_BUNDLE_ZIP_NAME's own docstring for why. Extracting overwrites an existing install
-        # in place, same as copytree's dirs_exist_ok=True does for the other two OSes below.
-        with zipfile.ZipFile(resource_path(APP_BUNDLE_ZIP_NAME)) as zf:
-            zf.extractall(install_dir)
+        # APP_BUNDLE_ZIP_NAME's own docstring for why. Extracted with macOS's own ditto, not
+        # zipfile: confirmed with a real build, zipfile.extractall dropped the executable's +x
+        # bit and all 65 of the bundle's symlinks (breaking its code signature), so the installed
+        # app refused to launch at all. ditto preserves permissions, symlinks and signatures, and
+        # overwrites an existing install in place.
+        subprocess.run(["ditto", "-x", "-k", resource_path(APP_BUNDLE_ZIP_NAME), install_dir], check=True)
     else:
         # The app ships as a PyInstaller onedir build (an exe plus an _internal/ folder of
         # support files) rather than onefile -- deliberately, since onefile re-extracts itself to

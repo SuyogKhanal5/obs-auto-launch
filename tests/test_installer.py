@@ -234,3 +234,29 @@ class MacTemplateConfigTests(unittest.TestCase):
         with patch.object(installer.sys, "platform", "darwin"), \
                 patch.object(installer, "resource_path", side_effect=lambda name: os.path.join("/nonexistent", name)):
             self.assertTrue(installer.template_config_path().endswith("config.example.json"))
+
+
+@unittest.skipUnless(sys.platform == "darwin", "exercises macOS's own ditto")
+class MacInstallExtractionTests(unittest.TestCase):
+    # Confirmed with a real build: zipfile.extractall dropped the app executable's +x bit and all
+    # of the bundle's symlinks, so the installed app couldn't launch ("Launchd job spawn failed").
+    def test_installed_app_keeps_executable_bit_and_symlinks(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            app = os.path.join(tmp, "src", installer.APP_BUNDLE_NAME, "Contents", "MacOS")
+            os.makedirs(app)
+            exe = os.path.join(app, installer.EXE_NAME)
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(exe, 0o755)
+            os.symlink(installer.EXE_NAME, os.path.join(app, "link"))
+            zip_path = os.path.join(tmp, "app.zip")
+            subprocess.run(["zip", "-qry", zip_path, installer.APP_BUNDLE_NAME], cwd=os.path.join(tmp, "src"), check=True)
+            target = os.path.join(tmp, "install")
+            with patch.object(installer, "resource_path", return_value=zip_path), \
+                    patch.object(installer, "ensure_ffmpeg", return_value="ok"):
+                installer.do_install(target, None, {}, lambda message: None, write_config=False)
+            installed = os.path.join(target, installer.app_relative_path())
+            self.assertTrue(os.access(installed, os.X_OK))
+            self.assertTrue(os.path.islink(os.path.join(os.path.dirname(installed), "link")))
