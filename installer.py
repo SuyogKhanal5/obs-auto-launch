@@ -144,26 +144,26 @@ def find_obs_exe():
 _OBS_PROCESS_NAMES = {"obs64.exe", "obs32.exe", "obs"}  # Windows / Windows / Linux+macOS
 
 
-def is_obs_running():
-    for proc in psutil.process_iter(["name"]):
+def running_process_names():
+    """Lowercased names of every running process. Reads each name inside its own try rather than
+    via process_iter(["name"]): that resolves names while advancing the iterator, outside any
+    try, and on macOS a sandboxed helper process can make it raise SystemError (confirmed live in
+    the app itself -- see autostart_script.get_running_processes)."""
+    names = set()
+    for proc in psutil.process_iter():
         try:
-            name = (proc.info.get("name") or "").lower()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            names.add((proc.name() or "").lower())
+        except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError, PermissionError):
             continue
-        if name in _OBS_PROCESS_NAMES:
-            return True
-    return False
+    return names
+
+
+def is_obs_running():
+    return bool(running_process_names() & _OBS_PROCESS_NAMES)
 
 
 def is_app_running():
-    for proc in psutil.process_iter(["name"]):
-        try:
-            name = (proc.info.get("name") or "").lower()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        if name == EXE_NAME.lower():
-            return True
-    return False
+    return EXE_NAME.lower() in running_process_names()
 
 
 def close_obs_for_setup():
@@ -391,13 +391,54 @@ def do_uninstall(install_dir, keep_config, on_progress):
     on_progress("Done.")
 
 
+# Where the app's icon lives, and what OBS's executable is called, in this OS's own terms.
+TRAY_NAME = "menu bar" if sys.platform == "darwin" else "system tray"
+OBS_EXECUTABLE_EXAMPLE = {"win32": "obs64.exe", "darwin": "OBS.app"}.get(sys.platform, "obs")
+
 PAGE_BG = "#f4f4f4"
+PAGE_FG = "#111827"
+ENTRY_BG = "#ffffff"
 HEADER_BG = "#1f2937"
 HEADER_FG = "#ffffff"
 
 
+def apply_light_theme_defaults(root):
+    """The pages are drawn light (PAGE_BG) regardless of the OS theme, but any widget without an
+    explicit text color takes the OS's -- confirmed live on macOS in Dark Mode: white text on the
+    light pages, so the whole installer looked blank. Default every text-bearing widget to dark
+    text (and entries to white fields) to match; colors set explicitly on a widget still win."""
+    for widget_class in ("Label", "Checkbutton", "Radiobutton", "Message"):
+        root.option_add(f"*{widget_class}.foreground", PAGE_FG)
+        root.option_add(f"*{widget_class}.activeForeground", PAGE_FG)
+    for widget_class in ("Entry", "Listbox", "Text"):
+        root.option_add(f"*{widget_class}.foreground", PAGE_FG)
+        root.option_add(f"*{widget_class}.background", ENTRY_BG)
+        root.option_add(f"*{widget_class}.insertBackground", PAGE_FG)
+    root.option_add("*Entry.readonlyBackground", ENTRY_BG)
+    root.option_add("*Entry.disabledForeground", "#6b7280")
+
+
+def use_light_appearance_on_macos():
+    """Draws the installer's native parts (window background, button bar, checkboxes, buttons)
+    light too, matching its light pages -- in Dark Mode they rendered dark, leaving the bottom
+    buttons blank and unchecked checkboxes nearly invisible (confirmed live). Must run after
+    tk.Tk(): touching NSApplication before Tk registers with it crashes on startup (see
+    CROSS_PLATFORM_PLAN.md §5.12)."""
+    if sys.platform != "darwin":
+        return
+    try:
+        import AppKit
+        AppKit.NSApplication.sharedApplication().setAppearance_(
+            AppKit.NSAppearance.appearanceNamed_(AppKit.NSAppearanceNameAqua)
+        )
+    except Exception:
+        pass
+
+
 def main():
     root = tk.Tk()
+    use_light_appearance_on_macos()
+    apply_light_theme_defaults(root)
     root.title(f"{APP_NAME} Setup")
     root.geometry("580x600")
     root.resizable(False, False)
@@ -456,8 +497,8 @@ def main():
     )
     for line in [
         "\u2713  Detects games automatically (Steam, Epic, GOG, Xbox) — nothing to set up",
-        "\u2713  Runs quietly in the system tray, out of your way",
-        "\u2713  Can start automatically when your PC turns on",
+        f"\u2713  Runs quietly in the {TRAY_NAME}, out of your way",
+        f"\u2713  Can start automatically when you log in",
     ]:
         tk.Label(welcome, text=line, bg=PAGE_BG, font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=2)
 
@@ -520,7 +561,7 @@ def main():
             obs_status.config(
                 text=(
                     "Couldn't find OBS automatically. If it's already installed, click Browse "
-                    "to find obs64.exe. Don't have OBS yet? That's fine — install it now with the "
+                    f"to find {OBS_EXECUTABLE_EXAMPLE}. Don't have OBS yet? That's fine — install it now with the "
                     "link below, or later from obsproject.com, then point to it from this app's Settings."
                 ),
                 fg="#b45309",
@@ -528,7 +569,7 @@ def main():
             download_link.pack(side="left", padx=(16, 0))
 
     def browse_obs():
-        example = platform_common.example_executable_name("obs64")
+        example = OBS_EXECUTABLE_EXAMPLE
         chosen = filedialog.askopenfilename(
             title=f"Locate {example}", filetypes=platform_common.executable_filetypes()
         )
@@ -575,7 +616,7 @@ def main():
     obs_buttons_row = tk.Frame(obs_page, bg=PAGE_BG)
     obs_buttons_row.pack(anchor="w", pady=(0, 8))
     tk.Button(
-        obs_buttons_row, text=f"Browse for {platform_common.example_executable_name('obs64')}...", command=browse_obs,
+        obs_buttons_row, text=f"Browse for {OBS_EXECUTABLE_EXAMPLE}...", command=browse_obs,
     ).pack(side="left")
     linux_install_command = platform_common.build_linux_install_command("obs") if sys.platform not in ("win32", "darwin") else None
     if sys.platform in ("win32", "darwin"):
@@ -871,7 +912,15 @@ def main():
     next_btn = tk.Button(nav, text="Next >")
     cancel_btn = tk.Button(nav, text="Cancel", command=root.destroy)
 
+    nav_state = {"shown": None}
+
     def show_nav(back=True, next_=True, cancel=True):
+        # Only re-pack when which buttons are visible actually changes: on macOS, native buttons
+        # that were unpacked and packed again stayed invisible (confirmed live -- every page
+        # after the first showed an empty button bar).
+        if nav_state["shown"] == (back, next_, cancel):
+            return
+        nav_state["shown"] = (back, next_, cancel)
         for widget in (back_btn, next_btn, cancel_btn):
             widget.pack_forget()
         if cancel:
@@ -928,7 +977,7 @@ def main():
                     f"OBS location: {obs_var.get() or 'not set yet'}\n"
                     f"Games to watch: {games_note}\n"
                     f"Desktop shortcut: {'Yes' if desktop_var.get() else 'No'}\n"
-                    f"Start with Windows: {'Yes' if startup_var.get() else 'No'}"
+                    f"Start automatically at login: {'Yes' if startup_var.get() else 'No'}"
                 )
             )
             # Checked here (before install starts) rather than only reported after the fact on
@@ -1079,7 +1128,7 @@ def main():
     def on_update_clicked():
         if is_app_running():
             existing_error.config(
-                text=f"Please quit {APP_NAME} from the system tray first, then try again."
+                text=f"Please quit {APP_NAME} from the {TRAY_NAME} first, then try again."
             )
             return
         update_btn.config(state="disabled")
@@ -1110,7 +1159,7 @@ def main():
     def on_uninstall_clicked():
         if is_app_running():
             existing_error.config(
-                text=f"Please quit {APP_NAME} from the system tray first, then try again."
+                text=f"Please quit {APP_NAME} from the {TRAY_NAME} first, then try again."
             )
             return
         update_btn.config(state="disabled")

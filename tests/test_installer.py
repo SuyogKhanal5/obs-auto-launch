@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -107,8 +108,16 @@ class BuildConfigTests(unittest.TestCase):
 class IsObsRunningTests(unittest.TestCase):
     def make_fake_proc(self, name):
         proc = unittest.mock.Mock()
-        proc.info = {"name": name}
+        proc.name.return_value = name
         return proc
+
+    def test_a_process_whose_name_raises_systemerror_is_skipped(self):
+        # Confirmed live in the app on macOS: a sandboxed helper process can make psutil raise
+        # SystemError reading its name; that must not crash the installer's check.
+        broken = unittest.mock.Mock()
+        broken.name.side_effect = SystemError("proc_cmdline returned a result with an exception set")
+        with patch.object(installer.psutil, "process_iter", return_value=[broken, self.make_fake_proc("OBS")]):
+            self.assertTrue(installer.is_obs_running())
 
     def test_true_for_windows_process_names(self):
         for name in ("obs64.exe", "OBS32.EXE"):
