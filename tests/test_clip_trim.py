@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -948,6 +949,14 @@ class ListRecentRecordingsTests(unittest.TestCase):
 
 
 class ResolveRecentRecordingsFolderTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._cache_dir.cleanup)
+        patcher = unittest.mock.patch.object(a, "OBS_STATE_CACHE_PATH", os.path.join(self._cache_dir.name, "cache.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     # Found as a real bug: obs.output_folder only exists as an override, and most users (this
     # app's own real user included) never set it -- without this fallback to OBS's own live
     # record_directory, list_recent_recordings(None) always returns [], and the clip editor's
@@ -1113,3 +1122,42 @@ class TrimClipProgressCallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ObsStateCacheFallbackTests(unittest.TestCase):
+    # Confirmed live: with OBS closed between games on macOS, the clip editor's recordings
+    # dropdown disappeared -- it could only learn the folder from a running OBS.
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = patch.object(a, "OBS_STATE_CACHE_PATH", os.path.join(self._tmp.name, "cache.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_folder_comes_from_the_cache_while_obs_is_closed(self):
+        client = FakeObsClient()
+        client.set_record_directory("/Users/someone/Movies")
+        with patch.object(a, "connect_obs", return_value=client):
+            a.resolve_recent_recordings_folder({"websocket": {}})
+        with patch.object(a, "connect_obs", return_value=None):
+            self.assertEqual(a.resolve_recent_recordings_folder({"websocket": {}}), "/Users/someone/Movies")
+
+    def test_input_kinds_come_from_the_cache_while_obs_is_closed(self):
+        client = FakeObsClient(inputs={"macOS Screen Capture": {"kind": "screen_capture", "tracks": {}}})
+        with patch.object(a, "connect_obs", return_value=client):
+            a.resolve_input_kinds({"websocket": {}})
+        with patch.object(a, "connect_obs", return_value=None):
+            self.assertEqual(a.resolve_input_kinds({"websocket": {}}), {"macOS Screen Capture": "screen_capture"})
+
+    def test_remember_obs_state_records_both(self):
+        client = FakeObsClient(inputs={"Mic/Aux": {"kind": "coreaudio_input_capture", "tracks": {}}})
+        client.set_record_directory("/rec")
+        a.remember_obs_state(client)
+        cache = a.read_obs_state_cache()
+        self.assertEqual(cache["recording_folder"], "/rec")
+        self.assertEqual(cache["input_kinds"], {"Mic/Aux": "coreaudio_input_capture"})
+
+    def test_empty_values_never_overwrite_what_was_known(self):
+        a.update_obs_state_cache(recording_folder="/rec")
+        a.update_obs_state_cache(recording_folder=None, input_kinds={})
+        self.assertEqual(a.read_obs_state_cache().get("recording_folder"), "/rec")

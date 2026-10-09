@@ -102,3 +102,45 @@ class CloseObsBetweenSessionsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConnectObsForTaskTests(unittest.TestCase):
+    # Confirmed live: with OBS closed between games, "Calibrate Audio Sync" just failed to connect.
+    def test_uses_a_running_obs_as_is(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a, "connect_obs", return_value=client), \
+                unittest.mock.patch.object(a, "launch_obs") as mock_launch:
+            self.assertEqual(a.connect_obs_for_task({}, {}), (client, False))
+        mock_launch.assert_not_called()
+
+    def test_starts_obs_when_it_is_not_running(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a, "connect_obs", side_effect=[None, client]), \
+                unittest.mock.patch.object(a, "get_running_processes", return_value=[]), \
+                unittest.mock.patch.object(a, "obs_process_name", return_value="OBS"), \
+                unittest.mock.patch.object(a, "launch_obs", return_value=True) as mock_launch:
+            self.assertEqual(a.connect_obs_for_task({}, {}), (client, True))
+        mock_launch.assert_called_once()
+
+    def test_never_launches_a_second_obs(self):
+        with unittest.mock.patch.object(a, "connect_obs", return_value=None), \
+                unittest.mock.patch.object(a, "get_running_processes", return_value=[("OBS", "", 1)]), \
+                unittest.mock.patch.object(a, "obs_process_name", return_value="OBS"), \
+                unittest.mock.patch.object(a, "launch_obs") as mock_launch:
+            self.assertEqual(a.connect_obs_for_task({}, {}), (None, False))
+        mock_launch.assert_not_called()
+
+    def test_closes_obs_again_only_if_this_task_started_it(self):
+        with unittest.mock.patch.object(a, "close_obs_between_sessions", return_value=True) as mock_close, \
+                unittest.mock.patch.object(a, "obs_process_name", return_value="OBS"):
+            a.release_obs_after_task(FakeObsClient(), {}, started_here=False)
+            mock_close.assert_not_called()
+            a.release_obs_after_task(FakeObsClient(), {}, started_here=True)
+            mock_close.assert_called_once()
+
+    def test_keeps_obs_open_when_set_to(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a, "close_obs_between_sessions") as mock_close:
+            a.release_obs_after_task(client, {"keep_running_between_sessions": True}, started_here=True)
+        mock_close.assert_not_called()
+        self.assertIn(("disconnect",), client.calls)

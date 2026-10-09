@@ -714,6 +714,42 @@ def close_obs_between_sessions(client, overlay_enabled, process_name=None):
     return True
 
 
+def obs_process_name(obs_config):
+    """OBS's process name on this OS, self-healing a stale configured one (e.g. "obs64.exe" in a
+    config carried over from Windows) the same way the watcher does."""
+    found = platform_common.find_obs_executable(configured_path=obs_config.get("path"))
+    return os.path.basename(found) if found else obs_config.get("process_name", "")
+
+
+def connect_obs_for_task(obs_config, ws_config):
+    """Connects to OBS for a one-off task (audio sync calibration), starting OBS first if it isn't
+    running -- on macOS it's closed between games (see close_obs_between_sessions), which made
+    "Calibrate Audio Sync" fail with "could not connect" (confirmed live). Never launches a second
+    OBS when one is running but unreachable. Returns (client, started_here)."""
+    client = connect_obs(ws_config, retries=1, delay=0)
+    if client:
+        return client, False
+    if is_obs_running(obs_process_name(obs_config), get_running_processes()):
+        return None, False
+    logging.info("OBS isn't running; starting it for this task.")
+    if not launch_obs(obs_config):
+        return None, False
+    client = connect_obs(ws_config, retries=5, delay=2)
+    return client, client is not None
+
+
+def release_obs_after_task(client, obs_config, started_here):
+    """Disconnects after connect_obs_for_task, closing OBS again if this task started it and
+    OBS isn't meant to stay open between games."""
+    if started_here and not obs_config.get("keep_running_between_sessions", False):
+        if close_obs_between_sessions(client, False, obs_process_name(obs_config)):
+            return
+    try:
+        client.disconnect()
+    except Exception:
+        pass
+
+
 def connect_obs(ws_config, retries=5, delay=2):
     for attempt in range(1, retries + 1):
         try:
@@ -1060,6 +1096,7 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
     )
     apply_output_folder(client, obs_config.get("output_folder"))
     apply_screen_fit(client, obs_config)
+    remember_obs_state(client)
     apply_recording_resolution(client, obs_config)
     apply_recording_format(client, obs_config.get("recording_format"))
     event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
@@ -6181,7 +6218,8 @@ def _run_config_editor(master_root, restart_callback, on_close):
     row += 1
 
     def run_calibration_worker(ws_config, target_input):
-        client = connect_obs(ws_config, retries=1, delay=0)
+        task_obs_config = load_config().get("obs", {})
+        client, started_obs = connect_obs_for_task(task_obs_config, ws_config)
 
         def finish(result_ms, error_message):
             calibrate_button.config(state="normal", text="Calibrate Audio Sync...")
@@ -6212,13 +6250,13 @@ def _run_config_editor(master_root, restart_callback, on_close):
             return
         ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
         if not ffmpeg_path:
-            client.disconnect()
+            release_obs_after_task(client, task_obs_config, started_obs)
             obs_tab.after(0, finish, None, "ffmpeg isn't installed -- install it from Settings > Post-Processing first.")
             return
         try:
             result_ms = run_audio_sync_calibration(client, ffmpeg_path, target_input)
         finally:
-            client.disconnect()
+            release_obs_after_task(client, task_obs_config, started_obs)
         obs_tab.after(0, finish, result_ms, None)
 
     def start_calibration():
@@ -7196,17 +7234,17 @@ def _run_config_editor(master_root, restart_callback, on_close):
             )
             root.update_idletasks()
             target_input = new_config["obs"]["game_audio_capture"].get("input_name") or "Game Audio"
-            client = connect_obs(get_current_ws_config(), retries=1, delay=0)
+            client, started_obs = connect_obs_for_task(new_config["obs"], get_current_ws_config())
             result_ms = None
             if client:
                 ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
-                if ffmpeg_path:
-                    try:
+                try:
+                    if ffmpeg_path:
                         result_ms = run_audio_sync_calibration(client, ffmpeg_path, target_input)
-                    finally:
-                        client.disconnect()
-                else:
-                    logging.warning("Could not auto-calibrate audio sync offset: ffmpeg isn't installed.")
+                    else:
+                        logging.warning("Could not auto-calibrate audio sync offset: ffmpeg isn't installed.")
+                finally:
+                    release_obs_after_task(client, new_config["obs"], started_obs)
             else:
                 logging.warning("Could not auto-calibrate audio sync offset: OBS is not reachable.")
             if result_ms is not None:
@@ -7291,6 +7329,44 @@ def get_quality_scale_height(quality_choice):
     return CLIP_EDITOR_QUALITY_HEIGHTS.get(quality_choice)
 
 
+OBS_STATE_CACHE_PATH = os.path.join(SCRIPT_DIR, ".obs_state_cache.json")
+
+
+def read_obs_state_cache():
+    try:
+        with open(OBS_STATE_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def update_obs_state_cache(**values):
+    """Remembers things the clip editor needs from OBS -- its recordings folder and each input's
+    kind -- so it still has them while OBS is closed, which on macOS is whenever no game is
+    running (see close_obs_between_sessions; confirmed live: with OBS closed, the editor's
+    recordings dropdown disappeared)."""
+    data = read_obs_state_cache()
+    data.update({k: v for k, v in values.items() if v})
+    try:
+        with open(OBS_STATE_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        logging.exception("Could not save the OBS state cache.")
+
+
+def remember_obs_state(client):
+    try:
+        folder = client.get_record_directory().record_directory
+    except Exception:
+        folder = None
+    try:
+        kinds = {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
+    except Exception:
+        kinds = None
+    update_obs_state_cache(recording_folder=folder, input_kinds=kinds)
+
+
 def resolve_recent_recordings_folder(obs_config):
     """Falls back to OBS's own live recording directory when obs.output_folder isn't explicitly
     configured. output_folder only ever exists as an override for pointing recordings somewhere
@@ -7305,14 +7381,17 @@ def resolve_recent_recordings_folder(obs_config):
     if configured:
         return configured
     client = connect_obs(obs_config.get("websocket"), retries=1, delay=0)
-    if not client:
-        return None
-    try:
-        return client.get_record_directory().record_directory
-    except Exception:
-        return None
-    finally:
-        client.disconnect()
+    if client:
+        try:
+            folder = client.get_record_directory().record_directory
+            update_obs_state_cache(recording_folder=folder)
+            return folder
+        except Exception:
+            pass
+        finally:
+            client.disconnect()
+    # OBS closed (between games on macOS) or unreachable: the folder it last reported.
+    return read_obs_state_cache().get("recording_folder")
 
 
 def resolve_input_kinds(obs_config):
@@ -7324,14 +7403,17 @@ def resolve_input_kinds(obs_config):
     failure (OBS unreachable, etc.); compute_reference_track treats that exactly like "kind
     unknown" and falls back to its older, kind-blind heuristic rather than refusing to work."""
     client = connect_obs(obs_config.get("websocket"), retries=1, delay=0)
-    if not client:
-        return {}
-    try:
-        return {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
-    except Exception:
-        return {}
-    finally:
-        client.disconnect()
+    if client:
+        try:
+            kinds = {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
+            update_obs_state_cache(input_kinds=kinds)
+            return kinds
+        except Exception:
+            pass
+        finally:
+            client.disconnect()
+    # OBS closed (between games on macOS) or unreachable: the kinds it last reported.
+    return read_obs_state_cache().get("input_kinds") or {}
 
 
 def list_recent_recordings(folder, limit=CLIP_EDITOR_MAX_RECENT_RECORDINGS):

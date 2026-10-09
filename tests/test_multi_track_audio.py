@@ -193,6 +193,14 @@ class ComputeReferenceTrackTests(unittest.TestCase):
 
 
 class ResolveInputKindsTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._cache_dir.cleanup)
+        patcher = unittest.mock.patch.object(a, "OBS_STATE_CACHE_PATH", os.path.join(self._cache_dir.name, "cache.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_returns_name_to_kind_map(self):
         client = FakeObsClient(inputs={
             "Mic/Aux": {"kind": "coreaudio_input_capture", "tracks": {}},
