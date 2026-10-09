@@ -25,10 +25,25 @@ from PIL import Image, ImageDraw
 
 import platform_common
 
-if getattr(sys, "frozen", False):
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+def resolve_script_dir(frozen, executable, script_file):
+    """Folder holding config.json and the log. A built macOS app's executable is inside its
+    bundle (X.app/Contents/MacOS/), but the installer writes config.json next to X.app -- and
+    writing into a signed bundle would break its signature -- so use the bundle's parent."""
+    if not frozen:
+        return os.path.dirname(os.path.abspath(script_file))
+    exe_dir = os.path.dirname(os.path.abspath(executable))
+    contents = os.path.dirname(exe_dir)
+    bundle = os.path.dirname(contents)
+    if (
+        os.path.basename(exe_dir) == "MacOS"
+        and os.path.basename(contents) == "Contents"
+        and bundle.endswith(".app")
+    ):
+        return os.path.dirname(bundle)
+    return exe_dir
+
+
+SCRIPT_DIR = resolve_script_dir(getattr(sys, "frozen", False), sys.executable, __file__)
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
 
@@ -1157,7 +1172,12 @@ def set_game_audio_capture_target(client, input_name, process_name):
             # live: a source pointed at an app launched after that recorded silence, even after
             # re-applying its settings). Reading the source's app list rebuilds it, and clearing
             # the target first makes the write below a real change that restarts the capture.
-            client.get_input_properties_list_property_items(input_name, refresh_property)
+            # Best-effort: the listing itself fails while the screen is locked (ScreenCaptureKit
+            # lists nothing then -- confirmed live), which must not read as "input missing".
+            try:
+                client.get_input_properties_list_property_items(input_name, refresh_property)
+            except Exception:
+                pass
             client.set_input_settings(input_name, {refresh_property: ""}, True)
         client.set_input_settings(input_name, settings, True)
         logging.info("Pointed '%s' audio capture at %s", input_name, process_name)

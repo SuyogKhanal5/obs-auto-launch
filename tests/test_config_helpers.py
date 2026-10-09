@@ -487,3 +487,21 @@ class ResolveDefaultOverlayMonitorIndexTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolveScriptDirTests(unittest.TestCase):
+    # The macOS installer writes config.json next to OBSAutoRecorder.app; the built app used to
+    # look inside its own bundle (Contents/MacOS) and never found it.
+    def test_from_source_uses_the_script_folder(self):
+        self.assertEqual(
+            a.resolve_script_dir(False, "/usr/bin/python3", os.path.join("/repo", "autostart_script.py")),
+            os.path.abspath("/repo"),
+        )
+
+    def test_frozen_macos_app_uses_the_folder_holding_the_bundle(self):
+        exe = os.path.join("/Users/x/Applications", "OBSAutoRecorder.app", "Contents", "MacOS", "OBSAutoRecorder")
+        self.assertEqual(a.resolve_script_dir(True, exe, "unused"), os.path.abspath("/Users/x/Applications"))
+
+    def test_frozen_onedir_build_uses_the_executable_folder(self):
+        exe = os.path.join("/opt/OBSAutoRecorder", "OBSAutoRecorder")
+        self.assertEqual(a.resolve_script_dir(True, exe, "unused"), os.path.abspath("/opt/OBSAutoRecorder"))

@@ -730,3 +730,19 @@ class PointNewlyRunningAppCapturesTests(unittest.TestCase):
             )
         self.assertEqual(running, set())
         mock_point.assert_not_called()
+
+
+class MacAppCaptureRefreshFailureTests(unittest.TestCase):
+    # Confirmed live: with the screen locked, listing the source's apps fails with "not found",
+    # which used to send the existing source down the "create it" path (601 already exists).
+    def test_failed_app_listing_still_points_the_existing_source(self):
+        class LockedScreenClient(FakeObsClient):
+            def get_input_properties_list_property_items(self, name, prop):
+                raise a.obsws.error.OBSSDKRequestError("GetInputPropertiesListPropertyItems", 600, "")
+        client = LockedScreenClient(inputs={"Discord": {"kind": "sck_audio_capture", "tracks": {}, "settings": {}}})
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+                unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings",
+                                           return_value={"type": 1, "application": "com.hnc.Discord"}):
+            a.set_game_audio_capture_target(client, "Discord", "Discord")
+        self.assertEqual(client.inputs["Discord"]["settings"], {"type": 1, "application": "com.hnc.Discord"})
+        self.assertNotIn("create_input", [c[0] for c in client.calls])
