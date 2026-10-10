@@ -133,6 +133,12 @@ jobs:
         if: runner.os == 'macOS'
         run: pyinstaller --windowed --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
 
+      - name: Name and re-sign the app bundle (macOS)
+        if: runner.os == 'macOS'
+        # Shows as "OBS Auto Recorder" (com.obsautorecorder.app) in macOS's permission lists
+        # instead of PyInstaller's bare "OBSAutoRecorder" -- see ci/finalize_macos_app.py.
+        run: python ci/finalize_macos_app.py dist/OBSAutoRecorder.app
+
       - name: Package DMG (macOS)
         if: runner.os == 'macOS'
         run: hdiutil create -volname "OBS Auto Recorder" -srcfolder dist/OBSAutoRecorder.app -ov -format UDZO "dist/OBSAutoRecorder-macos-${MACOS_ARCH}.dmg"

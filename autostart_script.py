@@ -5053,12 +5053,13 @@ _COMMON_GAMES_WINDOWS = [
     {"name": "Genshin Impact", "process_name": "GenshinImpact.exe"},
 ]
 
-# League of Legends and Roblox both ship real macOS clients; Valorant/Warframe/Apex/Genshin/
-# Wizard101 do not (no native Mac build, and several rely on kernel-level anti-cheat that
-# explicitly excludes macOS). Process names here are best-effort based on each game's typical
-# macOS bundle naming and haven't been confirmed against real hardware yet -- see
-# CROSS_PLATFORM_PLAN.md's open macOS unknowns. If one doesn't match, "Pick Running..." (while
-# the game is open) or typing the exact process name by hand still works.
+# League of Legends and Roblox both ship real macOS clients; Valorant/Warframe/Apex/Genshin do
+# not (no native Mac build, and several rely on kernel-level anti-cheat that excludes macOS).
+# Wizard101's Mac app is a Wine wrapper around the Windows client, so it has no predictable Mac
+# process name (see CROSS_PLATFORM_PLAN.md §10). League's "LeagueofLegends" is confirmed from its
+# real installed bundle (LoL/Game/LeagueofLegends.app's CFBundleExecutable); Minecraft's and
+# Roblox's are still best-effort. If one doesn't match, "Pick Running..." (while the game is open)
+# or typing the exact process name by hand still works.
 _COMMON_GAMES_MACOS = [
     {"name": "League of Legends", "process_name": "LeagueofLegends"},
     {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
@@ -5235,7 +5236,7 @@ def build_watched_windows_editor(parent, initial_rows):
     container.pack(fill="x", padx=10)
     rows = []
 
-    def add_row(process="", title="", display=""):
+    def add_row(process="", title="", display="", extra=None):
         row_frame = tk.Frame(container, bg=DARK_BG)
         row_frame.pack(fill="x", pady=2)
         process_var = tk.StringVar(value=process)
@@ -5245,7 +5246,10 @@ def build_watched_windows_editor(parent, initial_rows):
             tk.Entry(
                 row_frame, textvariable=var, width=16, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG,
             ).pack(side="left", padx=2)
-        entry = {"process": process_var, "title": title_var, "display": display_var}
+        # Options this editor has no column for (e.g. use_title_as_display_name, which names
+        # GeForce NOW recordings after the game) -- kept so saving doesn't silently drop them
+        # (confirmed live: a Settings save lost GeForce NOW's).
+        entry = {"process": process_var, "title": title_var, "display": display_var, "extra": dict(extra or {})}
 
         def pick():
             open_process_picker(
@@ -5262,7 +5266,8 @@ def build_watched_windows_editor(parent, initial_rows):
         rows.append(entry)
 
     for w in initial_rows:
-        add_row(w.get("process_name", ""), w.get("title_contains", ""), w.get("display_name", ""))
+        extra = {k: v for k, v in w.items() if k not in ("process_name", "title_contains", "display_name")}
+        add_row(w.get("process_name", ""), w.get("title_contains", ""), w.get("display_name", ""), extra)
 
     dark_button(parent, text="+ Add Window Rule", command=lambda: add_row()).pack(anchor="w", padx=10, pady=(4, 10))
     return rows, add_row
@@ -6948,7 +6953,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             title = row_vars["title"].get().strip()
             if not process or not title:
                 continue
-            entry = {"process_name": process, "title_contains": title}
+            entry = {**row_vars.get("extra", {}), "process_name": process, "title_contains": title}
             display = row_vars["display"].get().strip()
             if display:
                 entry["display_name"] = display

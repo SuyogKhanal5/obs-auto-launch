@@ -218,6 +218,7 @@ pip install -r requirements.txt
 pyinstaller --onedir --noconsole --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py   # Windows
 pyinstaller --onedir --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py               # Linux
 pyinstaller --windowed --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py             # macOS (produces OBSAutoRecorder.app)
+python ci/finalize_macos_app.py OBSAutoRecorder.app                                                                      # macOS: names it "OBS Auto Recorder" and re-signs it
 ```
 
 On Windows/Linux this produces an `OBSAutoRecorder/` folder (an exe/binary plus an `_internal/` support-files folder — both required, don't separate them); on macOS, an `OBSAutoRecorder.app` bundle. `config.json` is read from that same folder (or `OBSAutoRecorder.app/Contents/MacOS/` on macOS). Rebuild any time you change `autostart_script.py`.

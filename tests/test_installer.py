@@ -32,31 +32,53 @@ class BuildConfigTests(unittest.TestCase):
         with open(template_path, encoding="utf-8") as f:
             self.template = json.load(f)
 
-    def test_watched_games_and_windows_start_empty(self):
+    def setUp_games(self, games):
+        patcher = patch.object(installer, "COMMON_GAMES", games)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_watched_games_start_empty_and_template_windows_are_kept(self):
         config = installer.build_config(self.template, None, "pw", base_options())
         self.assertEqual(config["watched_games"], [])
-        self.assertEqual(config["watched_windows"], [])
+        self.assertEqual(config["watched_windows"], self.template["watched_windows"])
 
     def test_selected_plain_exe_game_lands_in_watched_games(self):
+        self.setUp_games(installer._COMMON_GAMES_WINDOWS)
         options = base_options(selected_games=["Warframe"])
         config = installer.build_config(self.template, None, "pw", options)
         self.assertEqual(config["watched_games"], ["Warframe.x64.exe"])
-        self.assertEqual(config["watched_windows"], [])
+        self.assertEqual(config["watched_windows"], self.template["watched_windows"])
 
-    def test_selected_title_contains_game_lands_in_watched_windows(self):
+    def test_selected_title_contains_game_is_added_to_the_template_windows(self):
+        self.setUp_games(installer._COMMON_GAMES_LINUX)
         options = base_options(selected_games=["Minecraft: Java Edition"])
         config = installer.build_config(self.template, None, "pw", options)
         self.assertEqual(config["watched_games"], [])
-        self.assertEqual(
+        self.assertIn(
+            {"process_name": "java", "title_contains": "minecraft", "display_name": "Minecraft: Java Edition"},
             config["watched_windows"],
-            [{"process_name": "javaw.exe", "title_contains": "minecraft", "display_name": "Minecraft: Java Edition"}],
         )
+        self.assertIn(self.template["watched_windows"][-1], config["watched_windows"])
+
+    def test_a_game_already_in_the_template_is_not_duplicated(self):
+        self.setUp_games(installer._COMMON_GAMES_WINDOWS)
+        options = base_options(selected_games=["Minecraft: Java Edition"])
+        config = installer.build_config(self.template, None, "pw", options)
+        self.assertEqual(config["watched_windows"], self.template["watched_windows"])
 
     def test_unknown_selected_game_name_is_ignored(self):
         options = base_options(selected_games=["Some Game Not In The List"])
         config = installer.build_config(self.template, None, "pw", options)
         self.assertEqual(config["watched_games"], [])
-        self.assertEqual(config["watched_windows"], [])
+        self.assertEqual(config["watched_windows"], self.template["watched_windows"])
+
+    def test_mac_games_use_mac_process_names(self):
+        # Confirmed live: League's in-game process on macOS is LeagueofLegends (its bundle's
+        # CFBundleExecutable); the old shared list saved "league of legends.exe" on a Mac.
+        self.setUp_games(installer._COMMON_GAMES_MACOS)
+        config = installer.build_config(self.template, None, "pw", base_options(selected_games=["League of Legends"]))
+        self.assertEqual(config["watched_games"], ["LeagueofLegends"])
+        self.assertFalse(any(g["process_name"].lower().endswith(".exe") for g in installer._COMMON_GAMES_MACOS))
 
     def test_advanced_options_all_apply_when_enabled(self):
         options = base_options(

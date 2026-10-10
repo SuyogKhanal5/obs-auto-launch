@@ -71,7 +71,7 @@ FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
 # games with at least one launch path this app can't auto-discover belong here -- Steam, Epic,
 # GOG, Xbox, and Battle.net installs are all found automatically once those launchers are enabled
 # in Settings, so a Steam-only title would just be redundant clutter on this page.
-COMMON_GAMES = [
+_COMMON_GAMES_WINDOWS = [
     {"name": "League of Legends", "process_name": "league of legends.exe"},
     {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
     {"name": "Valorant", "process_name": "VALORANT-Win64-Shipping.exe"},
@@ -81,6 +81,18 @@ COMMON_GAMES = [
     {"name": "Roblox", "process_name": "RobloxPlayerBeta.exe"},
     {"name": "Genshin Impact", "process_name": "GenshinImpact.exe"},
 ]
+# Per OS, mirroring autostart_script.py's own lists -- one shared Windows list put .exe names in
+# Mac configs that could never match (confirmed live: League of Legends and Wizard101 picked in
+# the Mac installer saved "league of legends.exe" and "WizardGraphicalClient.exe").
+_COMMON_GAMES_MACOS = [
+    {"name": "League of Legends", "process_name": "LeagueofLegends"},
+    {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
+    {"name": "Roblox", "process_name": "RobloxPlayer"},
+]
+_COMMON_GAMES_LINUX = [
+    {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
+]
+COMMON_GAMES = {"win32": _COMMON_GAMES_WINDOWS, "darwin": _COMMON_GAMES_MACOS}.get(sys.platform, _COMMON_GAMES_LINUX)
 
 
 def is_ffmpeg_installed():
@@ -252,7 +264,12 @@ def build_config(template, obs_path, password, options):
         else:
             watched_games.append(game["process_name"])
     config["watched_games"] = watched_games
-    config["watched_windows"] = watched_windows
+    # Added to the template's own entries (e.g. GeForce NOW), not in place of them -- replacing
+    # them silently dropped GeForce NOW support from every fresh install (confirmed live).
+    existing = {(w.get("process_name"), w.get("title_contains")) for w in template.get("watched_windows", [])}
+    config["watched_windows"] = list(template.get("watched_windows", [])) + [
+        w for w in watched_windows if (w["process_name"], w["title_contains"]) not in existing
+    ]
     config["obs"]["path"] = obs_path or template["obs"]["path"]
     config["obs"]["websocket"]["password"] = password
     config["obs"]["auto_split"]["enabled"] = options["split_long_recordings"]
