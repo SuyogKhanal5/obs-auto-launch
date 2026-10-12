@@ -9,6 +9,7 @@ import logging
 import os
 import platform
 import plistlib
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -964,7 +965,7 @@ def bundled_game_audio_driver_path():
 def game_audio_device_installed():
     """Whether the Game Audio loopback driver is installed (it loads at the next Core Audio
     restart, which installing does itself)."""
-    return os.path.isdir(os.path.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME))
+    return os.path.isdir(posixpath.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME))
 
 
 def process_audio_tap_available():
@@ -981,7 +982,8 @@ def process_audio_tap_available():
 def game_audio_driver_install_command(driver_path):
     """Shell command that installs driver_path as the Game Audio device and restarts Core Audio
     so it loads (all sound cuts out for a second or two)."""
-    target = os.path.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME)
+    # posixpath, not os.path: this always runs on macOS, but the tests also run on Windows CI.
+    target = posixpath.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME)
     return (
         f"rm -rf {_shell_quote(target)} && mkdir -p {_shell_quote(GAME_AUDIO_DRIVER_DIR)} && "
         f"ditto {_shell_quote(driver_path)} {_shell_quote(target)} && "
