@@ -1530,8 +1530,11 @@ class TrimClipProgressCallbackTests(unittest.TestCase):
                 # the whole clip too (its output is thrown away), so it takes just as long as
                 # pass 2 and needs its own real progress rather than a single frozen 0% call.
                 on_progress(0.5)
-                with open(cmd[-1], "wb") as f:
-                    f.write(b"data")
+                # Pass 1's "NUL" is Windows' null device; written to here it left a stray NUL
+                # file in the working directory on macOS/Linux.
+                if cmd[-1] != "NUL":
+                    with open(cmd[-1], "wb") as f:
+                        f.write(b"data")
                 return 0, "", False
 
             calls = []
