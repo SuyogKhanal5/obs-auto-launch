@@ -662,6 +662,10 @@ def install_game_audio_device(driver_path=None):
     return False
 
 
+def uninstall_game_audio_device():
+    return True
+
+
 def start_process_audio_tap(pids):
     return None
 

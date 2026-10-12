@@ -476,6 +476,11 @@ def install_game_audio_device(driver_path=None, platform_name=None):
     return _select_backend(platform_name).install_game_audio_device(driver_path)
 
 
+def uninstall_game_audio_device(platform_name=None):
+    """Removes the Game Audio device (macOS asks for an admin password). True if it's gone."""
+    return _select_backend(platform_name).uninstall_game_audio_device()
+
+
 def start_process_audio_tap(pids, platform_name=None):
     """Feeds pids' audio into the Game Audio device; returns a handle for stop_process_audio_tap."""
     return _select_backend(platform_name).start_process_audio_tap(pids)

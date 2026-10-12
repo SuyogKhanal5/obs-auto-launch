@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from unittest.mock import patch
@@ -322,3 +323,30 @@ class AppLaunchCommandTests(unittest.TestCase):
     def test_flag_matches_the_app(self):
         source = open(os.path.join(os.path.dirname(installer.__file__), "autostart_script.py"), encoding="utf-8").read()
         self.assertIn(f'ACCESSIBILITY_REQUEST_FLAG = "{installer.ACCESSIBILITY_REQUEST_FLAG}"', source)
+
+
+class UninstallGameAudioDeviceTests(unittest.TestCase):
+    """macOS: the uninstaller also removes the Wine & Java game audio device."""
+
+    def run_uninstall(self, installed, removed=True):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(installer.platform_common, "disable_autostart"), \
+                patch.object(installer, "get_desktop_shortcut_path", return_value=None), \
+                patch.object(installer.platform_common, "game_audio_device_installed", return_value=installed), \
+                patch.object(installer.platform_common, "uninstall_game_audio_device", return_value=removed) as uninstall:
+            result = installer.do_uninstall(tmp, keep_config=False, on_progress=lambda _m: None)
+        return result, uninstall
+
+    def test_removes_the_device_when_installed(self):
+        result, uninstall = self.run_uninstall(installed=True)
+        uninstall.assert_called_once()
+        self.assertFalse(result["game_audio_device_left"])
+
+    def test_reports_a_device_left_behind_when_removal_is_cancelled(self):
+        result, _ = self.run_uninstall(installed=True, removed=False)
+        self.assertTrue(result["game_audio_device_left"])
+
+    def test_leaves_the_device_alone_when_not_installed(self):
+        result, uninstall = self.run_uninstall(installed=False)
+        uninstall.assert_not_called()
+        self.assertFalse(result["game_audio_device_left"])

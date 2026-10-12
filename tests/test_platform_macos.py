@@ -1001,3 +1001,22 @@ class KeybindTapConsumptionTests(unittest.TestCase):
         with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_services}):
             pmac.run_clip_editor_space_bar_listener(None, unittest.mock.Mock(), unittest.mock.Mock())
         self.assertEqual(fake_quartz.CGEventTapCreate.call_args[0][2], fake_quartz.kCGEventTapOptionListenOnly)
+
+
+class UninstallGameAudioDeviceTests(unittest.TestCase):
+    def test_uninstall_command_removes_the_driver_and_restarts_core_audio(self):
+        self.assertEqual(
+            pmac.game_audio_driver_uninstall_command(),
+            "rm -rf '/Library/Audio/Plug-Ins/HAL/OBSAutoRecorderGameAudio.driver' && killall coreaudiod",
+        )
+
+    def test_nothing_to_do_when_not_installed(self):
+        with unittest.mock.patch.object(pmac, "game_audio_device_installed", return_value=False), \
+                unittest.mock.patch.object(pmac.subprocess, "run") as run:
+            self.assertTrue(pmac.uninstall_game_audio_device())
+        run.assert_not_called()
+
+    def test_cancelled_password_prompt_reports_failure(self):
+        with unittest.mock.patch.object(pmac, "game_audio_device_installed", return_value=True), \
+                unittest.mock.patch.object(pmac.subprocess, "run", return_value=unittest.mock.Mock(returncode=1, stderr="User canceled.")):
+            self.assertFalse(pmac.uninstall_game_audio_device())

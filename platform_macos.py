@@ -1030,6 +1030,33 @@ def install_game_audio_device(driver_path=None):
     return True
 
 
+def game_audio_driver_uninstall_command():
+    """Shell command that removes the Game Audio device and restarts Core Audio so it's gone."""
+    target = posixpath.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME)
+    return f"rm -rf {_shell_quote(target)} && killall coreaudiod"
+
+
+def uninstall_game_audio_device():
+    """Removes the Game Audio device, asking for an administrator password through macOS's own
+    prompt. Returns True if it's gone (or was never installed); False if cancelled or failed."""
+    if not game_audio_device_installed():
+        return True
+    command = game_audio_driver_uninstall_command().replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'do shell script "{command}" with prompt "OBS Auto Recorder wants to remove its Game Audio '
+        'device." with administrator privileges'
+    )
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    except OSError as exc:
+        logging.warning("Could not remove the Game Audio device: %s", exc)
+        return False
+    if result.returncode != 0:
+        logging.info("Game Audio device removal didn't complete: %s", result.stderr.strip())
+        return False
+    return not game_audio_device_installed()
+
+
 def start_process_audio_tap(pids):
     """Starts feeding pids' audio into the Game Audio device. Returns the helper process (pass
     it to stop_process_audio_tap), or None if it couldn't start. The helper waits for a process

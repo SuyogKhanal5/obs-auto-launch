@@ -368,6 +368,14 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
         # app refused to launch at all. ditto preserves permissions, symlinks and signatures, and
         # overwrites an existing install in place.
         subprocess.run(["ditto", "-x", "-k", resource_path(APP_BUNDLE_ZIP_NAME), install_dir], check=True)
+        # The user already approved this installer in Gatekeeper (README, Quick install); clear
+        # the "downloaded from the internet" flag from the app it installs, in case it was
+        # carried over, so the app doesn't need approving a second time. Best-effort: nothing
+        # to clear is the normal case.
+        subprocess.run(
+            ["xattr", "-dr", "com.apple.quarantine", os.path.join(install_dir, APP_BUNDLE_NAME)],
+            capture_output=True,
+        )
     else:
         # The app ships as a PyInstaller onedir build (an exe plus an _internal/ folder of
         # support files) rather than onefile -- deliberately, since onefile re-extracts itself to
@@ -475,7 +483,15 @@ def do_uninstall(install_dir, keep_config, on_progress):
             os.rmdir(install_dir)
     except OSError:
         pass
+
+    # macOS: the Wine & Java game audio device lives outside the install folder, in the system's
+    # audio plug-ins, and removing it needs an administrator password like installing it did.
+    game_audio_device_left = False
+    if platform_common.game_audio_device_installed():
+        on_progress("Removing the Game Audio device (macOS will ask for your password)...")
+        game_audio_device_left = not platform_common.uninstall_game_audio_device()
     on_progress("Done.")
+    return {"game_audio_device_left": game_audio_device_left}
 
 
 # Where the app's icon lives, and what OBS's executable is called, in this OS's own terms.
@@ -1300,9 +1316,16 @@ def main():
         show_nav(back=False, next_=True, cancel=False)
         next_btn.config(text="Finish", state="normal", command=finish)
 
-    def show_uninstall_finish():
+    def show_uninstall_finish(result):
         finish_heading.config(text="Uninstalled")
-        finish_body.config(text=f"{APP_NAME} has been removed from {dir_var.get()}.")
+        text = f"{APP_NAME} has been removed from {dir_var.get()}."
+        if result.get("game_audio_device_left"):
+            text += (
+                "\n\nThe Game Audio device (for Wine & Java games) is still installed -- removing it "
+                "needs your password. To remove it later, run this in Terminal:\n\n"
+                "    sudo rm -rf /Library/Audio/Plug-Ins/HAL/OBSAutoRecorderGameAudio.driver && sudo killall coreaudiod"
+            )
+        finish_body.config(text=text)
         launch_var.set(False)
         launch_check.pack_forget()
         password_row.pack_forget()
@@ -1360,9 +1383,9 @@ def main():
             root.after(0, lambda: existing_progress_label.config(text=message))
 
         def worker():
-            do_uninstall(dir_var.get(), keep_config_var.get(), report_progress)
+            return do_uninstall(dir_var.get(), keep_config_var.get(), report_progress)
 
-        def done(_result, error):
+        def done(result, error):
             existing_progress_bar.stop()
             existing_progress_bar.pack_forget()
             existing_progress_label.config(text="")
@@ -1371,7 +1394,7 @@ def main():
             if error is not None:
                 messagebox.showerror("Uninstall failed", str(error), parent=root)
                 return
-            show_uninstall_finish()
+            show_uninstall_finish(result or {})
 
         run_async(worker, done)
 
