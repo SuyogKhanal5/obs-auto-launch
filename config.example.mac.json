@@ -113,7 +113,10 @@
         "trim_mode": "precise",
         "default_output_format": "Same as source",
         "default_quality": "Same as source",
-        "vlc_path": ""
+        "vlc_path": "",
+        "auto_fix_audio_sync": false,
+        "default_gains_db": {},
+        "default_target_size_mb": 20
     },
     "obs": {
         "process_name": "OBS",
@@ -179,7 +182,23 @@
             "max_seconds": 30
         },
         "keep_running_between_sessions": false,
-        "recording_format": "mkv"
+        "recording_format": "mkv",
+        "custom_keybind_hotkey_mode": "raw_input",
+        "mic_boost": {
+            "enabled": false,
+            "input_name": "",
+            "boost_db": 0.0,
+            "voice_isolation": {
+                "enabled": false,
+                "method": "rnnoise"
+            },
+            "eq": {
+                "enabled": false,
+                "low_db": -4.0,
+                "mid_db": -1.0,
+                "high_db": 3.0
+            }
+        }
     },
     "log_file": "autostart_script.log"
 }

@@ -1,6 +1,8 @@
 import os
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from unittest.mock import patch
@@ -234,6 +236,78 @@ class BuildAudioRoutingFilterArgsTests(unittest.TestCase):
         self.assertIn("[asrc1]", map_args)
         self.assertIn("[asrc1][asrc2]amix=inputs=2", filter_complex)
 
+    def test_zero_or_blank_gains_are_a_no_op(self):
+        self.assertEqual(
+            a.build_audio_routing_filter_args(3, routing={1: [1], 2: [2], 3: [3]}, gains_db={1: {1: 0}}),
+            ([], []),
+        )
+
+    def test_gain_on_single_source_destination_inserts_volume_filter(self):
+        filter_args, map_args = a.build_audio_routing_filter_args(2, routing={1: [1]}, gains_db={1: {1: 12}})
+        filter_complex = filter_args[1]
+        self.assertIn("[asrc1]volume=12dB[again1_1]", filter_complex)
+        self.assertEqual(map_args, ["-map", "[again1_1]"])
+
+    def test_same_source_gets_different_gain_on_different_destinations(self):
+        # The example that motivated this feature: boost a mic +12dB on one output track but
+        # leave it unboosted (0dB, i.e. no filter at all) on another output it's also routed to.
+        filter_args, map_args = a.build_audio_routing_filter_args(
+            2, routing={1: [1], 2: [1]}, gains_db={1: {1: 12}},
+        )
+        filter_complex = filter_args[1]
+        self.assertIn("[asrc1]volume=12dB[again1_1]", filter_complex)
+        self.assertNotIn("again2_1", filter_complex)
+        self.assertEqual(map_args, ["-map", "[again1_1]", "-map", "[asrc1]"])
+
+    def test_gain_applies_before_mixing_with_an_unboosted_source(self):
+        filter_args, map_args = a.build_audio_routing_filter_args(
+            2, routing={1: [1, 2]}, gains_db={1: {1: -6}},
+        )
+        filter_complex = filter_args[1]
+        self.assertIn("[asrc1]volume=-6dB[again1_1]", filter_complex)
+        self.assertIn("[again1_1][asrc2]amix=inputs=2", filter_complex)
+        self.assertEqual(map_args, ["-map", "[amix1]"])
+
+    def test_gain_disables_amixs_own_normalize_so_the_boost_actually_lands(self):
+        # Confirmed live: amix's own "normalize" defaults ON and silently rescales every input by
+        # 1/N regardless of any gain already applied -- e.g. a +12dB boost on one of 2 mixed
+        # sources measured a further -6dB from amix itself on top, almost completely canceling
+        # the boost out. Once any gain is set for a destination, amix's own auto-balancing has
+        # to be turned off there, or the whole feature would silently defeat itself the moment
+        # 2+ sources land in the same output.
+        filter_args, _map_args = a.build_audio_routing_filter_args(
+            3, routing={1: [1, 2, 3]}, gains_db={1: {1: 12}},
+        )
+        filter_complex = filter_args[1]
+        self.assertIn("amix=inputs=3:duration=longest:dropout_transition=0:normalize=0[amix1]", filter_complex)
+
+    def test_no_gain_leaves_amixs_default_normalize_untouched(self):
+        # Pure track consolidation (the original, gain-less feature) must keep its prior
+        # behavior exactly -- amix's own default auto-balancing across sources being combined
+        # with no explicit gain involved is the whole point there, unlike the case above.
+        filter_args, _map_args = a.build_audio_routing_filter_args(3, routing={1: [1, 2, 3]})
+        filter_complex = filter_args[1]
+        self.assertIn("amix=inputs=3:duration=longest:dropout_transition=0[amix1]", filter_complex)
+        self.assertNotIn("normalize", filter_complex)
+
+    def test_gain_and_mute_stack_on_the_same_destination(self):
+        filter_args, map_args = a.build_audio_routing_filter_args(
+            2, routing={1: [1]}, muted_destinations=[1], gains_db={1: {1: 12}},
+        )
+        filter_complex = filter_args[1]
+        self.assertIn("[asrc1]volume=12dB[again1_1]", filter_complex)
+        self.assertIn("[again1_1]volume=0[adest1]", filter_complex)
+        self.assertEqual(map_args, ["-map", "[adest1]"])
+
+    def test_gain_for_an_unrouted_source_is_ignored(self):
+        # Identity routing (default) means destination 1's only source is 1, not 2 -- a stray
+        # gain entry filed under the wrong destination/source pair should be silently irrelevant
+        # rather than forcing a real filter graph or leaking into the output.
+        self.assertEqual(
+            a.build_audio_routing_filter_args(2, gains_db={1: {2: 12}}),
+            ([], []),
+        )
+
 
 class ProbeAudioStreamCountTests(unittest.TestCase):
     def test_returns_none_when_ffprobe_not_found_next_to_ffmpeg(self):
@@ -276,6 +350,267 @@ class ProbeAudioStreamCountTests(unittest.TestCase):
             open(fake_ffprobe, "w").close()
             with patch.object(a.subprocess, "run", side_effect=OSError("boom")):
                 self.assertIsNone(a.probe_audio_stream_count(fake_ffmpeg, "in.mp4"))
+
+
+class BuildWaveformImageCommandTests(unittest.TestCase):
+    def test_seeks_before_input_for_speed(self):
+        cmd = a.build_waveform_image_command("ffmpeg", "in.mp4", 10, 20, 0, "out.png", 760, 80)
+        self.assertEqual(cmd[0], "ffmpeg")
+        ss_index = cmd.index("-ss")
+        i_index = cmd.index("-i")
+        self.assertLess(ss_index, i_index)  # fast seek: -ss before -i
+
+    def test_duration_is_end_minus_start(self):
+        cmd = a.build_waveform_image_command("ffmpeg", "in.mp4", 10, 25, 0, "out.png", 760, 80)
+        t_index = cmd.index("-t")
+        self.assertEqual(cmd[t_index + 1], a.format_timestamp(15))
+
+    def test_track_index_selects_the_right_audio_stream(self):
+        cmd = a.build_waveform_image_command("ffmpeg", "in.mp4", 0, 5, 3, "out.png", 760, 80)
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[0:a:3]showwavespic", filter_complex)
+
+    def test_size_is_passed_through_to_the_filter(self):
+        cmd = a.build_waveform_image_command("ffmpeg", "in.mp4", 0, 5, 0, "out.png", 400, 60)
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("s=400x60", filter_complex)
+
+    def test_output_path_is_last_argument(self):
+        cmd = a.build_waveform_image_command("ffmpeg", "in.mp4", 0, 5, 0, "out.png", 760, 80)
+        self.assertEqual(cmd[-1], "out.png")
+
+    def test_only_renders_a_single_frame(self):
+        cmd = a.build_waveform_image_command("ffmpeg", "in.mp4", 0, 5, 0, "out.png", 760, 80)
+        frames_index = cmd.index("-frames:v")
+        self.assertEqual(cmd[frames_index + 1], "1")
+
+
+class GenerateWaveformImageTests(unittest.TestCase):
+    def test_end_before_start_is_rejected_without_running_ffmpeg(self):
+        with patch.object(a.subprocess, "run") as mock_run:
+            self.assertFalse(a.generate_waveform_image("ffmpeg", "in.mp4", 10, 5, 0, "out.png"))
+        mock_run.assert_not_called()
+
+    def test_successful_render_returns_true(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.png")
+
+            def run(cmd, capture_output, text, creationflags=0):
+                with open(out, "wb") as f:
+                    f.write(b"fake-png-bytes")
+                return type("Result", (), {"returncode": 0, "stderr": ""})()
+
+            with patch.object(a.subprocess, "run", side_effect=run):
+                self.assertTrue(a.generate_waveform_image("ffmpeg", "in.mp4", 0, 5, 0, out))
+
+    def test_nonzero_exit_code_returns_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.png")
+
+            def run(cmd, capture_output, text, creationflags=0):
+                return type("Result", (), {"returncode": 1, "stderr": "boom"})()
+
+            with patch.object(a.subprocess, "run", side_effect=run):
+                with self.assertLogs(level="WARNING"):
+                    self.assertFalse(a.generate_waveform_image("ffmpeg", "in.mp4", 0, 5, 0, out))
+
+    def test_missing_output_file_returns_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.png")
+
+            def run(cmd, capture_output, text, creationflags=0):
+                return type("Result", (), {"returncode": 0, "stderr": ""})()  # never wrote the file
+
+            with patch.object(a.subprocess, "run", side_effect=run):
+                with self.assertLogs(level="WARNING"):
+                    self.assertFalse(a.generate_waveform_image("ffmpeg", "in.mp4", 0, 5, 0, out))
+
+    def test_zero_byte_output_returns_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.png")
+
+            def run(cmd, capture_output, text, creationflags=0):
+                open(out, "wb").close()
+                return type("Result", (), {"returncode": 0, "stderr": ""})()
+
+            with patch.object(a.subprocess, "run", side_effect=run):
+                with self.assertLogs(level="WARNING"):
+                    self.assertFalse(a.generate_waveform_image("ffmpeg", "in.mp4", 0, 5, 0, out))
+
+    def test_ffmpeg_not_runnable_returns_false_not_raised(self):
+        with patch.object(a.subprocess, "run", side_effect=OSError("not found")):
+            with self.assertLogs(level="WARNING"):
+                self.assertFalse(a.generate_waveform_image("ffmpeg", "in.mp4", 0, 5, 0, "out.png"))
+
+
+class ComputeWaveformViewCropTests(unittest.TestCase):
+    def test_full_view_is_a_full_passthrough(self):
+        self.assertEqual(a.compute_waveform_view_crop(10, 1000, 0, 10), (0, 1000))
+
+    def test_zoomed_into_the_middle_crops_proportionally(self):
+        # A 20-second clip rendered at 1000px; viewing [8, 12) (the middle 20%) should crop the
+        # middle 200px.
+        self.assertEqual(a.compute_waveform_view_crop(20, 1000, 8, 12), (400, 600))
+
+    def test_zoomed_to_the_very_start(self):
+        self.assertEqual(a.compute_waveform_view_crop(10, 1000, 0, 1), (0, 100))
+
+    def test_zoomed_to_the_very_end(self):
+        self.assertEqual(a.compute_waveform_view_crop(10, 1000, 9, 10), (900, 1000))
+
+    def test_view_always_within_duration_never_needs_clamping_in_practice(self):
+        # zoom_view/on_pan_drag always clamp view_state to [0, duration) themselves, so a valid
+        # view request should never actually need clamping -- this just confirms the math still
+        # lands exactly on the image's own bounds at the edges, not off by one either direction.
+        crop_left, crop_right = a.compute_waveform_view_crop(60, 6000, 0, 60)
+        self.assertEqual((crop_left, crop_right), (0, 6000))
+
+    def test_degenerate_inputs_are_rejected(self):
+        self.assertIsNone(a.compute_waveform_view_crop(0, 1000, 0, 10))
+        self.assertIsNone(a.compute_waveform_view_crop(-5, 1000, 0, 10))
+        self.assertIsNone(a.compute_waveform_view_crop(10, 0, 0, 10))
+        self.assertIsNone(a.compute_waveform_view_crop(10, 1000, 5, 5))
+        self.assertIsNone(a.compute_waveform_view_crop(10, 1000, 6, 5))
+
+    def test_crop_width_is_never_less_than_one_pixel(self):
+        # A tiny (sub-pixel) view span must still round up to something croppable/paintable.
+        crop_left, crop_right = a.compute_waveform_view_crop(10000, 1000, 5000.0, 5000.05)
+        self.assertGreaterEqual(crop_right - crop_left, 1)
+
+
+class WaveformViewNeedsHigherResolutionTests(unittest.TestCase):
+    def test_full_view_never_needs_it(self):
+        # The whole clip, at the full-render width, always has at least as much detail as any
+        # canvas could ever show.
+        self.assertFalse(a.waveform_view_needs_higher_resolution(60, 16000, 0, 60, 1200))
+
+    def test_deep_zoom_needs_it(self):
+        # A 1-hour clip rendered at 16000px is ~4.4px/sec; zooming into a 2-second window has
+        # under 9 real source pixels behind a 1200px-wide canvas -- badly upscaled.
+        self.assertTrue(a.waveform_view_needs_higher_resolution(3600, 16000, 100, 102, 1200))
+
+    def test_source_pixels_exactly_equal_to_canvas_is_not_flagged(self):
+        # Exactly enough real detail (no upscaling at all) shouldn't trigger a real re-render --
+        # only genuinely FEWER source pixels than the canvas should.
+        self.assertFalse(a.waveform_view_needs_higher_resolution(1000, 1000, 0, 500, 500))
+
+    def test_degenerate_inputs_are_false_not_raised(self):
+        self.assertFalse(a.waveform_view_needs_higher_resolution(0, 16000, 0, 10, 1200))
+        self.assertFalse(a.waveform_view_needs_higher_resolution(-5, 16000, 0, 10, 1200))
+        self.assertFalse(a.waveform_view_needs_higher_resolution(60, 16000, 0, 60, 0))
+        self.assertFalse(a.waveform_view_needs_higher_resolution(60, 16000, 5, 5, 1200))
+        self.assertFalse(a.waveform_view_needs_higher_resolution(60, 16000, 6, 5, 1200))
+
+
+class DownsampleWaveformImagePeakTests(unittest.TestCase):
+    def _make_source(self, width=200, height=40):
+        from PIL import Image
+        bg = tuple(int(a.WAVEFORM_BG_COLOR.removeprefix("0x")[i:i + 2], 16) for i in (0, 2, 4))
+        return Image.new("RGB", (width, height), bg), bg
+
+    def _wave_rgb(self):
+        return tuple(int(a.WAVEFORM_LINE_COLOR.removeprefix("0x")[i:i + 2], 16) for i in (0, 2, 4))
+
+    def _column_heights(self, image):
+        import numpy as np
+        arr = np.asarray(image.convert("RGB"))
+        bg = tuple(int(a.WAVEFORM_BG_COLOR.removeprefix("0x")[i:i + 2], 16) for i in (0, 2, 4))
+        is_wave = (arr != bg).any(axis=2)
+        return is_wave.sum(axis=0)
+
+    def test_narrow_spike_is_not_lost_when_downsampled(self):
+        # A single full-height column (e.g. a brief transient) sitting in an otherwise-silent
+        # source bucket must still show up at full height in its destination column -- a plain
+        # resize can dilute or drop it entirely depending on where it happens to fall relative to
+        # the resize's sampling grid.
+        from PIL import ImageDraw
+        img, bg = self._make_source(width=200, height=40)
+        draw = ImageDraw.Draw(img)
+        wave = self._wave_rgb()
+        draw.line((50, 2, 50, 37), fill=wave)  # one tall column amid silence
+        out = a.downsample_waveform_image_peak(img, 20)
+        heights = self._column_heights(out)
+        dest_col = int(50 / 200 * 20)
+        self.assertGreaterEqual(heights[dest_col], 34)  # ~full height preserved, not attenuated
+
+    def test_true_amplitude_of_a_broad_region_is_preserved(self):
+        # A wide, consistently-moderate region should downsample to its own true peak height,
+        # not get inflated by an unrelated spike elsewhere in the image.
+        from PIL import ImageDraw
+        img, bg = self._make_source(width=200, height=40)
+        draw = ImageDraw.Draw(img)
+        wave = self._wave_rgb()
+        for x in range(100, 170):
+            draw.line((x, 15, x, 25), fill=wave)  # a broad, modest-height region
+        out = a.downsample_waveform_image_peak(img, 20)
+        heights = self._column_heights(out)
+        broad_dest_cols = range(int(100 / 200 * 20), int(170 / 200 * 20))
+        for col in broad_dest_cols:
+            self.assertLessEqual(heights[col], 12)  # never inflated past its own true height
+
+    def test_silent_region_stays_silent(self):
+        img, bg = self._make_source(width=200, height=40)
+        out = a.downsample_waveform_image_peak(img, 20)
+        heights = self._column_heights(out)
+        self.assertTrue((heights == 0).all())
+
+    def test_output_size_matches_target_width(self):
+        img, bg = self._make_source(width=200, height=40)
+        out = a.downsample_waveform_image_peak(img, 33)
+        self.assertEqual(out.size, (33, 40))
+
+
+class WaveformImageCacheTests(unittest.TestCase):
+    def setUp(self):
+        a._waveform_image_cache.clear()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.path = os.path.join(self.tmpdir.name, "clip.mp4")
+        with open(self.path, "wb") as f:
+            f.write(b"fake video bytes")
+
+    def tearDown(self):
+        a._waveform_image_cache.clear()
+
+    def test_miss_when_nothing_cached(self):
+        self.assertIsNone(a.get_cached_waveform_image(self.path, 0))
+
+    def test_hit_returns_the_same_image_after_store(self):
+        from PIL import Image
+        image = Image.new("RGB", (10, 10))
+        a.store_cached_waveform_image(self.path, 0, image)
+        self.assertIs(a.get_cached_waveform_image(self.path, 0), image)
+
+    def test_different_track_index_is_a_separate_entry(self):
+        from PIL import Image
+        image0 = Image.new("RGB", (10, 10))
+        a.store_cached_waveform_image(self.path, 0, image0)
+        self.assertIsNone(a.get_cached_waveform_image(self.path, 1))
+
+    def test_miss_after_file_is_modified(self):
+        from PIL import Image
+        image = Image.new("RGB", (10, 10))
+        a.store_cached_waveform_image(self.path, 0, image)
+        with open(self.path, "wb") as f:
+            f.write(b"different bytes, different size")
+        self.assertIsNone(a.get_cached_waveform_image(self.path, 0))
+
+    def test_missing_file_is_always_a_miss(self):
+        a.store_cached_waveform_image(self.path, 0, object())
+        os.remove(self.path)
+        self.assertIsNone(a.get_cached_waveform_image(self.path, 0))
+
+    def test_oldest_entry_is_evicted_past_the_cap(self):
+        paths = []
+        for i in range(a._WAVEFORM_IMAGE_CACHE_MAX_ENTRIES + 1):
+            p = os.path.join(self.tmpdir.name, f"clip_{i}.mp4")
+            with open(p, "wb") as f:
+                f.write(b"x" * (i + 1))
+            paths.append(p)
+            a.store_cached_waveform_image(p, 0, object())
+        self.assertIsNone(a.get_cached_waveform_image(paths[0], 0))  # evicted (oldest)
+        self.assertIsNotNone(a.get_cached_waveform_image(paths[-1], 0))  # still cached (newest)
+        self.assertEqual(len(a._waveform_image_cache), a._WAVEFORM_IMAGE_CACHE_MAX_ENTRIES)
 
 
 class BuildTrimCommandTests(unittest.TestCase):
@@ -607,34 +942,61 @@ class ComputeTrimOutputPathTests(unittest.TestCase):
             self.assertEqual(os.path.basename(result), "recording_clip.mkv")
 
 
+class _FakePopen:
+    """Stand-in for subprocess.Popen matching what _run_cancellable_subprocess actually calls on
+    it: .communicate(), .poll(), .kill() -- trim_clip's pass 1 and its plain (no
+    progress_callback) path both moved off subprocess.run onto this so a Cancel button can kill
+    them mid-flight, which subprocess.run's own block-until-done has no way to support."""
+    def __init__(self, cmd, returncode=0, stderr="", write_output=True, output_bytes=b"data"):
+        self.cmd = cmd
+        self.returncode = returncode
+        self.stderr_text = stderr
+        self.write_output = write_output
+        self.output_bytes = output_bytes
+        self.finished = False
+        self.killed = False
+
+    def communicate(self):
+        if self.write_output and self.cmd[-1] != "NUL":
+            with open(self.cmd[-1], "wb") as f:
+                f.write(self.output_bytes)
+        self.finished = True
+        return "", self.stderr_text
+
+    def poll(self):
+        return self.returncode if self.finished else None
+
+    def kill(self):
+        self.killed = True
+        self.finished = True
+
+
 class TrimClipTests(unittest.TestCase):
-    def _fake_run(self, returncode=0, stderr="", write_output=True, output_bytes=b"data"):
-        def run(cmd, capture_output, text, creationflags=0):
+    def _fake_popen(self, returncode=0, stderr="", write_output=True, output_bytes=b"data"):
+        def popen(cmd, **kwargs):
             self.last_cmd = cmd
-            if write_output:
-                output_path = cmd[-1]
-                with open(output_path, "wb") as f:
-                    f.write(output_bytes)
-            return type("Result", (), {"returncode": returncode, "stderr": stderr})()
-        return run
+            return _FakePopen(
+                cmd, returncode=returncode, stderr=stderr, write_output=write_output, output_bytes=output_bytes,
+            )
+        return popen
 
     def test_end_before_start_is_rejected_without_running_ffmpeg(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in.mp4")
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
-            with patch.object(a.subprocess, "run") as mock_run:
+            with patch.object(a.subprocess, "Popen") as mock_popen:
                 with self.assertLogs(level="ERROR"):
                     result = a.trim_clip(src, 10, 5, out)
             self.assertFalse(result)
-            mock_run.assert_not_called()
+            mock_popen.assert_not_called()
 
     def test_successful_trim_returns_true_and_notifies(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in.mp4")
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
-            with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+            with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen()):
                 result = a.trim_clip(src, 0, 5, out)
             self.assertTrue(result)
             self.assertTrue(os.path.isfile(out))
@@ -644,7 +1006,7 @@ class TrimClipTests(unittest.TestCase):
             src = os.path.join(tmp, "in.mp4")
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
-            with patch.object(a.subprocess, "run", side_effect=self._fake_run(returncode=1, stderr="boom")):
+            with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen(returncode=1, stderr="boom")):
                 with self.assertLogs(level="ERROR"):
                     result = a.trim_clip(src, 0, 5, out, delete_original=True)
             self.assertFalse(result)
@@ -655,7 +1017,7 @@ class TrimClipTests(unittest.TestCase):
             src = os.path.join(tmp, "in.mp4")
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
-            with patch.object(a.subprocess, "run", side_effect=self._fake_run(output_bytes=b"")):
+            with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen(output_bytes=b"")):
                 with self.assertLogs(level="ERROR"):
                     result = a.trim_clip(src, 0, 5, out)
             self.assertFalse(result)
@@ -667,7 +1029,7 @@ class TrimClipTests(unittest.TestCase):
             src = os.path.join(tmp, "in.mp4")
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
-            with patch.object(a.subprocess, "run", side_effect=self._fake_run(write_output=False)):
+            with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen(write_output=False)):
                 with self.assertLogs(level="ERROR"):
                     result = a.trim_clip(src, 0, 5, out)
             self.assertFalse(result)
@@ -677,7 +1039,7 @@ class TrimClipTests(unittest.TestCase):
             src = os.path.join(tmp, "in.mp4")
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
-            with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+            with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen()):
                 result = a.trim_clip(src, 0, 5, out, delete_original=True)
             self.assertTrue(result)
             self.assertFalse(os.path.isfile(src))
@@ -687,7 +1049,7 @@ class TrimClipTests(unittest.TestCase):
             src = os.path.join(tmp, "in.mp4")
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
-            with patch.object(a.subprocess, "run", side_effect=OSError("not found")):
+            with patch.object(a.subprocess, "Popen", side_effect=OSError("not found")):
                 with self.assertLogs(level="ERROR"):
                     result = a.trim_clip(src, 0, 5, out)  # must not raise
             self.assertFalse(result)
@@ -699,14 +1061,11 @@ class TrimClipTests(unittest.TestCase):
             out = os.path.join(tmp, "out.mp4")
             calls = []
 
-            def run(cmd, capture_output, text, creationflags=0):
+            def popen(cmd, **kwargs):
                 calls.append(cmd)
-                if cmd[-1] != "NUL":
-                    with open(cmd[-1], "wb") as f:
-                        f.write(b"data")
-                return type("Result", (), {"returncode": 0, "stderr": ""})()
+                return _FakePopen(cmd)
 
-            with patch.object(a.subprocess, "run", side_effect=run):
+            with patch.object(a.subprocess, "Popen", side_effect=popen):
                 result = a.trim_clip(src, 0, 5, out, target_size_mb=5)
             self.assertTrue(result)
             self.assertEqual(len(calls), 2)
@@ -722,15 +1081,37 @@ class TrimClipTests(unittest.TestCase):
             out = os.path.join(tmp, "out.mp4")
             calls = []
 
-            def run(cmd, capture_output, text, creationflags=0):
+            def popen(cmd, **kwargs):
                 calls.append(cmd)
-                return type("Result", (), {"returncode": 1, "stderr": "boom"})()
+                return _FakePopen(cmd, returncode=1, stderr="boom", write_output=False)
 
-            with patch.object(a.subprocess, "run", side_effect=run):
+            with patch.object(a.subprocess, "Popen", side_effect=popen):
                 with self.assertLogs(level="ERROR"):
                     result = a.trim_clip(src, 0, 5, out, target_size_mb=5)
             self.assertFalse(result)
             self.assertEqual(len(calls), 1)  # never reached pass 2
+
+    def test_cancel_event_set_before_pass1_starts_still_aborts_cleanly(self):
+        # A simple, deterministic stand-in for "cancelled mid-flight": the real kill-mid-flight
+        # timing is covered live by _watch_for_cancel's own unit tests below, since reproducing a
+        # genuine race here would make this test flaky. What trim_clip itself is responsible for
+        # is reacting correctly once _run_cancellable_subprocess reports a cancellation.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.mp4")
+            open(src, "w").close()
+            out = os.path.join(tmp, "out.mp4")
+            cancel_event = threading.Event()
+            cancel_event.set()
+
+            def popen(cmd, **kwargs):
+                return _FakePopen(cmd, write_output=False)
+
+            with patch.object(a.subprocess, "Popen", side_effect=popen):
+                with self.assertLogs(level="INFO") as logs:
+                    result = a.trim_clip(src, 0, 5, out, target_size_mb=5, cancel_event=cancel_event)
+            self.assertFalse(result)
+            self.assertTrue(any("cancelled" in msg for msg in logs.output))
+            self.assertFalse(os.path.isfile(out))
 
     def test_audio_shift_probes_track_count_and_passes_it_through(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -738,7 +1119,7 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
             with patch.object(a, "probe_audio_stream_count", return_value=3) as mock_probe:
-                with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen()):
                     result = a.trim_clip(
                         src, 0, 5, out, audio_shift_ms_by_track={2: 27},
                     )
@@ -752,7 +1133,7 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
             with patch.object(a, "probe_audio_stream_count") as mock_probe:
-                with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen()):
                     a.trim_clip(src, 0, 5, out)
             mock_probe.assert_not_called()
 
@@ -762,7 +1143,7 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
             with patch.object(a, "probe_audio_stream_count", return_value=None):
-                with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen()):
                     with self.assertLogs(level="WARNING"):
                         result = a.trim_clip(src, 0, 5, out, audio_shift_ms_by_track={2: 27})
             self.assertTrue(result)  # still trims, just without the shift
@@ -774,14 +1155,11 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def run(cmd, capture_output, text, creationflags=0):
-                if cmd[-1] != "NUL":
-                    with open(cmd[-1], "wb") as f:
-                        f.write(b"data")
-                return type("Result", (), {"returncode": 0, "stderr": ""})()
+            def popen(cmd, **kwargs):
+                return _FakePopen(cmd)
 
             with patch.object(a, "probe_audio_stream_count") as mock_probe:
-                with patch.object(a.subprocess, "run", side_effect=run):
+                with patch.object(a.subprocess, "Popen", side_effect=popen):
                     with self.assertLogs(level="WARNING"):
                         result = a.trim_clip(
                             src, 0, 5, out, target_size_mb=5, audio_shift_ms_by_track={2: 27},
@@ -795,7 +1173,7 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
             with patch.object(a, "probe_audio_stream_count", return_value=3) as mock_probe:
-                with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen()):
                     result = a.trim_clip(src, 0, 5, out, muted_destinations=[2])
             self.assertTrue(result)
             mock_probe.assert_called_once()
@@ -807,7 +1185,7 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
             with patch.object(a, "probe_audio_stream_count") as mock_probe:
-                with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen()):
                     a.trim_clip(src, 0, 5, out, muted_destinations=[])
             mock_probe.assert_not_called()
 
@@ -817,14 +1195,11 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def run(cmd, capture_output, text, creationflags=0):
-                if cmd[-1] != "NUL":
-                    with open(cmd[-1], "wb") as f:
-                        f.write(b"data")
-                return type("Result", (), {"returncode": 0, "stderr": ""})()
+            def popen(cmd, **kwargs):
+                return _FakePopen(cmd)
 
             with patch.object(a, "probe_audio_stream_count") as mock_probe:
-                with patch.object(a.subprocess, "run", side_effect=run):
+                with patch.object(a.subprocess, "Popen", side_effect=popen):
                     with self.assertLogs(level="WARNING"):
                         result = a.trim_clip(src, 0, 5, out, target_size_mb=5, muted_destinations=[2])
             self.assertTrue(result)
@@ -836,7 +1211,7 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
             with patch.object(a, "probe_audio_stream_count", return_value=3) as mock_probe:
-                with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen()):
                     result = a.trim_clip(src, 0, 5, out, audio_routing={1: [2, 3]})
             self.assertTrue(result)
             mock_probe.assert_called_once()
@@ -848,7 +1223,7 @@ class TrimClipTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
             with patch.object(a, "probe_audio_stream_count") as mock_probe:
-                with patch.object(a.subprocess, "run", side_effect=self._fake_run()):
+                with patch.object(a.subprocess, "Popen", side_effect=self._fake_popen()):
                     a.trim_clip(src, 0, 5, out, audio_routing=None)
             mock_probe.assert_not_called()
 
@@ -1014,18 +1389,28 @@ class RunFfmpegWithProgressTests(unittest.TestCase):
             self.stdout = iter(out_lines)
             self.stderr = iter(stderr_lines or [])
             self.returncode = returncode
+            self.finished = False
+            self.killed = False
 
         def wait(self):
-            pass
+            self.finished = True
+
+        def poll(self):
+            return self.returncode if self.finished else None
+
+        def kill(self):
+            self.killed = True
+            self.finished = True
 
     def test_parses_out_time_into_fraction(self):
         lines = ["out_time=00:00:05.000000\n", "out_time=00:00:10.000000\n", "progress=end\n"]
         proc = self._FakeProc(lines)
         fractions = []
         with patch.object(a.subprocess, "Popen", return_value=proc):
-            returncode, stderr_text = a._run_ffmpeg_with_progress(["ffmpeg", "-y"], 10.0, fractions.append)
+            returncode, stderr_text, cancelled = a._run_ffmpeg_with_progress(["ffmpeg", "-y"], 10.0, fractions.append)
         self.assertEqual(returncode, 0)
         self.assertEqual(stderr_text, "")
+        self.assertFalse(cancelled)
         self.assertAlmostEqual(fractions[0], 0.5)
         self.assertAlmostEqual(fractions[1], 1.0)
 
@@ -1039,7 +1424,7 @@ class RunFfmpegWithProgressTests(unittest.TestCase):
     def test_captures_stderr(self):
         proc = self._FakeProc(["out_time=00:00:01.000000\n"], stderr_lines=["warning line\n"])
         with patch.object(a.subprocess, "Popen", return_value=proc):
-            returncode, stderr_text = a._run_ffmpeg_with_progress(["ffmpeg"], 1.0, lambda f: None)
+            returncode, stderr_text, _cancelled = a._run_ffmpeg_with_progress(["ffmpeg"], 1.0, lambda f: None)
         self.assertIn("warning line", stderr_text)
 
     def test_inserts_progress_flags_after_executable(self):
@@ -1050,6 +1435,65 @@ class RunFfmpegWithProgressTests(unittest.TestCase):
         self.assertEqual(called_cmd[0], "ffmpeg")
         self.assertEqual(called_cmd[1:3], ["-progress", "pipe:1"])
 
+    def test_cancel_event_already_set_kills_the_process(self):
+        proc = self._FakeProc([])  # no stdout lines -- the for-loop over it exits immediately
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with patch.object(a.subprocess, "Popen", return_value=proc):
+            _returncode, _stderr_text, cancelled = a._run_ffmpeg_with_progress(
+                ["ffmpeg"], 1.0, lambda f: None, cancel_event=cancel_event,
+            )
+        self.assertTrue(cancelled)
+        self.assertTrue(proc.killed)
+
+    def test_no_cancel_event_never_touches_kill(self):
+        proc = self._FakeProc([])
+        with patch.object(a.subprocess, "Popen", return_value=proc):
+            _returncode, _stderr_text, cancelled = a._run_ffmpeg_with_progress(["ffmpeg"], 1.0, lambda f: None)
+        self.assertFalse(cancelled)
+        self.assertFalse(proc.killed)
+
+
+class WatchForCancelTests(unittest.TestCase):
+    # Exercises the actual timing-sensitive kill-mid-flight behavior directly (rather than via
+    # trim_clip, where reproducing a real race would be flaky) -- a real subprocess this time,
+    # since the whole point is confirming a genuine OS-level kill actually happens.
+    def test_kills_a_real_running_process_once_cancelled(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        cancel_event = threading.Event()
+        was_cancelled = [False]
+        watcher = threading.Thread(target=a._watch_for_cancel, args=(proc, cancel_event, was_cancelled), daemon=True)
+        watcher.start()
+        cancel_event.set()
+        watcher.join(timeout=5)
+        proc.wait(timeout=5)
+        self.assertTrue(was_cancelled[0])
+        self.assertIsNotNone(proc.poll())
+
+    def test_never_kills_when_cancel_event_is_none(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait(timeout=5)
+        was_cancelled = [False]
+        # Must return immediately without touching proc at all -- proc has already exited, so any
+        # attempt to poll/kill it here would still be harmless, but the real point is this
+        # shouldn't loop or block when there's no event to watch in the first place.
+        a._watch_for_cancel(proc, None, was_cancelled)
+        self.assertFalse(was_cancelled[0])
+
+    def test_exits_on_its_own_once_the_process_finishes_normally(self):
+        # A cancel_event that's never set shouldn't leave this thread blocked forever once the
+        # process it's watching has already finished -- confirmed by giving it a real (but
+        # already-dead-by-the-time-poll-checks) process and a generous join timeout.
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait(timeout=5)
+        cancel_event = threading.Event()  # never set
+        was_cancelled = [False]
+        watcher = threading.Thread(target=a._watch_for_cancel, args=(proc, cancel_event, was_cancelled), daemon=True)
+        watcher.start()
+        watcher.join(timeout=2)
+        self.assertFalse(watcher.is_alive())
+        self.assertFalse(was_cancelled[0])
+
 
 class TrimClipProgressCallbackTests(unittest.TestCase):
     def test_progress_callback_used_for_plain_trim(self):
@@ -1058,12 +1502,12 @@ class TrimClipProgressCallbackTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def fake_progress_runner(cmd, total_duration, on_progress):
+            def fake_progress_runner(cmd, total_duration, on_progress, cancel_event=None):
                 self.assertAlmostEqual(total_duration, 5.0)
                 with open(cmd[-1], "wb") as f:
                     f.write(b"data")
                 on_progress(0.5)
-                return 0, ""
+                return 0, "", False
 
             calls = []
             with patch.object(a, "_run_ffmpeg_with_progress", side_effect=fake_progress_runner):
@@ -1080,43 +1524,42 @@ class TrimClipProgressCallbackTests(unittest.TestCase):
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def fake_run(cmd, capture_output, text, creationflags=0):
-                # pass 1 (analysis, discarded to NUL) still goes through plain subprocess.run
-                self.assertEqual(cmd[-1], "NUL")
-                return type("Result", (), {"returncode": 0, "stderr": ""})()
-
-            def fake_progress_runner(cmd, total_duration, on_progress):
+            def fake_progress_runner(cmd, total_duration, on_progress, cancel_event=None):
+                # Both pass 1 (analysis, discarded to NUL) and pass 2 go through
+                # _run_ffmpeg_with_progress when a progress_callback is given -- pass 1 re-encodes
+                # the whole clip too (its output is thrown away), so it takes just as long as
+                # pass 2 and needs its own real progress rather than a single frozen 0% call.
+                on_progress(0.5)
                 with open(cmd[-1], "wb") as f:
                     f.write(b"data")
-                return 0, ""
+                return 0, "", False
 
             calls = []
-            with patch.object(a.subprocess, "run", side_effect=fake_run):
-                with patch.object(a, "_run_ffmpeg_with_progress", side_effect=fake_progress_runner):
-                    result = a.trim_clip(
-                        src, 0, 5, out, target_size_mb=5,
-                        progress_callback=lambda phase, frac: calls.append((phase, frac)),
-                    )
+            with patch.object(a, "_run_ffmpeg_with_progress", side_effect=fake_progress_runner):
+                result = a.trim_clip(
+                    src, 0, 5, out, target_size_mb=5,
+                    progress_callback=lambda phase, frac: calls.append((phase, frac)),
+                )
             self.assertTrue(result)
-            self.assertTrue(any(phase == "Analyzing (pass 1 of 2)" for phase, _ in calls))
-            self.assertTrue(any(phase == "Encoding (pass 2 of 2)" for phase, _ in calls))
+            self.assertIn(("Analyzing (pass 1 of 2)", 0.0), calls)
+            self.assertIn(("Analyzing (pass 1 of 2)", 0.5), calls)
+            self.assertIn(("Encoding (pass 2 of 2)", 0.0), calls)
+            self.assertIn(("Encoding (pass 2 of 2)", 0.5), calls)
 
-    def test_no_progress_callback_still_uses_plain_subprocess_run(self):
+    def test_no_progress_callback_still_works_via_the_cancellable_runner(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in.mp4")
             open(src, "w").close()
             out = os.path.join(tmp, "out.mp4")
 
-            def fake_run(cmd, capture_output, text, creationflags=0):
-                with open(cmd[-1], "wb") as f:
-                    f.write(b"data")
-                return type("Result", (), {"returncode": 0, "stderr": ""})()
+            def fake_popen(cmd, **kwargs):
+                return _FakePopen(cmd)
 
-            with patch.object(a.subprocess, "run", side_effect=fake_run) as mock_run:
+            with patch.object(a.subprocess, "Popen", side_effect=fake_popen) as mock_popen:
                 with patch.object(a, "_run_ffmpeg_with_progress") as mock_progress_run:
                     result = a.trim_clip(src, 0, 5, out)
             self.assertTrue(result)
-            mock_run.assert_called_once()
+            mock_popen.assert_called_once()
             mock_progress_run.assert_not_called()
 
 

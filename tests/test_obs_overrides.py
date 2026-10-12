@@ -11,6 +11,58 @@ import autostart_script as a
 from tests.fakes import FakeObsClient
 
 
+class WaitUntilObsReadyTests(unittest.TestCase):
+    # Confirmed live, twice in one session: OBS can accept a websocket connection and finish the
+    # identify handshake well before it's actually ready to answer ANY request -- connect_obs's
+    # own retries only cover the connection itself, not this. wait_until_obs_ready is the guard
+    # for callers that need OBS genuinely ready, not just connected.
+    def test_ready_immediately_returns_true_without_sleeping(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a.time, "sleep") as mock_sleep:
+            self.assertTrue(a.wait_until_obs_ready(client))
+        mock_sleep.assert_not_called()
+
+    def test_retries_past_transient_not_ready_then_succeeds(self):
+        class FlakyClient(FakeObsClient):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            def get_record_status(self):
+                self.attempts += 1
+                if self.attempts < 3:
+                    raise a.obsws.error.OBSSDKRequestError("GetRecordStatus", a.OBS_NOT_READY_CODE, "not ready")
+                return super().get_record_status()
+
+        client = FlakyClient()
+        with unittest.mock.patch.object(a.time, "sleep"):
+            self.assertTrue(a.wait_until_obs_ready(client))
+        self.assertEqual(client.attempts, 3)
+
+    def test_gives_up_after_retries_exhausted(self):
+        class AlwaysNotReadyClient(FakeObsClient):
+            def get_record_status(self):
+                raise a.obsws.error.OBSSDKRequestError("GetRecordStatus", a.OBS_NOT_READY_CODE, "not ready")
+
+        client = AlwaysNotReadyClient()
+        with unittest.mock.patch.object(a.time, "sleep"):
+            self.assertFalse(a.wait_until_obs_ready(client, retries=3, delay=0))
+
+    def test_a_different_error_code_gives_up_immediately_without_retrying(self):
+        class DifferentErrorClient(FakeObsClient):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            def get_record_status(self):
+                self.attempts += 1
+                raise a.obsws.error.OBSSDKRequestError("GetRecordStatus", 500, "something else entirely")
+
+        client = DifferentErrorClient()
+        self.assertFalse(a.wait_until_obs_ready(client))
+        self.assertEqual(client.attempts, 1)
+
+
 class ApplyOutputFolderTests(unittest.TestCase):
     def test_none_is_a_noop(self):
         client = FakeObsClient()
@@ -60,6 +112,383 @@ class ApplyRecordingFormatTests(unittest.TestCase):
         client = FakeObsClient()
         a.apply_recording_format(client, "some_future_format_code")
         self.assertEqual(a.get_profile_parameter_value(client, "AdvOut", "RecFormat2"), "some_future_format_code")
+
+
+class ComputeMicBoostDbFromSamplesTests(unittest.TestCase):
+    def test_no_samples_reports_no_signal(self):
+        boost_db, error = a.compute_mic_boost_db_from_samples([], input_name="Scarlet")
+        self.assertIsNone(boost_db)
+        self.assertIn("Scarlet", error)
+        self.assertIn("No signal", error)
+
+    def test_near_silence_is_inconclusive_not_a_huge_boost(self):
+        # Below MIC_BOOST_CALIBRATION_MIN_SIGNAL_DB -- shouldn't compute a boost against what's
+        # basically silence, even though the math could technically produce a (meaningless) number.
+        voice = [10 ** (-90 / 20)] * 10
+        boost_db, error = a.compute_mic_boost_db_from_samples(voice)
+        self.assertIsNone(boost_db)
+        self.assertIn("normally", error)
+
+    def test_quiet_voice_below_compressor_threshold_gets_a_flat_solve(self):
+        # -50dBFS is below the compressor's -30dB threshold -- no compression applies, so the
+        # needed boost is simply target - reference, unclamped.
+        voice = [10 ** (-50 / 20)] * 10
+        boost_db, error = a.compute_mic_boost_db_from_samples(voice, target_db=-18.0)
+        self.assertIsNone(error)
+        self.assertAlmostEqual(boost_db, -18.0 - -50.0, places=1)
+
+    def test_loud_voice_above_compressor_threshold_accounts_for_the_ratio(self):
+        # -20dBFS is 10dB above the -30dB threshold; at a 3:1 ratio the compressor itself already
+        # pulls that down to just 3.33dB above threshold (-26.67dBFS) BEFORE any boost is added --
+        # so reaching the target actually needs MORE boost than a naive flat solve (target minus
+        # raw reference, ignoring what compression already did to the signal) would suggest.
+        voice = [10 ** (-20 / 20)] * 10
+        boost_db, error = a.compute_mic_boost_db_from_samples(voice, target_db=-18.0)
+        self.assertIsNone(error)
+        naive_flat_solve = -18.0 - -20.0
+        self.assertGreater(boost_db, naive_flat_solve)
+
+    def test_result_is_clamped_to_the_sane_range(self):
+        very_quiet = [10 ** (-84 / 20)] * 10  # just above the min-signal floor
+        boost_db, _error = a.compute_mic_boost_db_from_samples(very_quiet, target_db=-18.0)
+        self.assertLessEqual(boost_db, a.MIC_BOOST_CALIBRATION_MAX_BOOST_DB)
+
+        already_loud = [10 ** (10 / 20)] * 10
+        boost_db, _error = a.compute_mic_boost_db_from_samples(already_loud, target_db=-18.0)
+        self.assertGreaterEqual(boost_db, a.MIC_BOOST_CALIBRATION_MIN_BOOST_DB)
+
+    def test_uses_the_median_so_a_few_loud_words_dont_dominate(self):
+        # Mostly soft speech with a few loud words shouldn't drag the calibration toward the loud
+        # end -- the median should reflect the typical (soft) level, not the occasional peak.
+        voice = [10 ** (-50 / 20)] * 8 + [10 ** (-10 / 20)] * 2
+        boost_db, _error = a.compute_mic_boost_db_from_samples(voice, target_db=-18.0)
+        # Should land close to the flat solve for the typical (-50dB) level, not the loud one.
+        self.assertGreater(boost_db, 20)
+
+
+class MulToDbAndPercentileTests(unittest.TestCase):
+    def test_mul_to_db_zero_is_a_very_low_floor_not_an_error(self):
+        self.assertEqual(a._mul_to_db(0.0), -100.0)
+
+    def test_mul_to_db_full_scale_is_zero_db(self):
+        self.assertAlmostEqual(a._mul_to_db(1.0), 0.0, places=6)
+
+    def test_mul_to_db_matches_known_value(self):
+        self.assertAlmostEqual(a._mul_to_db(0.1), -20.0, places=6)
+
+    def test_percentile_empty_is_zero(self):
+        self.assertEqual(a._percentile([], 0.5), 0.0)
+
+    def test_percentile_zero_is_the_minimum(self):
+        self.assertEqual(a._percentile([3, 1, 2], 0.0), 1)
+
+    def test_percentile_one_is_the_maximum(self):
+        self.assertEqual(a._percentile([3, 1, 2], 1.0), 3)
+
+
+class PredictMicBoostOutputMulTests(unittest.TestCase):
+    def test_zero_input_is_zero_output(self):
+        self.assertEqual(a.predict_mic_boost_output_mul(0.0, 12.0), 0.0)
+
+    def test_below_compressor_threshold_gets_a_flat_boost(self):
+        # -40dBFS is below the compressor's -30dB threshold -- no compression applies, so a
+        # +12dB boost should land exactly 12dB higher, unclamped (well under the -1dB limiter).
+        result = a.predict_mic_boost_output_mul(10 ** (-40 / 20), 12.0)
+        self.assertAlmostEqual(result, 10 ** (-28 / 20), places=6)
+
+    def test_above_compressor_threshold_is_compressed_before_the_boost(self):
+        # -20dBFS is 10dB above the -30dB threshold; at a 3:1 ratio that 10dB becomes 3.33dB
+        # above threshold (-26.67dBFS) BEFORE the +12dB makeup gain is added.
+        result = a.predict_mic_boost_output_mul(10 ** (-20 / 20), 12.0)
+        expected_db = -30 + (-20 - -30) / 3 + 12
+        self.assertAlmostEqual(result, 10 ** (expected_db / 20), places=6)
+
+    def test_limiter_clamps_a_large_boost(self):
+        # A full-scale (0dBFS) input with a generous +30dB boost would land at +10dBFS post-
+        # compression -- the limiter's -1dB ceiling must cap it there instead.
+        result = a.predict_mic_boost_output_mul(1.0, 30.0)
+        self.assertAlmostEqual(result, 10 ** (-1 / 20), places=6)
+
+    def test_result_never_exceeds_the_full_scale_multiplier(self):
+        result = a.predict_mic_boost_output_mul(1.0, 200.0)
+        self.assertLessEqual(result, 1.0)
+
+
+class MicBoostVoiceIsolationSettingsTests(unittest.TestCase):
+    def test_rnnoise_has_no_other_settings(self):
+        self.assertEqual(a.mic_boost_voice_isolation_settings("rnnoise"), {"method": "rnnoise"})
+
+    def test_speex_includes_the_apps_own_lighter_suppress_level(self):
+        settings = a.mic_boost_voice_isolation_settings("speex")
+        self.assertEqual(settings["method"], "speex")
+        self.assertEqual(settings["suppress_level"], a.MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB)
+
+    def test_unknown_method_falls_back_to_rnnoise(self):
+        self.assertEqual(a.mic_boost_voice_isolation_settings("bogus"), {"method": "rnnoise"})
+
+
+class ApplyMicBoostFromConfigTests(unittest.TestCase):
+    def _client(self):
+        a._legacy_noise_gate_checked_inputs.clear()  # see EnsureMicBoostFilterTests._client
+        return FakeObsClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})
+
+    def test_disabled_is_a_noop(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(client, {"mic_boost": {"enabled": False, "input_name": "Scarlet"}})
+        self.assertEqual(client.calls, [])
+
+    def test_enabled_with_no_input_name_is_a_noop(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(client, {"mic_boost": {"enabled": True, "input_name": ""}})
+        self.assertEqual(client.calls, [])
+
+    def test_enabled_applies_the_configured_boost(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(
+            client, {"mic_boost": {"enabled": True, "input_name": "Scarlet", "boost_db": 24.0}},
+        )
+        compressor = client.get_source_filter("Scarlet", a.MIC_BOOST_COMPRESSOR_FILTER_NAME)
+        self.assertEqual(compressor.filter_settings["output_gain"], 24.0)
+
+    def test_enabled_applies_the_configured_voice_isolation(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(
+            client,
+            {
+                "mic_boost": {
+                    "enabled": True, "input_name": "Scarlet", "boost_db": 24.0,
+                    "voice_isolation": {"enabled": True},
+                },
+            },
+        )
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertTrue(voice_isolation.filter_enabled)
+        self.assertEqual(voice_isolation.filter_settings["method"], "rnnoise")
+
+    def test_configured_method_is_applied(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(
+            client,
+            {
+                "mic_boost": {
+                    "enabled": True, "input_name": "Scarlet", "boost_db": 24.0,
+                    "voice_isolation": {"enabled": True, "method": "speex"},
+                },
+            },
+        )
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertEqual(voice_isolation.filter_settings["method"], "speex")
+        self.assertEqual(
+            voice_isolation.filter_settings["suppress_level"], a.MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB,
+        )
+
+    def test_configured_eq_is_applied(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(
+            client,
+            {
+                "mic_boost": {
+                    "enabled": True, "input_name": "Scarlet", "boost_db": 24.0,
+                    "eq": {"enabled": True, "low_db": -6.0, "mid_db": 1.0, "high_db": 4.0},
+                },
+            },
+        )
+        eq = client.get_source_filter("Scarlet", a.MIC_BOOST_EQ_FILTER_NAME)
+        self.assertTrue(eq.filter_enabled)
+        self.assertEqual(eq.filter_settings, {"low": -6.0, "mid": 1.0, "high": 4.0})
+
+    def test_missing_mic_boost_key_entirely_is_a_noop(self):
+        client = self._client()
+        a.apply_mic_boost_from_config(client, {})
+        self.assertEqual(client.calls, [])
+
+
+class EnsureMicBoostFilterTests(unittest.TestCase):
+    def _client(self):
+        # ensure_mic_boost_filter only ever checks for the legacy noise gate ONCE per input_name
+        # per app run (see _legacy_noise_gate_checked_inputs) -- cleared here so each test starts
+        # fresh instead of a later test silently inheriting an earlier one's "already checked"
+        # state for the same "Scarlet" input name.
+        a._legacy_noise_gate_checked_inputs.clear()
+        return FakeObsClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})
+
+    def test_no_input_name_is_a_noop(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "", 12.0)
+        self.assertEqual(client.calls, [])
+
+    def test_creates_all_four_filters_on_a_fresh_source(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        filters = client.get_source_filter_list("Scarlet").filters
+        names = {f.filter_name: f.filter_kind for f in filters}
+        self.assertEqual(
+            names,
+            {
+                a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME: "noise_suppress_filter_v2",
+                a.MIC_BOOST_EQ_FILTER_NAME: "basic_eq_filter",
+                a.MIC_BOOST_COMPRESSOR_FILTER_NAME: "compressor_filter",
+                a.MIC_BOOST_LIMITER_FILTER_NAME: "limiter_filter",
+            },
+        )
+        compressor = client.get_source_filter("Scarlet", a.MIC_BOOST_COMPRESSOR_FILTER_NAME)
+        self.assertEqual(compressor.filter_settings["output_gain"], 12.0)
+        limiter = client.get_source_filter("Scarlet", a.MIC_BOOST_LIMITER_FILTER_NAME)
+        self.assertEqual(limiter.filter_settings["threshold"], -1.0)
+        # Not enabled unless explicitly opted into -- voice_isolation_enabled/eq_enabled default
+        # to False, same as the noise gate they replaced never enabled itself just by existing.
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertFalse(voice_isolation.filter_enabled)
+        self.assertEqual(voice_isolation.filter_settings["method"], "rnnoise")
+        eq = client.get_source_filter("Scarlet", a.MIC_BOOST_EQ_FILTER_NAME)
+        self.assertFalse(eq.filter_enabled)
+        self.assertEqual(
+            eq.filter_settings,
+            {"low": a.MIC_BOOST_EQ_PRESET_LOW_DB, "mid": a.MIC_BOOST_EQ_PRESET_MID_DB, "high": a.MIC_BOOST_EQ_PRESET_HIGH_DB},
+        )
+        # EQ sits between Voice Isolation and the Compressor.
+        ordered_names = [f.filter_name for f in filters]
+        self.assertEqual(
+            ordered_names,
+            [
+                a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, a.MIC_BOOST_EQ_FILTER_NAME,
+                a.MIC_BOOST_COMPRESSOR_FILTER_NAME, a.MIC_BOOST_LIMITER_FILTER_NAME,
+            ],
+        )
+
+    def test_eq_enabled_with_custom_values(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, eq_enabled=True, eq_low_db=-6.0, eq_mid_db=0.0, eq_high_db=5.0)
+        eq = client.get_source_filter("Scarlet", a.MIC_BOOST_EQ_FILTER_NAME)
+        self.assertTrue(eq.filter_enabled)
+        self.assertEqual(eq.filter_settings, {"low": -6.0, "mid": 0.0, "high": 5.0})
+
+    def test_eq_toggle_and_value_changes_do_not_recreate(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, eq_enabled=True)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, eq_enabled=False, eq_low_db=-8.0)
+        self.assertEqual([c for c in client.calls if c[0] == "create_source_filter"], [])
+        eq = client.get_source_filter("Scarlet", a.MIC_BOOST_EQ_FILTER_NAME)
+        self.assertFalse(eq.filter_enabled)
+        self.assertEqual(eq.filter_settings["low"], -8.0)
+
+    def test_legacy_noise_gate_is_removed_if_present(self):
+        # Simulates a source left over from before this app switched from a Noise Gate to voice
+        # isolation -- must be actively removed, not just ignored, or it would keep gating the raw
+        # signal alongside the new filter.
+        client = self._client()
+        client.create_source_filter(
+            "Scarlet", a._LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME, "noise_gate_filter", {"open_threshold": -30.0},
+        )
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        names = {f.filter_name for f in client.get_source_filter_list("Scarlet").filters}
+        self.assertNotIn(a._LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME, names)
+        self.assertIn(("remove_source_filter", "Scarlet", a._LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME), client.calls)
+
+    def test_no_legacy_noise_gate_present_sends_no_extra_requests(self):
+        # The common case (nothing to clean up) must stay a true no-op -- no remove_source_filter
+        # call, not even one that would just no-op server-side.
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        self.assertNotIn(
+            "remove_source_filter", [c[0] for c in client.calls],
+        )
+
+    def test_compressor_created_before_limiter_in_the_chain(self):
+        # Ordering matters here: a limiter has to come AFTER the compressor's own output_gain to
+        # actually catch what that gain produces, not before it.
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        create_calls = [c for c in client.calls if c[0] == "create_source_filter"]
+        self.assertEqual(
+            [c[2] for c in create_calls],
+            [
+                a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, a.MIC_BOOST_EQ_FILTER_NAME,
+                a.MIC_BOOST_COMPRESSOR_FILTER_NAME, a.MIC_BOOST_LIMITER_FILTER_NAME,
+            ],
+        )
+
+    def test_already_matching_settings_are_not_rewritten(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        self.assertEqual(client.calls, [])
+
+    def test_changed_boost_db_updates_the_compressor_only(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 24.0)
+        self.assertEqual(
+            client.calls,
+            [(
+                "set_source_filter_settings", "Scarlet", a.MIC_BOOST_COMPRESSOR_FILTER_NAME,
+                dict(a.MIC_BOOST_COMPRESSOR_BASE_SETTINGS, output_gain=24.0), False,
+            )],
+        )
+        compressor = client.get_source_filter("Scarlet", a.MIC_BOOST_COMPRESSOR_FILTER_NAME)
+        self.assertEqual(compressor.filter_settings["output_gain"], 24.0)
+
+    def test_never_raises_when_client_errors(self):
+        class RaisingClient(FakeObsClient):
+            def create_source_filter(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        client = RaisingClient(inputs={"Scarlet": {"kind": "wasapi_input_capture", "tracks": {}, "settings": {}}})
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0)  # must not raise
+
+    def test_unknown_source_is_logged_not_raised(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "No Such Source", 12.0)  # must not raise
+
+    def test_voice_isolation_created_enabled_and_moved_to_front(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertEqual(voice_isolation.filter_settings["method"], "rnnoise")
+        self.assertTrue(voice_isolation.filter_enabled)
+        names = [f.filter_name for f in client.get_source_filter_list("Scarlet").filters]
+        self.assertEqual(names[0], a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+
+    def test_voice_isolation_disabled_toggle_is_synced_even_though_the_filter_stays(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=False)
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertFalse(voice_isolation.filter_enabled)  # toggled off, but not deleted
+
+    def test_voice_isolation_reenabled_restores_without_recreating(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=False)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
+        self.assertEqual(
+            [c for c in client.calls if c[0] == "create_source_filter"], [],  # never recreated
+        )
+        self.assertIn(("set_source_filter_enabled", "Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, True), client.calls)
+
+    def test_unchanged_voice_isolation_state_is_not_rewritten(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True)
+        self.assertEqual(client.calls, [])
+
+    def test_switching_method_updates_settings_without_recreating(self):
+        client = self._client()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True, voice_isolation_method="rnnoise")
+        client.calls.clear()
+        a.ensure_mic_boost_filter(client, "Scarlet", 12.0, voice_isolation_enabled=True, voice_isolation_method="speex")
+        self.assertEqual([c for c in client.calls if c[0] == "create_source_filter"], [])  # never recreated
+        voice_isolation = client.get_source_filter("Scarlet", a.MIC_BOOST_VOICE_ISOLATION_FILTER_NAME)
+        self.assertEqual(voice_isolation.filter_settings["method"], "speex")
+        self.assertEqual(
+            voice_isolation.filter_settings["suppress_level"], a.MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB,
+        )
 
 
 class GetReplayBufferModeTests(unittest.TestCase):

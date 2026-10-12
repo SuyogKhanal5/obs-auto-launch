@@ -15,13 +15,14 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
+from collections import OrderedDict
 from tkinter import filedialog, messagebox, ttk
 
 import obsws_python as obsws
 import psutil
 import pystray
 import screeninfo
-from PIL import Image, ImageDraw
+from PIL import Image, ImageColor, ImageDraw, ImageTk
 
 import platform_common
 
@@ -1119,6 +1120,10 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
     # profile fresh at startup.
     replay_buffer_restart_needed = apply_replay_buffer_settings(client, obs_config.get("replay_buffer", {}))
 
+    # Filters apply live -- unlike the profile-parameter writes above, this never needs OBS to
+    # restart to take effect.
+    apply_mic_boost_from_config(client, obs_config)
+
     if replay_buffer_restart_needed:
         logging.info("Replay buffer settings changed -- restarting OBS so the change actually takes effect.")
         notify(
@@ -1152,6 +1157,31 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
 
 
 OBS_NOT_READY_CODE = 207
+
+
+def wait_until_obs_ready(client, retries=6, delay=2):
+    """Blocks until client answers a trivial, harmless read-only request successfully, retrying
+    past OBS's own "not ready yet" response (code 207) -- confirmed live (twice, in two different
+    call paths this same session) that OBS can accept a websocket connection well before it's
+    actually ready to answer ANY request at all, for a few real seconds right after either OBS
+    itself or its websocket plugin has just started up. Same retry shape as start_recording's own
+    handling of this exact code, reused here for callers (like measure_mic_boost_db) that
+    need OBS to be genuinely ready before doing their own real work, not just connected.
+
+    Returns True once ready, False if it never became ready within the retry budget (a caller
+    should treat that as "couldn't reach OBS", not silently proceed)."""
+    for attempt in range(1, retries + 1):
+        try:
+            client.get_record_status()
+            return True
+        except obsws.error.OBSSDKRequestError as exc:
+            if exc.code == OBS_NOT_READY_CODE and attempt < retries:
+                time.sleep(delay)
+                continue
+            return False
+        except Exception:
+            return False
+    return False
 
 
 def start_recording(client, retries=6, delay=2):
@@ -1425,6 +1455,488 @@ def point_newly_running_app_captures(client, multi_track_config, captured, proce
     return (captured & running) | newly_captured
 
 
+MIC_BOOST_VOICE_ISOLATION_FILTER_NAME = "OBS Auto Recorder - Mic Boost Voice Isolation"
+MIC_BOOST_EQ_FILTER_NAME = "OBS Auto Recorder - Mic Boost EQ"
+MIC_BOOST_COMPRESSOR_FILTER_NAME = "OBS Auto Recorder - Mic Boost"
+MIC_BOOST_LIMITER_FILTER_NAME = "OBS Auto Recorder - Mic Boost Limiter"
+# The old Noise Gate filter's name, kept only so ensure_mic_boost_filter can find and remove one
+# left over on an input from before this app switched to voice isolation -- see there.
+_LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME = "OBS Auto Recorder - Mic Boost Noise Gate"
+# Input names ensure_mic_boost_filter has already checked (and cleaned up if needed) for that
+# legacy filter, this app run -- see the check itself for why this only ever needs to happen once.
+_legacy_noise_gate_checked_inputs = set()
+# OBS's own real "Noise Suppression" filter kind (confirmed live via GetSourceFilterKindList) --
+# replaces the old Noise Gate's simple hard on/off threshold (a gate either passes the WHOLE
+# signal or mutes it outright based on a single per-room threshold that needs re-calibrating
+# whenever the environment changes, and still lets through any noise loud enough to sit above that
+# threshold alongside real speech) with continuous suppression instead, needing no threshold or
+# per-room calibration at all.
+#
+# Two selectable methods, both CPU-only (OBS's third method, NVIDIA's "nvafx", needs an NVIDIA GPU
+# and the separate NVIDIA Broadcast runtime, so it's not offered here at all):
+# - "rnnoise": a small neural network, OBS's own default. Removes more noise, but confirmed live
+#   via a real user report to make voice sound noticeably muffled/processed on at least some
+#   mics -- a known, commonly-reported RNNoise characteristic, not a bug, and one it has no
+#   tunable knob for (OBS's own UI shows no other setting for this method either).
+# - "speex": the classic, older algorithm. Removes less noise, but is generally lighter-touch on
+#   voice clarity -- suppress_level (how aggressively it suppresses, in dB) IS tunable for this
+#   one; MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB is deliberately less aggressive than
+#   OBS's own default (-30dB) specifically to favor clarity over maximum noise removal, matching
+#   what was confirmed live to sound better on that same real report.
+MIC_BOOST_VOICE_ISOLATION_METHODS = ("rnnoise", "speex")
+DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD = "rnnoise"
+MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB = -15
+MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS = {
+    "rnnoise": "RNNoise (stronger noise removal, can sound muffled)",
+    "speex": "Speex (lighter touch, clearer voice, less noise removed)",
+}
+MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS_BY_LABEL = {v: k for k, v in MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS.items()}
+# OBS's real "3-Band Equalizer" filter kind (confirmed live via GetSourceFilterKindList/
+# GetSourceFilterDefaultSettings) -- exactly 3 knobs (low/mid/high, each a shelf/band gain in dB
+# at OBS's own fixed crossover points; no frequency or Q control, unlike a fully parametric EQ).
+# Placed right after Voice Isolation and before the Compressor -- shaping tone on the CLEANED
+# signal (not the raw, noisy one) and before dynamics processing reacts to it, the standard order
+# for a voice chain.
+#
+# The default preset below is a conservative, generally-applicable "voice clarity" curve, not a
+# per-mic calibration (there's no live measurement behind it, unlike boost_db/the old noise gate
+# threshold): a mild low cut (less boominess/proximity effect/rumble), a mild mid cut (less
+# boxiness/mud), and a mild high boost (more presence/intelligibility) -- confirmed live to sound
+# better on a real report, but freely adjustable in Settings since "better" here is inherently
+# mic- and room-dependent, unlike voice isolation's method choice which at least has a clear
+# right-or-wrong failure mode (muffled or not).
+MIC_BOOST_EQ_PRESET_LOW_DB = -4.0
+MIC_BOOST_EQ_PRESET_MID_DB = -1.0
+MIC_BOOST_EQ_PRESET_HIGH_DB = 3.0
+
+
+def mic_boost_voice_isolation_settings(method):
+    """Builds the real OBS filter settings dict for the given voice-isolation method -- rnnoise
+    takes no other settings, speex additionally needs its own suppress_level (see
+    MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB for why this app picks a specific, less
+    aggressive value rather than leaving OBS's own harsher default in place). Falls back to
+    rnnoise for anything unrecognized (e.g. a config hand-edited with a typo), same as this app's
+    established rule for a bad/unknown config value elsewhere."""
+    if method == "speex":
+        return {"method": "speex", "suppress_level": MIC_BOOST_VOICE_ISOLATION_SPEEX_SUPPRESS_LEVEL_DB}
+    return {"method": "rnnoise"}
+# Fixed compressor shape -- only output_gain (the user's own configured boost_db) varies.
+# Threshold sits comfortably below a genuinely quiet mic's own peaks (confirmed live against a
+# real recording: -25dBFS peaks on a source averaging -67dBFS) so compression actually engages on
+# most of what the mic captures, tempering how hard the loudest moments get pushed up right along
+# with the quiet ones. A plain volume/Gain filter has no such mechanism at all -- it multiplies
+# every sample by the same fixed amount, so it hits 0dBFS (full digital clipping) far sooner than
+# a compressor's makeup gain does, confirmed live via the SAME real recording: a flat +36dB
+# export-time gain in the clip editor already had this source's peaks pinned at 0.0dBFS while its
+# average level still only reached -32.5dBFS -- there simply isn't a single-stage flat-gain fix
+# for a source recorded this quiet.
+MIC_BOOST_COMPRESSOR_BASE_SETTINGS = {
+    "threshold": -30.0,
+    "ratio": 3.0,
+    "attack_time": 6,
+    "release_time": 60,
+    "sidechain_source": "none",
+}
+# A hard safety ceiling chained AFTER the compressor's own output_gain -- confirmed live (via
+# GetSourceFilterKindList/GetSourceFilterDefaultSettings against a real OBS instance) that this is
+# a genuinely separate OBS filter kind ("limiter_filter"), not something the compressor itself
+# also provides; without it, a large boost_db could still clip outright on a moment the
+# compressor's own ratio/threshold didn't fully tame.
+MIC_BOOST_LIMITER_SETTINGS = {"threshold": -1.0}
+
+
+def predict_mic_boost_output_mul(peak_mul, boost_db):
+    """Approximates what the Audio Mixer Levels overlay's live meter reading for this input would
+    become once the real mic-boost filter chain is actually applied, using each filter's own
+    static input/output curve (dB in, dB out) rather than fully emulating their real envelope-
+    follower timing (attack/hold/release) -- a single instantaneous peak reading has no signal
+    history to feed a real stateful compressor simulation anyway. Deliberately only useful for
+    PREVIEWING a candidate boost_db against the CURRENT raw signal before actually enabling it:
+    once mic_boost is genuinely enabled, OBS's own InputVolumeMeters for this input already
+    reports the real post-filter level directly (confirmed live: a real +30dB boost raised a live
+    reading's mean peak from ~0.0028 to ~0.109, matching this same compressor+limiter shape) --
+    computing this on top of an ALREADY-boosted reading would double-apply the chain.
+
+    Doesn't model voice isolation (RNNoise) at all -- unlike a noise gate's simple threshold, it's
+    a continuously adaptive neural denoiser with no static dB in/out curve to approximate; a real
+    reading through it also isn't representative sample-to-sample the way a gate's hard cutoff
+    was, so this preview only ever shows the boost/compressor/limiter stage.
+
+    peak_mul/return value: both an OBS-style 0-1 linear multiplier peak (same units as
+    audio_state["levels"]), not dB -- callers never need to think in dB themselves."""
+    if peak_mul <= 0:
+        return 0.0
+    peak_db = 20 * math.log10(peak_mul)
+
+    threshold = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["threshold"]
+    ratio = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["ratio"]
+    compressed_db = threshold + (peak_db - threshold) / ratio if peak_db > threshold else peak_db
+    boosted_db = compressed_db + boost_db
+    output_db = min(boosted_db, MIC_BOOST_LIMITER_SETTINGS["threshold"])
+    return min(1.0, 10 ** (output_db / 20))
+
+
+MIC_BOOST_CALIBRATION_VOICE_SECONDS = 5.0
+# A comfortable, moderate listening level (broadcast/podcast territory) to aim a TYPICAL speaking
+# level at -- not the loudest possible without clipping, since the compressor+limiter already
+# guard against that regardless of exactly how this lands.
+MIC_BOOST_CALIBRATION_TARGET_DB = -18.0
+# Median, not peak -- a handful of extra-loud words shouldn't be what the whole boost gets
+# calibrated against.
+MIC_BOOST_CALIBRATION_REFERENCE_PERCENTILE = 0.5
+MIC_BOOST_CALIBRATION_MIN_BOOST_DB = 0.0
+MIC_BOOST_CALIBRATION_MAX_BOOST_DB = 40.0
+# Below this, the reference reading is close enough to silence that computing a boost against it
+# would mostly be amplifying noise floor, not voice -- likely nothing was actually said.
+MIC_BOOST_CALIBRATION_MIN_SIGNAL_DB = -85.0
+
+
+def compute_mic_boost_db_from_samples(voice_peaks, target_db=MIC_BOOST_CALIBRATION_TARGET_DB, input_name="the input"):
+    """Pure calibration math behind measure_mic_boost_db, split out so it's testable with plain
+    synthetic sample lists instead of a live OBS connection.
+
+    Solves for the boost_db that would land a TYPICAL (median, not peak) raw speaking level at
+    target_db, inverting the exact same compressor transfer curve predict_mic_boost_output_mul
+    already uses going forward: below the compressor's own threshold, a boost is a flat 1:1
+    addition in dB; above it, the compressor's ratio already closes part of the gap on its own,
+    so the same formula run in reverse has to account for that too, or it would over-boost
+    anything already loud enough to engage compression.
+
+    Returns (boost_db, error_message) -- error_message is None on success."""
+    if not voice_peaks:
+        return None, (
+            f"No signal at all was received from '{input_name}' -- check the input name is exactly "
+            "right (use Pick...) and that the mic isn't muted."
+        )
+    reference_db = _mul_to_db(_percentile(voice_peaks, MIC_BOOST_CALIBRATION_REFERENCE_PERCENTILE))
+    if reference_db <= MIC_BOOST_CALIBRATION_MIN_SIGNAL_DB:
+        return None, (
+            "Didn't hear anything loud enough to calibrate against -- make sure you're talking "
+            "normally (like you would while playing) during the listening phase, then try again."
+        )
+
+    threshold = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["threshold"]
+    ratio = MIC_BOOST_COMPRESSOR_BASE_SETTINGS["ratio"]
+    compressed_db = threshold + (reference_db - threshold) / ratio if reference_db > threshold else reference_db
+    boost_db = target_db - compressed_db
+    boost_db = max(MIC_BOOST_CALIBRATION_MIN_BOOST_DB, min(MIC_BOOST_CALIBRATION_MAX_BOOST_DB, boost_db))
+    return round(boost_db, 1), None
+
+
+def _ensure_obs_filter_settings(client, input_name, filter_name, filter_kind, settings):
+    """Shared create-or-update-if-changed logic behind every filter in
+    ensure_mic_boost_filter's chain. Returns (current_or_new_filter, just_created) --
+    just_created lets a caller do something ONLY the first time a filter comes into existence
+    (e.g. moving it to a specific position in the chain, which would be pointless -- and would
+    fight a user's own manual reordering in OBS -- on every later idempotent check). Returns
+    (None, False) on any failure; every failure is logged, never raised, matching this app's
+    established rule for OBS-facing background calls."""
+    try:
+        current = client.get_source_filter(input_name, filter_name)
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
+            logging.warning("Could not check mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
+            return None, False
+        try:
+            client.create_source_filter(input_name, filter_name, filter_kind, settings)
+            logging.info("Created OBS mic-boost filter '%s' on '%s'.", filter_name, input_name)
+            return client.get_source_filter(input_name, filter_name), True
+        except Exception as create_exc:
+            logging.warning("Could not create mic-boost filter '%s' on '%s': %s", filter_name, input_name, create_exc)
+            return None, False
+    except Exception as exc:
+        logging.warning("Could not check mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
+        return None, False
+
+    if not all(current.filter_settings.get(key) == value for key, value in settings.items()):
+        try:
+            client.set_source_filter_settings(input_name, filter_name, settings, overlay=False)
+            logging.info("Updated OBS mic-boost filter '%s' on '%s'.", filter_name, input_name)
+            current = client.get_source_filter(input_name, filter_name)
+        except Exception as exc:
+            logging.warning("Could not update mic-boost filter '%s' on '%s': %s", filter_name, input_name, exc)
+    return current, False
+
+
+def ensure_mic_boost_filter(
+    client, input_name, boost_db, voice_isolation_enabled=False,
+    voice_isolation_method=DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD,
+    eq_enabled=False, eq_low_db=MIC_BOOST_EQ_PRESET_LOW_DB, eq_mid_db=MIC_BOOST_EQ_PRESET_MID_DB,
+    eq_high_db=MIC_BOOST_EQ_PRESET_HIGH_DB,
+):
+    """Applies OBS Auto Recorder's mic-boost filter chain directly to input_name -- live, at OBS's
+    own audio pipeline, so every FUTURE recording captures this source boosted from the start.
+    Deliberately independent from (and stackable with) the clip editor's own per-trim ffmpeg gain
+    (Track Routing dialog / Settings > Clip Editor > Default Track Gains): that one can only
+    re-encode an already-recorded FILE, and can't do anything about a source that was captured too
+    quiet to begin with -- see the settings above for why a flat gain alone can't either, at any
+    single stage.
+
+    Chain order (signal flows top to bottom): optional Voice Isolation (noise suppression) first
+    (so it cleans the RAW signal before anything downstream amplifies whatever noise is left),
+    then an optional 3-band EQ (shaping tone on that already-cleaned signal, before dynamics
+    processing reacts to it), then a Compressor for makeup gain + dynamics control, then a Limiter
+    as a hard safety ceiling. New filters are appended to the end of OBS's own filter list by
+    CreateSourceFilter -- harmless for the Compressor/Limiter pair (always created together, in
+    the right relative order), but Voice Isolation and EQ specifically get moved to indexes 0 and
+    1 right after their own creation, since either can be toggled on independently, later, well
+    after the other filters already exist.
+
+    voice_isolation_enabled/eq_enabled: unlike the Compressor/Limiter (created once and otherwise
+    left alone -- see _ensure_obs_filter_settings), these two filters' own OBS-side enabled state
+    is actively kept in sync on every call, since "toggleable" is the whole point of exposing them
+    as their own Settings checkboxes -- a user flipping one needs that to actually take effect,
+    not just influence whether the filter gets created in the first place. voice_isolation_method/
+    eq_low_db/eq_mid_db/eq_high_db are likewise kept in sync via the same _ensure_obs_filter_
+    settings drift check every other filter here already uses, so changing them in Settings takes
+    effect on the next apply without needing to delete/recreate anything.
+
+    Idempotent and safe to call on every OBS-ready check: only writes a settings/enabled update
+    when something has actually drifted from what's configured here, so this never resets the
+    Compressor's or Limiter's enabled state if the user disabled one of THOSE by hand in OBS."""
+    if not input_name:
+        return
+
+    # One-time cleanup for anyone upgrading from before this filter existed: the old Noise Gate
+    # this replaced may still be sitting on input_name, actively enabled, from before the switch.
+    # Left alone, it would keep gating the raw signal alongside (and independently of) the new
+    # Voice Isolation filter below -- removed outright, not just disabled, since the whole point
+    # of switching approaches was to stop using it, not run both at once. Skipped entirely after
+    # the first check per input_name per app run (_legacy_noise_gate_checked_inputs) -- otherwise
+    # this checks on EVERY call (every recording start, plus the idle watcher path), and unlike
+    # _ensure_obs_filter_settings's own get_source_filter probes (which only ever 404 ONCE, right
+    # before a filter's first creation), this one always 404s again forever once the legacy filter
+    # is actually gone -- confirmed live that obsws_python itself logs that 404 at ERROR level with
+    # a full traceback internally, before this function's own try/except ever sees it, which would
+    # otherwise spam one scary-looking (but harmless) ERROR block into the log on every single call
+    # for the rest of this app's life.
+    if input_name not in _legacy_noise_gate_checked_inputs:
+        _legacy_noise_gate_checked_inputs.add(input_name)
+        try:
+            client.get_source_filter(input_name, _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME)
+        except obsws.error.OBSSDKRequestError as exc:
+            if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
+                logging.warning("Could not check for the old mic-boost noise gate filter on '%s': %s", input_name, exc)
+        except Exception as exc:
+            logging.warning("Could not check for the old mic-boost noise gate filter on '%s': %s", input_name, exc)
+        else:
+            try:
+                client.remove_source_filter(input_name, _LEGACY_MIC_BOOST_NOISE_GATE_FILTER_NAME)
+                logging.info("Removed the old mic-boost noise gate filter on '%s' (replaced by voice isolation).", input_name)
+            except Exception as exc:
+                logging.warning("Could not remove the old mic-boost noise gate filter on '%s': %s", input_name, exc)
+
+    voice_isolation, just_created = _ensure_obs_filter_settings(
+        client, input_name, MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, "noise_suppress_filter_v2",
+        mic_boost_voice_isolation_settings(voice_isolation_method),
+    )
+    if voice_isolation is not None:
+        if just_created:
+            try:
+                client.set_source_filter_index(input_name, MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, 0)
+            except Exception as exc:
+                logging.warning("Could not move mic-boost voice isolation to the front of the chain: %s", exc)
+        if voice_isolation.filter_enabled != voice_isolation_enabled:
+            try:
+                client.set_source_filter_enabled(input_name, MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, voice_isolation_enabled)
+                logging.info(
+                    "%s OBS mic-boost voice isolation on '%s'.",
+                    "Enabled" if voice_isolation_enabled else "Disabled", input_name,
+                )
+            except Exception as exc:
+                logging.warning("Could not toggle mic-boost voice isolation on '%s': %s", input_name, exc)
+
+    eq, eq_just_created = _ensure_obs_filter_settings(
+        client, input_name, MIC_BOOST_EQ_FILTER_NAME, "basic_eq_filter",
+        {"low": eq_low_db, "mid": eq_mid_db, "high": eq_high_db},
+    )
+    if eq is not None:
+        if eq_just_created:
+            try:
+                client.set_source_filter_index(input_name, MIC_BOOST_EQ_FILTER_NAME, 1)
+            except Exception as exc:
+                logging.warning("Could not move mic-boost EQ into place in the chain: %s", exc)
+        if eq.filter_enabled != eq_enabled:
+            try:
+                client.set_source_filter_enabled(input_name, MIC_BOOST_EQ_FILTER_NAME, eq_enabled)
+                logging.info("%s OBS mic-boost EQ on '%s'.", "Enabled" if eq_enabled else "Disabled", input_name)
+            except Exception as exc:
+                logging.warning("Could not toggle mic-boost EQ on '%s': %s", input_name, exc)
+
+    compressor_settings = dict(MIC_BOOST_COMPRESSOR_BASE_SETTINGS, output_gain=boost_db)
+    _ensure_obs_filter_settings(client, input_name, MIC_BOOST_COMPRESSOR_FILTER_NAME, "compressor_filter", compressor_settings)
+    _ensure_obs_filter_settings(client, input_name, MIC_BOOST_LIMITER_FILTER_NAME, "limiter_filter", MIC_BOOST_LIMITER_SETTINGS)
+
+
+def apply_mic_boost_from_config(client, obs_config):
+    """Reads obs.mic_boost out of a full obs_config dict and applies it via
+    ensure_mic_boost_filter if enabled. Shared by ensure_obs_ready (the recording-start path) AND
+    watcher_loop's own idle Audio-Mixer-Levels-only path -- confirmed live that without the
+    latter, the boost was never actually applied until a watched game got detected and a real
+    recording started, even with mic_boost.enabled true the whole time: a user just talking into
+    the mic to check the overlay (not recording anything) had no path that ever created the
+    filters at all, so the overlay correctly showed the true, unboosted level -- not a display
+    bug, but this exact lifecycle gap. Calling this wherever OBS is confirmed reachable at all,
+    not only at actual recording start, closes it."""
+    mic_boost_config = obs_config.get("mic_boost", {})
+    if not (mic_boost_config.get("enabled") and mic_boost_config.get("input_name")):
+        return
+    voice_isolation_config = mic_boost_config.get("voice_isolation", {})
+    eq_config = mic_boost_config.get("eq", {})
+    ensure_mic_boost_filter(
+        client, mic_boost_config["input_name"], mic_boost_config.get("boost_db", 0.0),
+        voice_isolation_enabled=voice_isolation_config.get("enabled", False),
+        voice_isolation_method=voice_isolation_config.get("method", DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD),
+        eq_enabled=eq_config.get("enabled", False),
+        eq_low_db=eq_config.get("low_db", MIC_BOOST_EQ_PRESET_LOW_DB),
+        eq_mid_db=eq_config.get("mid_db", MIC_BOOST_EQ_PRESET_MID_DB),
+        eq_high_db=eq_config.get("high_db", MIC_BOOST_EQ_PRESET_HIGH_DB),
+    )
+
+
+def _mul_to_db(peak_mul):
+    return 20 * math.log10(peak_mul) if peak_mul > 0 else -100.0
+
+
+def _percentile(values, fraction):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return ordered[index]
+
+
+def _measure_mic_chain_input_levels(ws_config, input_name, phases, on_phase=None, label="calibration"):
+    """Shared live-measurement scaffolding behind measure_mic_boost_db: connects, waits for OBS to
+    genuinely be ready (not just connected -- see wait_until_obs_ready), temporarily disables this
+    app's own mic-boost filter chain on input_name for the duration (if any of it already exists)
+    so the RAW, unprocessed signal is what actually gets measured, listens through each of
+    `phases` collecting real peak readings, then restores every filter's prior enabled state
+    before returning either way, success or failure -- never touches a filter's settings, only
+    whether it's temporarily disabled.
+
+    phases: an ordered sequence of (phase_name, seconds) pairs -- e.g. a single ("voice", 5.0)
+    phase for a boost-level calibration.
+
+    on_phase(phase_name, seconds_remaining), if given, is called roughly once a second during each
+    phase so a caller can show live countdown feedback. label is used only in log messages, to
+    tell which calibration feature's log lines are which.
+
+    Returns ({phase_name: [peak_mul, ...]}, error_message) -- error_message is None on success."""
+    client = connect_obs(ws_config, retries=1, delay=0)
+    if not client:
+        return None, (
+            "Could not connect to OBS over its WebSocket using the settings above. Make sure OBS "
+            "is running and the host/port/password are correct, then try again."
+        )
+    if not wait_until_obs_ready(client):
+        client.disconnect()
+        return None, (
+            "OBS accepted the connection but never became ready to answer requests. If it was "
+            "just launched, wait a few more seconds and try again."
+        )
+
+    filter_names = (MIC_BOOST_VOICE_ISOLATION_FILTER_NAME, MIC_BOOST_COMPRESSOR_FILTER_NAME, MIC_BOOST_LIMITER_FILTER_NAME)
+    prior_enabled = {}
+    readings = {phase_name: [] for phase_name, _seconds in phases}
+    try:
+        for filter_name in filter_names:
+            try:
+                prior_enabled[filter_name] = client.get_source_filter(input_name, filter_name).filter_enabled
+                client.set_source_filter_enabled(input_name, filter_name, False)
+                logging.info(
+                    "%s: disabled '%s' for the duration (was enabled=%s).",
+                    label, filter_name, prior_enabled[filter_name],
+                )
+            except obsws.error.OBSSDKRequestError as exc:
+                if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
+                    logging.warning("%s: could not disable '%s': %s", label, filter_name, exc)
+                else:
+                    logging.info("%s: '%s' doesn't exist yet -- nothing to disable.", label, filter_name)
+
+        event_client = None
+        try:
+            event_client = obsws.EventClient(
+                host=ws_config.get("host", "localhost"), port=ws_config.get("port", 4455),
+                password=ws_config.get("password", ""), timeout=5,
+                subs=obsws.Subs.LOW_VOLUME | obsws.Subs.INPUTVOLUMEMETERS,
+            )
+        except Exception as exc:
+            return None, f"Could not start listening to '{input_name}': {exc}"
+
+        phase = {"name": phases[0][0]}
+
+        def on_input_volume_meters(data):
+            for entry in data.inputs:
+                if entry.get("inputName") != input_name:
+                    continue
+                peak = 0.0
+                for channel in entry.get("inputLevelsMul") or []:
+                    for value in channel:
+                        if isinstance(value, (int, float)) and value > peak:
+                            peak = value
+                readings[phase["name"]].append(peak)
+
+        event_client.callback.register(on_input_volume_meters)
+        try:
+            for phase_name, seconds in phases:
+                phase["name"] = phase_name
+                remaining = seconds
+                while remaining > 0:
+                    if on_phase:
+                        try:
+                            on_phase(phase_name, remaining)
+                        except Exception:
+                            logging.exception("%s: on_phase callback failed.", label)
+                    step = min(1.0, remaining)
+                    time.sleep(step)
+                    remaining -= step
+        finally:
+            event_client.disconnect()
+    finally:
+        for filter_name, was_enabled in prior_enabled.items():
+            try:
+                client.set_source_filter_enabled(input_name, filter_name, was_enabled)
+            except Exception as exc:
+                logging.warning("%s: could not restore '%s': %s", label, filter_name, exc)
+        client.disconnect()
+
+    logging.info(
+        "%s: collected readings for '%s': %s.", label, input_name,
+        {name: f"{len(samples)} samples, first 10: {[round(v, 5) for v in samples[:10]]}" for name, samples in readings.items()},
+    )
+    return readings, None
+
+
+def measure_mic_boost_db(ws_config, input_name, on_phase=None):
+    """Live-measures input_name's own real raw voice level while talking normally, to compute a
+    boost_db that lands a typical speaking level at a comfortable target (see
+    compute_mic_boost_db_from_samples for the target and the math against the compressor's own
+    transfer curve) -- rather than guessing, which is exactly how this app's own mic ended up
+    boosted +36dB via a flat export-time gain earlier this session, clipping badly.
+
+    See _measure_mic_chain_input_levels for how the raw signal is actually measured (temporarily
+    disabling this app's own mic-boost chain, restoring it afterward either way).
+
+    on_phase(phase_name, seconds_remaining), if given, is called roughly once a second during the
+    single "voice" phase, so a caller can show live countdown feedback.
+
+    Returns (boost_db, error_message) -- error_message is None on success."""
+    readings, error_message = _measure_mic_chain_input_levels(
+        ws_config, input_name, [("voice", MIC_BOOST_CALIBRATION_VOICE_SECONDS)],
+        on_phase=on_phase, label="Mic boost calibration",
+    )
+    if error_message:
+        return None, error_message
+
+    boost_db, error_message = compute_mic_boost_db_from_samples(readings["voice"], input_name=input_name)
+    if error_message:
+        logging.warning("Mic boost calibration: %s", error_message)
+    else:
+        logging.info("Mic boost calibration: computed boost %sdB for '%s'.", boost_db, input_name)
+    return boost_db, error_message
+
+
 # Confirmed live via a controlled cross-correlation test: a real-world sound captured
 # simultaneously through OBS's two WASAPI audio capture paths lands later on a
 # wasapi_process_output_capture input (Application Audio Capture -- what Game Audio and every
@@ -1545,6 +2057,20 @@ CALIBRATION_CLICK_DURATION_SECONDS = 0.003
 CALIBRATION_TARGET_TRACK = 6
 
 
+def _import_numpy():
+    """Lazy numpy import shared by every numpy-using feature in this file -- numpy isn't imported
+    at module level so features that never touch it (most app startups) don't pay its import cost.
+    Also explicitly touches numpy._core._multiarray_tests: PyInstaller's numpy hook doesn't
+    reliably bundle this internal submodule, which numpy's own docstring-patching machinery
+    imports during its normal startup chain, so a frozen build that never explicitly references it
+    itself can raise ModuleNotFoundError the first time ANYTHING actually imports numpy -- confirmed
+    live: this broke the clip editor's waveform view entirely (silently, since draw_waveform_view
+    catches and logs the exception) in a real deployed build."""
+    import numpy as np
+    import numpy._core._multiarray_tests  # noqa: F401 -- see docstring above
+    return np
+
+
 def generate_calibration_tone(output_path):
     """Writes a short WAV of sharp broadband click impulses at known positions to output_path --
     used as run_audio_sync_calibration's test signal. Broadband noise bursts (rather than a pure
@@ -1552,7 +2078,7 @@ def generate_calibration_tone(output_path):
     here (both capture paths re-encode through OBS's own AAC encoder before this ever reads
     them back)."""
     import wave
-    import numpy as np
+    np = _import_numpy()
 
     sr = CALIBRATION_TONE_SAMPLE_RATE
     audio = np.zeros(int(sr * CALIBRATION_TONE_DURATION_SECONDS), dtype=np.float32)
@@ -1607,7 +2133,7 @@ def measure_audio_lag_ms(reference_wav_path, target_wav_path):
     matched in both signals (e.g. one input never actually received the test tone, or too much
     background noise drowned it out)."""
     import wave
-    import numpy as np
+    np = _import_numpy()
 
     def load_mono(path):
         with wave.open(path, "rb") as f:
@@ -1759,7 +2285,7 @@ def measure_waveform_lag_ms(reference_wav_path, target_wav_path, max_expected_la
     reliably-alignable content, so trusting a "measured" lag here would be worse than not
     measuring at all."""
     import wave
-    import numpy as np
+    np = _import_numpy()
 
     # Logged at INFO (not DEBUG) unconditionally -- confirmed live that a real in-app "Fix audio
     # track sync" run can return an empty/no-confidence result on a file+window where the exact
@@ -3075,6 +3601,34 @@ CUSTOM_KEYBIND_ACTIONS_BY_LABEL = {label: action for action, label in CUSTOM_KEY
 CUSTOM_KEYBIND_KEY_OPTIONS = (
     [str(d) for d in range(10)] + [chr(c) for c in range(65, 91)] + [f"F{n}" for n in range(1, 13)]
 )
+# Windows-only choice of how custom keybinds are actually delivered (see platform_windows.py's own
+# module comment above its "Global hotkeys" section for the full real-world story behind this) --
+# three mechanisms, in the order they were tried:
+# - "register_hotkey": Win32 RegisterHotKey. No input-lag risk at all (never sits in another
+#   application's own input path), but a game holding true fullscreen EXCLUSIVE mode can silently
+#   suppress its delivery -- confirmed live with League of Legends.
+# - "low_level_hook": a global WH_KEYBOARD_LL hook. Fixes the fullscreen case, but Windows delivers
+#   every keystroke system-wide SYNCHRONOUSLY through it first -- confirmed via a real user report
+#   of perceived input lag, plausible because this app's own other background threads (e.g. the
+#   audio-mixer overlay's own event callback) can hold Python's GIL and delay this callback, and
+#   that delay lands on every keystroke in every other application, not just this one.
+# - "raw_input" (the default): RegisterRawInputDevices with RIDEV_INPUTSINK. The actual right tool
+#   for this -- confirmed against Microsoft's own docs, raw input is pure observation, delivered to
+#   the foreground application AND any registered sink independently/in parallel, never chained/
+#   serialized the way a hook is, so it carries none of the low_level_hook's input-lag risk while
+#   still working over exclusive fullscreen games the same way. register_hotkey/low_level_hook stay
+#   selectable as a fallback in case raw input ever fails to register on some system.
+# Linux/macOS have no equivalent choice (see their own run_custom_keybind_listener docstrings), so
+# this only ever actually matters on Windows.
+CUSTOM_KEYBIND_HOTKEY_MODES = ("raw_input", "register_hotkey", "low_level_hook")
+DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE = "raw_input"
+CUSTOM_KEYBIND_HOTKEY_MODE_LABELS = {
+    "raw_input": "Raw Input (recommended -- no input-lag risk, works in fullscreen games)",
+    "register_hotkey": "Standard (no input-lag risk, but a fullscreen-exclusive game can block it)",
+    "low_level_hook": "Low-level hook (legacy fallback -- works in fullscreen games, may add input lag)",
+}
+CUSTOM_KEYBIND_HOTKEY_MODE_LABELS_BY_LABEL = {v: k for k, v in CUSTOM_KEYBIND_HOTKEY_MODE_LABELS.items()}
+
 
 def describe_keybind(binding):
     parts = [m.capitalize() for m in binding.get("modifiers", [])]
@@ -3138,20 +3692,26 @@ def fire_custom_keybind(
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
-    recording_state=None,
+    recording_state=None, stop_event=None, hotkey_mode=None,
 ):
-    """Thin dispatcher -- the real per-OS implementation (RegisterHotKey/GetMessageW on Windows,
-    XGrabKey/XNextEvent on Linux/X11, a CGEventTap/CFRunLoop on macOS; a clear logged no-op under
-    Wayland) now lives in platform_common.run_custom_keybind_listener() /
-    platform_windows.py / platform_linux.py / platform_macos.py, see
-    CROSS_PLATFORM_PLAN.md Phase 3. fire_custom_keybind/describe_keybind/notify are passed in
-    rather than imported by the backend modules, so those never depend on this one (the
-    dependency only ever goes the other way). recording_state lets add_recording_marker record a
-    marker's timestamp -- see its own docstring for why that's no longer tied to OBS's own
-    chapter mechanism at all."""
+    """Thin dispatcher -- the real per-OS implementation (RegisterHotKey or a selectable global
+    WH_KEYBOARD_LL hook on Windows, XGrabKey/XNextEvent on Linux/X11, a CGEventTap/CFRunLoop on
+    macOS; a clear logged no-op under Wayland) now lives in
+    platform_common.run_custom_keybind_listener() / platform_windows.py / platform_linux.py /
+    platform_macos.py, see CROSS_PLATFORM_PLAN.md Phase 3. fire_custom_keybind/describe_keybind/
+    notify are passed in rather than imported by the backend modules, so those never depend on
+    this one (the dependency only ever goes the other way). recording_state lets
+    add_recording_marker record a marker's timestamp -- see its own docstring for why that's no
+    longer tied to OBS's own chapter mechanism at all. stop_event: passed straight through so
+    platform_windows.py's backend can release its hook the moment shutdown is requested rather
+    than waiting on process death -- see that function's own docstring for why this matters.
+    hotkey_mode: passed straight through to platform_windows.py's own backend, which is currently
+    the only one that does anything with it -- see CUSTOM_KEYBIND_HOTKEY_MODE_LABELS for the real
+    input-lag-vs-fullscreen-games tradeoff behind the choice."""
     platform_common.run_custom_keybind_listener(
         bindings, get_client, get_manual_split_buffer_seconds, fire_custom_keybind, describe_keybind, notify,
         icon=icon, notifications_config=notifications_config, status=status, recording_state=recording_state,
+        stop_event=stop_event, hotkey_mode=hotkey_mode,
     )
 
 
@@ -3689,13 +4249,16 @@ def build_audio_track_filter_args(audio_stream_count, shift_ms_by_track=None, mu
     return ["-filter_complex", ";".join(filter_parts)], map_args
 
 
-def build_audio_routing_filter_args(audio_stream_count, routing=None, muted_destinations=None, shift_ms_by_track=None):
+def build_audio_routing_filter_args(
+    audio_stream_count, routing=None, muted_destinations=None, shift_ms_by_track=None, gains_db=None,
+):
     """Builds (-filter_complex ..., -map ... -map ...) args for the clip editor's Track Routing
     dialog -- lets a user consolidate multiple source tracks into fewer output tracks (e.g. mix
     Spotify and Firefox together), drop a source entirely (e.g. remove Desktop Audio from the
-    export), and mute an output track, on top of whatever per-source sync-fix shift already
-    applies -- rather than the simpler 1:1 build_audio_track_filter_args, which has no notion of
-    combining or dropping tracks at all.
+    export), mute an output track, and/or boost or attenuate a specific source's gain going into a
+    specific output, on top of whatever per-source sync-fix shift already applies -- rather than
+    the simpler 1:1 build_audio_track_filter_args, which has no notion of combining or dropping
+    tracks at all.
 
     routing: {destination_track: [source_track, ...]} -- which 1-based source track(s) (as in the
     original file) get mixed together into each 1-based destination track of the output. Defaults
@@ -3714,17 +4277,29 @@ def build_audio_routing_filter_args(audio_stream_count, routing=None, muted_dest
     measure_clip_audio_sync_shifts_ms) to shift before mixing, so a per-track sync-fix correction
     still applies correctly to a source even after it's combined with others.
 
-    Returns ([], []) if the result would be a pure identity passthrough with nothing muted or
-    shifted -- the caller falls back to its own plain "-map 0:a" wildcard (eligible for a fast
-    stream copy) in that case, same as build_audio_track_filter_args always has."""
+    gains_db: {destination_track: {source_track: gain_db}} -- an optional dB gain (positive
+    boosts, negative attenuates) applied to one SOURCE only as it feeds into one particular
+    DESTINATION, before mixing -- e.g. boosting a mic +12dB into destination 1 but leaving it
+    unboosted into destination 2, where the same source is routed to both. Applied per
+    (destination, source) pair rather than per source, precisely because the same source can need
+    different treatment depending on which output track it ends up in -- a per-source-only gain
+    couldn't express that. A missing or 0 entry means no change for that pair.
+
+    Returns ([], []) if the result would be a pure identity passthrough with nothing muted,
+    shifted, or gained -- the caller falls back to its own plain "-map 0:a" wildcard (eligible for
+    a fast stream copy) in that case, same as build_audio_track_filter_args always has."""
     if not audio_stream_count:
         return [], []
     identity_routing = {t: [t] for t in range(1, audio_stream_count + 1)}
     routing = routing if routing is not None else identity_routing
     muted_destinations = set(muted_destinations or [])
     shift_by_source = {t: ms for t, ms in (shift_ms_by_track or {}).items() if ms}
+    gains_db = gains_db or {}
+    has_gains = any(
+        gains_db.get(dest, {}).get(s) for dest, sources in routing.items() for s in sources
+    )
 
-    if not muted_destinations and not shift_by_source and routing == identity_routing:
+    if not muted_destinations and not shift_by_source and not has_gains and routing == identity_routing:
         return [], []
 
     referenced_sources = sorted({
@@ -3733,9 +4308,11 @@ def build_audio_routing_filter_args(audio_stream_count, routing=None, muted_dest
     if not referenced_sources:
         return [], []
 
-    # Stage 1: per-source filters (shift only -- destination muting happens in stage 2, after
-    # mixing, so it silences the COMBINED result of everything routed there, not just one
-    # contributing source).
+    # Stage 1: per-source filters (shift only -- destination muting happens after mixing, in
+    # stage 2 below, so it silences the COMBINED result of everything routed there rather than
+    # just one contributing source; gain happens in stage 2 too, and specifically NOT here,
+    # since gain can differ per destination for the very same source -- a single per-source
+    # filter here couldn't express "boost this source on destination 1 but not destination 2").
     filter_parts = []
     for s in referenced_sources:
         i = s - 1
@@ -3749,20 +4326,47 @@ def build_audio_routing_filter_args(audio_stream_count, routing=None, muted_dest
         else:
             filter_parts.append(f"[0:a:{i}]anull[{label}]")
 
-    # Stage 2: mix each destination's source(s) (or pass the one straight through), then mute if
-    # asked. A destination with no valid sources at all is simply omitted from the output.
+    # Stage 2: apply this destination's own gain (if any) to its own copy of each source, mix
+    # each destination's (possibly gain-adjusted) source(s) together -- or pass the one straight
+    # through -- then mute if asked. A destination with no valid sources at all is simply
+    # omitted from the output.
     map_args = []
     for dest in sorted(routing.keys()):
         sources = [s for s in routing[dest] if 1 <= s <= audio_stream_count]
         if not sources:
             continue
-        if len(sources) == 1:
-            mixed_label = f"asrc{sources[0]}"
+        dest_gains = gains_db.get(dest, {})
+        mix_inputs = []
+        any_gain_applied = False
+        for s in sources:
+            gain = dest_gains.get(s)
+            if gain:
+                any_gain_applied = True
+                gained_label = f"again{dest}_{s}"
+                filter_parts.append(f"[asrc{s}]volume={gain}dB[{gained_label}]")
+                mix_inputs.append(gained_label)
+            else:
+                mix_inputs.append(f"asrc{s}")
+        if len(mix_inputs) == 1:
+            mixed_label = mix_inputs[0]
         else:
             mixed_label = f"amix{dest}"
-            inputs = "".join(f"[asrc{s}]" for s in sources)
+            inputs = "".join(f"[{label}]" for label in mix_inputs)
+            # amix's own "normalize" option defaults ON -- it silently rescales EVERY input by
+            # 1/N regardless of any gain already applied above, which would otherwise cancel out
+            # a meaningful chunk of a deliberate boost the moment 2+ sources land in the same
+            # destination (confirmed live: mixing 2 sources with one boosted +12dB measured a
+            # further -6dB from amix's own normalization on top -- exactly 1/2 in dB -- and it
+            # only gets worse with more sources mixed together). Once the user has taken explicit
+            # control of one source's relative level here, amix re-normalizing on top of that
+            # would just be fighting the user's own choice -- so it's turned off for any
+            # destination that actually used a gain. Left at its default (on) when no gain was
+            # set for this destination at all, so plain track consolidation (the original,
+            # gain-less feature) keeps its prior auto-balanced behavior unchanged.
+            normalize_arg = ":normalize=0" if any_gain_applied else ""
             filter_parts.append(
-                f"{inputs}amix=inputs={len(sources)}:duration=longest:dropout_transition=0[{mixed_label}]"
+                f"{inputs}amix=inputs={len(mix_inputs)}:duration=longest:"
+                f"dropout_transition=0{normalize_arg}[{mixed_label}]"
             )
         if dest in muted_destinations:
             final_label = f"adest{dest}"
@@ -3801,10 +4405,216 @@ def probe_audio_stream_count(ffmpeg_path, input_path):
     return count or None
 
 
+WAVEFORM_BG_COLOR = "0x2b2b2b"
+# A brighter blue than the app's usual accent color specifically for contrast against the dark
+# background -- confirmed live the original (0x3b82f6) rendered as a thin, hard-to-see line at a
+# glance; this one, combined with draw=full/scale=sqrt below, reads as an actual solid waveform
+# shape instead.
+WAVEFORM_LINE_COLOR = "0x60a5fa"
+
+
+def downsample_waveform_image_peak(image, target_width):
+    """Shrinks a rendered waveform image to target_width by taking, for each destination column,
+    the peak-to-peak envelope (topmost-to-bottommost non-background pixel) across every source
+    column it covers -- unlike a generic resize (even PIL's own BILINEAR), which just samples or
+    blends a handful of source columns and silently drops the rest. That loss isn't neutral for
+    waveform data: a genuinely loud but brief passage that doesn't happen to land near a sampled
+    point gets flattened away, while an isolated transient (a mic pop, a keyboard click) that DOES
+    survive then reads as dramatically louder than everything around it -- confirmed live: at the
+    full-clip (most zoomed-out) view, a single mic pop looked louder than the rest of the speech
+    entirely, and became proportionate again only once zoomed in past the point where this
+    function's caller stops downsampling at all. Only meaningful when target_width < image.width;
+    draw_waveform_view only calls this for that case and keeps using a plain resize otherwise."""
+    np = _import_numpy()
+    bg_rgb = ImageColor.getrgb("#" + WAVEFORM_BG_COLOR.removeprefix("0x"))
+    wave_rgb = ImageColor.getrgb("#" + WAVEFORM_LINE_COLOR.removeprefix("0x"))
+    arr = np.asarray(image.convert("RGB"))
+    height, source_width = arr.shape[0], arr.shape[1]
+    is_wave = np.any(arr != np.array(bg_rgb, dtype=arr.dtype), axis=2)
+    has_wave = is_wave.any(axis=0)
+    top = np.argmax(is_wave, axis=0)
+    bottom = height - 1 - np.argmax(is_wave[::-1, :], axis=0)
+    out = Image.new("RGB", (target_width, height), bg_rgb)
+    draw = ImageDraw.Draw(out)
+    for dest_x in range(target_width):
+        src_left = int(dest_x * source_width / target_width)
+        src_right = max(src_left + 1, int((dest_x + 1) * source_width / target_width))
+        bucket_has_wave = has_wave[src_left:src_right]
+        if not bucket_has_wave.any():
+            continue
+        bucket_top = int(top[src_left:src_right][bucket_has_wave].min())
+        bucket_bottom = int(bottom[src_left:src_right][bucket_has_wave].max())
+        draw.line((dest_x, bucket_top, dest_x, bucket_bottom), fill=wave_rgb)
+    return out
+
+
+def compute_waveform_view_crop(duration, image_width, view_start, view_end):
+    """Maps a visible [view_start, view_end) time window onto the pixel range of a waveform image
+    that was rendered once for the WHOLE [0, duration) clip at image_width pixels -- the basis for
+    the clip editor's own zoom/pan: rather than re-rendering via ffmpeg on every zoom/pan step (or
+    approximating one render's own stretched pixels from another, which was confirmed live to look
+    jaggy and get progressively worse across a burst of zoom steps), the waveform is rendered ONCE
+    per file/track and all zooming/panning after that is a pure, instant crop+resize of that same
+    single image -- exactly how the timeline's own ruler/markers already work off one shared
+    view_state with no per-zoom re-render at all.
+
+    Pure geometry, no image library involved, so it's fully unit-testable on its own -- same
+    reasoning as this file's other pure calibration/geometry helpers.
+
+    Because view_start/view_end are always themselves already clamped to [0, duration) (see
+    zoom_view/on_pan_drag's own clamping), the requested window can never actually fall outside
+    what the full-clip image covers -- unlike a stretch-from-whatever's-currently-shown approach,
+    there's no "no overlap at all" case to handle here; this only guards against degenerate inputs
+    (zero/negative duration, width, or span).
+
+    Returns (crop_left_px, crop_right_px), both ints, clamped to [0, image_width] -- or None on a
+    degenerate input. A caller crops the full image to this range, then resizes that crop to fill
+    its own canvas width."""
+    if duration <= 0 or image_width <= 0 or view_end <= view_start:
+        return None
+    left = max(0.0, min(float(image_width), view_start / duration * image_width))
+    right = max(0.0, min(float(image_width), view_end / duration * image_width))
+    if right <= left:
+        return None
+    crop_left = int(round(left))
+    crop_right = max(crop_left + 1, int(round(right)))
+    return crop_left, crop_right
+
+
+def waveform_view_needs_higher_resolution(full_duration, full_image_width, view_start, view_end, canvas_width):
+    """True when the current view, cropped out of the one full-clip render, has FEWER real
+    source pixels behind it than the canvas has to display them in -- meaning it's being
+    upscaled and would look visibly blocky/soft next to a render made specifically for this
+    narrower window, at canvas resolution, where every displayed pixel has its own real,
+    ffmpeg-computed peak behind it instead of an interpolated guess. Used to decide whether a
+    zoomed-in view is worth a real (debounced) re-render at all, rather than firing one on every
+    zoom level regardless of whether the full-clip crop already has plenty of detail to show.
+
+    Pure geometry, unit-testable like compute_waveform_view_crop above."""
+    if full_duration <= 0 or canvas_width <= 0:
+        return False
+    view_span = view_end - view_start
+    if view_span <= 0:
+        return False
+    source_pixels = view_span / full_duration * full_image_width
+    return source_pixels < canvas_width
+
+
+def build_waveform_image_command(
+    ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width, height,
+):
+    """Builds the ffmpeg argv that renders a single waveform PNG for one audio track over
+    [start_seconds, end_seconds) of input_path -- ffmpeg's own showwavespic filter does the actual
+    rendering server-side (peak amplitude per horizontal pixel), so there's no need to decode raw
+    PCM and draw it by hand in Python.
+
+    track_index: 0-based, same convention as every other ffmpeg audio-track reference in this
+    file (0:a:0 is the first audio stream) -- the clip editor's own audio track dropdown's
+    selected INDEX (not VLC's own internal track id, which uses a different, non-0-based
+    numbering) is what a caller should pass here.
+
+    A fast (before -i) seek is used deliberately -- this is a visual aid for picking a trim point,
+    not the trim itself, so the same keyframe-snap imprecision build_trim_command's own fast mode
+    accepts is a fine trade for speed here too, and matters more here since this can re-render on
+    every track/range change a user makes."""
+    start_str = format_timestamp(start_seconds)
+    duration_str = format_timestamp(end_seconds - start_seconds)
+    # showwavespic has no background-color option of its own -- it always renders onto opaque
+    # white -- so a color source + overlay composites it onto this app's own dark editor
+    # background instead of a jarring white rectangle sitting in an otherwise dark window
+    # (confirmed live: this composites correctly, matching EDITOR_BG exactly). -update 1 is
+    # required by newer ffmpeg's image2 muxer for a single still frame written to a fixed
+    # filename (confirmed live: ffmpeg 9.0.1 warns without it, about wanting a sequence pattern
+    # like %03d instead -- still wrote a valid file this time, but on a fixed filename rather
+    # than something guaranteed to keep working).
+    # draw=full fills the whole waveform shape (peak-to-peak) rather than the default's thin
+    # single-pixel-tall line per column; scale=sqrt compresses the visual dynamic range so a quiet
+    # passage still shows SOME visible shape instead of looking flat next to a loud one -- both
+    # confirmed live to matter a lot for actually being able to see anything at this size.
+    filter_complex = (
+        f"color=c={WAVEFORM_BG_COLOR}:s={width}x{height}[bg];"
+        f"[0:a:{track_index}]showwavespic=s={width}x{height}:colors={WAVEFORM_LINE_COLOR}:draw=full:scale=sqrt[wave];"
+        f"[bg][wave]overlay=format=auto"
+    )
+    return [
+        ffmpeg_path, "-y", "-ss", start_str, "-i", input_path, "-t", duration_str,
+        "-filter_complex", filter_complex, "-frames:v", "1", "-update", "1", output_path,
+    ]
+
+
+# Caches each full-clip waveform render (the WAVEFORM_FULL_RENDER_WIDTH-wide image covering the
+# whole file, not a zoomed detail render -- see _run_clip_editor's own refresh_waveform) in memory,
+# keyed by (path, track_index, mtime, size) so a file that's changed on disk (re-trimmed, replaced)
+# always misses. Confirmed live (benchmarked against a real 2h16m/6.6GB recording) that this render
+# costs several seconds regardless of the requested width -- ffmpeg has to decode the WHOLE audio
+# track either way -- so reopening the SAME clip and track within the same app run (closing the
+# editor to check something, then coming back to finish trimming) skips that cost entirely instead
+# of re-paying it every time. Module-level, not part of waveform_state, specifically so it survives
+# across separate _run_clip_editor calls (each one is a fresh function scope). Capped at a handful
+# of entries -- each cached image is a few MB, and editing many different long recordings in one
+# sitting shouldn't let this grow unbounded.
+_WAVEFORM_IMAGE_CACHE_MAX_ENTRIES = 8
+_waveform_image_cache = OrderedDict()
+
+
+def _waveform_image_cache_key(path, track_index):
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (path, track_index, stat.st_mtime, stat.st_size)
+
+
+def get_cached_waveform_image(path, track_index):
+    """Returns the cached full-clip waveform PIL Image for this exact (path, track_index) if the
+    file's mtime and size still match what was cached -- else None (including if the file no
+    longer exists at all)."""
+    key = _waveform_image_cache_key(path, track_index)
+    if key is None:
+        return None
+    image = _waveform_image_cache.get(key)
+    if image is not None:
+        _waveform_image_cache.move_to_end(key)
+    return image
+
+
+def store_cached_waveform_image(path, track_index, image):
+    key = _waveform_image_cache_key(path, track_index)
+    if key is None:
+        return
+    _waveform_image_cache[key] = image
+    _waveform_image_cache.move_to_end(key)
+    while len(_waveform_image_cache) > _WAVEFORM_IMAGE_CACHE_MAX_ENTRIES:
+        _waveform_image_cache.popitem(last=False)
+
+
+def generate_waveform_image(ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width=760, height=120):
+    """Runs build_waveform_image_command and reports whether it actually produced a real image --
+    blocking, callers run this on a background thread the same way trim_clip's callers do.
+    Returns True on success, False on any failure (never raises)."""
+    if end_seconds <= start_seconds:
+        return False
+    cmd = build_waveform_image_command(
+        ffmpeg_path, input_path, start_seconds, end_seconds, track_index, output_path, width, height,
+    )
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs())
+    except OSError as exc:
+        logging.warning("Clip editor: could not run ffmpeg at '%s' to render a waveform: %s", ffmpeg_path, exc)
+        return False
+    if result.returncode != 0 or not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+        logging.warning(
+            "Clip editor: waveform render failed (exit code %s).\nCommand: %s\nstderr:\n%s",
+            result.returncode, " ".join(cmd), result.stderr[-2000:],
+        )
+        return False
+    return True
+
+
 def build_trim_command(
     ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False, crf=None,
     scale_height=None, audio_shift_ms_by_track=None, audio_stream_count=None,
-    audio_routing=None, muted_destinations=None,
+    audio_routing=None, muted_destinations=None, gains_db=None,
 ):
     """Builds the ffmpeg argv to cut [start_seconds, end_seconds) out of input_path. Always uses
     -t (duration) rather than -to (absolute end time) even though both express the same cut --
@@ -3837,18 +4647,19 @@ def build_trim_command(
     audio_shift_ms_by_track/audio_stream_count: shift each given 1-based OBS track number by its
     own ms amount (a per-track dict, since real process-capture tracks were confirmed live to
     each lag Desktop Audio by a genuinely different amount) to fix a clip whose isolated audio
-    track(s) still sound a few ms out of sync with the rest. audio_routing/muted_destinations:
-    the clip editor's Track Routing dialog -- consolidate multiple source tracks into fewer
-    output tracks, drop a source entirely, and/or mute an output track; see
-    build_audio_routing_filter_args, which this delegates to (and which also applies
-    audio_shift_ms_by_track to the right SOURCE tracks before any consolidation mixes them
-    together). Requires audio_stream_count (e.g. from probe_audio_stream_count) to correctly
-    re-map every track; using any of this forces the AUDIO side to re-encode (a filter graph
-    can't be stream-copied) but never touches video's own copy-vs-re-encode decision above."""
+    track(s) still sound a few ms out of sync with the rest. audio_routing/muted_destinations/
+    gains_db: the clip editor's Track Routing dialog -- consolidate multiple source tracks into
+    fewer output tracks, drop a source entirely, mute an output track, and/or boost/attenuate one
+    source's gain into one specific output track; see build_audio_routing_filter_args, which this
+    delegates to (and which also applies audio_shift_ms_by_track to the right SOURCE tracks before
+    any consolidation mixes them together). Requires audio_stream_count (e.g. from
+    probe_audio_stream_count) to correctly re-map every track; using any of this forces the AUDIO
+    side to re-encode (a filter graph can't be stream-copied) but never touches video's own
+    copy-vs-re-encode decision above."""
     start_str = format_timestamp(start_seconds)
     duration_str = format_timestamp(end_seconds - start_seconds)
     filter_complex_args, shifted_audio_map_args = build_audio_routing_filter_args(
-        audio_stream_count, audio_routing, muted_destinations, audio_shift_ms_by_track,
+        audio_stream_count, audio_routing, muted_destinations, audio_shift_ms_by_track, gains_db,
     )
     filtering_audio = bool(filter_complex_args)
     # Only video and audio -- not "-map 0" for every stream. OBS's Hybrid MP4 recordings carry
@@ -3969,7 +4780,48 @@ def cleanup_two_pass_log_files(passlog_prefix):
             pass
 
 
-def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress):
+def _watch_for_cancel(proc, cancel_event, was_cancelled):
+    """Shared cancellation watcher for both _run_ffmpeg_with_progress and
+    _run_cancellable_subprocess: polls rather than a bare cancel_event.wait() so this thread
+    exits on its own once proc finishes normally, instead of leaking a thread blocked forever on
+    an Event that (each trim creates a fresh one) will never fire again. Kills proc the moment
+    cancellation is actually requested, regardless of whether the main thread is currently
+    blocked reading the process's stdout/stderr -- a plain "check a flag between lines" approach
+    would stay stuck until ffmpeg happened to emit its next line, which isn't guaranteed to be
+    prompt. was_cancelled is a single-item list used as an out-param (mutated in place) since a
+    daemon thread's return value has nowhere else to go."""
+    if cancel_event is None:
+        return
+    while proc.poll() is None:
+        if cancel_event.wait(timeout=0.2):
+            was_cancelled[0] = True
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return
+
+
+def _run_cancellable_subprocess(cmd, cancel_event=None):
+    """subprocess.run's capture_output=True equivalent, except killable mid-flight via
+    cancel_event (a threading.Event) -- subprocess.run blocks until the process exits with no way
+    to interrupt it early once started, which left trim_clip's own two-pass "Cancel" button
+    unable to actually stop a size-targeted export's first (analysis) pass.
+
+    Returns (returncode, stdout, stderr, was_cancelled)."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace", **platform_common.hide_console_subprocess_kwargs(),
+    )
+    was_cancelled = [False]
+    watcher = threading.Thread(target=_watch_for_cancel, args=(proc, cancel_event, was_cancelled), daemon=True)
+    watcher.start()
+    stdout, stderr = proc.communicate()
+    watcher.join(timeout=1)
+    return proc.returncode, stdout, stderr, was_cancelled[0]
+
+
+def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress, cancel_event=None):
     """Runs cmd (ffmpeg_path must be cmd[0]) via subprocess.Popen with -progress piped back to
     this process instead of trim_clip's usual subprocess.run, which only ever reports anything
     once the WHOLE command has already finished -- calls on_progress(fraction), fraction in
@@ -3978,14 +4830,19 @@ def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress):
     actually takes. Only used when a caller actually wants that (trim_clip's own progress_callback
     param); every other caller keeps using plain subprocess.run completely unchanged.
 
-    Returns (returncode, stderr_text) -- the same two fields callers already read off a
-    subprocess.run() CompletedProcess, so the caller's existing success/failure handling doesn't
-    need to know which of the two actually ran."""
+    cancel_event: see _watch_for_cancel -- optional, killable mid-flight if given.
+
+    Returns (returncode, stderr_text, was_cancelled) -- the first two are the same fields callers
+    already read off a subprocess.run() CompletedProcess, so the caller's existing success/failure
+    handling doesn't need to know which of the two actually ran."""
     progress_cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
     proc = subprocess.Popen(
         progress_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace", **platform_common.hide_console_subprocess_kwargs(),
     )
+    was_cancelled = [False]
+    watcher = threading.Thread(target=_watch_for_cancel, args=(proc, cancel_event, was_cancelled), daemon=True)
+    watcher.start()
     stderr_chunks = []
 
     def drain_stderr():
@@ -4014,41 +4871,53 @@ def _run_ffmpeg_with_progress(cmd, total_duration_seconds, on_progress):
 
     proc.wait()
     stderr_thread.join(timeout=5)
-    return proc.returncode, "".join(stderr_chunks)
+    watcher.join(timeout=1)
+    return proc.returncode, "".join(stderr_chunks), was_cancelled[0]
 
 
 def trim_clip(
     input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
     delete_original=False, icon=None, notifications_config=None, crf=None, scale_height=None,
     target_size_mb=None, audio_shift_ms_by_track=None, audio_routing=None, muted_destinations=None,
-    progress_callback=None,
+    gains_db=None, progress_callback=None, cancel_event=None,
 ):
     """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
     way transcode_recording's callers do. Verifies the output file actually exists and has a
     nonzero size before reporting success or deleting the source; never deletes on a failed or
     suspicious-looking trim, same rule transcode_recording already follows.
 
-    audio_shift_ms_by_track/audio_routing/muted_destinations: see build_audio_routing_filter_args.
-    Only probes the source's real audio track count (an extra ffprobe subprocess) when any of
-    them is actually requested -- the common case (none) pays nothing extra. Not supported
-    together with target_size_mb: a size-targeted export already keeps only the first audio track
-    (see build_two_pass_size_targeted_commands), so there's nothing left to shift, route, or
-    mute.
+    audio_shift_ms_by_track/audio_routing/muted_destinations/gains_db: see
+    build_audio_routing_filter_args. Only probes the source's real audio track count (an extra
+    ffprobe subprocess) when any of them is actually requested -- the common case (none) pays
+    nothing extra. Not supported together with target_size_mb: a size-targeted export already
+    keeps only the first audio track (see build_two_pass_size_targeted_commands), so there's
+    nothing left to shift, route, mute, or boost/attenuate.
 
     progress_callback(phase_text, fraction), if given, is called repeatedly with real progress
     (fraction in [0, 1]) as the actual output-producing encode runs -- see
     _run_ffmpeg_with_progress. Left as None (the default), every ffmpeg invocation here still
-    goes through plain subprocess.run exactly as before, unchanged."""
+    goes through plain subprocess.run exactly as before, unchanged.
+
+    cancel_event: a threading.Event a caller can set from another thread (e.g. a Cancel button)
+    to kill whichever ffmpeg process is currently running -- every subprocess this function can
+    launch (pass 1, pass 2, and the plain single-pass path) is killable via this, not just the
+    main progress-reporting one. A cancelled run returns False exactly like a genuine failure
+    (there's no separate return value for it -- callers that care check cancel_event.is_set()
+    themselves afterward, same object they already own), but is logged/notified as a cancellation
+    rather than an error."""
     basename = os.path.basename(input_path)
     if end_seconds <= start_seconds:
         logging.error("Could not trim %s: end time must be after the start time.", basename)
         return False
 
+    def was_cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
     passlog_prefix = None
     if target_size_mb:
-        if audio_shift_ms_by_track or audio_routing or muted_destinations:
+        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db:
             logging.warning(
-                "Clip editor: ignoring the audio sync shift/routing/mute for %s -- a "
+                "Clip editor: ignoring the audio sync shift/routing/mute/gain for %s -- a "
                 "size-targeted export only keeps the first audio track, so there's nothing left "
                 "to apply it to.",
                 basename,
@@ -4059,23 +4928,35 @@ def trim_clip(
             passlog_prefix,
         )
         logging.info("Trimming %s (pass 1/2, targeting %s MB): %s", basename, target_size_mb, " ".join(pass1_cmd))
-        if progress_callback:
-            try:
-                progress_callback("Analyzing (pass 1 of 2)", 0.0)
-            except Exception:
-                logging.exception("Trim progress callback failed.")
+        pass1_phase_text = "Analyzing (pass 1 of 2)"
         try:
-            result1 = subprocess.run(
-                pass1_cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs()
-            )
+            if progress_callback:
+                progress_callback(pass1_phase_text, 0.0)
+                # Pass 1 re-encodes the WHOLE clip too (its output is thrown away -- it's only
+                # used to measure bitrate stats for pass 2) and so takes just as long as pass 2 in
+                # practice. Reporting real progress for it the same way as pass 2 (rather than a
+                # single 0% call before running it as one opaque blocking step) is what actually
+                # fixes "stuck at 0% with no sign of life" -- confirmed that was pass 1, not pass 2,
+                # since pass 2 already had per-frame progress via _run_ffmpeg_with_progress below.
+                returncode1, stderr1, cancelled1 = _run_ffmpeg_with_progress(
+                    pass1_cmd, end_seconds - start_seconds,
+                    lambda fraction: progress_callback(pass1_phase_text, fraction),
+                    cancel_event=cancel_event,
+                )
+            else:
+                returncode1, _stdout1, stderr1, cancelled1 = _run_cancellable_subprocess(pass1_cmd, cancel_event)
         except OSError as exc:
             logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
             notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
             return False
-        if result1.returncode != 0:
+        if cancelled1:
+            logging.info("Trim of %s cancelled during pass 1/2.", basename)
+            cleanup_two_pass_log_files(passlog_prefix)
+            return False
+        if returncode1 != 0:
             logging.error(
                 "ffmpeg trim (pass 1/2) failed for %s (exit code %s).\nCommand: %s\nstderr:\n%s",
-                input_path, result1.returncode, " ".join(pass1_cmd), result1.stderr[-4000:],
+                input_path, returncode1, " ".join(pass1_cmd), stderr1[-4000:],
             )
             notify(
                 icon, notifications_config, "Trim failed",
@@ -4088,16 +4969,16 @@ def trim_clip(
         logging.info("Trimming %s (pass 2/2): %s", basename, " ".join(cmd))
     else:
         audio_stream_count = None
-        if audio_shift_ms_by_track or audio_routing or muted_destinations:
+        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db:
             audio_stream_count = probe_audio_stream_count(ffmpeg_path, input_path)
             if not audio_stream_count:
                 logging.warning(
                     "Clip editor: could not determine %s's audio track count -- skipping the "
-                    "requested audio sync shift/routing/mute.", basename,
+                    "requested audio sync shift/routing/mute/gain.", basename,
                 )
         cmd = build_trim_command(
             ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise, crf, scale_height,
-            audio_shift_ms_by_track, audio_stream_count, audio_routing, muted_destinations,
+            audio_shift_ms_by_track, audio_stream_count, audio_routing, muted_destinations, gains_db,
         )
         phase_text = "Encoding clip"
         logging.info("Trimming %s: %s", basename, " ".join(cmd))
@@ -4105,15 +4986,13 @@ def trim_clip(
     try:
         if progress_callback:
             progress_callback(phase_text, 0.0)
-            returncode, stderr_text = _run_ffmpeg_with_progress(
+            returncode, stderr_text, cancelled = _run_ffmpeg_with_progress(
                 cmd, end_seconds - start_seconds,
                 lambda fraction: progress_callback(phase_text, fraction),
+                cancel_event=cancel_event,
             )
         else:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs()
-            )
-            returncode, stderr_text = result.returncode, result.stderr
+            returncode, _stdout, stderr_text, cancelled = _run_cancellable_subprocess(cmd, cancel_event)
     except OSError as exc:
         logging.error("Could not run ffmpeg at '%s' to trim %s: %s", ffmpeg_path, basename, exc)
         notify(icon, notifications_config, "Trim failed", f"Could not trim {basename}: ffmpeg failed to run.")
@@ -4121,6 +5000,15 @@ def trim_clip(
     finally:
         if passlog_prefix:
             cleanup_two_pass_log_files(passlog_prefix)
+
+    if cancelled or was_cancelled():
+        logging.info("Trim of %s cancelled.", basename)
+        if os.path.isfile(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return False
 
     output_ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
     if returncode != 0 or not output_ok:
@@ -4529,6 +5417,36 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                 if not obs_event_client:
                     if obs_running_now:
                         obs_event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
+                        if obs_event_client:
+                            # Applies mic_boost as soon as OBS is confirmed reachable, not only
+                            # once a watched game triggers ensure_obs_ready -- see
+                            # apply_mic_boost_from_config's own docstring for why this matters:
+                            # without it, the overlay would never show a boosted level at all
+                            # while just idly talking into the mic outside of a real recording.
+                            # On its own background thread (like launch_obs below): confirmed
+                            # live that OBS can still answer "not ready" (code 207) to a plain
+                            # request for a few seconds right after its websocket first accepts a
+                            # connection -- connect_obs's own default retries/delay ride that out,
+                            # but doing that on the watcher loop's own thread would stall game
+                            # detection for as long as it takes.
+                            def apply_mic_boost_in_background():
+                                req_client = connect_obs(obs_config["websocket"])
+                                if req_client:
+                                    try:
+                                        # connect_obs only retries the connection/identify
+                                        # handshake itself -- confirmed live that OBS can still
+                                        # answer "not ready" (207) to the very next real request
+                                        # for a few seconds after that succeeds, on a fresh
+                                        # launch. This has no UI and no natural retry trigger
+                                        # like the calibration button does, so it's worth
+                                        # actually waiting out here rather than silently skipping
+                                        # this one attempt.
+                                        if wait_until_obs_ready(req_client):
+                                            apply_mic_boost_from_config(req_client, obs_config)
+                                    finally:
+                                        req_client.disconnect()
+
+                            threading.Thread(target=apply_mic_boost_in_background, daemon=True).start()
                     else:
                         audio_state["levels"] = {}
                         # Show Audio Mixer Levels used to just sit there showing "No active audio
@@ -4829,19 +5747,19 @@ def meter_bar_color(peak):
     return METER_LOW_COLOR
 
 
-def run_overlay(monitors, overlay_state, audio_state, status, stop_event):
+def run_overlay(monitors, overlay_state, audio_state, status, stop_event, mic_boost_config=None):
     # Without this wrapper, an exception anywhere in here (Tk init, widget construction, the
     # poll loop) kills the thread completely silently in a --noconsole build -- no stderr to
     # print a traceback to -- permanently disabling both the overlay AND Settings (which now
     # depends on this same interpreter) with zero trace in the log. Matches watcher_loop's
     # own try/except-wrapping-impl pattern below.
     try:
-        _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event)
+        _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event, mic_boost_config or {})
     except Exception:
         logging.exception("Overlay thread crashed unexpectedly; overlay and Settings are unavailable this session.")
 
 
-def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
+def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event, mic_boost_config):
     # A Tk() failure right after a relaunch (before the fix to stop inheriting a stale
     # TCL_LIBRARY/TK_LIBRARY from the parent process) is the one failure mode transient enough
     # to be worth retrying rather than just logging once and giving up.
@@ -4926,7 +5844,21 @@ def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
         show = audio_state["enabled"]
         index = overlay_state["monitor_index"] if show else None
         levels = audio_state["levels"]
-        row_count = max(len(levels), 1)
+
+        # A preview row showing what this reading would become after the mic-boost chain, right
+        # under the mic's own real (raw) row -- only while mic_boost isn't actually enabled yet.
+        # Once it genuinely IS enabled, OBS's own reading for this input already reports the real
+        # post-filter level directly (confirmed live -- see predict_mic_boost_output_mul's own
+        # docstring), so a second computed row at that point would just be a redundant, slightly-
+        # off approximation of a number already being shown correctly.
+        preview_input_name = None if mic_boost_config.get("enabled") else mic_boost_config.get("input_name")
+        rows = []
+        for name, peak in levels.items():
+            rows.append((name, peak))
+            if name == preview_input_name:
+                predicted = predict_mic_boost_output_mul(peak, mic_boost_config.get("boost_db", 0.0))
+                rows.append((f"{name} (after boost)", predicted))
+        row_count = max(len(rows), 1)
 
         if index != meter_shown_index[0] or row_count != meter_row_count[0]:
             meter_shown_index[0] = index
@@ -4944,12 +5876,12 @@ def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event):
 
         if meter_shown_index[0] is not None:
             meter_canvas.delete("all")
-            if not levels:
+            if not rows:
                 meter_canvas.create_text(
                     8, METER_ROW_HEIGHT // 2, anchor="w", fill="#888888", text="No active audio sources"
                 )
             else:
-                for i, (name, peak) in enumerate(levels.items()):
+                for i, (name, peak) in enumerate(rows):
                     top = i * METER_ROW_HEIGHT
                     label = name if len(name) <= METER_LABEL_CHARS else name[: METER_LABEL_CHARS - 1] + "…"
                     bar_x = 90
@@ -6549,6 +7481,200 @@ def _run_config_editor(master_root, restart_callback, on_close):
 
     calibrate_button.config(command=start_calibration)
 
+    mic_boost_config = obs_config.get("mic_boost", {})
+    add_section_label(obs_tab, row, "Microphone Boost")
+    row += 1
+    mic_boost_enabled_var = tk.BooleanVar(value=mic_boost_config.get("enabled", False))
+    add_checkbox(obs_tab, row, "Boost a quiet microphone live, in OBS itself", mic_boost_enabled_var)
+    row += 1
+    mic_boost_input_var = tk.StringVar(value=mic_boost_config.get("input_name", ""))
+    add_labeled_entry(obs_tab, row, "Microphone input source name", mic_boost_input_var)
+
+    def pick_mic_boost_input():
+        open_obs_input_picker(obs_tab, get_current_ws_config, on_pick=lambda name: mic_boost_input_var.set(name))
+
+    dark_button(obs_tab, text="Pick...", command=pick_mic_boost_input).grid(row=row, column=2, padx=(0, 10), pady=4)
+    row += 1
+    mic_boost_db_var = tk.StringVar(value=str(mic_boost_config.get("boost_db", 0.0)))
+    add_labeled_entry(obs_tab, row, "Boost amount (dB)", mic_boost_db_var, width=10)
+    mic_boost_db_detect_button = dark_button(obs_tab, text="Auto-Detect...")
+    mic_boost_db_detect_button.grid(row=row, column=2, padx=(0, 10), pady=4)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    \"Auto-Detect\" measures your own real speaking level instead of guessing -- "
+            "confirmed live this session that a guessed, too-large flat gain (+36dB, from the "
+            "clip editor's own export-time gain, a different feature from this one) clipped this "
+            "app's own Desktop Audio track badly once mixed with other audio. This one is safer "
+            "by construction (it solves for a target level against the Compressor's own curve "
+            "above, not a blind flat number), but still measures your real mic and room rather "
+            "than assuming."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    def run_mic_boost_db_detection(ws_config, input_name, progress_window, progress_label):
+        def on_phase(phase_name, seconds_remaining):
+            text = f"Talk normally (like you would while playing)... {seconds_remaining:.0f}s"
+
+            def update():
+                if progress_window.winfo_exists():
+                    progress_label.config(text=text)
+            try:
+                obs_tab.after(0, update)
+            except tk.TclError:
+                pass
+
+        boost_db, error_message = measure_mic_boost_db(ws_config, input_name, on_phase=on_phase)
+
+        def finish():
+            if progress_window.winfo_exists():
+                progress_window.destroy()
+            mic_boost_db_detect_button.config(state="normal", text="Auto-Detect...")
+            if error_message:
+                messagebox.showwarning("Can't auto-detect", error_message, parent=obs_tab)
+            else:
+                mic_boost_db_var.set(str(boost_db))
+                messagebox.showinfo(
+                    "Auto-detect complete",
+                    f"Measured boost: {boost_db}dB. The field above has been updated -- click "
+                    "Save for it to take effect.",
+                    parent=obs_tab,
+                )
+        try:
+            obs_tab.after(0, finish)
+        except tk.TclError:
+            pass
+
+    def start_mic_boost_db_detection():
+        input_name = mic_boost_input_var.get().strip()
+        if not input_name:
+            messagebox.showwarning(
+                "No microphone set", "Set \"Microphone input source name\" above first.", parent=obs_tab,
+            )
+            return
+        proceed = messagebox.askyesno(
+            "Auto-Detect Boost Amount",
+            f"This briefly listens to '{input_name}' while you talk normally for "
+            f"{MIC_BOOST_CALIBRATION_VOICE_SECONDS:.0f}s (like you would while playing), then "
+            "computes a boost that lands your typical speaking level at a comfortable target. "
+            "The boost/voice isolation are both temporarily turned off during this so it can hear "
+            "the real, raw signal.\n\nContinue?",
+            parent=obs_tab,
+        )
+        if not proceed:
+            return
+
+        progress_window = tk.Toplevel(obs_tab)
+        progress_window.title("Auto-Detect Boost Amount")
+        progress_window.configure(bg=DARK_BG)
+        progress_window.transient(obs_tab.winfo_toplevel())
+        progress_window.resizable(False, False)
+        progress_label = tk.Label(
+            progress_window, text="Starting...", bg=DARK_BG, fg=DARK_FG, font=("Segoe UI", 11), padx=30, pady=30,
+        )
+        progress_label.pack()
+
+        mic_boost_db_detect_button.config(state="disabled", text="Listening...")
+        threading.Thread(
+            target=run_mic_boost_db_detection,
+            args=(get_current_ws_config(), input_name, progress_window, progress_label),
+            daemon=True,
+        ).start()
+
+    mic_boost_db_detect_button.config(command=start_mic_boost_db_detection)
+    tk.Label(
+        obs_tab,
+        text=(
+            "    Applies a Compressor (for makeup gain that doesn't push already-loud moments as "
+            "hard as quiet ones) plus a Limiter (a hard safety ceiling) directly to this OBS input "
+            "-- live, so every future recording captures it boosted from the start. This is "
+            "separate from the clip editor's own Track Routing gain (Settings > Clip Editor > "
+            "Default Track Gains, or the dialog itself): that one only re-encodes an already-"
+            "recorded FILE per trim and can't do anything about a source that was captured too "
+            "quiet in the first place -- confirmed live that a genuinely under-recorded mic "
+            "(e.g. -67dBFS average) can't be fixed by a flat gain at any single stage, since its "
+            "existing peaks hit the digital ceiling long before the quiet parts catch up. The two "
+            "can be used together."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    mic_voice_isolation_config = mic_boost_config.get("voice_isolation", {})
+    mic_voice_isolation_enabled_var = tk.BooleanVar(value=mic_voice_isolation_config.get("enabled", False))
+    add_checkbox(
+        obs_tab, row, "Also add voice isolation ahead of the boost, to reduce background noise",
+        mic_voice_isolation_enabled_var,
+    )
+    row += 1
+    configured_voice_isolation_method = mic_voice_isolation_config.get("method", DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD)
+    if configured_voice_isolation_method not in MIC_BOOST_VOICE_ISOLATION_METHODS:
+        configured_voice_isolation_method = DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD
+    mic_voice_isolation_method_var = tk.StringVar(
+        value=MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS[configured_voice_isolation_method]
+    )
+    tk.Label(obs_tab, text="Voice isolation method", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        obs_tab, textvariable=mic_voice_isolation_method_var,
+        values=list(MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS.values()),
+        state="readonly", width=46, style="Settings.TCombobox",
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    Runs on the RAW signal before the boost above amplifies whatever's left -- "
+            "placed first in the chain regardless of when it was added. Unlike a noise gate, both "
+            "methods continuously reduce noise instead of hard-muting below a threshold, so "
+            "there's no per-room calibration to keep up to date. RNNoise (a small neural network) "
+            "removes more noise but can sound muffled/processed on some mics; Speex (the older, "
+            "classic algorithm) removes less but is generally lighter-touch on voice clarity -- "
+            "worth trying both on your own mic and picking whichever sounds better. Freely "
+            "toggleable/switchable here -- unchecking it disables the filter in OBS rather than "
+            "removing it."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    mic_eq_config = mic_boost_config.get("eq", {})
+    mic_eq_enabled_var = tk.BooleanVar(value=mic_eq_config.get("enabled", False))
+    add_checkbox(
+        obs_tab, row, "Also add a 3-band EQ ahead of the boost, to shape the tone",
+        mic_eq_enabled_var,
+    )
+    row += 1
+    mic_eq_low_var = tk.StringVar(value=str(mic_eq_config.get("low_db", MIC_BOOST_EQ_PRESET_LOW_DB)))
+    mic_eq_mid_var = tk.StringVar(value=str(mic_eq_config.get("mid_db", MIC_BOOST_EQ_PRESET_MID_DB)))
+    mic_eq_high_var = tk.StringVar(value=str(mic_eq_config.get("high_db", MIC_BOOST_EQ_PRESET_HIGH_DB)))
+    tk.Label(obs_tab, text="EQ (dB): Low / Mid / High", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    mic_eq_entries_row = tk.Frame(obs_tab, bg=DARK_BG)
+    mic_eq_entries_row.grid(row=row, column=1, sticky="w", pady=4)
+    for eq_var in (mic_eq_low_var, mic_eq_mid_var, mic_eq_high_var):
+        tk.Entry(
+            mic_eq_entries_row, textvariable=eq_var, width=6, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG,
+        ).pack(side="left", padx=(0, 8))
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    OBS's own 3-band equalizer, applied right after voice isolation (before the "
+            "boost/compressor react to it). Positive boosts, negative cuts. The prefilled values "
+            "are a mild, generally-applicable \"voice clarity\" curve -- a small low cut (less "
+            "boominess/rumble), a small mid cut (less boxiness), a small high boost (more "
+            "presence/intelligibility) -- not a per-mic calibration, so freely adjust to taste."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
     multi_track_config = obs_config.get("multi_track_audio", {})
     # Keyed by input name so re-running Quick Setup (or hand-editing tracks afterward) never
     # loses a previously-recorded app -> process mapping; collect_config() below reads this back
@@ -6611,6 +7737,41 @@ def _run_config_editor(master_root, restart_callback, on_close):
     # --- Custom Keybinds ---
     keybinds_tab = make_scrollable_tab(notebook, "Custom Keybinds")
     custom_keybind_rows, _ = build_custom_keybinds_editor(keybinds_tab, obs_config.get("custom_keybinds", []))
+
+    # Windows-only (see CUSTOM_KEYBIND_HOTKEY_MODE_LABELS): the mechanism choice this settles
+    # doesn't exist on Linux/macOS at all, so there's nothing meaningful to show there.
+    if sys.platform == "win32":
+        configured_hotkey_mode = obs_config.get("custom_keybind_hotkey_mode", DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE)
+        if configured_hotkey_mode not in CUSTOM_KEYBIND_HOTKEY_MODES:
+            configured_hotkey_mode = DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE
+        custom_keybind_hotkey_mode_var = tk.StringVar(
+            value=CUSTOM_KEYBIND_HOTKEY_MODE_LABELS[configured_hotkey_mode]
+        )
+        hotkey_mode_row = tk.Frame(keybinds_tab, bg=DARK_BG)
+        hotkey_mode_row.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(hotkey_mode_row, text="Hotkey delivery mode", bg=DARK_BG, fg=DARK_FG).pack(side="left")
+        ttk.Combobox(
+            hotkey_mode_row, textvariable=custom_keybind_hotkey_mode_var,
+            values=list(CUSTOM_KEYBIND_HOTKEY_MODE_LABELS.values()),
+            state="readonly", width=65, style="Settings.TCombobox",
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(
+            keybinds_tab,
+            text=(
+                "    Raw Input (the default) receives keystrokes independently and in parallel with "
+                "whatever app has focus -- including a game running in true fullscreen EXCLUSIVE "
+                "mode -- without ever sitting in its input path, so it carries no input-lag risk. "
+                "Standard (Win32 RegisterHotKey) is equally lag-free but can be silently blocked "
+                "by a fullscreen-exclusive game (confirmed with League of Legends). Low-level hook "
+                "is an older fallback that also works in fullscreen games, but taps every keystroke "
+                "system-wide before your game or any other app sees it -- confirmed via a real "
+                "report to add perceptible input lag; only use it if Raw Input genuinely doesn't "
+                "work on your system."
+            ),
+            anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+        ).pack(fill="x", padx=10, pady=(0, 6))
+    else:
+        custom_keybind_hotkey_mode_var = None
 
     multi_track_list_frame = tk.Frame(obs_tab, bg=DARK_BG)
     multi_track_list_frame.grid(row=row, column=0, columnspan=3, sticky="we")
@@ -6969,6 +8130,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
         clip_delete_original_var,
     )
     row += 1
+    clip_auto_fix_sync_var = tk.BooleanVar(value=clip_editor_config.get("auto_fix_audio_sync", False))
+    add_checkbox(
+        clip_editor_tab, row, "Automatically check \"Fix audio track sync\" when opening a clip to trim",
+        clip_auto_fix_sync_var,
+    )
+    row += 1
     configured_trim_mode = clip_editor_config.get("trim_mode", "precise")
     if configured_trim_mode not in CLIP_EDITOR_TRIM_MODE_OPTIONS:
         configured_trim_mode = "precise"
@@ -6993,7 +8160,9 @@ def _run_config_editor(master_root, restart_callback, on_close):
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
-    clip_target_size_var = tk.StringVar(value=str(clip_editor_config.get("default_target_size_mb") or ""))
+    clip_target_size_var = tk.StringVar(
+        value=str(clip_editor_config.get("default_target_size_mb", CLIP_EDITOR_DEFAULT_TARGET_SIZE_MB) or "")
+    )
     add_labeled_entry(clip_editor_tab, row, "Default target size (MB, blank = off)", clip_target_size_var, width=10)
     row += 1
     tk.Label(
@@ -7072,6 +8241,66 @@ def _run_config_editor(master_root, restart_callback, on_close):
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
+
+    add_section_label(clip_editor_tab, row, "Default Track Gains (dB)")
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Pre-fills the Track Routing dialog's own per-track gain boxes with these "
+            "values whenever it's opened -- still freely changeable (or clearable) per trim from "
+            "there. Boosts (positive) or attenuates (negative) a source only when it's routed "
+            "into that one output track (the row); the same source can have a different default "
+            "-- or none -- on each output it's also routed to. Leave blank or 0 for no default. "
+            "This changes the exported FILE itself (via ffmpeg) once a trim actually runs -- it's "
+            "unrelated to the clip editor's own \"Preview\" volume slider, which only ever affects "
+            "what you hear while scrubbing a clip, never the exported output."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
+    # A fixed 6x6 grid rather than one sized to any particular recording's real track count --
+    # Settings has no specific file open to probe, and 6 is OBS's own hard cap on simultaneous
+    # audio tracks (see e.g. CALIBRATION_TARGET_TRACK and the multi_track_audio tab's own track
+    # dropdown above, both hardcoded to range(1, 7) for the same reason). Keyed by track NUMBER,
+    # same convention as track_name_hints/multi_track_audio.tracks -- this app's own multi-track
+    # routing assigns each source to a fixed, stable track number, so a number-keyed default
+    # reliably means the same source every time, unlike e.g. a source's on-disk stream index.
+    DEFAULT_GAIN_GRID_TRACKS = 6
+    default_gains_config = clip_editor_config.get("default_gains_db") or {}
+    gain_track_hints = track_name_hints(obs_config)
+
+    def default_gain_text(dest, src):
+        value = default_gains_config.get(str(dest), {}).get(str(src))
+        return "" if not value else str(value)
+
+    default_gain_vars = {
+        dest: {
+            src: tk.StringVar(value=default_gain_text(dest, src))
+            for src in range(1, DEFAULT_GAIN_GRID_TRACKS + 1)
+        }
+        for dest in range(1, DEFAULT_GAIN_GRID_TRACKS + 1)
+    }
+    gain_header_row = row
+    for src in range(1, DEFAULT_GAIN_GRID_TRACKS + 1):
+        hint = gain_track_hints.get(src)
+        header_text = f"{src}\n({hint})" if hint else str(src)
+        tk.Label(
+            clip_editor_tab, text=header_text, bg=DARK_BG, fg=DARK_FG, justify="center",
+            font=("Segoe UI", 8),
+        ).grid(row=gain_header_row, column=src, padx=2, pady=(0, 2))
+    row += 1
+    for dest in range(1, DEFAULT_GAIN_GRID_TRACKS + 1):
+        tk.Label(clip_editor_tab, text=f"-> Track {dest}:", bg=DARK_BG, fg=DARK_FG, anchor="w").grid(
+            row=row, column=0, sticky="w", padx=(10, 4), pady=1
+        )
+        for src in range(1, DEFAULT_GAIN_GRID_TRACKS + 1):
+            tk.Entry(
+                clip_editor_tab, textvariable=default_gain_vars[dest][src], width=4,
+                bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG, justify="center",
+            ).grid(row=row, column=src, padx=1, pady=1)
+        row += 1
 
     add_section_label(clip_editor_tab, row, "Video Preview (VLC)")
     row += 1
@@ -7325,6 +8554,10 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 "key": row_vars["key"].get(),
             })
         obs["custom_keybinds"] = custom_keybinds
+        if custom_keybind_hotkey_mode_var is not None:
+            obs["custom_keybind_hotkey_mode"] = CUSTOM_KEYBIND_HOTKEY_MODE_LABELS_BY_LABEL.get(
+                custom_keybind_hotkey_mode_var.get(), DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE,
+            )
 
         recovery = obs.setdefault("recovery", {})
         recovery["memory_limit_gb"] = read_float(
@@ -7343,6 +8576,24 @@ def _run_config_editor(master_root, restart_callback, on_close):
         obs["process_audio_capture_sync_offset_ms"] = read_int(
             process_capture_sync_offset_var, "Audio capture sync offset", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS,
         )
+
+        mic_boost = obs.setdefault("mic_boost", {})
+        mic_boost["enabled"] = mic_boost_enabled_var.get()
+        mic_boost["input_name"] = mic_boost_input_var.get().strip()
+        mic_boost["boost_db"] = read_float(mic_boost_db_var, "Microphone boost amount", mic_boost.get("boost_db", 0.0))
+        if mic_boost_enabled_var.get() and not mic_boost["input_name"]:
+            errors.append("\"Microphone input source name\" is required when Microphone Boost is enabled")
+        mic_voice_isolation = mic_boost.setdefault("voice_isolation", {})
+        mic_voice_isolation["enabled"] = mic_voice_isolation_enabled_var.get()
+        mic_voice_isolation["method"] = MIC_BOOST_VOICE_ISOLATION_METHOD_LABELS_BY_LABEL.get(
+            mic_voice_isolation_method_var.get(), DEFAULT_MIC_BOOST_VOICE_ISOLATION_METHOD,
+        )
+        mic_eq = mic_boost.setdefault("eq", {})
+        mic_eq["enabled"] = mic_eq_enabled_var.get()
+        mic_eq["low_db"] = read_float(mic_eq_low_var, "EQ low", mic_eq.get("low_db", MIC_BOOST_EQ_PRESET_LOW_DB))
+        mic_eq["mid_db"] = read_float(mic_eq_mid_var, "EQ mid", mic_eq.get("mid_db", MIC_BOOST_EQ_PRESET_MID_DB))
+        mic_eq["high_db"] = read_float(mic_eq_high_var, "EQ high", mic_eq.get("high_db", MIC_BOOST_EQ_PRESET_HIGH_DB))
+        mic_boost.pop("noise_gate", None)
 
         multi_track_audio = obs.setdefault("multi_track_audio", {})
         multi_track_audio["enabled"] = multi_track_enabled_var.get()
@@ -7457,6 +8708,27 @@ def _run_config_editor(master_root, restart_callback, on_close):
             clip_editor.pop("markers_folder", None)
         clip_editor["output_suffix"] = clip_output_suffix_var.get()
         clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
+        clip_editor["auto_fix_audio_sync"] = clip_auto_fix_sync_var.get()
+        default_gains_out = {}
+        for gain_dest, gain_sources in default_gain_vars.items():
+            dest_gains_out = {}
+            for gain_src, gain_var in gain_sources.items():
+                text = gain_var.get().strip()
+                if not text:
+                    continue
+                try:
+                    value = float(text)
+                except ValueError:
+                    errors.append(f"Default Track Gains: 'Track {gain_dest}' column {gain_src} must be a number")
+                    continue
+                if value:
+                    dest_gains_out[str(gain_src)] = value
+            if dest_gains_out:
+                default_gains_out[str(gain_dest)] = dest_gains_out
+        if default_gains_out:
+            clip_editor["default_gains_db"] = default_gains_out
+        else:
+            clip_editor.pop("default_gains_db", None)
         clip_editor["trim_mode"] = CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL.get(trim_mode_var.get(), "precise")
         if clip_target_size_var.get().strip():
             target_size_value = read_float(clip_target_size_var, "Default target size", None)
@@ -7465,7 +8737,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
             elif target_size_value is not None:
                 errors.append("'Default target size' must be a positive number of MB")
         else:
-            clip_editor.pop("default_target_size_mb", None)
+            # Explicitly 0, not popped -- now that an absent key falls back to
+            # CLIP_EDITOR_DEFAULT_TARGET_SIZE_MB, popping it here would make "the user cleared
+            # this field to turn size limiting off" indistinguishable from "never configured,"
+            # silently reverting to the default the next time Settings opens.
+            clip_editor["default_target_size_mb"] = 0
         clip_editor["preview_quality"] = clip_preview_quality_var.get()
         clip_editor["default_output_format"] = clip_default_format_var.get()
         clip_editor["default_quality"] = clip_default_quality_var.get()
@@ -7587,6 +8863,11 @@ CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL = {v: k for k, v in CLIP_EDITOR_TRIM_MODE_
 # only exposes the former; this is the same value build_trim_command always used for its one re-
 # encode path before resolution scaling existed.
 CLIP_EDITOR_DEFAULT_CRF = 18
+# A reasonable out-of-the-box cap for a clip meant to be shared somewhere with its own upload
+# limit, rather than leaving size limiting off until a user discovers and sets it themselves.
+# Still freely changeable (or clearable, to turn size limiting off again) from Settings' own
+# "Default target size" field.
+CLIP_EDITOR_DEFAULT_TARGET_SIZE_MB = 20
 
 
 def get_quality_scale_height(quality_choice):
@@ -8004,6 +9285,33 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
 
         recent_combo.bind("<<ComboboxSelected>>", on_recent_selected)
 
+        def step_recent_recording(delta):
+            """Moves to the next-older (delta=+1) or next-newer (delta=-1) recording in the
+            Recent recordings list above, relative to whichever recording is currently open --
+            lets you work through a backlog of recent session recordings one at a time without
+            reopening the dropdown for each one. A no-op (with a short status message) at either
+            end of the list, or if the currently open file isn't part of this list at all (e.g.
+            opened via Browse from somewhere else), since there's no defined position to step
+            from."""
+            try:
+                current_index = recent_recordings.index(state["path"])
+            except ValueError:
+                status_label.config(fg=SEEKER_COLOR, text="Can't step to another recording -- this file isn't in the Recent list.")
+                return
+            new_index = current_index + delta
+            if not (0 <= new_index < len(recent_recordings)):
+                status_label.config(fg=SEEKER_COLOR, text="No older recordings." if delta > 0 else "No newer recordings.")
+                return
+            load_file(recent_recordings[new_index])
+            recent_combo.current(new_index)
+
+        dark_button(
+            open_row, text="⏮", font=("Segoe UI", 11), command=lambda: step_recent_recording(-1),
+        ).pack(side="left", padx=(8, 0))
+        dark_button(
+            open_row, text="⏭", font=("Segoe UI", 11), command=lambda: step_recent_recording(1),
+        ).pack(side="left", padx=(4, 0))
+
     audio_track_var = tk.StringVar()
     audio_track_ids = []
     audio_track_combo = ttk.Combobox(
@@ -8073,11 +9381,18 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         if current_id in audio_track_ids:
             audio_track_combo.current(audio_track_ids.index(current_id))
         state["tracks_loaded"] = True
+        schedule_waveform_refresh()
 
     def on_audio_track_selected(_event):
         index = audio_track_combo.current()
         if 0 <= index < len(audio_track_ids):
             player.audio_set_track(audio_track_ids[index])
+        # The displayed waveform (if any) is for whichever track was selected when it was
+        # rendered -- invalidates it rather than silently leaving a now-mismatched one on screen;
+        # schedule_waveform_refresh() below then renders the new one automatically.
+        waveform_state["generation"] += 1
+        show_waveform_placeholder("Rendering waveform...")
+        schedule_waveform_refresh()
 
     audio_track_combo.bind("<<ComboboxSelected>>", on_audio_track_selected)
 
@@ -8102,6 +9417,316 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
 
     timeline_canvas = tk.Canvas(root, height=TIMELINE_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
     timeline_canvas.pack(fill="x", padx=10, pady=(0, 4))
+
+    # --- Waveform for whichever audio track is selected above -- rendered ONCE for the WHOLE clip
+    # per file/track change, then all zooming/panning is a pure, instant client-side crop+resize of
+    # that one image (see draw_waveform_view/compute_waveform_view_crop), exactly like the
+    # timeline's own ruler/markers already work off the same shared view_state with no per-zoom
+    # re-render. (An earlier version re-rendered via ffmpeg -- or approximated one render's own
+    # stretched pixels from another -- on every zoom/pan step; confirmed live that both felt
+    # laggy/jumpy and the repeated stretch-from-a-stretch approximation visibly degraded across a
+    # burst of zoom steps. Rendering once and cropping is both simpler and better on both counts.)
+    WAVEFORM_HEIGHT = 120
+    # Generous width for the one full-clip render -- ffmpeg has to decode the WHOLE audio track
+    # regardless of requested width anyway (showwavespic needs every sample to compute accurate
+    # per-column peaks), so asking for many more columns than any single canvas width will ever
+    # show is nearly free relative to that, and keeps a deep zoom from visibly running out of real
+    # pixel detail (looking blocky/blown-up) too quickly.
+    WAVEFORM_FULL_RENDER_WIDTH = 16000
+    WAVEFORM_DEBOUNCE_MS = 400
+    waveform_canvas = tk.Canvas(root, height=WAVEFORM_HEIGHT, bg=EDITOR_BG, highlightthickness=0)
+    waveform_canvas.pack(fill="x", padx=10, pady=(0, 4))
+    waveform_state = {
+        "photo": None, "full_image": None, "full_duration": None,
+        "generation": 0, "pending_after_id": None,
+        "view_generation": 0, "detail_pending_after_id": None,
+    }
+
+    def show_waveform_placeholder(text):
+        waveform_state["full_image"] = None
+        waveform_state["full_duration"] = None
+        waveform_state["view_generation"] += 1  # invalidates any in-flight detail render
+        waveform_canvas.delete("all")
+        waveform_canvas.create_text(
+            8, WAVEFORM_HEIGHT // 2, anchor="w", fill=MUTED_TEXT_COLOR, text=text,
+        )
+
+    show_waveform_placeholder("Open a recording to see its waveform here.")
+
+    def draw_waveform_overlay():
+        # Draws the start/end trim markers and the playhead on top of whatever's currently
+        # displayed -- always against the LIVE view_state now (draw_waveform_view below keeps the
+        # image itself exactly in sync with view_state on every call, with no debounce/staleness
+        # window to account for anymore, unlike when this had to track a separately-rendered
+        # range).
+        waveform_canvas.delete("waveform_overlay")
+        if waveform_state["full_image"] is None:
+            return
+        width = waveform_canvas.winfo_width()
+        span = view_state["end"] - view_state["start"]
+        if width <= 0 or span <= 0:
+            return
+
+        def x_of(seconds):
+            return (seconds - view_state["start"]) / span * width
+
+        try:
+            x = x_of(parse_timestamp(start_var.get()))
+            if 0 <= x <= width:
+                waveform_canvas.create_line(
+                    x, 0, x, WAVEFORM_HEIGHT, fill=START_MARKER_COLOR, width=2, tags="waveform_overlay",
+                )
+        except ValueError:
+            pass
+        try:
+            x = x_of(parse_timestamp(end_var.get()))
+            if 0 <= x <= width:
+                waveform_canvas.create_line(
+                    x, 0, x, WAVEFORM_HEIGHT, fill=END_MARKER_COLOR, width=2, tags="waveform_overlay",
+                )
+        except ValueError:
+            pass
+        if state["path"]:
+            x = x_of(player.get_time() / 1000)
+            if 0 <= x <= width:
+                waveform_canvas.create_line(
+                    x, 0, x, WAVEFORM_HEIGHT, fill=SEEKER_COLOR, width=1, tags="waveform_overlay",
+                )
+
+    def draw_waveform_view():
+        # Pure crop + resize of the one full-clip image to whatever view_state currently shows --
+        # instant (no ffmpeg, no debounce, no background thread) -- called directly from every
+        # zoom/pan/resize handler, the same way draw_timeline() redraws the ruler/markers directly
+        # off view_state with no re-render of its own either.
+        full_image = waveform_state["full_image"]
+        full_duration = waveform_state["full_duration"]
+        if full_image is None or not full_duration:
+            return
+        if not view_state["initialized"]:
+            reset_view()
+        canvas_width = waveform_canvas.winfo_width()
+        if canvas_width <= 1:
+            return
+        crop = compute_waveform_view_crop(full_duration, full_image.width, view_state["start"], view_state["end"])
+        if crop is None:
+            return
+        crop_left, crop_right = crop
+        try:
+            cropped = full_image.crop((crop_left, 0, crop_right, full_image.height))
+            if canvas_width < cropped.width:
+                # Downsampling -- see downsample_waveform_image_peak's own docstring for why a
+                # generic resize isn't safe here (it silently loses real peaks and exaggerates
+                # transients). Upsampling (the else branch, i.e. zoomed in past native
+                # resolution) has no lost peaks to recover this way -- a plain resize is a fine,
+                # instant placeholder there until schedule_waveform_detail_refresh's real re-render
+                # lands.
+                resized = downsample_waveform_image_peak(cropped, canvas_width)
+            else:
+                resized = cropped.resize((canvas_width, full_image.height), Image.BILINEAR)
+            photo = ImageTk.PhotoImage(resized)
+        except Exception:
+            logging.exception("Clip editor: could not draw the waveform view.")
+            return
+        waveform_state["photo"] = photo  # kept alive -- Tkinter drops a PhotoImage with no live reference
+        waveform_canvas.delete("all")
+        waveform_canvas.create_image(0, 0, anchor="nw", image=photo, tags="waveform_image")
+        draw_waveform_overlay()
+        # This crop is only ever an upscale of the one full-clip render -- good enough as an
+        # instant response to every zoom/pan step, but genuinely blocky once zoomed in far enough
+        # (see waveform_view_needs_higher_resolution). schedule_waveform_detail_refresh below
+        # decides whether THIS specific view is actually worth a real, debounced re-render on top,
+        # and invalidates any earlier one still in flight for a now-superseded view either way.
+        waveform_state["view_generation"] += 1
+        schedule_waveform_detail_refresh()
+
+    def schedule_waveform_refresh():
+        # Debounced rather than firing on every single keystroke -- e.g. rapidly switching audio
+        # tracks shouldn't each spawn their own full-clip ffmpeg render. NOT used for zoom/pan
+        # anymore -- those call draw_waveform_view() directly (see its own docstring for why that's
+        # now a cheap, instant, non-ffmpeg operation with nothing left to debounce).
+        if waveform_state["pending_after_id"] is not None:
+            try:
+                root.after_cancel(waveform_state["pending_after_id"])
+            except tk.TclError:
+                pass
+        try:
+            waveform_state["pending_after_id"] = root.after(WAVEFORM_DEBOUNCE_MS, refresh_waveform)
+        except tk.TclError:
+            pass
+
+    def schedule_waveform_detail_refresh():
+        # Debounced the same way the old per-zoom re-render was -- a burst of rapid zoom/pan steps
+        # should only ever fire ONE detail render, for wherever the view actually settles, not one
+        # per step.
+        if waveform_state["detail_pending_after_id"] is not None:
+            try:
+                root.after_cancel(waveform_state["detail_pending_after_id"])
+            except tk.TclError:
+                pass
+        try:
+            waveform_state["detail_pending_after_id"] = root.after(WAVEFORM_DEBOUNCE_MS, refresh_waveform_detail)
+        except tk.TclError:
+            pass
+
+    def refresh_waveform_detail():
+        # Real ffmpeg render for EXACTLY the current (settled) view, at canvas resolution -- only
+        # actually fired when the view is zoomed in enough that the full-clip crop is genuinely
+        # short on real detail (see waveform_view_needs_higher_resolution); most zoom levels never
+        # reach this at all. Draws directly over whatever draw_waveform_view already showed; the
+        # very next zoom/pan reverts to the instant crop-of-full immediately (same as before), and
+        # this fires again once THAT settles.
+        waveform_state["detail_pending_after_id"] = None
+        full_image = waveform_state["full_image"]
+        full_duration = waveform_state["full_duration"]
+        if full_image is None or not full_duration:
+            return
+        canvas_width = waveform_canvas.winfo_width()
+        if canvas_width <= 1:
+            return
+        view_start, view_end = view_state["start"], view_state["end"]
+        if not waveform_view_needs_higher_resolution(full_duration, full_image.width, view_start, view_end, canvas_width):
+            return
+        track_index = audio_track_combo.current()
+        if track_index < 0:
+            return
+        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+        if not ffmpeg_path:
+            return
+
+        this_view_generation = waveform_state["view_generation"]
+        source_path = state["path"]
+
+        def worker():
+            tmp_path = os.path.join(tempfile.gettempdir(), f"obsautorec_waveform_detail_{os.getpid()}_{int(time.time() * 1000)}.png")
+            ok = generate_waveform_image(
+                ffmpeg_path, source_path, view_start, view_end, track_index, tmp_path,
+                width=canvas_width, height=WAVEFORM_HEIGHT,
+            )
+
+            def finish():
+                if this_view_generation != waveform_state["view_generation"]:
+                    # The view moved on (or the file/track changed) before this finished -- a
+                    # newer draw_waveform_view() (and likely its own detail request) already owns
+                    # what's on screen now, so this stale result is simply discarded.
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    return
+                if not root.winfo_exists() or not ok:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    return
+                try:
+                    image = Image.open(tmp_path)
+                    image.load()
+                    photo = ImageTk.PhotoImage(image)
+                except Exception:
+                    logging.exception("Clip editor: could not load the detailed waveform image.")
+                    return
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                waveform_state["photo"] = photo
+                waveform_canvas.delete("all")
+                waveform_canvas.create_image(0, 0, anchor="nw", image=photo, tags="waveform_image")
+                draw_waveform_overlay()
+
+            try:
+                root.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def refresh_waveform():
+        # Renders the WHOLE clip ONCE (see WAVEFORM_FULL_RENDER_WIDTH) -- triggered by a file or
+        # track change, never by zoom/pan (draw_waveform_view handles those directly, with no
+        # re-render at all).
+        waveform_state["pending_after_id"] = None
+        if not state["path"]:
+            show_waveform_placeholder("Open a recording to see its waveform here.")
+            return
+        duration = state["duration"]
+        if not duration:
+            show_waveform_placeholder("Loading waveform...")
+            return
+        track_index = audio_track_combo.current()
+        if track_index < 0:
+            show_waveform_placeholder("No audio track detected yet.")
+            return
+        source_path = state["path"]
+
+        # Guards against a slow, stale render finishing AFTER a newer request (a different track
+        # or a different file picked while the first one was still rendering) and overwriting what
+        # should be shown now -- only the MOST RECENT request's own result is ever actually applied.
+        waveform_state["generation"] += 1
+        waveform_state["view_generation"] += 1  # invalidates any in-flight detail render too
+        this_generation = waveform_state["generation"]
+
+        cached_image = get_cached_waveform_image(source_path, track_index)
+        if cached_image is not None:
+            # Skips ffmpeg entirely -- reopening the same clip/track this app run (see
+            # get_cached_waveform_image's own docstring) shows the waveform instantly instead of
+            # re-paying the full-clip decode this render otherwise costs every single time.
+            waveform_state["full_image"] = cached_image
+            waveform_state["full_duration"] = duration
+            draw_waveform_view()
+            return
+
+        ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
+        if not ffmpeg_path:
+            show_waveform_placeholder("ffmpeg isn't installed -- install it from Settings > Post-Processing first.")
+            return
+
+        def worker():
+            tmp_path = os.path.join(tempfile.gettempdir(), f"obsautorec_waveform_{os.getpid()}_{int(time.time() * 1000)}.png")
+            ok = generate_waveform_image(
+                ffmpeg_path, source_path, 0.0, duration, track_index, tmp_path,
+                width=WAVEFORM_FULL_RENDER_WIDTH, height=WAVEFORM_HEIGHT,
+            )
+
+            def finish():
+                if this_generation != waveform_state["generation"]:
+                    # Superseded by a newer request while this one was rendering -- its own
+                    # finish() (or a later one still) owns showing something, not this one.
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    return
+                if not root.winfo_exists():
+                    return
+                if not ok:
+                    show_waveform_placeholder("Could not render a waveform -- see the log for details.")
+                    return
+                try:
+                    image = Image.open(tmp_path)
+                    image.load()  # force the read now, before the temp file is removed below
+                except Exception:
+                    logging.exception("Clip editor: could not load the rendered waveform image.")
+                    show_waveform_placeholder("Could not display the rendered waveform.")
+                    return
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                waveform_state["full_image"] = image
+                waveform_state["full_duration"] = duration
+                draw_waveform_view()
+                store_cached_waveform_image(source_path, track_index, image)
+
+            try:
+                root.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # The visible [start, end) window into the clip -- always the full clip until the user zooms
     # in, at which point this shrinks and the ruler/markers/seeker are all drawn relative to it
@@ -8209,6 +9834,10 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 timeline_canvas.create_line(
                     tx, 0, tx, TRACK_Y + 3, fill=TEMP_TIMESTAMP_COLOR, width=2, dash=(3, 2)
                 )
+        # Keeps the waveform's own start/end/playhead overlay in sync with every single thing
+        # that moves them on the timeline (seeking, dragging a marker, playback, a marker jump) --
+        # piggybacking on draw_timeline's own call sites rather than duplicating each one.
+        draw_waveform_overlay()
 
     def refresh_markers():
         # Markers ("Add Marker" keybind) are tracked by this app itself now, independently of
@@ -8353,6 +9982,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         view_state["start"] = new_start
         view_state["end"] = new_start + new_span
         draw_timeline()
+        draw_waveform_view()
 
     def on_timeline_wheel(event):
         if not state["duration"]:
@@ -8376,6 +10006,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         view_state["start"] = new_start
         view_state["end"] = new_start + span
         draw_timeline()
+        draw_waveform_view()
 
     def zoom_in_button():
         if not state["duration"]:
@@ -8392,6 +10023,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
     def zoom_reset_button():
         reset_view()
         draw_timeline()
+        draw_waveform_view()
 
     def on_pan_press(event):
         pan_state["active"] = True
@@ -8409,6 +10041,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         view_state["start"] = new_start
         view_state["end"] = new_start + span
         draw_timeline()
+        draw_waveform_view()
 
     def on_pan_release(_event):
         pan_state["active"] = False
@@ -8418,15 +10051,30 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         # or scrub made while paused, snapping straight back to the playhead the instant the user
         # releases the mouse (confirmed live: panning while paused had no visible effect at all
         # until this guard was added).
+        #
+        # Also skipped entirely once the user has actually zoomed in (span meaningfully below the
+        # full clip) -- confirmed live via a real report: zooming in to inspect the waveform, then
+        # pressing play, silently panned the view away (to keep the playhead in frame) the moment
+        # playback crossed the zoomed window's own edge, which reads as "the app zooms back out on
+        # its own" even though the SPAN itself was never touched, only the scroll position -- not
+        # something a deliberate zoom-in should ever be fighting. Auto-follow stays in effect at
+        # (or near) the full-clip view, where there's no specific region being inspected to lose.
+        # Returns True if it actually changed view_state, so callers can keep the waveform image
+        # (which needs its own explicit re-crop, unlike the ruler/markers) in sync only when
+        # something genuinely moved, not on every poll tick.
         duration = state["duration"]
         if not duration or pan_state["active"] or not player.is_playing():
-            return
+            return False
         span = view_state["end"] - view_state["start"]
+        if span < duration * 0.99:
+            return False
         current = player.get_time() / 1000
         if current < view_state["start"] or current > view_state["end"]:
             new_start = max(0.0, min(current - span / 2, duration - span))
             view_state["start"] = new_start
             view_state["end"] = new_start + span
+            return True
+        return False
 
     timeline_canvas.bind("<Button-1>", lambda event: on_timeline_press(event.x))
     timeline_canvas.bind("<B1-Motion>", lambda event: on_timeline_drag(event.x))
@@ -8437,6 +10085,17 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
     timeline_canvas.bind("<MouseWheel>", on_timeline_wheel)
     timeline_canvas.bind("<Shift-MouseWheel>", on_timeline_horizontal_wheel)
     timeline_canvas.bind("<Configure>", lambda event: draw_timeline())
+    # The waveform shares the timeline's own zoomed/panned view window (see refresh_waveform), so
+    # it takes the same wheel-to-zoom and right-drag-to-pan gestures the timeline does, using the
+    # very same handlers -- zooming or panning from either one moves both together.
+    waveform_canvas.bind("<MouseWheel>", on_timeline_wheel)
+    waveform_canvas.bind("<Shift-MouseWheel>", on_timeline_horizontal_wheel)
+    waveform_canvas.bind("<Button-3>", on_pan_press)
+    waveform_canvas.bind("<B3-Motion>", on_pan_drag)
+    waveform_canvas.bind("<ButtonRelease-3>", on_pan_release)
+    # A resize changes the waveform canvas's own width too -- draw_waveform_view() re-crops from
+    # the full-clip image at the new width instantly, same as any other view change.
+    waveform_canvas.bind("<Configure>", lambda event: draw_waveform_view())
 
     # --- Controls row: zoom (left), transport (centered), volume (right) ---
     controls_row = tk.Frame(root, bg=EDITOR_BG)
@@ -8503,7 +10162,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
 
     volume_group = tk.Frame(controls_row, bg=EDITOR_BG)
     volume_group.grid(row=0, column=2, sticky="e")
-    tk.Label(volume_group, text="🔊", font=("Segoe UI", 11), bg=EDITOR_BG, fg=EDITOR_FG).pack(side="left", padx=(0, 6))
+    # Explicitly labeled "Preview" -- this only ever calls player.audio_set_volume() on the VLC
+    # instance showing THIS window's playback; it never reaches ffmpeg or the exported file at
+    # all. Confirmed live this reads as ambiguous against Track Routing's per-track dB gain below
+    # (which DOES change the exported file) -- a bare speaker icon gave no hint they're two
+    # completely separate things, one temporary/for-your-ears-right-now, the other permanent and
+    # baked into the output.
+    tk.Label(
+        volume_group, text="🔊 Preview:", font=("Segoe UI", 9), bg=EDITOR_BG, fg=EDITOR_FG,
+    ).pack(side="left", padx=(0, 6))
     volume_var = tk.IntVar(value=100)
 
     def on_volume_change(value):
@@ -8542,10 +10209,13 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
 
     # Forces a re-encode targeting an explicit bitrate (see compute_target_video_bitrate_kbps)
     # instead of CRF -- e.g. so a clip comes out under a specific upload-size limit. Settings'
-    # own default target size (if any) pre-fills and pre-checks this; still freely overridable
-    # per trim.
-    default_target_size = clip_editor_config.get("default_target_size_mb")
-    limit_size_var = tk.BooleanVar(value=bool(default_target_size))
+    # own default target size (if any) pre-fills the field below, but the checkbox itself starts
+    # unchecked either way -- sizing down is a deliberate per-trim choice (it forces the export
+    # down to just the first audio track, see the size_limit_hint_label warning below), not
+    # something that should silently apply to every export just because a default number is
+    # configured.
+    default_target_size = clip_editor_config.get("default_target_size_mb", CLIP_EDITOR_DEFAULT_TARGET_SIZE_MB)
+    limit_size_var = tk.BooleanVar(value=False)
     target_size_var = tk.StringVar(value=str(default_target_size) if default_target_size else "")
     tk.Checkbutton(
         range_row, text="Limit size to", variable=limit_size_var,
@@ -8556,7 +10226,28 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         range_row, textvariable=target_size_var, width=6, bg=ENTRY_BG, fg=EDITOR_FG, insertbackground=EDITOR_FG,
     ).pack(side="left", padx=(4, 4))
     tk.Label(range_row, text="MB", bg=EDITOR_BG, fg=EDITOR_FG).pack(side="left")
+    # A size target forces the export down to just the first audio track (see
+    # build_two_pass_size_targeted_commands) -- silently, from the user's point of view, since
+    # nothing about the checkbox itself hints at that tradeoff. Confirmed live: this bit a real
+    # export -- "Limit size to" stayed checked across several later, unrelated trims in the same
+    # open editor session, each one quietly losing every audio track but the first with no
+    # indication why. This hint makes that tradeoff visible right where the checkbox is, the
+    # moment it's checked, rather than only discoverable by inspecting the output file afterward.
+    size_limit_hint_label = tk.Label(
+        range_row, text="", fg=MUTED_TEXT_COLOR, bg=EDITOR_BG,
+    )
+    size_limit_hint_label.pack(side="left", padx=(6, 0))
 
+    def update_size_limit_hint(*_args):
+        size_limit_hint_label.config(text="(audio: track 1 only)" if limit_size_var.get() else "")
+
+    limit_size_var.trace_add("write", update_size_limit_hint)
+    update_size_limit_hint()
+
+    # Moving Start/End doesn't need a new waveform render -- draw_timeline() (called below) already
+    # calls draw_waveform_overlay() itself, which just redraws the marker lines on top of whatever
+    # waveform image is already showing. Only an actual view (zoom/pan) or track/file change needs
+    # a real re-render -- see schedule_waveform_refresh's other call sites.
     start_var.trace_add("write", lambda *_args: draw_timeline())
     end_var.trace_add("write", lambda *_args: draw_timeline())
 
@@ -8587,7 +10278,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
     actions_row.pack(fill="x", padx=10, pady=(0, 4))
     trim_button = dark_button(actions_row, text="✂ Trim Clip", command=lambda: do_trim())
     trim_button.pack(side="right")
-    dark_button(range_row, text="✕ Close", command=close_editor).pack(side="right", padx=(0, 8))
+    close_button = dark_button(range_row, text="✕ Close", command=close_editor)
+    close_button.pack(side="right", padx=(0, 8))
 
     # --- Audio tracks row: "Fix audio track sync" checkbox (left) + "Track Routing..." button
     # (right), both on one line. A prior version of the sync fix reapplied one fixed, configured
@@ -8605,7 +10297,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
     audio_tracks_row.pack(fill="x", padx=10, pady=4)
     fix_sync_tracks = compute_process_capture_tracks(obs_config)
     fix_sync_reference_track = compute_reference_track(obs_config, input_kinds=resolve_input_kinds(obs_config))
-    fix_sync_var = tk.BooleanVar(value=False)
+    fix_sync_var = tk.BooleanVar(value=clip_editor_config.get("auto_fix_audio_sync", False))
     fix_sync_checkbox = tk.Checkbutton(
         audio_tracks_row, text="Fix audio track sync", variable=fix_sync_var,
         bg=EDITOR_BG, fg=EDITOR_FG, activebackground=EDITOR_BG, activeforeground=EDITOR_FG,
@@ -8640,7 +10332,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
     # recording and stale routing for a since-replaced file's track layout could silently apply
     # to the wrong tracks.
     track_name_hints_map = track_name_hints(obs_config)
-    routing_state = {"track_count": 0, "routing_vars": {}, "mute_vars": {}}
+    routing_state = {"track_count": 0, "routing_vars": {}, "mute_vars": {}, "gain_vars": {}}
     routing_dialog_state = {"window": None}
 
     def rebuild_routing_state(track_count):
@@ -8657,6 +10349,17 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
             for dest in range(1, track_count + 1)
         }
         routing_state["mute_vars"] = {dest: tk.BooleanVar(value=False) for dest in range(1, track_count + 1)}
+        # Pre-fills from Settings > Clip Editor > "Default Track Gains (dB)" (same {dest: {src:
+        # gain}} shape, string-keyed since it round-trips through JSON) -- still freely editable
+        # or clearable per trim from here, this is just the dialog's own starting point.
+        default_gains = clip_editor_config.get("default_gains_db") or {}
+        routing_state["gain_vars"] = {
+            dest: {
+                src: tk.StringVar(value=str(default_gains.get(str(dest), {}).get(str(src)) or ""))
+                for src in range(1, track_count + 1)
+            }
+            for dest in range(1, track_count + 1)
+        }
         track_routing_button.config(state="normal" if track_count else "disabled")
 
     def probe_track_count_for_routing(path):
@@ -8702,9 +10405,14 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 "Check which source track(s) (columns) feed into each output track (rows) below "
                 "-- check several under one output to mix them together, leave a source "
                 "unchecked everywhere to drop it from the export entirely, or check \"Mute\" to "
-                "keep an output track present but silent."
+                "keep an output track present but silent. The dB box under a checked source boosts "
+                "(positive) or attenuates (negative) just that source for that one output -- the "
+                "same source can have a different gain (or none) on each output it's routed to; "
+                "leave blank or 0 for no change. This is baked into the exported FILE itself by "
+                "ffmpeg -- separate from (and unaffected by) the \"Preview\" volume slider above, "
+                "which only ever changes what you hear while scrubbing here, never the output."
             ),
-            bg=EDITOR_BG, fg=EDITOR_FG, anchor="w", justify="left", wraplength=60 + 46 * n,
+            bg=EDITOR_BG, fg=EDITOR_FG, anchor="w", justify="left", wraplength=90 + 46 * n,
         ).grid(row=0, column=0, columnspan=n + 2, sticky="w", padx=10, pady=(10, 8))
 
         header_row = 1
@@ -8724,6 +10432,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 row=row, column=0, sticky="w", padx=(10, 4), pady=2
             )
             for src in range(1, n + 1):
+                # A small Frame per cell keeps the checkbox and its gain entry stacked in the
+                # same grid position, rather than needing a whole extra row/column pair per
+                # source just for gain -- the entry stays visible (not shown/hidden on check
+                # state) since that would need extra trace callbacks for no real benefit: a
+                # gain typed under an unchecked source is simply never read (see do_trim's
+                # gains_db build, which only looks at gain for sources actually routed
+                # somewhere).
+                cell = tk.Frame(dialog, bg=EDITOR_BG)
+                cell.grid(row=row, column=src, pady=2, padx=1)
                 # indicatoron=False + a real width/height renders as a solid block that swaps
                 # its WHOLE background color between bg (off) and selectcolor (on), rather than
                 # a native tiny indicator square with a checkmark drawn inside it -- confirmed
@@ -8731,11 +10448,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 # theme (a dark glyph on a dark selectcolor fill has very little contrast); a
                 # full color swap is unambiguous regardless of theme.
                 tk.Checkbutton(
-                    dialog, variable=routing_state["routing_vars"][dest][src],
+                    cell, variable=routing_state["routing_vars"][dest][src],
                     indicatoron=False, width=2, height=1,
                     bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG,
                     selectcolor=START_MARKER_COLOR,
-                ).grid(row=row, column=src, pady=2, padx=1)
+                ).pack()
+                tk.Entry(
+                    cell, textvariable=routing_state["gain_vars"][dest][src], width=4,
+                    bg=ENTRY_BG, fg=EDITOR_FG, insertbackground=EDITOR_FG, justify="center",
+                ).pack(pady=(2, 0))
             tk.Checkbutton(
                 dialog, variable=routing_state["mute_vars"][dest],
                 indicatoron=False, width=2, height=1,
@@ -8743,10 +10464,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 selectcolor=END_MARKER_COLOR,
             ).grid(row=row, column=n + 1, padx=(14, 10), pady=2)
 
+        default_gains = clip_editor_config.get("default_gains_db") or {}
+
         def reset_to_defaults():
             for dest in range(1, n + 1):
                 for src in range(1, n + 1):
                     routing_state["routing_vars"][dest][src].set(src == dest)
+                    routing_state["gain_vars"][dest][src].set(
+                        str(default_gains.get(str(dest), {}).get(str(src)) or "")
+                    )
                 routing_state["mute_vars"][dest].set(False)
 
         button_row = header_row + n + 1
@@ -8775,8 +10501,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
     }
 
     def browse_for_file():
+        # Defaults to OBS's own raw recordings folder, not wherever the OS file dialog last
+        # happened to land -- this dialog is for picking an UNEDITED recording to trim, so it
+        # should start where those actually live, not clip_editor.output_folder (where already-
+        # trimmed clips end up) or whatever directory a previous unrelated dialog remembered.
+        obs_recordings_folder = obs_config.get("output_folder")
+        initial_dir = obs_recordings_folder if obs_recordings_folder and os.path.isdir(obs_recordings_folder) else None
         path = filedialog.askopenfilename(
-            title="Open a recording", filetypes=[("Video files", "*.mp4 *.mkv *.mov *.flv *.ts *.webm *.avi"), ("All files", "*.*")],
+            title="Open a recording", initialdir=initial_dir,
+            filetypes=[("Video files", "*.mp4 *.mkv *.mov *.flv *.ts *.webm *.avi"), ("All files", "*.*")],
         )
         if path:
             load_file(path)
@@ -8830,6 +10563,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         start_var.set(format_timestamp(0))
         end_var.set(format_timestamp(0))
         status_label.config(text="")
+        waveform_state["generation"] += 1
+        show_waveform_placeholder("Loading waveform...")
         root.title(f"OBS Auto Recorder - Clip Editor - {os.path.basename(path)}")
         logging.info("Clip editor: opened %s", os.path.basename(path))
         rebuild_routing_state(0)
@@ -9034,6 +10769,36 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
             if routing != identity_routing or muted:
                 audio_routing = routing
                 muted_destinations = muted
+        gains_db = None
+        if n:
+            gains = {}
+            invalid_gain_cells = []
+            for dest in range(1, n + 1):
+                dest_gains = {}
+                for src, var in routing_state["gain_vars"][dest].items():
+                    text = var.get().strip()
+                    if not text:
+                        continue
+                    try:
+                        value = float(text)
+                    except ValueError:
+                        invalid_gain_cells.append(f"Output {dest}, track {src}")
+                        continue
+                    if value:
+                        dest_gains[src] = value
+                if dest_gains:
+                    gains[dest] = dest_gains
+            if invalid_gain_cells:
+                logging.warning(
+                    "Clip editor: could not start trim -- invalid gain (dB) value for %s.",
+                    ", ".join(invalid_gain_cells),
+                )
+                status_label.config(
+                    fg=END_MARKER_COLOR, text=f"Invalid gain (dB) value for: {', '.join(invalid_gain_cells)}.",
+                )
+                return
+            if gains:
+                gains_db = gains
         source_path = state["path"]
 
         # Measures a representative window starting at the trim's own start point -- but NOT
@@ -9087,6 +10852,17 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
 
         set_status(f"Trimming to {os.path.basename(output_path)}...")
         trim_button.config(state="disabled")
+        # "Cancel" now genuinely stops the running ffmpeg process (see trim_clip's own
+        # cancel_event support) rather than just closing the whole editor out from under an
+        # export that keeps running in the background regardless -- cancel_trim below sets this
+        # same event trim_clip is watching, instead of close_editor's window-teardown path.
+        cancel_event = threading.Event()
+
+        def cancel_trim():
+            cancel_event.set()
+            close_button.config(state="disabled", text="✕ Cancelling...")
+
+        close_button.config(text="✕ Cancel", command=cancel_trim)
         progress.config(mode="indeterminate")
         progress.pack(fill="x", padx=10, pady=(0, 6), before=status_label)
         progress.start(12)
@@ -9195,7 +10971,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 notifications_config=notifications_config, scale_height=scale_height,
                 target_size_mb=target_size_mb, audio_routing=audio_routing,
                 muted_destinations=muted_destinations, audio_shift_ms_by_track=audio_shift_ms_by_track,
-                progress_callback=on_trim_progress,
+                gains_db=gains_db, progress_callback=on_trim_progress, cancel_event=cancel_event,
             )
 
             def finish():
@@ -9207,8 +10983,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 progress.stop()
                 progress.pack_forget()
                 trim_button.config(state="normal")
+                close_button.config(state="normal", text="✕ Close", command=close_editor)
                 if success:
-                    status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}")
+                    size_limit_note = " (audio: track 1 only, size-limited)" if target_size_mb else ""
+                    status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}{size_limit_note}")
+                elif cancel_event.is_set():
+                    status_label.config(fg=END_MARKER_COLOR, text="Trim cancelled.")
                 else:
                     status_label.config(fg=END_MARKER_COLOR, text="Trim failed -- see the log for details.")
 
@@ -9266,7 +11046,14 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 refresh_audio_tracks()
             if not state["markers_loaded"]:
                 refresh_markers()
-            ensure_playhead_visible()
+            if ensure_playhead_visible():
+                # The ruler/markers (draw_timeline -> draw_waveform_overlay) redraw off view_state
+                # directly on every poll tick regardless, but the waveform IMAGE itself needs its
+                # own explicit re-crop (draw_waveform_view) -- without this, a genuine auto-follow
+                # pan (see ensure_playhead_visible's own guard for when that still applies) would
+                # leave the displayed waveform image stale while its overlay markers silently jump
+                # to the new position underneath it.
+                draw_waveform_view()
             draw_timeline()
             update_play_pause_icon()
             time_label.config(
@@ -9737,10 +11524,12 @@ def main():
         daemon=True,
     )
     overlay_thread = threading.Thread(
-        target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event), daemon=True
+        target=run_overlay, args=(monitors, overlay_state, audio_state, status, stop_event),
+        kwargs={"mic_boost_config": config.get("obs", {}).get("mic_boost", {})}, daemon=True,
     )
     custom_keybinds = config.get("obs", {}).get("custom_keybinds", [])
     manual_split_buffer_seconds = config.get("obs", {}).get("manual_split", {}).get("buffer_seconds", 0)
+    custom_keybind_hotkey_mode = config.get("obs", {}).get("custom_keybind_hotkey_mode", DEFAULT_CUSTOM_KEYBIND_HOTKEY_MODE)
     keybind_thread = None
     if any(kb.get("enabled", True) for kb in custom_keybinds):
         keybind_thread = threading.Thread(
@@ -9749,6 +11538,7 @@ def main():
                 custom_keybinds, lambda: runtime_state.get("obs_client"), lambda: manual_split_buffer_seconds,
                 icon, config.get("notifications", {}), status, recording_state,
             ),
+            kwargs={"stop_event": stop_event, "hotkey_mode": custom_keybind_hotkey_mode},
             daemon=True,
         )
 

@@ -9,8 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
 from tests.fakes import FakeObsClient
 
-# vk_code_for_key/mod_flags_for/MOD_*/is_space_bar_toggle_event/run_custom_keybind_listener/
-# run_clip_editor_space_bar_listener moved to platform_windows.py -- see
+# vk_code_for_key/held_modifier_names/find_matching_custom_keybind/is_space_bar_toggle_event/
+# run_custom_keybind_listener/run_clip_editor_space_bar_listener moved to platform_windows.py -- see
 # CROSS_PLATFORM_PLAN.md Phase 3 and tests/test_platform_windows.py, which now covers them (in a
 # way that also works cross-OS via patch.object(..., create=True) for the pure-logic pieces, and
 # a real skip-guard for the ones that touch the real Win32 ctypes.windll API). describe_keybind/
@@ -104,7 +104,8 @@ class RunCustomKeybindListenerDispatchTests(unittest.TestCase):
         mock_run.assert_called_once_with(
             [{"enabled": True, "key": "S", "modifiers": []}], "get_client", "get_seconds",
             a.fire_custom_keybind, a.describe_keybind, a.notify,
-            icon="icon", notifications_config="notif_cfg", status="status", recording_state="rec_state",
+            icon="icon", notifications_config="notif_cfg", status="status", recording_state="rec_state", stop_event=None,
+            hotkey_mode=None,
         )
 
 
