@@ -1,7 +1,9 @@
 import os
 import sys
 import unittest
+import tempfile
 import unittest.mock
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
@@ -117,3 +119,33 @@ class RunClipEditorSpaceBarListenerDispatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunAccessibilityRequestTests(unittest.TestCase):
+    def test_already_granted_writes_status_without_prompting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status")
+            with patch.object(a.platform_common, "accessibility_permission_granted", return_value=True), \
+                    patch.object(a.platform_common, "request_accessibility_permission") as request:
+                self.assertTrue(a.run_accessibility_request(path))
+            request.assert_not_called()
+            self.assertEqual(open(path).read(), "granted")
+
+    def test_prompts_then_waits_until_granted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status")
+            with patch.object(a.platform_common, "accessibility_permission_granted", side_effect=[False, False, True]), \
+                    patch.object(a.platform_common, "request_accessibility_permission") as request, \
+                    patch.object(a.time, "sleep"):
+                self.assertTrue(a.run_accessibility_request(path))
+            request.assert_called_once()
+            self.assertTrue(os.path.isfile(path))
+
+    def test_gives_up_after_timeout_without_writing_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status")
+            with patch.object(a.platform_common, "accessibility_permission_granted", return_value=False), \
+                    patch.object(a.platform_common, "request_accessibility_permission"), \
+                    patch.object(a.time, "sleep"):
+                self.assertFalse(a.run_accessibility_request(path, timeout=0))
+            self.assertFalse(os.path.exists(path))

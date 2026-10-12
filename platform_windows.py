@@ -691,6 +691,16 @@ def open_path(path):
     os.startfile(path)
 
 
+def accessibility_permission_granted():
+    """Always True -- only macOS gates global key listening behind a per-app permission."""
+    return True
+
+
+def request_accessibility_permission():
+    """No-op -- only macOS gates global key listening behind a per-app permission."""
+    pass
+
+
 def open_accessibility_settings():
     """No-op -- only macOS gates global key listening behind a per-app permission."""
     pass

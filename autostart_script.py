@@ -213,12 +213,32 @@ def get_running_processes():
             continue
         if not name:
             continue
+        if name.endswith(WINE_PRELOADER_SUFFIX):
+            try:
+                name = wine_program_name(name, proc.cmdline())
+            except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError, PermissionError):
+                pass
         try:
             exe = proc.exe()
         except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError, PermissionError):
             exe = ""
         processes.append((name, exe, proc.pid))
     return processes
+
+
+# Wine (and CrossOver-based wrappers like Wizard101's Mac app) runs every Windows program as a
+# "wine64-preloader"/"wine32on64-preloader" process whose first argument is the program's own path,
+# e.g. ["…/wine64-preloader", "C:\\…\\WizardGraphicalClient.exe"] (confirmed live with
+# Wizard101.app's bundled CrossOver). Reporting the program's name instead lets the same .exe
+# names used on Windows match here.
+WINE_PRELOADER_SUFFIX = "-preloader"
+
+
+def wine_program_name(name, cmdline):
+    """The Windows program a Wine preloader process is running, or name unchanged if unknown."""
+    if not name.endswith(WINE_PRELOADER_SUFFIX) or len(cmdline) < 2 or not cmdline[1]:
+        return name
+    return cmdline[1].replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def get_window_titles():
@@ -5055,13 +5075,14 @@ _COMMON_GAMES_WINDOWS = [
 
 # League of Legends and Roblox both ship real macOS clients; Valorant/Warframe/Apex/Genshin do
 # not (no native Mac build, and several rely on kernel-level anti-cheat that excludes macOS).
-# Wizard101's Mac app is a Wine wrapper around the Windows client, so it has no predictable Mac
-# process name (see CROSS_PLATFORM_PLAN.md §10). League's "LeagueofLegends" is confirmed from its
+# Wizard101's Mac app runs its Windows client through a bundled CrossOver (Wine), which
+# get_running_processes reports under the client's own .exe name, same as on Windows. League's "LeagueofLegends" is confirmed from its
 # real installed bundle (LoL/Game/LeagueofLegends.app's CFBundleExecutable); Minecraft's and
 # Roblox's are still best-effort. If one doesn't match, "Pick Running..." (while the game is open)
 # or typing the exact process name by hand still works.
 _COMMON_GAMES_MACOS = [
     {"name": "League of Legends", "process_name": "LeagueofLegends"},
+    {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
     {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
     {"name": "Roblox", "process_name": "RobloxPlayer"},
 ]
@@ -9532,7 +9553,36 @@ def main():
         overlay_thread.join(timeout=5)
 
 
+# The installer opens the installed app with this flag so macOS asks for Accessibility for the
+# app itself: the permission belongs to whichever app asks, so the installer asking would only
+# have allowed the installer.
+ACCESSIBILITY_REQUEST_FLAG = "--request-accessibility"
+ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS = 600
+ACCESSIBILITY_REQUEST_POLL_SECONDS = 1
+
+
+def run_accessibility_request(status_path, timeout=ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS):
+    """Shows macOS's Accessibility prompt for this app, then waits for the user to allow it,
+    writing "granted" to status_path once they do (the installer watches that file). Returns
+    True if granted before the timeout."""
+    if not platform_common.accessibility_permission_granted():
+        platform_common.request_accessibility_permission()
+        deadline = time.time() + timeout
+        while not platform_common.accessibility_permission_granted():
+            if time.time() >= deadline:
+                return False
+            time.sleep(ACCESSIBILITY_REQUEST_POLL_SECONDS)
+    try:
+        with open(status_path, "w", encoding="utf-8") as f:
+            f.write("granted")
+    except OSError:
+        pass
+    return True
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == ACCESSIBILITY_REQUEST_FLAG:
+        sys.exit(0 if run_accessibility_request(sys.argv[2]) else 1)
     try:
         main()
     except KeyboardInterrupt:

@@ -78,7 +78,9 @@ class BuildConfigTests(unittest.TestCase):
         self.setUp_games(installer._COMMON_GAMES_MACOS)
         config = installer.build_config(self.template, None, "pw", base_options(selected_games=["League of Legends"]))
         self.assertEqual(config["watched_games"], ["LeagueofLegends"])
-        self.assertFalse(any(g["process_name"].lower().endswith(".exe") for g in installer._COMMON_GAMES_MACOS))
+        # Wizard101 is the one .exe: its Mac app runs the Windows client under a bundled Wine.
+        exe_games = [g["name"] for g in installer._COMMON_GAMES_MACOS if g["process_name"].lower().endswith(".exe")]
+        self.assertEqual(exe_games, ["Wizard101"])
 
     def test_advanced_options_all_apply_when_enabled(self):
         options = base_options(
@@ -291,3 +293,32 @@ class MacInstallExtractionTests(unittest.TestCase):
             installed = os.path.join(target, installer.app_relative_path())
             self.assertTrue(os.access(installed, os.X_OK))
             self.assertTrue(os.path.islink(os.path.join(os.path.dirname(installed), "link")))
+
+
+class AppLaunchCommandTests(unittest.TestCase):
+    def test_macos_launches_through_open_so_permissions_belong_to_the_app(self):
+        with patch.object(installer.sys, "platform", "darwin"):
+            self.assertEqual(
+                installer.app_launch_command("/Apps/OAR"),
+                ["open", "-a", os.path.join("/Apps/OAR", installer.APP_BUNDLE_NAME)],
+            )
+
+    def test_macos_accessibility_request_opens_a_new_copy_with_the_flag(self):
+        with patch.object(installer.sys, "platform", "darwin"):
+            command = installer.accessibility_request_command("/Apps/OAR", "/tmp/status")
+        self.assertEqual(
+            command,
+            ["open", "-n", "-a", os.path.join("/Apps/OAR", installer.APP_BUNDLE_NAME),
+             "--args", "--request-accessibility", "/tmp/status"],
+        )
+
+    def test_other_platforms_run_the_executable_directly(self):
+        with patch.object(installer.sys, "platform", "win32"):
+            self.assertEqual(
+                installer.app_launch_command("C:\\OAR"),
+                [os.path.join("C:\\OAR", installer.app_relative_path())],
+            )
+
+    def test_flag_matches_the_app(self):
+        source = open(os.path.join(os.path.dirname(installer.__file__), "autostart_script.py"), encoding="utf-8").read()
+        self.assertIn(f'ACCESSIBILITY_REQUEST_FLAG = "{installer.ACCESSIBILITY_REQUEST_FLAG}"', source)

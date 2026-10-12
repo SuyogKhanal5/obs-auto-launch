@@ -258,6 +258,27 @@ class GetRunningProcessesTests(unittest.TestCase):
             result = a.get_running_processes()
         self.assertEqual(result, [("OBS", "/x/OBS", 2)])
 
+    def test_wine_process_reports_the_windows_program_name(self):
+        # Argument shape confirmed live with Wizard101.app's bundled CrossOver.
+        preloader = "/Applications/Wizard101.app/Contents/SharedSupport/wizard101/Wizard101/wine64-preloader"
+        proc = self._fake_proc(name="wine64-preloader", exe=preloader, pid=7)
+        proc.cmdline.return_value = [preloader, "C:\\ProgramData\\KingsIsle Entertainment\\Wizard101\\Bin\\WizardGraphicalClient.exe"]
+        with patch.object(a.psutil, "process_iter", return_value=[proc]):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("WizardGraphicalClient.exe", preloader, 7)])
+
+    def test_wine_process_with_unreadable_cmdline_keeps_its_own_name(self):
+        proc = self._fake_proc(name="wine32on64-preloader", exe="/x/wine32on64-preloader", pid=8)
+        proc.cmdline.side_effect = a.psutil.AccessDenied(pid=8)
+        with patch.object(a.psutil, "process_iter", return_value=[proc]):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("wine32on64-preloader", "/x/wine32on64-preloader", 8)])
+
+    def test_wine_program_name_handles_bare_names_and_missing_args(self):
+        self.assertEqual(a.wine_program_name("wine32on64-preloader", ["/x/p", "notepad.exe"]), "notepad.exe")
+        self.assertEqual(a.wine_program_name("wine64-preloader", ["/x/p"]), "wine64-preloader")
+        self.assertEqual(a.wine_program_name("OBS", ["/x/OBS", "C:\\a.exe"]), "OBS")
+
 
 class HasSufficientDiskSpaceTests(unittest.TestCase):
     def test_disabled_guard_always_passes(self):

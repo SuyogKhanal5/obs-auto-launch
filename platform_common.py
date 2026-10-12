@@ -442,6 +442,17 @@ def open_accessibility_settings(platform_name=None):
     return _select_backend(platform_name).open_accessibility_settings()
 
 
+def accessibility_permission_granted(platform_name=None):
+    """True if this app may listen for global keys -- always True outside macOS, where no
+    per-app permission gates it."""
+    return _select_backend(platform_name).accessibility_permission_granted()
+
+
+def request_accessibility_permission(platform_name=None):
+    """Shows macOS's own Accessibility prompt for this app; no-op elsewhere."""
+    return _select_backend(platform_name).request_accessibility_permission()
+
+
 def open_screen_recording_settings(platform_name=None):
     """Opens the OS's own Screen Recording privacy settings, macOS only -- see
     platform_macos.open_screen_recording_settings's own docstring for why this exists (OBS, not

@@ -17,6 +17,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 import webbrowser
@@ -53,6 +54,30 @@ def app_relative_path():
     return EXE_NAME
 
 
+def app_launch_command(install_dir, args=()):
+    """Command that starts the installed app. On macOS it goes through `open` so the app runs as
+    itself: started as this installer's child, macOS would attribute its permission requests
+    (Accessibility, Screen Recording) to the installer instead."""
+    if sys.platform == "darwin":
+        bundle = os.path.join(install_dir, APP_BUNDLE_NAME)
+        if not args:
+            return ["open", "-a", bundle]
+        # -n: a separate copy even if the app is already running, which would otherwise just be
+        # brought forward with these arguments dropped.
+        return ["open", "-n", "-a", bundle, "--args", *args]
+    return [os.path.join(install_dir, app_relative_path()), *args]
+
+
+# Mirrors autostart_script.ACCESSIBILITY_REQUEST_FLAG.
+ACCESSIBILITY_REQUEST_FLAG = "--request-accessibility"
+
+
+def accessibility_request_command(install_dir, status_path):
+    """Opens the installed app just to ask macOS for its Accessibility permission (see
+    autostart_script.run_accessibility_request); it writes "granted" to status_path once allowed."""
+    return app_launch_command(install_dir, [ACCESSIBILITY_REQUEST_FLAG, status_path])
+
+
 # Per-user install locations (CROSS_PLATFORM_PLAN.md §2.8) -- none of the 3 need elevation for
 # the app install itself (a separate concern from installing system packages like ffmpeg/OBS via
 # platform_common.install_optional_dependency/run_linux_install_command, which does need root on
@@ -82,10 +107,12 @@ _COMMON_GAMES_WINDOWS = [
     {"name": "Genshin Impact", "process_name": "GenshinImpact.exe"},
 ]
 # Per OS, mirroring autostart_script.py's own lists -- one shared Windows list put .exe names in
-# Mac configs that could never match (confirmed live: League of Legends and Wizard101 picked in
-# the Mac installer saved "league of legends.exe" and "WizardGraphicalClient.exe").
+# Mac configs that could never match (confirmed live: League of Legends picked in the Mac
+# installer saved "league of legends.exe"). Wizard101 keeps its .exe name: its Mac app runs the
+# Windows client under a bundled Wine, which the app reports by the .exe's own name.
 _COMMON_GAMES_MACOS = [
     {"name": "League of Legends", "process_name": "LeagueofLegends"},
+    {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
     {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
     {"name": "Roblox", "process_name": "RobloxPlayer"},
 ]
@@ -690,19 +717,6 @@ def main():
             screen_recording_row, text="Open Screen Recording Settings",
             command=platform_common.open_screen_recording_settings,
         ).pack(anchor="w")
-        tk.Label(
-            screen_recording_row,
-            text=(
-                "OBS Auto Recorder itself needs Accessibility permission for custom keybinds "
-                "(e.g. Add Marker) and the clip editor's space bar. It asks the first time a "
-                "keybind is used, or you can allow \"OBS Auto Recorder\" now."
-            ),
-            bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
-        ).pack(fill="x", pady=(12, 6))
-        tk.Button(
-            screen_recording_row, text="Open Accessibility Settings",
-            command=platform_common.open_accessibility_settings,
-        ).pack(anchor="w")
 
     # ---------- Quick options ----------
     options_page = page_frame()
@@ -917,6 +931,61 @@ def main():
 
     tk.Button(password_row, text="Copy", command=copy_password).pack(side="left", padx=(8, 8))
     password_copied_label.pack(side="left")
+    # macOS only: Accessibility (custom keybinds such as Add Marker, the clip editor's space bar)
+    # is granted to the installed app itself, so it's requested by opening that app -- see
+    # accessibility_request_command. Shown after install because the app has to exist first.
+    accessibility_row = tk.Frame(finish_page, bg=PAGE_BG)
+    tk.Label(
+        accessibility_row,
+        text=(
+            f"Allow {APP_NAME} in Accessibility so keybinds (like Add Marker) and the clip "
+            "editor's space bar work. macOS will ask -- click \"Open System Settings\", then turn "
+            f"on \"{APP_NAME}\"."
+        ),
+        bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
+    ).pack(fill="x", pady=(0, 6))
+    accessibility_buttons = tk.Frame(accessibility_row, bg=PAGE_BG)
+    accessibility_buttons.pack(fill="x")
+    accessibility_btn = tk.Button(accessibility_buttons, text="Allow Accessibility...")
+    accessibility_btn.pack(side="left")
+    accessibility_status = tk.Label(accessibility_buttons, text="", bg=PAGE_BG, font=("Segoe UI", 10))
+    accessibility_status.pack(side="left", padx=(10, 0))
+    accessibility_state = {"status_path": None}
+
+    def watch_accessibility():
+        status_path = accessibility_state["status_path"]
+        if status_path and os.path.isfile(status_path):
+            accessibility_status.config(text="✓ Allowed", fg="#15803d")
+            accessibility_btn.config(state="disabled")
+            try:
+                os.remove(status_path)
+            except OSError:
+                pass
+            return
+        root.after(1000, watch_accessibility)
+
+    def request_accessibility():
+        install_dir = current.get("install_dir")
+        if not install_dir:
+            return
+        status_path = os.path.join(tempfile.gettempdir(), f"obsautorecorder-accessibility-{os.getpid()}")
+        try:
+            os.remove(status_path)
+        except OSError:
+            pass
+        try:
+            subprocess.Popen(accessibility_request_command(install_dir, status_path))
+        except OSError:
+            accessibility_status.config(text="Couldn't open the app -- allow it in System Settings.", fg="#b91c1c")
+            platform_common.open_accessibility_settings()
+            return
+        accessibility_status.config(text="Waiting for permission...", fg=PAGE_FG)
+        if accessibility_state["status_path"] is None:
+            root.after(1000, watch_accessibility)
+        accessibility_state["status_path"] = status_path
+
+    accessibility_btn.config(command=request_accessibility)
+
     launch_var = tk.BooleanVar(value=True)
     launch_check = tk.Checkbutton(finish_page, text=f"Launch {APP_NAME} now", variable=launch_var, bg=PAGE_BG)
     launch_check.pack(anchor="w", pady=(8, 0))
@@ -1125,8 +1194,11 @@ def main():
             password_row.pack(anchor="w", pady=(0, 12))
         else:
             password_row.pack_forget()
-        launch_check.pack(anchor="w", pady=(8, 0))
         current["install_dir"] = dir_var.get()
+        if sys.platform == "darwin":
+            accessibility_row.pack(fill="x", pady=(0, 12), before=launch_check)
+            request_accessibility()
+        launch_check.pack(anchor="w", pady=(8, 0))
         show("finish")
         show_nav(back=False, next_=True, cancel=False)
         next_btn.config(text="Finish", state="normal", command=finish)
@@ -1137,6 +1209,7 @@ def main():
         launch_var.set(False)
         launch_check.pack_forget()
         password_row.pack_forget()
+        accessibility_row.pack_forget()
         current["install_dir"] = None
         show("finish")
         show_nav(back=False, next_=True, cancel=False)
@@ -1218,7 +1291,7 @@ def main():
     def finish():
         if launch_var.get() and current["install_dir"]:
             try:
-                subprocess.Popen([os.path.join(current["install_dir"], app_relative_path())], cwd=current["install_dir"])
+                subprocess.Popen(app_launch_command(current["install_dir"]), cwd=current["install_dir"])
             except OSError:
                 pass
         root.destroy()
