@@ -28,6 +28,15 @@ def finalize(app_path):
     # Editing Info.plist invalidates the bundle's signature; macOS refuses to launch an
     # arm64 app with a broken one, so re-sign (ad hoc, same as PyInstaller's own signing).
     subprocess.run(["codesign", "--force", "--deep", "--sign", "-", app_path], check=True)
+    # An ad hoc signature's default requirement is the build's own hash, and macOS ties
+    # Accessibility/Screen Recording grants to it -- so every update silently lost them (the
+    # switch in System Settings stays on but no longer applies). Requiring only the bundle id
+    # lets a grant carry over to later builds. Outer bundle only: nested code has its own ids.
+    subprocess.run(
+        ["codesign", "--force", "--sign", "-", "--requirements",
+         f'=designated => identifier "{BUNDLE_ID}"', app_path],
+        check=True,
+    )
 
 
 if __name__ == "__main__":

@@ -9557,8 +9557,26 @@ def main():
 # app itself: the permission belongs to whichever app asks, so the installer asking would only
 # have allowed the installer.
 ACCESSIBILITY_REQUEST_FLAG = "--request-accessibility"
+ACCESSIBILITY_CHECK_FLAG = "--check-accessibility"
 ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS = 600
-ACCESSIBILITY_REQUEST_POLL_SECONDS = 1
+ACCESSIBILITY_REQUEST_POLL_SECONDS = 2
+
+
+def accessibility_check_command():
+    """Runs this app again just to report whether it holds Accessibility (exit code 0 = yes)."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, ACCESSIBILITY_CHECK_FLAG]
+    return [sys.executable, os.path.abspath(__file__), ACCESSIBILITY_CHECK_FLAG]
+
+
+def accessibility_granted_in_fresh_process():
+    """Whether Accessibility is granted now, asked from a new child process. A process keeps
+    the answer it got first (confirmed live: after the user allowed the app, the waiting process
+    still saw "not granted" while a fresh copy saw "granted"); a child counts as this app."""
+    try:
+        return subprocess.run(accessibility_check_command(), timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def run_accessibility_request(status_path, timeout=ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS):
@@ -9568,7 +9586,7 @@ def run_accessibility_request(status_path, timeout=ACCESSIBILITY_REQUEST_TIMEOUT
     if not platform_common.accessibility_permission_granted():
         platform_common.request_accessibility_permission()
         deadline = time.time() + timeout
-        while not platform_common.accessibility_permission_granted():
+        while not accessibility_granted_in_fresh_process():
             if time.time() >= deadline:
                 return False
             time.sleep(ACCESSIBILITY_REQUEST_POLL_SECONDS)
@@ -9583,6 +9601,8 @@ def run_accessibility_request(status_path, timeout=ACCESSIBILITY_REQUEST_TIMEOUT
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == ACCESSIBILITY_REQUEST_FLAG:
         sys.exit(0 if run_accessibility_request(sys.argv[2]) else 1)
+    if len(sys.argv) >= 2 and sys.argv[1] == ACCESSIBILITY_CHECK_FLAG:
+        sys.exit(0 if platform_common.accessibility_permission_granted() else 1)
     try:
         main()
     except KeyboardInterrupt:

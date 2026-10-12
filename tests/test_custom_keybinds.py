@@ -134,7 +134,9 @@ class RunAccessibilityRequestTests(unittest.TestCase):
     def test_prompts_then_waits_until_granted(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "status")
-            with patch.object(a.platform_common, "accessibility_permission_granted", side_effect=[False, False, True]), \
+            # The wait re-checks in a fresh process: this one keeps its first answer.
+            with patch.object(a.platform_common, "accessibility_permission_granted", return_value=False), \
+                    patch.object(a, "accessibility_granted_in_fresh_process", side_effect=[False, True]), \
                     patch.object(a.platform_common, "request_accessibility_permission") as request, \
                     patch.object(a.time, "sleep"):
                 self.assertTrue(a.run_accessibility_request(path))
@@ -145,7 +147,21 @@ class RunAccessibilityRequestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "status")
             with patch.object(a.platform_common, "accessibility_permission_granted", return_value=False), \
+                    patch.object(a, "accessibility_granted_in_fresh_process", return_value=False), \
                     patch.object(a.platform_common, "request_accessibility_permission"), \
                     patch.object(a.time, "sleep"):
                 self.assertFalse(a.run_accessibility_request(path, timeout=0))
             self.assertFalse(os.path.exists(path))
+
+    def test_fresh_process_check_uses_the_check_flag_and_exit_code(self):
+        with patch.object(a.subprocess, "run", return_value=unittest.mock.Mock(returncode=0)) as run:
+            self.assertTrue(a.accessibility_granted_in_fresh_process())
+        self.assertEqual(run.call_args[0][0][-1], a.ACCESSIBILITY_CHECK_FLAG)
+        with patch.object(a.subprocess, "run", return_value=unittest.mock.Mock(returncode=1)):
+            self.assertFalse(a.accessibility_granted_in_fresh_process())
+        with patch.object(a.subprocess, "run", side_effect=OSError("boom")):
+            self.assertFalse(a.accessibility_granted_in_fresh_process())
+
+    def test_frozen_app_checks_by_running_itself(self):
+        with patch.object(a.sys, "frozen", True, create=True), patch.object(a.sys, "executable", "/X.app/Contents/MacOS/X"):
+            self.assertEqual(a.accessibility_check_command(), ["/X.app/Contents/MacOS/X", a.ACCESSIBILITY_CHECK_FLAG])
