@@ -17,8 +17,11 @@ class FakeObsError(Exception):
 
 
 class FakeObsClient:
-    def __init__(self, profile_name="Untitled", inputs=None, current_scene="Screen"):
+    def __init__(self, profile_name="Untitled", inputs=None, current_scene="Screen", listed_apps=()):
         self.current_scene = current_scene
+        # What a macOS app-capture source lists as capturable (bundle ids) -- see
+        # get_input_properties_list_property_items.
+        self.listed_apps = list(listed_apps)
         self.profiles = {
             profile_name: {
                 "video": SimpleNamespace(
@@ -157,7 +160,9 @@ class FakeObsClient:
                 "GetInputPropertiesListPropertyItems", RESOURCE_NOT_FOUND_CODE, f"No source was found by the name of `{name}`"
             )
         self.calls.append(("get_input_properties_list_property_items", name, prop))
-        return SimpleNamespace(property_items=[])
+        return SimpleNamespace(property_items=[
+            {"itemName": value, "itemValue": value, "itemEnabled": True} for value in self.listed_apps
+        ])
 
     def set_input_settings(self, name, settings, overlay):
         if name not in self.inputs:

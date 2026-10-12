@@ -429,6 +429,9 @@ def make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=True):
     fake.kCGSessionEventTap = 1
     fake.kCGHeadInsertEventTap = 0
     fake.kCGEventTapOptionListenOnly = 1
+    fake.kCGEventTapOptionDefault = 0
+    fake.kCGEventTapDisabledByTimeout = 0xFFFFFFFE
+    fake.kCGEventTapDisabledByUserInput = 0xFFFFFFFF
     fake.kCGEventKeyDown = 10
     fake.kCGKeyboardEventKeycode = 9
     fake.kCFRunLoopCommonModes = "kCFRunLoopCommonModes"
@@ -576,7 +579,9 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
                 fake_quartz.CGEventGetFlags.return_value = fake_quartz.kCGEventFlagMaskControl
                 result = tap_callback(None, fake_quartz.kCGEventKeyDown, fake_event, None)
 
-                self.assertIs(result, fake_event)
+                # Swallowed, so the frontmost app (and macOS's alert sound) never sees it.
+                self.assertIsNone(result)
+                self.assertEqual(fake_quartz.CGEventTapCreate.call_args[0][2], fake_quartz.kCGEventTapOptionDefault)
                 mock_thread_cls.assert_called_once_with(
                     target=fire_keybind,
                     args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status", "rec_state"),
@@ -957,3 +962,42 @@ class ProcessAudioTapTests(unittest.TestCase):
     def test_start_without_helper_does_nothing(self):
         with unittest.mock.patch.object(pmac, "process_audio_tap_helper_path", return_value=None):
             self.assertIsNone(pmac.start_process_audio_tap([7]))
+
+
+class KeybindTapConsumptionTests(unittest.TestCase):
+    """Custom keybinds swallow exactly their own key combination (an active tap); everything else,
+    and the clip editor's space bar listener, passes through untouched."""
+
+    def start_keybind_tap(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_services = make_fake_application_services(accessibility_trusted=True)
+        binding = {"enabled": True, "key": "F3", "modifiers": ["win"], "action": "add_marker"}
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_services}), \
+                unittest.mock.patch.object(pmac.threading, "Thread"):
+            pmac.run_custom_keybind_listener(
+                [binding], get_client=None, get_manual_split_buffer_seconds=None,
+                fire_keybind=unittest.mock.Mock(), describe_keybind=unittest.mock.Mock(return_value="Win+F3"),
+                notify=unittest.mock.Mock(),
+            )
+        return fake_quartz, fake_quartz.CGEventTapCreate.call_args[0][4]
+
+    def test_other_keys_pass_through(self):
+        fake_quartz, tap_callback = self.start_keybind_tap()
+        event = unittest.mock.Mock()
+        fake_quartz.CGEventGetIntegerValueField.return_value = pmac.macos_keycode_for_key("F3")
+        fake_quartz.CGEventGetFlags.return_value = 0  # F3 without Cmd
+        with unittest.mock.patch.object(pmac.threading, "Thread"):
+            self.assertIs(tap_callback(None, fake_quartz.kCGEventKeyDown, event, None), event)
+
+    def test_a_disabled_tap_is_switched_back_on(self):
+        fake_quartz, tap_callback = self.start_keybind_tap()
+        event = unittest.mock.Mock()
+        self.assertIs(tap_callback(None, fake_quartz.kCGEventTapDisabledByTimeout, event, None), event)
+        fake_quartz.CGEventTapEnable.assert_called_with(fake_quartz.CGEventTapCreate.return_value, True)
+
+    def test_space_bar_listener_stays_passive(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_services = make_fake_application_services(accessibility_trusted=True)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_services}):
+            pmac.run_clip_editor_space_bar_listener(None, unittest.mock.Mock(), unittest.mock.Mock())
+        self.assertEqual(fake_quartz.CGEventTapCreate.call_args[0][2], fake_quartz.kCGEventTapOptionListenOnly)

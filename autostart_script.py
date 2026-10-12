@@ -1266,18 +1266,30 @@ def start_game_audio_tap_if_needed(game_audio_config, process_name, pid):
 PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND = {"sck_audio_capture": "application"}
 
 
+def capture_target_listed(items, target):
+    """Whether an app-capture source's application list (GetInputPropertiesListPropertyItems)
+    includes target."""
+    return any(item.get("itemValue") == target for item in items)
+
+
 def set_game_audio_capture_target(client, input_name, process_name):
-    """Points the game-audio-isolation input at the detected game's process, creating that
-    Application Audio Capture input in OBS first if it doesn't exist yet -- so obs.game_audio_capture
-    works without needing to add the OBS source by hand first, the same way the multi-track
-    quick-setup wizard self-creates sources for common apps."""
+    """Points an app-audio input (Game Audio, or an app capture like Discord) at process_name's
+    app, creating that Application Audio Capture input in OBS first if it doesn't exist yet -- so
+    obs.game_audio_capture works without needing to add the OBS source by hand first, the same
+    way the multi-track quick-setup wizard self-creates sources for common apps.
+
+    Returns True once pointed at an app OBS can capture, False if pointed but macOS doesn't list
+    the app as capturable yet -- it only lists apps with a window, so an app caught right as it
+    launches records silence (confirmed live: Safari, pointed half a second after it started) --
+    and None when there's nothing to retry (no target, or the request failed). False means call
+    again shortly: re-pointing once the app is listed captures it."""
     kind, settings = resolve_process_audio_capture(process_name)
     if not kind:
         logging.warning(
             "Per-app audio capture has no confirmed OBS source kind on this OS yet; '%s' was "
             "left unchanged.", input_name,
         )
-        return
+        return None
     if settings is None:
         # Make sure an input still on capture-everything defaults (e.g. created before its app
         # ever ran) records nothing rather than the whole desktop mix. Overlay keeps any
@@ -1292,8 +1304,9 @@ def set_game_audio_capture_target(client, input_name, process_name):
             "Could not resolve an audio-capture target for %s (not currently running, or its "
             "app isn't in a normal bundle); '%s' won't capture anything this time.", process_name, input_name,
         )
-        return
+        return None
     refresh_property = PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND.get(kind)
+    listed = True
     try:
         if refresh_property:
             # OBS only finds apps that were running when the source last listed them (confirmed
@@ -1303,20 +1316,24 @@ def set_game_audio_capture_target(client, input_name, process_name):
             # Best-effort: the listing itself fails while the screen is locked (ScreenCaptureKit
             # lists nothing then -- confirmed live), which must not read as "input missing".
             try:
-                client.get_input_properties_list_property_items(input_name, refresh_property)
+                items = client.get_input_properties_list_property_items(input_name, refresh_property).property_items
+                listed = capture_target_listed(items, settings.get(refresh_property))
             except Exception:
                 pass
             client.set_input_settings(input_name, {refresh_property: ""}, True)
         client.set_input_settings(input_name, settings, True)
-        logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
-        return
+        if listed:
+            logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
+        else:
+            logging.debug("%s isn't capturable yet (no window); '%s' will be pointed again.", process_name, input_name)
+        return listed
     except obsws.error.OBSSDKRequestError as exc:
         if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
             logging.warning("Could not point '%s' audio capture at %s: %s", input_name, process_name, exc)
-            return
+            return None
     except Exception as exc:
         logging.warning("Could not point '%s' audio capture at %s: %s", input_name, process_name, exc)
-        return
+        return None
 
     # Input doesn't exist yet -- create it with the target already set, instead of requiring it
     # be added by hand in OBS first.
@@ -1327,8 +1344,25 @@ def set_game_audio_capture_target(client, input_name, process_name):
             "Created Application Audio Capture input '%s' in OBS and pointed it at %s.",
             input_name, process_name,
         )
+        return True
     except Exception as exc:
         logging.warning("Could not create '%s' audio capture input in OBS: %s", input_name, exc)
+        return None
+
+
+def app_capture_is_listed(client, input_name, process_name):
+    """Whether input_name's app is in its source's capturable list right now (always True where
+    the source kind has no such list, e.g. Windows) -- used at session start to tell which of
+    the app captures just pointed need pointing again once their app opens a window."""
+    kind, settings = resolve_process_audio_capture(process_name)
+    refresh_property = PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND.get(kind)
+    if not settings or not refresh_property:
+        return True
+    try:
+        items = client.get_input_properties_list_property_items(input_name, refresh_property).property_items
+    except Exception:
+        return True
+    return capture_target_listed(items, settings.get(refresh_property))
 
 
 def running_app_capture_processes(multi_track_config, processes):
@@ -1339,19 +1373,56 @@ def running_app_capture_processes(multi_track_config, processes):
     return {name for name, _exe, _pid in processes if name in wanted}
 
 
-def point_newly_running_app_captures(client, multi_track_config, previously_running, processes, offset_ms):
-    """Points each app capture whose app has started since previously_running at it, so an app
-    opened partway through a recording (e.g. Discord joined mid-game) is captured from then on
-    instead of only from the next recording. Returns the current running set to pass back next
-    time -- an app that quits and relaunches is picked up again."""
+def captured_app_captures(client, multi_track_config, processes):
+    """The running app captures already pointed at a capturable app -- what
+    point_newly_running_app_captures starts from at the beginning of a session."""
+    captured = set()
+    for process_name in running_app_capture_processes(multi_track_config, processes):
+        inputs = [
+            ac["input_name"] for ac in multi_track_config.get("app_captures", [])
+            if ac.get("process_name") == process_name and ac.get("input_name")
+        ]
+        if all(app_capture_is_listed(client, input_name, process_name) for input_name in inputs):
+            captured.add(process_name)
+    return captured
+
+
+# How often an app capture (or Game Audio) whose app isn't capturable yet is pointed again.
+CAPTURE_RETRY_SECONDS = 5
+
+
+def point_newly_running_app_captures(client, multi_track_config, captured, processes, offset_ms, retry_state=None):
+    """Points each running app capture that isn't captured yet at its app -- an app opened
+    partway through a recording (e.g. Discord joined mid-game), or one that had no window yet
+    when last pointed -- so it's captured from then on instead of only from the next recording.
+    captured is the set this returned last time; an app that quits and relaunches is picked up
+    again. retry_state (a dict kept across calls) spaces out attempts at an app that still isn't
+    capturable to every CAPTURE_RETRY_SECONDS."""
+    retry_state = {} if retry_state is None else retry_state
     running = running_app_capture_processes(multi_track_config, processes)
-    for process_name in sorted(running - previously_running):
+    now = time.time()
+    newly_captured = set()
+    for process_name in sorted(running - captured):
+        if now - retry_state.get(process_name, 0.0) < CAPTURE_RETRY_SECONDS:
+            continue
+        first_attempt = process_name not in retry_state
+        retry_state[process_name] = now
+        results = []
         for app_capture in multi_track_config.get("app_captures", []):
             if app_capture.get("process_name") == process_name and app_capture.get("input_name"):
-                logging.info("%s started during the recording; pointing '%s' at it.", process_name, app_capture["input_name"])
-                set_game_audio_capture_target(client, app_capture["input_name"], process_name)
+                if first_attempt:
+                    logging.info("%s is running; pointing '%s' at it.", process_name, app_capture["input_name"])
+                results.append(set_game_audio_capture_target(client, app_capture["input_name"], process_name))
                 apply_process_capture_sync_offset(client, app_capture["input_name"], offset_ms)
-    return running
+        if all(result is not False for result in results):
+            newly_captured.add(process_name)
+            retry_state.pop(process_name, None)
+        elif first_attempt:
+            logging.info("%s has no window yet, so it can't be captured; trying again until it does.", process_name)
+    for process_name in list(retry_state):
+        if process_name not in running:
+            retry_state.pop(process_name)
+    return (captured & running) | newly_captured
 
 
 # Confirmed live via a controlled cross-correlation test: a real-world sound captured
@@ -4376,6 +4447,10 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     obs_close_pending_since = None  # set when a session ends; see close_obs_between_sessions
     app_captures_running = set()  # see point_newly_running_app_captures
     game_audio_tap = None  # see start_game_audio_tap_if_needed
+    app_capture_retry_state = {}  # see point_newly_running_app_captures
+    # Game Audio was pointed at a game macOS didn't list as capturable yet (no window): retried
+    # every CAPTURE_RETRY_SECONDS -- see set_game_audio_capture_target.
+    game_audio_retry = {"waiting": False, "last_attempt": 0.0}
 
     # A recording this app started can be left running with nothing tracking it if the
     # previous instance was force-killed, crashed, or otherwise never reached the normal
@@ -4556,10 +4631,12 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                     # last frame read as frozen since then (confirmed live: fired 2s into a
                     # recording, claiming no change for over 180s).
                     frozen_capture_state.update(last_hash=None, unchanged_since=None, last_check=0.0)
-                    # sync_multi_track_audio (in ensure_obs_ready) just pointed everything running now.
-                    app_captures_running = running_app_capture_processes(
-                        obs_config.get("multi_track_audio", {}), processes,
+                    # sync_multi_track_audio (in ensure_obs_ready) just pointed everything running
+                    # now; any whose app has no window yet are pointed again from the loop below.
+                    app_captures_running = captured_app_captures(
+                        obs_client, obs_config.get("multi_track_audio", {}), processes,
                     )
+                    app_capture_retry_state = {}
                     active_display_name = display_name
                     active_replay_buffer_only = replay_buffer_only
                     active_window_entry = window_entry
@@ -4578,7 +4655,10 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                         if replay_buffer_mode == "with_recording":
                             start_replay_buffer(obs_client)
                     if game_audio_config.get("enabled"):
-                        set_game_audio_capture_target(obs_client, game_audio_config["input_name"], name)
+                        pointed = set_game_audio_capture_target(obs_client, game_audio_config["input_name"], name)
+                        game_audio_retry.update(waiting=pointed is False, last_attempt=time.time())
+                        if pointed is False:
+                            logging.info("%s has no window yet, so its audio can't be captured; trying again until it does.", name)
                         apply_process_capture_sync_offset(
                             obs_client, game_audio_config["input_name"],
                             obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
@@ -4635,6 +4715,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                 active_name, active_pid, active_display_name = None, None, None
                 platform_common.stop_process_audio_tap(game_audio_tap)
                 game_audio_tap = None
+                game_audio_retry["waiting"] = False
                 active_replay_buffer_only = False
                 active_window_entry = None
                 reset_recording_state(recording_state)
@@ -4644,11 +4725,16 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                 # right here OBS still reports the recording as active (confirmed live).
                 obs_close_pending_since = time.time()
             elif obs_client:
+                offset_ms = obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS)
                 if not active_replay_buffer_only:
                     app_captures_running = point_newly_running_app_captures(
                         obs_client, obs_config.get("multi_track_audio", {}), app_captures_running, processes,
-                        obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
+                        offset_ms, app_capture_retry_state,
                     )
+                if game_audio_retry["waiting"] and time.time() - game_audio_retry["last_attempt"] >= CAPTURE_RETRY_SECONDS:
+                    pointed = set_game_audio_capture_target(obs_client, game_audio_config["input_name"], active_name)
+                    apply_process_capture_sync_offset(obs_client, game_audio_config["input_name"], offset_ms)
+                    game_audio_retry.update(waiting=pointed is False, last_attempt=time.time())
                 now = time.time()
                 if now - frozen_capture_state["last_check"] >= FROZEN_CAPTURE_CHECK_INTERVAL_SECONDS:
                     frozen_capture_state["last_check"] = now
@@ -4700,6 +4786,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                             active_name, active_pid, active_display_name = None, None, None
                             platform_common.stop_process_audio_tap(game_audio_tap)
                             game_audio_tap = None
+                            game_audio_retry["waiting"] = False
                             active_replay_buffer_only = False
                             active_window_entry = None
                             reset_recording_state(recording_state)

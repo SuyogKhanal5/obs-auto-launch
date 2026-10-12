@@ -833,3 +833,57 @@ class StartGameAudioTapTests(unittest.TestCase):
     def test_needs_the_device_and_isolation_on(self):
         self.assertIsNone(self.run_with(available=False)[0])
         self.assertIsNone(self.run_with(config={"enabled": False})[0])
+
+
+class CaptureListingRetryTests(unittest.TestCase):
+    """macOS lists an app as capturable only once it has a window; an app pointed before that
+    records silence (confirmed live: Safari, pointed 0.5s after launch, was silent all session)."""
+
+    def setUp(self):
+        for target, value in (
+            ("process_audio_capture_kind", "sck_audio_capture"),
+            ("process_audio_capture_settings", {"type": 1, "application": "com.apple.Safari"}),
+        ):
+            p = unittest.mock.patch.object(a.platform_common, target, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def client(self, listed):
+        return FakeObsClient(
+            inputs={"Safari": {"kind": "sck_audio_capture", "tracks": {}, "settings": {}}},
+            listed_apps=["com.apple.Safari"] if listed else [],
+        )
+
+    def test_reports_whether_the_app_is_capturable(self):
+        self.assertIs(a.set_game_audio_capture_target(self.client(True), "Safari", "Safari"), True)
+        self.assertIs(a.set_game_audio_capture_target(self.client(False), "Safari", "Safari"), False)
+
+    def test_unlisted_app_is_still_pointed(self):
+        client = self.client(False)
+        a.set_game_audio_capture_target(client, "Safari", "Safari")
+        self.assertEqual(client.inputs["Safari"]["settings"], {"type": 1, "application": "com.apple.Safari"})
+
+    def test_session_start_only_counts_capturable_apps(self):
+        config = {"enabled": True, "app_captures": [{"input_name": "Safari", "process_name": "Safari"}]}
+        processes = [("Safari", "", 1)]
+        self.assertEqual(a.captured_app_captures(self.client(True), config, processes), {"Safari"})
+        self.assertEqual(a.captured_app_captures(self.client(False), config, processes), set())
+
+    def test_unlisted_app_is_retried_after_the_interval_until_capturable(self):
+        config = {"enabled": True, "app_captures": [{"input_name": "Safari", "process_name": "Safari"}]}
+        processes = [("Safari", "", 1)]
+        retry_state = {}
+        with unittest.mock.patch.object(a, "apply_process_capture_sync_offset"), \
+                unittest.mock.patch.object(a.time, "time", side_effect=[100.0, 101.0, 106.0]):
+            client = self.client(False)
+            captured = a.point_newly_running_app_captures(client, config, set(), processes, 0, retry_state)
+            self.assertEqual(captured, set())
+            # Too soon: not pointed again.
+            calls_before = len(client.calls)
+            captured = a.point_newly_running_app_captures(client, config, captured, processes, 0, retry_state)
+            self.assertEqual(len(client.calls), calls_before)
+            # Window open now, interval passed: pointed and captured.
+            client.listed_apps = ["com.apple.Safari"]
+            captured = a.point_newly_running_app_captures(client, config, captured, processes, 0, retry_state)
+        self.assertEqual(captured, {"Safari"})
+        self.assertEqual(retry_state, {})

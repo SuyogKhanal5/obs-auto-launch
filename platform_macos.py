@@ -244,7 +244,9 @@ def get_window_titles():
 # macOS has no API for a true exclusive OS-level hotkey reservation the way Win32's RegisterHotKey
 # or X11's XGrabKey have -- the standard approach (used by essentially every third-party macOS
 # hotkey utility) is a session-level CGEventTap: a passive, non-consuming observer of every
-# keystroke system-wide, matched against the configured bindings in the callback itself. This is
+# keystroke system-wide, matched against the configured bindings in the callback itself. Custom
+# keybinds use an active tap that swallows exactly the configured combinations (see
+# run_custom_keybind_listener); the clip editor's space bar stays passive. This is
 # actually the SAME shape Windows' WH_KEYBOARD_LL space-bar hook already uses in this app (see
 # platform_windows.py's run_clip_editor_space_bar_listener) -- here it does double duty for BOTH
 # custom keybinds and the space bar, unlike Windows/X11 which use two different mechanisms
@@ -357,10 +359,12 @@ def _resolve_event_tap_names(Quartz):
             "keycode_field": Quartz.kCGKeyboardEventKeycode,
             "get_field": Quartz.CGEventGetIntegerValueField,
             "get_flags": Quartz.CGEventGetFlags,
+            "tap_disabled_types": (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput),
+            "tap_enable": Quartz.CGEventTapEnable,
         }
 
 
-def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_event=None):
+def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_event=None, consume=False):
     """Shared by run_custom_keybind_listener and run_clip_editor_space_bar_listener below --
     both need the exact same CGEventTapCreate/CFRunLoop wiring, differing only in which keydowns
     the callback itself cares about. Blocks in CFRunLoopRun() for this thread's whole lifetime (or
@@ -376,7 +380,11 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
     purpose). When stop_event is given, a small watcher daemon thread blocks on stop_event.wait()
     and stops this run loop the moment it fires, so a stop_event.set() from elsewhere (e.g. the
     clip editor window closing) actually tears this listener down instead of leaking a
-    permanently-running tap thread until process exit."""
+    permanently-running tap thread until process exit.
+
+    consume=True makes it an active tap: an event the callback returns None for is swallowed
+    instead of reaching the frontmost app. macOS switches an active tap off if a callback is ever
+    too slow; it's switched straight back on here."""
     if not accessibility_permission_granted():
         logging.warning(
             "This feature needs Accessibility permission, which hasn't been granted yet -- "
@@ -387,10 +395,21 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
         on_permission_denied()
         return
 
+    names = _resolve_event_tap_names(Quartz)
+    tap_holder = []
+
+    def callback(proxy, event_type, event, refcon):
+        if event_type in names["tap_disabled_types"]:
+            if tap_holder:
+                names["tap_enable"](tap_holder[0], True)
+            return event
+        return tap_callback(proxy, event_type, event, refcon)
+
     try:
         tap = Quartz.CGEventTapCreate(
-            Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap, Quartz.kCGEventTapOptionListenOnly,
-            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown), tap_callback, None,
+            Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault if consume else Quartz.kCGEventTapOptionListenOnly,
+            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown), callback, None,
         )
         if not tap:
             logging.warning(
@@ -398,6 +417,7 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
                 "taken effect yet; try restarting the app."
             )
             return
+        tap_holder.append(tap)
         run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
         run_loop = Quartz.CFRunLoopGetCurrent()
         Quartz.CFRunLoopAddSource(run_loop, run_loop_source, Quartz.kCFRunLoopCommonModes)
@@ -466,6 +486,10 @@ def run_custom_keybind_listener(
                         ),
                         daemon=True,
                     ).start()
+                    # Swallowed, as Windows' RegisterHotKey does: passed on, the frontmost app
+                    # got Cmd+F3 too and macOS played its alert sound into the recording at
+                    # every marker (confirmed live).
+                    return None
         except Exception:
             logging.exception("Custom keybind macOS event tap callback failed.")
         return event
@@ -477,7 +501,7 @@ def run_custom_keybind_listener(
             "& Security > Accessibility, then restart the app.",
         )
 
-    _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied)
+    _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, consume=True)
 
 
 # --- Autostart (LaunchAgents .plist) ---
