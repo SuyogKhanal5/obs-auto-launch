@@ -442,6 +442,44 @@ def open_accessibility_settings(platform_name=None):
     return _select_backend(platform_name).open_accessibility_settings()
 
 
+def process_audio_tap_available(platform_name=None):
+    """Whether games without an app bundle (Wine, Java) can get their own game audio track:
+    macOS 14.2+ with the Game Audio device installed. False elsewhere."""
+    return _select_backend(platform_name).process_audio_tap_available()
+
+
+def game_audio_device_uid(platform_name=None):
+    """The Game Audio loopback device's UID (OBS's coreaudio "device_id"), or None."""
+    return getattr(_select_backend(platform_name), "GAME_AUDIO_DEVICE_UID", None)
+
+
+def game_audio_device_installed(platform_name=None):
+    return _select_backend(platform_name).game_audio_device_installed()
+
+
+def install_game_audio_device(driver_path=None, platform_name=None):
+    """Installs the Game Audio device (macOS asks for an admin password). True if installed.
+    driver_path defaults to the copy bundled with this app."""
+    return _select_backend(platform_name).install_game_audio_device(driver_path)
+
+
+def start_process_audio_tap(pids, platform_name=None):
+    """Feeds pids' audio into the Game Audio device; returns a handle for stop_process_audio_tap."""
+    return _select_backend(platform_name).start_process_audio_tap(pids)
+
+
+def stop_process_audio_tap(handle, platform_name=None):
+    return _select_backend(platform_name).stop_process_audio_tap(handle)
+
+
+def request_system_audio_recording_permission(platform_name=None):
+    return _select_backend(platform_name).request_system_audio_recording_permission()
+
+
+def open_system_audio_recording_settings(platform_name=None):
+    return _select_backend(platform_name).open_system_audio_recording_settings()
+
+
 def accessibility_permission_granted(platform_name=None):
     """True if this app may listen for global keys -- always True outside macOS, where no
     per-app permission gates it."""

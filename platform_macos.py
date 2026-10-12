@@ -7,6 +7,7 @@ import ctypes.util
 import glob
 import logging
 import os
+import platform
 import plistlib
 import shutil
 import subprocess
@@ -899,6 +900,157 @@ def open_path(path):
     (no such function outside Windows), silently swallowed by the tray menu's own error handling,
     so clicking either looked exactly like nothing happened at all."""
     subprocess.run(["open", path])
+
+
+# ---------- Game audio for games without an app bundle (Wine, Java) ----------
+#
+# OBS's per-app capture (sck_audio_capture) targets apps by bundle id only, so a Wine game or
+# Java Minecraft can't get its own track. A Core Audio process tap can capture them by pid, but
+# OBS can't read a tap itself (macOS hands tap audio only to apps declaring
+# NSAudioCaptureUsageDescription, and OBS doesn't -- confirmed live: silence). So this app's
+# helper (macos/process_audio_tap.swift) reads the tap and plays it into a loopback device
+# (macos/game_audio_driver), which OBS records like a microphone. Confirmed live end to end:
+# -44.1 dB in OBS from a tapped test tone; -43.6 dB from Wizard101's own client.
+GAME_AUDIO_DEVICE_UID = "OBSAutoRecorderGameAudio_UID"
+GAME_AUDIO_DRIVER_NAME = "OBSAutoRecorderGameAudio.driver"
+GAME_AUDIO_DRIVER_DIR = "/Library/Audio/Plug-Ins/HAL"
+PROCESS_AUDIO_TAP_HELPER_NAME = "process_audio_tap"
+SYSTEM_AUDIO_RECORDING_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+
+
+def _bundled_macos_file(name):
+    """A file built from macos/ that ships with the app: Contents/Resources/<name> in the
+    packaged app, macos/build/<name> when running from source (see macos/build.sh)."""
+    if getattr(sys, "frozen", False):
+        base = os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "Resources")
+    else:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "macos", "build")
+    path = os.path.join(base, name)
+    return path if os.path.exists(path) else None
+
+
+def process_audio_tap_helper_path():
+    return _bundled_macos_file(PROCESS_AUDIO_TAP_HELPER_NAME)
+
+
+def bundled_game_audio_driver_path():
+    return _bundled_macos_file(GAME_AUDIO_DRIVER_NAME)
+
+
+def game_audio_device_installed():
+    """Whether the Game Audio loopback driver is installed (it loads at the next Core Audio
+    restart, which installing does itself)."""
+    return os.path.isdir(os.path.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME))
+
+
+def process_audio_tap_available():
+    """Process taps need macOS 14.2+, the helper, and the installed loopback device."""
+    try:
+        major, minor = (int(p) for p in ((platform.mac_ver()[0] or "0") + ".0").split(".")[:2])
+    except ValueError:
+        return False
+    if (major, minor) < (14, 2):
+        return False
+    return bool(process_audio_tap_helper_path()) and game_audio_device_installed()
+
+
+def game_audio_driver_install_command(driver_path):
+    """Shell command that installs driver_path as the Game Audio device and restarts Core Audio
+    so it loads (all sound cuts out for a second or two)."""
+    target = os.path.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME)
+    return (
+        f"rm -rf {_shell_quote(target)} && mkdir -p {_shell_quote(GAME_AUDIO_DRIVER_DIR)} && "
+        f"ditto {_shell_quote(driver_path)} {_shell_quote(target)} && "
+        f"chown -R root:wheel {_shell_quote(target)} && killall coreaudiod"
+    )
+
+
+def _shell_quote(text):
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def install_game_audio_device(driver_path=None):
+    """Installs the Game Audio device, asking for an administrator password through macOS's own
+    prompt. Returns True once installed; False if cancelled or it failed."""
+    driver_path = driver_path or bundled_game_audio_driver_path()
+    if not driver_path:
+        logging.warning("The Game Audio device isn't bundled with this copy of the app.")
+        return False
+    command = game_audio_driver_install_command(driver_path).replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'do shell script "{command}" with prompt "OBS Auto Recorder wants to install its Game '
+        'Audio device, so audio from Wine and Java games can be recorded on its own track." '
+        "with administrator privileges"
+    )
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    except OSError as exc:
+        logging.warning("Could not install the Game Audio device: %s", exc)
+        return False
+    if result.returncode != 0:
+        logging.info("Game Audio device install didn't complete: %s", result.stderr.strip())
+        return False
+    logging.info("Installed the Game Audio device.")
+    return True
+
+
+def start_process_audio_tap(pids):
+    """Starts feeding pids' audio into the Game Audio device. Returns the helper process (pass
+    it to stop_process_audio_tap), or None if it couldn't start. The helper waits for a process
+    that hasn't opened audio yet, and exits on its own once every pid has."""
+    helper = process_audio_tap_helper_path()
+    if not helper or not pids:
+        return None
+    command = [helper]
+    for pid in pids:
+        command += ["--pid", str(pid)]
+    try:
+        # stdin stays open: the helper stops when it closes, so it never outlives this app.
+        return subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+    except OSError as exc:
+        logging.warning("Could not start the game audio tap: %s", exc)
+        return None
+
+
+def stop_process_audio_tap(process):
+    if process is None:
+        return
+    try:
+        process.stdin.close()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        process.kill()
+        return
+    if process.returncode:
+        error = (process.stderr.read() if process.stderr else "").strip()
+        logging.warning("The game audio tap stopped with an error: %s", error or process.returncode)
+
+
+def request_system_audio_recording_permission():
+    """Shows macOS's "record system audio" prompt for this app by briefly tapping all audio
+    (the permission belongs to whichever app reads a tap -- here, this app's helper). Returns
+    True if the probe ran; macOS gives no way to read the answer, a denied tap just hears
+    silence."""
+    helper = process_audio_tap_helper_path()
+    if not helper:
+        return False
+    try:
+        return subprocess.run([helper, "--probe", "1"], stdin=subprocess.PIPE, capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        logging.warning("Could not ask for System Audio Recording permission: %s", exc)
+        return False
+
+
+def open_system_audio_recording_settings():
+    try:
+        subprocess.run(["open", SYSTEM_AUDIO_RECORDING_SETTINGS_URL], check=False)
+    except Exception as exc:
+        logging.warning("Could not open System Audio Recording settings: %s", exc)
 
 
 def open_accessibility_settings():

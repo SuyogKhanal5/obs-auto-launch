@@ -133,11 +133,16 @@ jobs:
         if: runner.os == 'macOS'
         run: pyinstaller --windowed --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
 
+      - name: Build the Wine & Java game audio helper and driver (macOS)
+        if: runner.os == 'macOS'
+        run: macos/build.sh macos/build
+
       - name: Name and re-sign the app bundle (macOS)
         if: runner.os == 'macOS'
         # Shows as "OBS Auto Recorder" (com.obsautorecorder.app) in macOS's permission lists
-        # instead of PyInstaller's bare "OBSAutoRecorder" -- see ci/finalize_macos_app.py.
-        run: python ci/finalize_macos_app.py dist/OBSAutoRecorder.app
+        # instead of PyInstaller's bare "OBSAutoRecorder", and adds the game audio helper and
+        # driver to Contents/Resources -- see ci/finalize_macos_app.py.
+        run: python ci/finalize_macos_app.py dist/OBSAutoRecorder.app macos/build
 
       - name: Package DMG (macOS)
         if: runner.os == 'macOS'

@@ -691,6 +691,35 @@ def open_path(path):
     os.startfile(path)
 
 
+def process_audio_tap_available():
+    """False -- the process-tap Game Audio device is macOS only."""
+    return False
+
+
+def game_audio_device_installed():
+    return False
+
+
+def install_game_audio_device(driver_path=None):
+    return False
+
+
+def start_process_audio_tap(pids):
+    return None
+
+
+def stop_process_audio_tap(handle):
+    pass
+
+
+def request_system_audio_recording_permission():
+    return False
+
+
+def open_system_audio_recording_settings():
+    pass
+
+
 def accessibility_permission_granted():
     """Always True -- only macOS gates global key listening behind a per-app permission."""
     return True

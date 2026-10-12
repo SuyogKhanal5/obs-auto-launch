@@ -517,6 +517,12 @@ class ReapplyMultiTrackRoutingTests(unittest.TestCase):
 
 
 class EnsureGameAudioTrackTests(unittest.TestCase):
+    def setUp(self):
+        # Whether this machine has the macOS Game Audio device installed must not matter here.
+        patcher = unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def make_config(self, tracks, game_enabled=True, multi_enabled=True, input_name="Game Audio"):
         return {"obs": {
             "game_audio_capture": {"enabled": game_enabled, "input_name": input_name},
@@ -585,6 +591,21 @@ class EnsureGameAudioInputExistsTests(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        tap_patcher = unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=False)
+        tap_patcher.start()
+        self.addCleanup(tap_patcher.stop)
+
+    def test_creates_the_wine_and_java_input_even_when_game_audio_exists(self):
+        # Confirmed live: an early return when Game Audio existed skipped this input entirely.
+        client = FakeObsClient(current_scene="Scene", inputs={"Game Audio": {"kind": "sck_audio_capture", "tracks": {}}})
+        with unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=True), \
+                unittest.mock.patch.object(a.platform_common, "game_audio_device_uid", return_value="OBSAutoRecorderGameAudio_UID"):
+            a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
+        self.assertIn(
+            ("create_input", "Scene", "Game Audio (Wine & Java)", "coreaudio_input_capture",
+             {"device_id": "OBSAutoRecorderGameAudio_UID"}),
+            client.calls,
+        )
 
     def test_creates_missing_input_in_current_scene_capturing_nothing(self):
         client = FakeObsClient(current_scene="Scene")
@@ -754,3 +775,61 @@ class MacAppCaptureRefreshFailureTests(unittest.TestCase):
             a.set_game_audio_capture_target(client, "Discord", "Discord")
         self.assertEqual(client.inputs["Discord"]["settings"], {"type": 1, "application": "com.hnc.Discord"})
         self.assertNotIn("create_input", [c[0] for c in client.calls])
+
+
+class ProcessTapTrackTests(unittest.TestCase):
+    """macOS: the Wine & Java input follows Game Audio's track when the device is installed."""
+
+    def setUp(self):
+        patcher = unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def config(self, tracks):
+        return {"obs": {
+            "game_audio_capture": {"enabled": True, "input_name": "Game Audio"},
+            "multi_track_audio": {"enabled": True, "tracks": tracks},
+        }}
+
+    def test_added_on_game_audios_track(self):
+        config = a.ensure_game_audio_track(self.config([{"input_name": "Mic/Aux", "track": 1}]))
+        tracks = config["obs"]["multi_track_audio"]["tracks"]
+        self.assertIn({"input_name": "Game Audio (Wine & Java)", "track": 3}, tracks)
+
+    def test_follows_game_audio_to_a_new_track(self):
+        config = a.ensure_game_audio_track(self.config([
+            {"input_name": "Game Audio", "track": 5}, {"input_name": "Game Audio (Wine & Java)", "track": 3},
+        ]))
+        tracks = config["obs"]["multi_track_audio"]["tracks"]
+        self.assertEqual([t for t in tracks if t["input_name"] == "Game Audio (Wine & Java)"],
+                         [{"input_name": "Game Audio (Wine & Java)", "track": 5}])
+
+    def test_not_added_without_the_device(self):
+        with unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=False):
+            config = a.ensure_game_audio_track(self.config([{"input_name": "Game Audio", "track": 3}]))
+        self.assertEqual(config["obs"]["multi_track_audio"]["tracks"], [{"input_name": "Game Audio", "track": 3}])
+
+
+class StartGameAudioTapTests(unittest.TestCase):
+    enabled = {"enabled": True, "input_name": "Game Audio"}
+
+    def run_with(self, available=True, settings=None, config=None):
+        with unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=available), \
+                unittest.mock.patch.object(a, "resolve_process_audio_capture", return_value=("sck_audio_capture", settings)), \
+                unittest.mock.patch.object(a.platform_common, "start_process_audio_tap", return_value="handle") as start:
+            result = a.start_game_audio_tap_if_needed(config or self.enabled, "WizardGraphicalClient.exe", 42)
+        return result, start
+
+    def test_taps_a_game_without_an_app_bundle(self):
+        result, start = self.run_with(settings=None)
+        self.assertEqual(result, "handle")
+        start.assert_called_once_with([42])
+
+    def test_leaves_bundled_games_to_per_app_capture(self):
+        result, start = self.run_with(settings={"type": 1, "application": "com.example.game"})
+        self.assertIsNone(result)
+        start.assert_not_called()
+
+    def test_needs_the_device_and_isolation_on(self):
+        self.assertIsNone(self.run_with(available=False)[0])
+        self.assertIsNone(self.run_with(config={"enabled": False})[0])

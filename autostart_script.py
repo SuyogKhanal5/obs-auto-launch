@@ -72,6 +72,7 @@ def ensure_game_audio_track(config):
     input_name = game_audio_config.get("input_name") or "Game Audio"
     tracks = multi_track_config.setdefault("tracks", [])
     if any(t.get("input_name") == input_name for t in tracks):
+        sync_process_tap_track(game_audio_config, tracks)
         return config
     used = {t.get("track") for t in tracks}
     free = [GAME_AUDIO_DEFAULT_TRACK] if GAME_AUDIO_DEFAULT_TRACK not in used else [
@@ -85,7 +86,34 @@ def ensure_game_audio_track(config):
         return config
     tracks.append({"input_name": input_name, "track": free[0]})
     logging.info("Added '%s' to multi-track audio on track %d (game audio isolation is on).", input_name, free[0])
+    sync_process_tap_track(game_audio_config, tracks)
     return config
+
+
+# macOS: games without an app bundle (Wine, Java Minecraft) reach OBS through the Game Audio
+# device instead of Game Audio's own per-app capture -- see platform_macos's process tap notes.
+PROCESS_TAP_INPUT_SUFFIX = " (Wine & Java)"
+
+
+def process_tap_input_name(game_audio_config):
+    return (game_audio_config.get("input_name") or "Game Audio") + PROCESS_TAP_INPUT_SUFFIX
+
+
+def sync_process_tap_track(game_audio_config, tracks):
+    """Puts the process-tap input on the same track as Game Audio (it's the same game audio,
+    just for games per-app capture can't target), following Game Audio if its track changes."""
+    if not platform_common.process_audio_tap_available():
+        return
+    input_name = game_audio_config.get("input_name") or "Game Audio"
+    tap_name = process_tap_input_name(game_audio_config)
+    game_track = next((t.get("track") for t in tracks if t.get("input_name") == input_name), None)
+    if game_track is None:
+        return
+    tap_entries = [t for t in tracks if t.get("input_name") == tap_name]
+    if tap_entries and all(t.get("track") == game_track for t in tap_entries):
+        return
+    tracks[:] = [t for t in tracks if t.get("input_name") != tap_name]
+    tracks.append({"input_name": tap_name, "track": game_track})
 
 
 MAX_LOG_LINES = 10000
@@ -1181,14 +1209,57 @@ def ensure_game_audio_input_exists(client, game_audio_config):
         return
     input_name = game_audio_config.get("input_name") or "Game Audio"
     try:
+        if input_name not in {i["inputName"] for i in client.get_input_list().inputs}:
+            scene = client.get_current_program_scene().current_program_scene_name
+            settings = platform_common.process_audio_capture_placeholder_settings() or {}
+            client.create_input(scene, input_name, kind, settings, True)
+            logging.info("Created game audio input '%s' in OBS.", input_name)
+    except Exception as exc:
+        logging.warning("Could not create game audio input '%s' in OBS: %s", input_name, exc)
+    # Checked even when Game Audio already exists (confirmed live: an early return here meant
+    # the Wine & Java input was never created for anyone who already had Game Audio).
+    ensure_process_tap_input_exists(client, game_audio_config)
+
+
+PROCESS_TAP_INPUT_KIND = "coreaudio_input_capture"
+
+
+def ensure_process_tap_input_exists(client, game_audio_config):
+    """Creates the input that records the Game Audio device (see PROCESS_TAP_INPUT_SUFFIX), when
+    that device is installed. It's silent except while a game without an app bundle is being
+    tapped, so it can stay in the scene permanently."""
+    if not platform_common.process_audio_tap_available():
+        return
+    input_name = process_tap_input_name(game_audio_config)
+    try:
         if input_name in {i["inputName"] for i in client.get_input_list().inputs}:
             return
         scene = client.get_current_program_scene().current_program_scene_name
-        settings = platform_common.process_audio_capture_placeholder_settings() or {}
-        client.create_input(scene, input_name, kind, settings, True)
+        client.create_input(
+            scene, input_name, PROCESS_TAP_INPUT_KIND,
+            {"device_id": platform_common.game_audio_device_uid()}, True,
+        )
         logging.info("Created game audio input '%s' in OBS.", input_name)
     except Exception as exc:
         logging.warning("Could not create game audio input '%s' in OBS: %s", input_name, exc)
+
+
+def start_game_audio_tap_if_needed(game_audio_config, process_name, pid):
+    """For a game per-app capture can't target (no app bundle: Wine, Java), starts feeding its
+    audio into the Game Audio device. Returns the tap handle, or None when not needed or not
+    available."""
+    if not game_audio_config.get("enabled") or not pid or not platform_common.process_audio_tap_available():
+        return None
+    kind, settings = resolve_process_audio_capture(process_name)
+    if not kind or settings is not None:
+        return None
+    handle = platform_common.start_process_audio_tap([pid])
+    if handle is not None:
+        logging.info(
+            "%s has no app bundle to capture directly; recording its audio through '%s'.",
+            process_name, process_tap_input_name(game_audio_config),
+        )
+    return handle
 
 
 # Per-app capture kinds whose list of capturable apps OBS caches; see set_game_audio_capture_target.
@@ -4304,6 +4375,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     frozen_capture_state = {"last_hash": None, "unchanged_since": None, "last_check": 0.0}
     obs_close_pending_since = None  # set when a session ends; see close_obs_between_sessions
     app_captures_running = set()  # see point_newly_running_app_captures
+    game_audio_tap = None  # see start_game_audio_tap_if_needed
 
     # A recording this app started can be left running with nothing tracking it if the
     # previous instance was force-killed, crashed, or otherwise never reached the normal
@@ -4516,6 +4588,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                         # every track for this whole recording (confirmed live), bleeding game
                         # audio into the Discord/Spotify/browser tracks.
                         reapply_multi_track_routing(obs_client, obs_config.get("multi_track_audio", {}))
+                        game_audio_tap = start_game_audio_tap_if_needed(game_audio_config, name, pid)
                 else:
                     obs_recovery_state["last_start_failure"] = now
                     logging.error("Could not get OBS ready to record; will keep retrying while %s runs.", exe or name)
@@ -4560,6 +4633,8 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                                 after_game_exit=True,
                             )
                 active_name, active_pid, active_display_name = None, None, None
+                platform_common.stop_process_audio_tap(game_audio_tap)
+                game_audio_tap = None
                 active_replay_buffer_only = False
                 active_window_entry = None
                 reset_recording_state(recording_state)
@@ -4623,6 +4698,8 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                             processes = get_running_processes()
                             obs_client = None
                             active_name, active_pid, active_display_name = None, None, None
+                            platform_common.stop_process_audio_tap(game_audio_tap)
+                            game_audio_tap = None
                             active_replay_buffer_only = False
                             active_window_entry = None
                             reset_recording_state(recording_state)
@@ -4640,6 +4717,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
             if get_replay_buffer_mode(replay_buffer_config) == "with_recording":
                 stop_replay_buffer(obs_client)
             stop_recording(obs_client, icon, active_display_name, recording_state, config)
+    platform_common.stop_process_audio_tap(game_audio_tap)
 
 
 OVERLAY_SIZE = 26
@@ -4957,6 +5035,86 @@ def add_checkbox(parent, row, label_text, var, columnspan=2):
         parent, text=label_text, variable=var, bg=DARK_BG, fg=DARK_FG,
         activebackground=DARK_BG, activeforeground=DARK_FG, selectcolor=DARK_ENTRY_BG,
     ).grid(row=row, column=0, columnspan=columnspan, sticky="w", padx=10, pady=4)
+
+
+PROCESS_TAP_SETUP_EXPLANATION = (
+    "Wine games (like Wizard101) and Java Minecraft can't be captured app-by-app on macOS. To "
+    "record their audio on the Game Audio track too, OBS Auto Recorder installs a small "
+    "\"OBS Auto Recorder Game Audio\" device (macOS asks for your password) and needs permission "
+    "to record system audio (macOS asks once). Without it, their sound is still in desktop audio."
+)
+
+
+def process_tap_setup_status_text():
+    if platform_common.process_audio_tap_available():
+        return "Wine & Java games: set up ✓"
+    if platform_common.game_audio_device_installed():
+        return "Wine & Java games: device installed, helper missing from this copy of the app"
+    return "Wine & Java games: not set up"
+
+
+def set_up_process_tap(parent):
+    """Installs the Game Audio device if needed (password prompt), then asks for System Audio
+    Recording permission. Runs on the calling (Tk) thread's behalf in a worker; returns True if
+    the device ended up installed."""
+    if not platform_common.game_audio_device_installed():
+        if not platform_common.install_game_audio_device():
+            return False
+    platform_common.request_system_audio_recording_permission()
+    return platform_common.game_audio_device_installed()
+
+
+def add_process_tap_setup_row(parent, row, game_audio_enabled_var):
+    """macOS Settings row for recording Wine/Java games' audio (see PROCESS_TAP_INPUT_SUFFIX):
+    status, a setup button, and an offer to set it up when game audio isolation is turned on."""
+    status_label = tk.Label(parent, text=process_tap_setup_status_text(), anchor="w", fg=DARK_FG, bg=DARK_BG)
+    status_label.grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 2))
+    setup_button = tk.Button(
+        parent, text="Set Up Wine & Java Game Audio...", bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    )
+    setup_button.grid(row=row + 1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
+    tk.Label(
+        parent, text="    " + PROCESS_TAP_SETUP_EXPLANATION,
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row + 2, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+
+    def run_setup():
+        setup_button.config(state="disabled")
+        status_label.config(text="Setting up... (macOS may ask for your password)")
+
+        def worker():
+            installed = set_up_process_tap(parent)
+
+            def finish():
+                setup_button.config(state="normal")
+                status_label.config(text=process_tap_setup_status_text())
+                if installed:
+                    messagebox.showinfo(
+                        "Wine & Java game audio",
+                        "Set up. If macOS asked to let OBS Auto Recorder record system audio, make sure "
+                        "it's allowed (System Settings > Privacy & Security > Screen & System Audio "
+                        "Recording). Save and restart the app to use it.",
+                        parent=parent,
+                    )
+
+            parent.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    setup_button.config(command=run_setup)
+
+    def offer_setup(*_args):
+        if not game_audio_enabled_var.get() or platform_common.game_audio_device_installed():
+            return
+        if messagebox.askyesno(
+            "Record Wine & Java games' audio too?", PROCESS_TAP_SETUP_EXPLANATION + "\n\nSet it up now?",
+            parent=parent,
+        ):
+            run_setup()
+
+    game_audio_enabled_var.trace_add("write", offer_setup)
+    return row + 3
 
 
 def add_browse_button(parent, row, var, mode="file", filetypes=None):
@@ -6215,6 +6373,8 @@ def _run_config_editor(master_root, restart_callback, on_close):
     game_audio_input_var = tk.StringVar(value=game_audio_config.get("input_name", "Game Audio"))
     add_labeled_entry(obs_tab, row, "Input source name", game_audio_input_var)
     row += 1
+    if sys.platform == "darwin":
+        row = add_process_tap_setup_row(obs_tab, row, game_audio_enabled_var)
     process_capture_sync_offset_var = tk.StringVar(
         value=str(obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS))
     )
@@ -9558,6 +9718,8 @@ def main():
 # have allowed the installer.
 ACCESSIBILITY_REQUEST_FLAG = "--request-accessibility"
 ACCESSIBILITY_CHECK_FLAG = "--check-accessibility"
+# Same idea for the Wine & Java game audio tap: macOS asks the app that reads the tap.
+SYSTEM_AUDIO_RECORDING_REQUEST_FLAG = "--request-system-audio-recording"
 ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS = 600
 ACCESSIBILITY_REQUEST_POLL_SECONDS = 2
 
@@ -9601,6 +9763,8 @@ def run_accessibility_request(status_path, timeout=ACCESSIBILITY_REQUEST_TIMEOUT
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == ACCESSIBILITY_REQUEST_FLAG:
         sys.exit(0 if run_accessibility_request(sys.argv[2]) else 1)
+    if len(sys.argv) >= 2 and sys.argv[1] == SYSTEM_AUDIO_RECORDING_REQUEST_FLAG:
+        sys.exit(0 if platform_common.request_system_audio_recording_permission() else 1)
     if len(sys.argv) >= 2 and sys.argv[1] == ACCESSIBILITY_CHECK_FLAG:
         sys.exit(0 if platform_common.accessibility_permission_granted() else 1)
     try:

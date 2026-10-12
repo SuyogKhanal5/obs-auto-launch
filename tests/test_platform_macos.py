@@ -926,3 +926,34 @@ class OpenAccessibilitySettingsTests(unittest.TestCase):
             mock_run.call_args[0][0],
             ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
         )
+
+
+class ProcessAudioTapTests(unittest.TestCase):
+    def test_install_command_quotes_paths_and_restarts_core_audio(self):
+        command = pmac.game_audio_driver_install_command("/Apps/It's Here/OBSAutoRecorderGameAudio.driver")
+        self.assertIn("'/Apps/It'\\''s Here/OBSAutoRecorderGameAudio.driver'", command)
+        self.assertIn("'/Library/Audio/Plug-Ins/HAL/OBSAutoRecorderGameAudio.driver'", command)
+        self.assertTrue(command.endswith("killall coreaudiod"))
+
+    def test_available_needs_macos_14_2_helper_and_device(self):
+        def check(version, helper="/x/process_audio_tap", installed=True):
+            with unittest.mock.patch.object(pmac.platform, "mac_ver", return_value=(version, ("", "", ""), "")), \
+                    unittest.mock.patch.object(pmac, "process_audio_tap_helper_path", return_value=helper), \
+                    unittest.mock.patch.object(pmac, "game_audio_device_installed", return_value=installed):
+                return pmac.process_audio_tap_available()
+        self.assertTrue(check("15.8.1"))
+        self.assertTrue(check("14.2"))
+        self.assertFalse(check("14.1"))
+        self.assertFalse(check("15.0", helper=None))
+        self.assertFalse(check("15.0", installed=False))
+
+    def test_start_passes_every_pid_and_keeps_stdin_open(self):
+        with unittest.mock.patch.object(pmac, "process_audio_tap_helper_path", return_value="/x/process_audio_tap"), \
+                unittest.mock.patch.object(pmac.subprocess, "Popen") as popen:
+            pmac.start_process_audio_tap([7, 9])
+        self.assertEqual(popen.call_args[0][0], ["/x/process_audio_tap", "--pid", "7", "--pid", "9"])
+        self.assertEqual(popen.call_args[1]["stdin"], pmac.subprocess.PIPE)
+
+    def test_start_without_helper_does_nothing(self):
+        with unittest.mock.patch.object(pmac, "process_audio_tap_helper_path", return_value=None):
+            self.assertIsNone(pmac.start_process_audio_tap([7]))

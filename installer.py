@@ -72,6 +72,16 @@ def app_launch_command(install_dir, args=()):
 ACCESSIBILITY_REQUEST_FLAG = "--request-accessibility"
 
 
+# Mirrors autostart_script.SYSTEM_AUDIO_RECORDING_REQUEST_FLAG.
+SYSTEM_AUDIO_RECORDING_REQUEST_FLAG = "--request-system-audio-recording"
+GAME_AUDIO_DRIVER_NAME = "OBSAutoRecorderGameAudio.driver"
+
+
+def installed_game_audio_driver_path(install_dir):
+    """The Game Audio device's driver shipped inside the installed app (macOS)."""
+    return os.path.join(install_dir, APP_BUNDLE_NAME, "Contents", "Resources", GAME_AUDIO_DRIVER_NAME)
+
+
 def accessibility_request_command(install_dir, status_path):
     """Opens the installed app just to ask macOS for its Accessibility permission (see
     autostart_script.run_accessibility_request); it writes "granted" to status_path once allowed."""
@@ -986,6 +996,58 @@ def main():
 
     accessibility_btn.config(command=request_accessibility)
 
+    # macOS only, when game audio isolation was chosen: Wine games and Java Minecraft need the
+    # Game Audio device to get their own track (see platform_macos's process tap notes). Offered
+    # here, not done silently: it asks for an admin password and a system-audio permission.
+    process_tap_row = tk.Frame(finish_page, bg=PAGE_BG)
+    tk.Label(
+        process_tap_row,
+        text=(
+            "Optional: record Wine games (like Wizard101) and Java Minecraft on the Game Audio "
+            "track too. This installs a small \"OBS Auto Recorder Game Audio\" device (macOS asks "
+            "for your password) and asks to let the app record system audio."
+        ),
+        bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
+    ).pack(fill="x", pady=(0, 6))
+    process_tap_buttons = tk.Frame(process_tap_row, bg=PAGE_BG)
+    process_tap_buttons.pack(fill="x")
+    process_tap_btn = tk.Button(process_tap_buttons, text="Set Up Wine & Java Game Audio...")
+    process_tap_btn.pack(side="left")
+    process_tap_status = tk.Label(process_tap_buttons, text="", bg=PAGE_BG, font=("Segoe UI", 10))
+    process_tap_status.pack(side="left", padx=(10, 0))
+
+    def set_up_process_tap():
+        install_dir = current.get("install_dir")
+        if not install_dir:
+            return
+        process_tap_btn.config(state="disabled")
+        process_tap_status.config(text="Waiting for your password...", fg=PAGE_FG)
+
+        def worker():
+            installed = platform_common.game_audio_device_installed() or platform_common.install_game_audio_device(
+                installed_game_audio_driver_path(install_dir)
+            )
+            if installed:
+                try:
+                    subprocess.Popen(app_launch_command(install_dir, [SYSTEM_AUDIO_RECORDING_REQUEST_FLAG]))
+                except OSError:
+                    pass
+
+            def finish():
+                if installed:
+                    process_tap_status.config(
+                        text="✓ Installed -- allow \"record system audio\" if macOS asks", fg="#15803d",
+                    )
+                else:
+                    process_tap_btn.config(state="normal")
+                    process_tap_status.config(text="Not installed (cancelled or failed).", fg="#b91c1c")
+
+            root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    process_tap_btn.config(command=set_up_process_tap)
+
     launch_var = tk.BooleanVar(value=True)
     launch_check = tk.Checkbutton(finish_page, text=f"Launch {APP_NAME} now", variable=launch_var, bg=PAGE_BG)
     launch_check.pack(anchor="w", pady=(8, 0))
@@ -1198,6 +1260,8 @@ def main():
         if sys.platform == "darwin":
             accessibility_row.pack(fill="x", pady=(0, 12), before=launch_check)
             request_accessibility()
+            if game_audio_var.get() and result["password"] is not None:
+                process_tap_row.pack(fill="x", pady=(0, 12), before=launch_check)
         launch_check.pack(anchor="w", pady=(8, 0))
         show("finish")
         show_nav(back=False, next_=True, cancel=False)
@@ -1210,6 +1274,7 @@ def main():
         launch_check.pack_forget()
         password_row.pack_forget()
         accessibility_row.pack_forget()
+        process_tap_row.pack_forget()
         current["install_dir"] = None
         show("finish")
         show_nav(back=False, next_=True, cancel=False)
