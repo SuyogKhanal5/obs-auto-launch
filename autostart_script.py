@@ -4918,6 +4918,19 @@ DARK_BG = "#2b2b2b"
 DARK_FG = "#e6e6e6"
 DARK_ENTRY_BG = "#3c3c3c"
 DARK_MUTED_FG = "#888888"
+DARK_BUTTON_HOVER_BG = "#4a4a4a"
+
+
+def dark_button(parent, **kwargs):
+    """A button for the dark-themed windows. On macOS that's a ClickableLabel: Tk draws native
+    buttons there, which ignore bg and always draw a light gray bezel, so DARK_FG text on them
+    was nearly unreadable (confirmed live). Elsewhere a plain tk.Button takes the colors."""
+    kwargs.setdefault("bg", DARK_ENTRY_BG)
+    kwargs.setdefault("fg", DARK_FG)
+    kwargs.setdefault("activebackground", DARK_BUTTON_HOVER_BG if sys.platform == "darwin" else DARK_ENTRY_BG)
+    kwargs.setdefault("activeforeground", DARK_FG)
+    button_cls = ClickableLabel if sys.platform == "darwin" else tk.Button
+    return button_cls(parent, **kwargs)
 
 
 class ClickableLabel(tk.Label):
@@ -5069,7 +5082,7 @@ def add_process_tap_setup_row(parent, row, game_audio_enabled_var):
     status, a setup button, and an offer to set it up when game audio isolation is turned on."""
     status_label = tk.Label(parent, text=process_tap_setup_status_text(), anchor="w", fg=DARK_FG, bg=DARK_BG)
     status_label.grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 2))
-    setup_button = tk.Button(
+    setup_button = dark_button(
         parent, text="Set Up Wine & Java Game Audio...", bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     )
@@ -5125,7 +5138,7 @@ def add_browse_button(parent, row, var, mode="file", filetypes=None):
         if path:
             var.set(os.path.normpath(path))
 
-    tk.Button(
+    dark_button(
         parent, text="Browse...", command=browse, bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     ).grid(row=row, column=2, padx=(0, 10), pady=4)
@@ -5194,8 +5207,8 @@ def open_process_picker(parent, on_add, multiselect=True, already_selected=None)
 
     button_bar = tk.Frame(picker)
     button_bar.pack(fill="x", padx=10, pady=10)
-    tk.Button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
-    tk.Button(button_bar, text="Add Selected" if multiselect else "Select", command=add_selected).pack(
+    dark_button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
+    dark_button(button_bar, text="Add Selected" if multiselect else "Select", command=add_selected).pack(
         side="right", padx=8
     )
     listbox.bind("<Double-Button-1>", lambda e: add_selected())
@@ -5321,8 +5334,8 @@ def open_common_games_picker(parent, insert_unique, current_watched_lower, add_w
 
     button_bar = tk.Frame(picker)
     button_bar.pack(fill="x", padx=10, pady=10)
-    tk.Button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
-    tk.Button(button_bar, text="Add Selected", command=add_selected).pack(side="right", padx=8)
+    dark_button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
+    dark_button(button_bar, text="Add Selected", command=add_selected).pack(side="right", padx=8)
     listbox.bind("<Double-Button-1>", lambda e: add_selected())
     filter_entry.bind("<Return>", lambda e: add_selected())
 
@@ -5375,11 +5388,6 @@ def build_watched_games_editor(parent, initial_games, on_pick_common=None):
             already_selected=current_watched_lower,
         )
 
-    def dark_button(parent_, **kwargs):
-        return tk.Button(
-            parent_, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG, **kwargs
-        )
-
     dark_button(controls, text="Add", command=add_game).pack(fill="x")
     dark_button(controls, text="Remove Selected", command=remove_selected).pack(fill="x", pady=(4, 0))
     dark_button(controls, text="Pick Running...", command=pick_from_running).pack(fill="x", pady=(4, 0))
@@ -5391,11 +5399,6 @@ def build_watched_games_editor(parent, initial_games, on_pick_common=None):
 
 
 def build_watched_windows_editor(parent, initial_rows):
-    def dark_button(parent_, **kwargs):
-        return tk.Button(
-            parent_, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG, **kwargs
-        )
-
     tk.Label(
         parent,
         text=(
@@ -5534,8 +5537,8 @@ def open_obs_input_picker(parent, get_ws_config, on_pick):
 
     button_bar = tk.Frame(picker)
     button_bar.pack(fill="x", padx=10, pady=(0, 10))
-    tk.Button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
-    tk.Button(button_bar, text="Select", command=select).pack(side="right", padx=8)
+    dark_button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
+    dark_button(button_bar, text="Select", command=select).pack(side="right", padx=8)
     listbox.bind("<Double-Button-1>", lambda e: select())
 
 
@@ -5657,7 +5660,7 @@ def build_custom_keybinds_editor(parent, initial_rows):
             rows.remove(entry)
             renumber()
 
-        remove_btn = tk.Button(
+        remove_btn = dark_button(
             table, text="Remove", command=remove, bg=DARK_ENTRY_BG, fg=DARK_FG,
             activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
         )
@@ -5671,7 +5674,7 @@ def build_custom_keybinds_editor(parent, initial_rows):
             kb.get("modifiers", []), kb.get("key", "S"),
         )
 
-    tk.Button(
+    dark_button(
         parent, text="+ Add Keybind", command=lambda: add_row(), bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     ).pack(anchor="w", padx=10, pady=(4, 10))
@@ -5918,16 +5921,11 @@ def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_ap
 
     button_bar = tk.Frame(dialog)
     button_bar.pack(fill="x", padx=10, pady=10, side="bottom")
-    tk.Button(button_bar, text="Cancel", command=dialog.destroy).pack(side="right")
-    tk.Button(button_bar, text="Apply", command=do_apply).pack(side="right", padx=8)
+    dark_button(button_bar, text="Cancel", command=dialog.destroy).pack(side="right")
+    dark_button(button_bar, text="Apply", command=do_apply).pack(side="right", padx=8)
 
 
 def build_multi_track_audio_editor(parent, initial_rows, get_ws_config):
-    def dark_button(parent_, **kwargs):
-        return tk.Button(
-            parent_, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG, **kwargs
-        )
-
     tk.Label(
         parent, text="Which input feeds which recording track, in the dedicated profile below", anchor="w",
         bg=DARK_BG, fg=DARK_FG,
@@ -6380,7 +6378,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
     )
     add_labeled_entry(obs_tab, row, "Audio capture sync offset (ms)", process_capture_sync_offset_var, width=10)
     row += 1
-    calibrate_button = tk.Button(
+    calibrate_button = dark_button(
         obs_tab, text="Calibrate Audio Sync...", bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     )
@@ -6517,7 +6515,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             on_quick_setup_apply,
         )
 
-    tk.Button(
+    dark_button(
         obs_tab, text="Quick Setup...", command=open_quick_setup, bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     ).grid(row=row, column=0, sticky="w", padx=10, pady=(0, 6))
@@ -6680,7 +6678,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 parent=post_tab,
             )
 
-    tk.Button(
+    dark_button(
         transcode_options_frame, text="Auto-detect ffmpeg", command=detect_ffmpeg, bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     ).grid(row=opt_row, column=0, sticky="w", padx=10, pady=(0, 6))
@@ -6710,7 +6708,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
         transcode_args_var.set(" ".join(MKV_TO_MP4_PRESERVE_TRACKS_ARGS))
         transcode_output_extension_var.set(MKV_TO_MP4_PRESERVE_TRACKS_EXTENSION)
 
-    tk.Button(
+    dark_button(
         transcode_options_frame, text="Use MKV → MP4 preset (preserve every audio track)",
         command=use_mkv_to_mp4_preset, bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
@@ -6819,7 +6817,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
         threading.Thread(target=worker, daemon=True).start()
 
     if has_winget():
-        winget_install_button = tk.Button(
+        winget_install_button = dark_button(
             ffmpeg_missing_frame, text="Install ffmpeg via winget", command=install_ffmpeg_via_winget,
             bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
         )
@@ -7049,7 +7047,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
         threading.Thread(target=worker, daemon=True).start()
 
     if has_winget():
-        winget_install_vlc_button = tk.Button(
+        winget_install_vlc_button = dark_button(
             vlc_missing_frame, text="Install VLC via winget", command=install_vlc_via_winget,
             bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
         )
@@ -7467,10 +7465,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             root.destroy()
 
     def dark_settings_button(**kwargs):
-        return tk.Button(
-            button_bar, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
-            **kwargs
-        )
+        return dark_button(button_bar, **kwargs)
 
     button_bar = tk.Frame(root, bg=DARK_BG)
     button_bar.pack(fill="x", padx=10, pady=10)
@@ -7749,7 +7744,7 @@ def _open_vlc_missing_window(master_root, on_close):
         threading.Thread(target=worker, daemon=True).start()
 
     if has_winget():
-        install_button = tk.Button(frame, text="Install VLC via winget", command=install_via_winget)
+        install_button = dark_button(frame, text="Install VLC via winget", command=install_via_winget)
         install_button.pack(anchor="w", pady=(0, 8))
 
     download_link = tk.Label(
@@ -7759,7 +7754,7 @@ def _open_vlc_missing_window(master_root, on_close):
     download_link.pack(anchor="w")
     download_link.bind("<Button-1>", lambda _event: webbrowser.open(VLC_DOWNLOAD_URL))
 
-    tk.Button(root, text="Close", command=root.destroy).pack(anchor="e", padx=16, pady=16)
+    dark_button(root, text="Close", command=root.destroy).pack(anchor="e", padx=16, pady=16)
 
 
 def _run_clip_editor(master_root, config, recording_state, on_close, icon, editor_state):
