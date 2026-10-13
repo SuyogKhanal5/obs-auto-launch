@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
@@ -67,6 +68,38 @@ class RenameWithGamePrefixTests(unittest.TestCase):
             src = self.make_file(tmp)
             result = a.rename_with_game_prefix(src, "Warframe", is_replay=False)
             self.assertEqual(os.path.basename(result), "Warframe - recording.mkv")
+
+    def test_retries_past_a_transient_lock_and_eventually_succeeds(self):
+        # OBS can still hold its own handle on the file for a while after stop_record() returns
+        # (confirmed live: a game crashing or being force-quit made this noticeably worse) --
+        # a few early WinError 32s shouldn't be treated as a permanent failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.make_file(tmp)
+            real_rename = os.rename
+            attempts = {"count": 0}
+
+            def flaky_rename(old, new):
+                attempts["count"] += 1
+                if attempts["count"] < 4:
+                    raise OSError("The process cannot access the file because it is being used by another process")
+                real_rename(old, new)
+
+            with patch.object(a.os, "rename", side_effect=flaky_rename), patch.object(a.time, "sleep"):
+                result = a.rename_with_game_prefix(src, "Warframe")
+            self.assertEqual(os.path.basename(result), "Warframe - recording.mkv")
+            self.assertTrue(os.path.isfile(result))
+            self.assertEqual(attempts["count"], 4)
+
+    def test_gives_up_after_the_full_retry_budget_and_keeps_the_original_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.make_file(tmp)
+            with patch.object(a.os, "rename", side_effect=OSError("locked")), patch.object(a.time, "sleep") as mock_sleep:
+                result = a.rename_with_game_prefix(src, "Warframe")
+            self.assertEqual(result, src)
+            self.assertTrue(os.path.isfile(src))
+            # 20 attempts, 19 sleeps between them -- the fix this guards: the old budget (5
+            # attempts) was confirmed live to not be generous enough for a real crash/force-quit.
+            self.assertEqual(mock_sleep.call_count, 19)
 
 
 if __name__ == "__main__":

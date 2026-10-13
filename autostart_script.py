@@ -4392,7 +4392,15 @@ def rename_with_game_prefix(
             target_dir = directory
 
     new_path = os.path.join(target_dir, new_name)
-    retries, delay = 5, 1
+    # Confirmed live (3 separate real sessions, all ending in the game crashing or being force-
+    # quit): OBS can still hold its own handle on output_path for well over 5 seconds after
+    # stop_record() has already returned -- WinError 32 ("used by another process") on every one
+    # of the old 5 retries (5s total), leaving the recording permanently unrenamed since nothing
+    # ever retries this later. A crashed/force-quit game seems to make OBS's own finalization
+    # (flushing the container's trailing index/chapter data) noticeably slower than a clean exit,
+    # though the exact worst case isn't known -- retries bumped to a much more generous budget
+    # instead of a value only proven to just barely not be enough.
+    retries, delay = 20, 1.5
     for attempt in range(1, retries + 1):
         try:
             os.rename(output_path, new_path)
