@@ -25,7 +25,10 @@ class LaunchObsTests(unittest.TestCase):
 
     def test_falls_back_to_discovery_when_configured_path_is_stale(self):
         # Mirrors a real config.json carried over from another OS -- e.g. a literal Windows path
-        # opened as-is on macOS/Linux, which will never exist there.
+        # opened as-is on macOS/Linux, which will never exist there. os.path.isfile is mocked
+        # rather than relying on the configured path genuinely not existing -- confirmed live
+        # this failed on a real Windows dev machine that actually has OBS installed at this
+        # exact standard default path, which the literal string alone can't rule out.
         with tempfile.TemporaryDirectory() as tmp:
             real_obs_path = os.path.join(tmp, "OBS")
             open(real_obs_path, "w").close()
@@ -35,6 +38,7 @@ class LaunchObsTests(unittest.TestCase):
             }
             with unittest.mock.patch.object(a.subprocess, "Popen") as mock_popen, \
                  unittest.mock.patch.object(a, "clear_obs_crash_sentinel"), \
+                 unittest.mock.patch.object(a.os.path, "isfile", return_value=False), \
                  unittest.mock.patch.object(
                      a.platform_common, "find_obs_executable", return_value=real_obs_path
                  ) as mock_find:
@@ -47,6 +51,7 @@ class LaunchObsTests(unittest.TestCase):
     def test_returns_false_when_nothing_can_be_found_anywhere(self):
         obs_config = {"path": r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"}
         with unittest.mock.patch.object(a.subprocess, "Popen") as mock_popen, \
+             unittest.mock.patch.object(a.os.path, "isfile", return_value=False), \
              unittest.mock.patch.object(
                  a.platform_common, "find_obs_executable", return_value=None
              ):

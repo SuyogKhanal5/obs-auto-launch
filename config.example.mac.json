@@ -116,6 +116,7 @@
         "vlc_path": "",
         "auto_fix_audio_sync": false,
         "default_gains_db": {},
+        "default_mono_sources": [],
         "default_target_size_mb": 20
     },
     "obs": {
