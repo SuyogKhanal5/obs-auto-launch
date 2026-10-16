@@ -201,9 +201,10 @@ def epic_manifest_dir():
 def get_window_titles():
     """Maps each visible top-level window's owning PID to its titles via Quartz's
     CGWindowListCopyWindowInfo -- returns metadata (including title and owning PID) for every
-    window currently on screen; unlike some other macOS window-introspection APIs, this
-    particular call needs no special Accessibility/Screen-Recording permission grant from the
-    user. Returns {} (never raises) if pyobjc isn't installed, or for any other reason this can't
+    window currently on screen. Titles of other apps' windows need this app to have Screen
+    Recording permission -- without it every title comes back empty (confirmed live: 28 windows,
+    0 titles), so window-title rules never match; see screen_recording_permission_granted.
+    Returns {} (never raises) if pyobjc isn't installed, or for any other reason this can't
     complete -- window-title-based game detection is one optional input to a bigger detection
     pipeline (see autostart_script.py's find_target_process), not something worth this app
     crashing over.
@@ -626,6 +627,11 @@ def _find_libtk_dylib():
         os.path.join(getattr(sys, "base_prefix", ""), "lib", lib_name),
         os.path.join(sys.prefix, "lib", lib_name),
     ]
+    if getattr(sys, "frozen", False):
+        # The packaged app keeps it directly in Contents/Frameworks (sys._MEIPASS), with no lib/
+        # folder -- confirmed live: missing it here left the packaged clip editor audio-only.
+        candidates.insert(0, os.path.join(getattr(sys, "_MEIPASS", ""), lib_name))
+        candidates.insert(1, os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "Frameworks", lib_name))
     found = ctypes.util.find_library(lib_name)
     if found:
         candidates.append(found)
@@ -709,7 +715,10 @@ def embed_video_player(player, tk_widget):
     root_view_ptr = _resolve_root_ns_view(tk_widget)
     if not root_view_ptr:
         logging.warning("Falling back to audio-only playback (no video preview) for this clip.")
-        player.set_xwindow(tk_widget.winfo_id())
+        # Without anywhere to draw, VLC logged a "No drawable-nsobject found" error several times
+        # per frame (confirmed live: thousands of log lines); the caller opens media with
+        # ":no-video" while this is set, so VLC doesn't try.
+        player.oar_audio_only = True
         return
 
     try:
@@ -836,9 +845,16 @@ def resolve_bundle_identifier(exe_path):
     if not exe_path:
         return None
     path = os.path.normpath(exe_path)
+    exe = path
     while True:
         parent = os.path.dirname(path)
         if path.endswith(".app"):
+            # Only the bundle's own executables (Contents/MacOS) are that app for capture. A
+            # program it merely ships elsewhere isn't: Wizard101.app runs its game as Wine's
+            # Contents/SharedSupport/.../wine64-preloader, which macOS lists under no bundle id --
+            # resolving it to com.kingsisle.wizard101 left Game Audio silent (confirmed live).
+            if not exe.startswith(os.path.join(path, "Contents", "MacOS") + os.sep):
+                return None
             plist_path = os.path.join(path, "Contents", "Info.plist")
             try:
                 with open(plist_path, "rb") as f:
@@ -1114,6 +1130,26 @@ def open_system_audio_recording_settings():
         subprocess.run(["open", SYSTEM_AUDIO_RECORDING_SETTINGS_URL], check=False)
     except Exception as exc:
         logging.warning("Could not open System Audio Recording settings: %s", exc)
+
+
+def screen_recording_permission_granted():
+    """True if this app may see other apps' window titles (macOS's Screen Recording permission;
+    reading titles needs it -- confirmed live, see autostart_script.SCREEN_RECORDING_REQUEST_FLAG)."""
+    try:
+        import Quartz
+        return bool(Quartz.CGPreflightScreenCaptureAccess())
+    except Exception:
+        return True  # unknown -- don't nag
+
+
+def request_screen_recording_permission():
+    """Shows macOS's Screen Recording prompt for this app and adds it to that list. macOS applies
+    a grant only after the app restarts."""
+    try:
+        import Quartz
+        Quartz.CGRequestScreenCaptureAccess()
+    except Exception:
+        logging.exception("Could not show the macOS Screen Recording permission prompt.")
 
 
 def open_accessibility_settings():

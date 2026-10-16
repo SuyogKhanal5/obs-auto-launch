@@ -137,7 +137,7 @@ class RunAccessibilityRequestTests(unittest.TestCase):
             path = os.path.join(tmp, "status")
             # The wait re-checks in a fresh process: this one keeps its first answer.
             with patch.object(a.platform_common, "accessibility_permission_granted", return_value=False), \
-                    patch.object(a, "accessibility_granted_in_fresh_process", side_effect=[False, True]), \
+                    patch.object(a, "permission_granted_in_fresh_process", side_effect=[False, True]), \
                     patch.object(a.platform_common, "request_accessibility_permission") as request, \
                     patch.object(a.time, "sleep"):
                 self.assertTrue(a.run_accessibility_request(path))
@@ -148,7 +148,7 @@ class RunAccessibilityRequestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "status")
             with patch.object(a.platform_common, "accessibility_permission_granted", return_value=False), \
-                    patch.object(a, "accessibility_granted_in_fresh_process", return_value=False), \
+                    patch.object(a, "permission_granted_in_fresh_process", return_value=False), \
                     patch.object(a.platform_common, "request_accessibility_permission"), \
                     patch.object(a.time, "sleep"):
                 self.assertFalse(a.run_accessibility_request(path, timeout=0))
@@ -166,3 +166,24 @@ class RunAccessibilityRequestTests(unittest.TestCase):
     def test_frozen_app_checks_by_running_itself(self):
         with patch.object(a.sys, "frozen", True, create=True), patch.object(a.sys, "executable", "/X.app/Contents/MacOS/X"):
             self.assertEqual(a.accessibility_check_command(), ["/X.app/Contents/MacOS/X", a.ACCESSIBILITY_CHECK_FLAG])
+
+
+class ScreenRecordingRequestTests(unittest.TestCase):
+    """The installer asks the installed app for Screen Recording the same way as Accessibility:
+    window titles (GeForce NOW, Minecraft rules) are hidden from apps without it."""
+
+    def test_prompts_then_waits_using_the_screen_recording_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status")
+            with patch.object(a.platform_common, "screen_recording_permission_granted", return_value=False), \
+                    patch.object(a.platform_common, "request_screen_recording_permission") as request, \
+                    patch.object(a, "permission_granted_in_fresh_process", side_effect=[False, True]) as fresh, \
+                    patch.object(a.time, "sleep"):
+                self.assertTrue(a.run_permission_request(path, "screen_recording"))
+            request.assert_called_once()
+            self.assertEqual(fresh.call_args[0][0], "screen_recording")
+            self.assertTrue(os.path.isfile(path))
+
+    def test_check_command_uses_the_screen_recording_flag(self):
+        with patch.object(a.sys, "frozen", True, create=True), patch.object(a.sys, "executable", "/X.app/Contents/MacOS/X"):
+            self.assertEqual(a.permission_check_command("screen_recording"), ["/X.app/Contents/MacOS/X", a.SCREEN_RECORDING_CHECK_FLAG])

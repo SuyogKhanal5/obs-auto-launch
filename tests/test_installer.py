@@ -350,3 +350,16 @@ class UninstallGameAudioDeviceTests(unittest.TestCase):
         result, uninstall = self.run_uninstall(installed=False)
         uninstall.assert_not_called()
         self.assertFalse(result["game_audio_device_left"])
+
+
+class PermissionRequestCommandTests(unittest.TestCase):
+    def test_screen_recording_request_opens_a_new_copy_with_its_flag(self):
+        with patch.object(installer.sys, "platform", "darwin"):
+            command = installer.app_permission_request_command("/Apps/OAR", "screen_recording", "/tmp/s")
+        self.assertEqual(command[-2:], ["--request-screen-recording", "/tmp/s"])
+        self.assertIn("-n", command)
+
+    def test_flags_match_the_app(self):
+        source = open(os.path.join(os.path.dirname(installer.__file__), "autostart_script.py"), encoding="utf-8").read()
+        self.assertIn(f'SCREEN_RECORDING_REQUEST_FLAG = "{installer.PERMISSION_REQUEST_FLAGS["screen_recording"]}"', source)
+        self.assertIn(f'ACCESSIBILITY_REQUEST_FLAG = "{installer.PERMISSION_REQUEST_FLAGS["accessibility"]}"', source)

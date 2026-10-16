@@ -372,7 +372,7 @@ class EmbedVideoPlayerTests(unittest.TestCase):
         player.set_nsobject.assert_called_once_with(999999)
         player.set_xwindow.assert_not_called()
 
-    def test_falls_back_to_set_xwindow_when_libtk_cannot_be_found(self):
+    def test_falls_back_to_audio_only_when_libtk_cannot_be_found(self):
         player = unittest.mock.Mock()
         widget = unittest.mock.Mock()
         widget.winfo_id.return_value = 4242
@@ -381,10 +381,12 @@ class EmbedVideoPlayerTests(unittest.TestCase):
             with self.assertLogs(level="WARNING"):
                 pmac.embed_video_player(player, widget)
 
-        player.set_xwindow.assert_called_once_with(4242)
+        # Audio-only: no drawing target for VLC (it logged errors every frame), media opens with :no-video.
+        player.set_xwindow.assert_not_called()
+        self.assertTrue(player.oar_audio_only)
         player.set_nsobject.assert_not_called()
 
-    def test_falls_back_to_set_xwindow_when_loading_libtk_fails(self):
+    def test_falls_back_to_audio_only_when_loading_libtk_fails(self):
         player = unittest.mock.Mock()
         widget = unittest.mock.Mock()
         widget.winfo_id.return_value = 4242
@@ -395,10 +397,12 @@ class EmbedVideoPlayerTests(unittest.TestCase):
             with self.assertLogs(level="WARNING"):
                 pmac.embed_video_player(player, widget)
 
-        player.set_xwindow.assert_called_once_with(4242)
+        # Audio-only: no drawing target for VLC (it logged errors every frame), media opens with :no-video.
+        player.set_xwindow.assert_not_called()
+        self.assertTrue(player.oar_audio_only)
         player.set_nsobject.assert_not_called()
 
-    def test_falls_back_to_set_xwindow_when_ns_view_is_null(self):
+    def test_falls_back_to_audio_only_when_ns_view_is_null(self):
         player = unittest.mock.Mock()
         widget = unittest.mock.Mock()
         widget.winfo_id.return_value = 4242
@@ -410,7 +414,9 @@ class EmbedVideoPlayerTests(unittest.TestCase):
             mock_cdll.LoadLibrary.return_value = fake_lib
             pmac.embed_video_player(player, widget)
 
-        player.set_xwindow.assert_called_once_with(4242)
+        # Audio-only: no drawing target for VLC (it logged errors every frame), media opens with :no-video.
+        player.set_xwindow.assert_not_called()
+        self.assertTrue(player.oar_audio_only)
         player.set_nsobject.assert_not_called()
 
 
@@ -763,6 +769,17 @@ class ResolveBundleIdentifierTests(unittest.TestCase):
     def test_none_when_exe_path_is_none(self):
         self.assertIsNone(pmac.resolve_bundle_identifier(None))
 
+    def test_none_for_a_program_the_app_only_ships(self):
+        # Wizard101.app runs its game through Wine's preloader in Contents/SharedSupport; macOS
+        # doesn't list that process under the app's bundle id, so it must go to the process tap.
+        exe_path = self.make_app_bundle("Wizard101", "com.kingsisle.wizard101")
+        wine_dir = os.path.join(os.path.dirname(os.path.dirname(exe_path)), "SharedSupport", "wizard101", "Wizard101")
+        os.makedirs(wine_dir)
+        preloader = os.path.join(wine_dir, "wine64-preloader")
+        open(preloader, "w").close()
+        self.assertIsNone(pmac.resolve_bundle_identifier(preloader))
+        self.assertEqual(pmac.resolve_bundle_identifier(exe_path), "com.kingsisle.wizard101")
+
     def test_none_when_exe_path_is_not_inside_an_app_bundle(self):
         bare_exe = os.path.join(self.tmp_dir, "bare-binary")
         with open(bare_exe, "w") as f:
@@ -1020,3 +1037,18 @@ class UninstallGameAudioDeviceTests(unittest.TestCase):
         with unittest.mock.patch.object(pmac, "game_audio_device_installed", return_value=True), \
                 unittest.mock.patch.object(pmac.subprocess, "run", return_value=unittest.mock.Mock(returncode=1, stderr="User canceled.")):
             self.assertFalse(pmac.uninstall_game_audio_device())
+
+
+
+class FindLibtkInPackagedAppTests(unittest.TestCase):
+    def test_packaged_app_finds_it_directly_in_frameworks(self):
+        # Confirmed live: the packaged app has Contents/Frameworks/libtk8.6.dylib, with no lib/.
+        with tempfile.TemporaryDirectory() as tmp:
+            frameworks = os.path.join(tmp, "Contents", "Frameworks")
+            os.makedirs(frameworks)
+            lib = os.path.join(frameworks, f"libtk{pmac.tkinter.TkVersion}.dylib")
+            open(lib, "w").close()
+            with unittest.mock.patch.object(pmac.sys, "frozen", True, create=True), \
+                    unittest.mock.patch.object(pmac.sys, "_MEIPASS", frameworks, create=True), \
+                    unittest.mock.patch.object(pmac.sys, "executable", os.path.join(tmp, "Contents", "MacOS", "App")):
+                self.assertEqual(pmac._find_libtk_dylib(), lib)

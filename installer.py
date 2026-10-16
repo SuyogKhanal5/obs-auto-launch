@@ -82,6 +82,19 @@ def installed_game_audio_driver_path(install_dir):
     return os.path.join(install_dir, APP_BUNDLE_NAME, "Contents", "Resources", GAME_AUDIO_DRIVER_NAME)
 
 
+# Mirrors autostart_script's permission request flags.
+PERMISSION_REQUEST_FLAGS = {
+    "accessibility": "--request-accessibility",
+    "screen_recording": "--request-screen-recording",
+}
+
+
+def app_permission_request_command(install_dir, kind, status_path):
+    """Opens the installed app just to ask macOS for one of its permissions (see
+    autostart_script.run_permission_request); it writes "granted" to status_path once allowed."""
+    return app_launch_command(install_dir, [PERMISSION_REQUEST_FLAGS[kind], status_path])
+
+
 def accessibility_request_command(install_dir, status_path):
     """Opens the installed app just to ask macOS for its Accessibility permission (see
     autostart_script.run_accessibility_request); it writes "granted" to status_path once allowed."""
@@ -990,60 +1003,79 @@ def main():
 
     tk.Button(password_row, text="Copy", command=copy_password).pack(side="left", padx=(8, 8))
     password_copied_label.pack(side="left")
-    # macOS only: Accessibility (custom keybinds such as Add Marker, the clip editor's space bar)
-    # is granted to the installed app itself, so it's requested by opening that app -- see
-    # accessibility_request_command. Shown after install because the app has to exist first.
-    accessibility_row = tk.Frame(finish_page, bg=PAGE_BG)
-    tk.Label(
-        accessibility_row,
-        text=(
-            f"Allow {APP_NAME} in Accessibility so keybinds (like Add Marker) and the clip "
-            "editor's space bar work. macOS will ask -- click \"Open System Settings\", then turn "
-            f"on \"{APP_NAME}\"."
-        ),
-        bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
-    ).pack(fill="x", pady=(0, 6))
-    accessibility_buttons = tk.Frame(accessibility_row, bg=PAGE_BG)
-    accessibility_buttons.pack(fill="x")
-    accessibility_btn = tk.Button(accessibility_buttons, text="Allow Accessibility...")
-    accessibility_btn.pack(side="left")
-    accessibility_status = tk.Label(accessibility_buttons, text="", bg=PAGE_BG, font=("Segoe UI", 10))
-    accessibility_status.pack(side="left", padx=(10, 0))
-    accessibility_state = {"status_path": None}
+    # macOS only: permissions granted to the installed app itself, so each is requested by
+    # opening that app (see app_permission_request_command). Shown after install because the
+    # app has to exist first. Accessibility: custom keybinds (Add Marker), the clip editor's space
+    # bar. Screen Recording: reading other apps' window titles, which window-title rules (GeForce
+    # NOW, Minecraft) depend on -- OBS's own Screen Recording grant is separate.
+    def make_permission_row(kind, text, button_text, open_settings, on_granted=None):
+        row = tk.Frame(finish_page, bg=PAGE_BG)
+        tk.Label(
+            row, text=text, bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
+        ).pack(fill="x", pady=(0, 6))
+        buttons = tk.Frame(row, bg=PAGE_BG)
+        buttons.pack(fill="x")
+        button = tk.Button(buttons, text=button_text)
+        button.pack(side="left")
+        status = tk.Label(buttons, text="", bg=PAGE_BG, font=("Segoe UI", 10))
+        status.pack(side="left", padx=(10, 0))
+        state = {"status_path": None}
 
-    def watch_accessibility():
-        status_path = accessibility_state["status_path"]
-        if status_path and os.path.isfile(status_path):
-            accessibility_status.config(text="✓ Allowed", fg="#15803d")
-            accessibility_btn.config(state="disabled")
+        def watch():
+            status_path = state["status_path"]
+            if status_path and os.path.isfile(status_path):
+                status.config(text="\u2713 Allowed", fg="#15803d")
+                button.config(state="disabled")
+                try:
+                    os.remove(status_path)
+                except OSError:
+                    pass
+                if on_granted:
+                    on_granted()
+                return
+            root.after(1000, watch)
+
+        def request():
+            install_dir = current.get("install_dir")
+            if not install_dir:
+                return
+            status_path = os.path.join(tempfile.gettempdir(), f"obsautorecorder-{kind}-{os.getpid()}")
             try:
                 os.remove(status_path)
             except OSError:
                 pass
-            return
-        root.after(1000, watch_accessibility)
+            try:
+                subprocess.Popen(app_permission_request_command(install_dir, kind, status_path))
+            except OSError:
+                status.config(text="Couldn't open the app -- allow it in System Settings.", fg="#b91c1c")
+                open_settings()
+                return
+            status.config(text="Waiting for permission...", fg=PAGE_FG)
+            if state["status_path"] is None:
+                root.after(1000, watch)
+            state["status_path"] = status_path
 
-    def request_accessibility():
-        install_dir = current.get("install_dir")
-        if not install_dir:
-            return
-        status_path = os.path.join(tempfile.gettempdir(), f"obsautorecorder-accessibility-{os.getpid()}")
-        try:
-            os.remove(status_path)
-        except OSError:
-            pass
-        try:
-            subprocess.Popen(accessibility_request_command(install_dir, status_path))
-        except OSError:
-            accessibility_status.config(text="Couldn't open the app -- allow it in System Settings.", fg="#b91c1c")
-            platform_common.open_accessibility_settings()
-            return
-        accessibility_status.config(text="Waiting for permission...", fg=PAGE_FG)
-        if accessibility_state["status_path"] is None:
-            root.after(1000, watch_accessibility)
-        accessibility_state["status_path"] = status_path
+        button.config(command=request)
+        return row, request
 
-    accessibility_btn.config(command=request_accessibility)
+    screen_recording_row, request_screen_recording = make_permission_row(
+        "screen_recording",
+        f"Allow {APP_NAME} in Screen & System Audio Recording so it can see window titles -- "
+        "needed to detect games like GeForce NOW by their window. It never records your screen "
+        "itself (OBS does). macOS will ask; turn it on, and it takes effect when the app starts.",
+        "Allow Screen Recording...",
+        platform_common.open_screen_recording_settings,
+    )
+    accessibility_row, request_accessibility = make_permission_row(
+        "accessibility",
+        f"Allow {APP_NAME} in Accessibility so keybinds (like Add Marker) and the clip "
+        "editor's space bar work. macOS will ask -- click \"Open System Settings\", then turn "
+        f"on \"{APP_NAME}\".",
+        "Allow Accessibility...",
+        platform_common.open_accessibility_settings,
+        # One macOS prompt at a time: Screen Recording is asked once Accessibility is done.
+        on_granted=lambda: request_screen_recording(),
+    )
 
     # macOS only, when game audio isolation was chosen: Wine games and Java Minecraft need the
     # Game Audio device to get their own track (see platform_macos's process tap notes). Offered
@@ -1308,6 +1340,7 @@ def main():
         current["install_dir"] = dir_var.get()
         if sys.platform == "darwin":
             accessibility_row.pack(fill="x", pady=(0, 12), before=launch_check)
+            screen_recording_row.pack(fill="x", pady=(0, 12), before=launch_check)
             request_accessibility()
             if game_audio_var.get() and result["password"] is not None:
                 process_tap_row.pack(fill="x", pady=(0, 12), before=launch_check)
@@ -1330,6 +1363,7 @@ def main():
         launch_check.pack_forget()
         password_row.pack_forget()
         accessibility_row.pack_forget()
+        screen_recording_row.pack_forget()
         process_tap_row.pack_forget()
         current["install_dir"] = None
         show("finish")

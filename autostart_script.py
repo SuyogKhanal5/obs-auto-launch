@@ -5311,11 +5311,31 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     notifications_config = config.get("notifications", {})
 
     logging.info("Watching for processes: %s", ", ".join(sorted(watched_games)))
+    if sys.platform == "darwin" and config.get("obs", {}).get("game_audio_capture", {}).get("enabled"):
+        logging.info(
+            "Wine & Java game audio: %s.",
+            "ready" if platform_common.process_audio_tap_available()
+            else "not set up (Settings > OBS > Set Up Wine & Java Game Audio...)",
+        )
     if watched_windows:
         logging.info(
             "Watching for window titles: %s",
             ", ".join(f"{w['process_name']} containing '{w['title_contains']}'" for w in watched_windows),
         )
+        if not platform_common.screen_recording_permission_granted():
+            # macOS hides other apps' window titles without it, so these rules would silently
+            # never match (confirmed live: 0 of 28 titles readable).
+            logging.warning(
+                "Window-title rules need Screen Recording permission for OBS Auto Recorder, which "
+                "it doesn't have -- asking now. Allow it in System Settings > Privacy & Security > "
+                "Screen & System Audio Recording, then restart the app."
+            )
+            platform_common.request_screen_recording_permission()
+            notify(
+                icon, notifications_config, "Screen Recording permission needed",
+                "To detect games by window title (e.g. GeForce NOW), allow OBS Auto Recorder in "
+                "Privacy & Security > Screen & System Audio Recording, then restart the app.",
+            )
     set_status(icon, status, "Watching")
 
     obs_client = None
@@ -10525,6 +10545,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
         release_file_lock()
         player.stop()
         media = instance.media_new(path)
+        if getattr(player, "oar_audio_only", False):
+            media.add_option(":no-video")  # see platform_macos.embed_video_player
         for option in CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS.get(preview_quality_var.get(), []):
             media.add_option(option)
         player.set_media(media)
@@ -11000,6 +11022,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon, edito
                 # (delete_original_after_trim).
                 if state["path"] == source_path and not delete_original and os.path.isfile(source_path):
                     media = instance.media_new(source_path)
+                    if getattr(player, "oar_audio_only", False):
+                        media.add_option(":no-video")
                     for option in CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS.get(preview_quality_var.get(), []):
                         media.add_option(option)
                     player.set_media(media)
@@ -11590,37 +11614,66 @@ def main():
 # have allowed the installer.
 ACCESSIBILITY_REQUEST_FLAG = "--request-accessibility"
 ACCESSIBILITY_CHECK_FLAG = "--check-accessibility"
+# Screen Recording, for this app itself: macOS hides other apps' window titles from apps without
+# it (confirmed live: 28 windows, 0 titles), so window-title rules (GeForce NOW, Minecraft) never
+# match. OBS needs its own separate grant to record the screen.
+SCREEN_RECORDING_REQUEST_FLAG = "--request-screen-recording"
+SCREEN_RECORDING_CHECK_FLAG = "--check-screen-recording"
 # Same idea for the Wine & Java game audio tap: macOS asks the app that reads the tap.
 SYSTEM_AUDIO_RECORDING_REQUEST_FLAG = "--request-system-audio-recording"
 ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS = 600
 ACCESSIBILITY_REQUEST_POLL_SECONDS = 2
 
+# kind -> (check flag, is it granted, show macOS's prompt)
+PERMISSION_REQUESTS = {
+    "accessibility": (
+        ACCESSIBILITY_CHECK_FLAG,
+        lambda: platform_common.accessibility_permission_granted(),
+        lambda: platform_common.request_accessibility_permission(),
+    ),
+    "screen_recording": (
+        SCREEN_RECORDING_CHECK_FLAG,
+        lambda: platform_common.screen_recording_permission_granted(),
+        lambda: platform_common.request_screen_recording_permission(),
+    ),
+}
+
+
+def permission_check_command(kind="accessibility"):
+    """Runs this app again just to report whether it holds a permission (exit code 0 = yes)."""
+    flag = PERMISSION_REQUESTS[kind][0]
+    if getattr(sys, "frozen", False):
+        return [sys.executable, flag]
+    return [sys.executable, os.path.abspath(__file__), flag]
+
 
 def accessibility_check_command():
-    """Runs this app again just to report whether it holds Accessibility (exit code 0 = yes)."""
-    if getattr(sys, "frozen", False):
-        return [sys.executable, ACCESSIBILITY_CHECK_FLAG]
-    return [sys.executable, os.path.abspath(__file__), ACCESSIBILITY_CHECK_FLAG]
+    return permission_check_command("accessibility")
 
 
-def accessibility_granted_in_fresh_process():
-    """Whether Accessibility is granted now, asked from a new child process. A process keeps
+def permission_granted_in_fresh_process(kind="accessibility"):
+    """Whether a permission is granted now, asked from a new child process. A process keeps
     the answer it got first (confirmed live: after the user allowed the app, the waiting process
     still saw "not granted" while a fresh copy saw "granted"); a child counts as this app."""
     try:
-        return subprocess.run(accessibility_check_command(), timeout=60).returncode == 0
+        return subprocess.run(permission_check_command(kind), timeout=60).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
 
-def run_accessibility_request(status_path, timeout=ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS):
-    """Shows macOS's Accessibility prompt for this app, then waits for the user to allow it,
-    writing "granted" to status_path once they do (the installer watches that file). Returns
-    True if granted before the timeout."""
-    if not platform_common.accessibility_permission_granted():
-        platform_common.request_accessibility_permission()
+def accessibility_granted_in_fresh_process():
+    return permission_granted_in_fresh_process("accessibility")
+
+
+def run_permission_request(status_path, kind="accessibility", timeout=ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS):
+    """Shows macOS's prompt for one of this app's permissions, then waits for the user to allow
+    it, writing "granted" to status_path once they do (the installer watches that file).
+    Returns True if granted before the timeout."""
+    _flag, granted, request = PERMISSION_REQUESTS[kind]
+    if not granted():
+        request()
         deadline = time.time() + timeout
-        while not accessibility_granted_in_fresh_process():
+        while not permission_granted_in_fresh_process(kind):
             if time.time() >= deadline:
                 return False
             time.sleep(ACCESSIBILITY_REQUEST_POLL_SECONDS)
@@ -11632,13 +11685,21 @@ def run_accessibility_request(status_path, timeout=ACCESSIBILITY_REQUEST_TIMEOUT
     return True
 
 
+def run_accessibility_request(status_path, timeout=ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS):
+    return run_permission_request(status_path, "accessibility", timeout)
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == ACCESSIBILITY_REQUEST_FLAG:
         sys.exit(0 if run_accessibility_request(sys.argv[2]) else 1)
     if len(sys.argv) >= 2 and sys.argv[1] == SYSTEM_AUDIO_RECORDING_REQUEST_FLAG:
         sys.exit(0 if platform_common.request_system_audio_recording_permission() else 1)
+    if len(sys.argv) >= 3 and sys.argv[1] == SCREEN_RECORDING_REQUEST_FLAG:
+        sys.exit(0 if run_permission_request(sys.argv[2], "screen_recording") else 1)
     if len(sys.argv) >= 2 and sys.argv[1] == ACCESSIBILITY_CHECK_FLAG:
         sys.exit(0 if platform_common.accessibility_permission_granted() else 1)
+    if len(sys.argv) >= 2 and sys.argv[1] == SCREEN_RECORDING_CHECK_FLAG:
+        sys.exit(0 if platform_common.screen_recording_permission_granted() else 1)
     try:
         main()
     except KeyboardInterrupt:

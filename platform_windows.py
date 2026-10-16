@@ -1226,6 +1226,14 @@ def open_system_audio_recording_settings():
     pass
 
 
+def screen_recording_permission_granted():
+    return True
+
+
+def request_screen_recording_permission():
+    pass
+
+
 def accessibility_permission_granted():
     """Always True -- only macOS gates global key listening behind a per-app permission."""
     return True

@@ -498,6 +498,15 @@ def open_system_audio_recording_settings(platform_name=None):
     return _select_backend(platform_name).open_system_audio_recording_settings()
 
 
+def screen_recording_permission_granted(platform_name=None):
+    """macOS: whether this app may read other apps' window titles. True elsewhere."""
+    return _select_backend(platform_name).screen_recording_permission_granted()
+
+
+def request_screen_recording_permission(platform_name=None):
+    return _select_backend(platform_name).request_screen_recording_permission()
+
+
 def accessibility_permission_granted(platform_name=None):
     """True if this app may listen for global keys -- always True outside macOS, where no
     per-app permission gates it."""
