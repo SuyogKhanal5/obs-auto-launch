@@ -41,6 +41,31 @@ _FLATPAK_OBS_PATHS = [
 ]
 
 
+def prepare_calibration_player(ffplay_path, work_dir):
+    """ffplay itself -- this OS's per-app capture can target it directly."""
+    return ffplay_path
+
+
+def is_this_app_frontmost():
+    """Always True: only macOS's custom tray popup asks this."""
+    return True
+
+
+def display_top_inset_pixels(pixel_width, pixel_height):
+    """0: only macOS built-in displays have a notch strip to crop."""
+    return 0
+
+
+def obs_launch_command(path, launch_args):
+    return [path, *launch_args]
+
+
+def quit_obs_gracefully():
+    """No-op: only macOS shows a screen-sharing indicator while OBS idles, so only there is OBS
+    closed between game sessions."""
+    return False
+
+
 def find_obs_executable():
     """OBS on Linux is normally either a native package (obs on PATH, already covered by
     platform_common's shutil.which check before this ever runs) or a Flatpak -- Flatpak is
@@ -282,7 +307,8 @@ def unregister_global_hotkey(display, root, handle):
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None, stop_event=None, hotkey_mode=None,
+    icon=None, notifications_config=None, status=None, recording_state=None, stop_event=None,
+    hotkey_mode=None,
 ):
     """X11 counterpart of platform_windows.run_custom_keybind_listener -- registers every enabled
     binding via XGrabKey, then blocks in an XNextEvent loop on this same thread for the
@@ -354,7 +380,10 @@ def run_custom_keybind_listener(
                 if binding:
                     threading.Thread(
                         target=fire_keybind,
-                        args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                        args=(
+                            binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config,
+                            status, recording_state,
+                        ),
                         daemon=True,
                     ).start()
         finally:
@@ -398,17 +427,22 @@ def is_autostart_enabled():
     return os.path.isfile(_autostart_desktop_path())
 
 
-def enable_autostart(target_path, working_dir):
+def enable_autostart(target_path, working_dir, extra_args=None):
     """Writes a .desktop file to the XDG autostart directory -- every mainstream Linux desktop
     environment (GNOME, KDE, XFCE, ...) launches every entry there once at login, no elevation
-    needed since it's entirely under the user's own home directory."""
+    needed since it's entirely under the user's own home directory.
+
+    extra_args (e.g. the script path when running from source, target_path then being just the
+    Python interpreter) are appended as their own separately-quoted tokens on the same Exec=
+    line -- needed since target_path alone isn't a directly-runnable program in that case."""
     path = _autostart_desktop_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # Exec's value is a single already-quoted command line per the XDG desktop-entry spec,
         # not a shell string -- a target path containing a space (a real possibility under e.g.
         # ~/.local/share/OBS Auto Recorder) needs its own quoting here, not shell-style escaping.
-        exec_value = f'"{target_path}"'
+        exec_parts = [f'"{target_path}"'] + [f'"{arg}"' for arg in (extra_args or [])]
+        exec_value = " ".join(exec_parts)
         content = (
             "[Desktop Entry]\n"
             "Type=Application\n"
@@ -576,3 +610,104 @@ def run_clip_editor_space_bar_listener(editor_window_id, on_toggle, stop_event):
         )
     finally:
         display.close()
+
+
+# Confirmed negative finding, not an unimplemented feature -- CROSS_PLATFORM_PLAN.md §6.1: a real
+# CI spike (speaker-test + GetInputPropertiesListPropertyItems against a real pulse_output_capture
+# input) found no per-application audio capture kind exists under PulseAudio in the tested
+# config. None here means "confirmed this OS can't do it", exactly like process_audio_capture_kind
+# itself documents -- don't reintroduce a guessed kind string without a fresh empirical spike.
+PROCESS_AUDIO_CAPTURE_KIND = None
+PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS = None
+
+
+def process_audio_capture_settings(process_name, exe_path):
+    """Always None -- see PROCESS_AUDIO_CAPTURE_KIND. Kept as a real function (not just relying
+    on callers checking process_audio_capture_kind() first) so platform_common's dispatch always
+    has a symmetric pair of functions to call on every OS."""
+    return None
+
+
+def hide_dock_icon():
+    """No-op -- Linux desktop environments don't give a pystray tray icon an equivalent unwanted
+    taskbar entry that needs hiding; only accepted for signature parity with the macOS backend,
+    which does real work here."""
+    pass
+
+
+def run_on_main_thread(func):
+    """No-op marshaling -- Linux's tray/GUI toolkits have no macOS-style main-thread-only AppKit
+    constraint, so func() just runs immediately on whichever thread called this. Only accepted for
+    signature parity with the macOS backend, which does real work here."""
+    func()
+
+
+def open_path(path):
+    """xdg-open -- the freedesktop.org-standard "open this with whatever's registered for it"
+    command, present on essentially every Linux desktop environment (GNOME, KDE, XFCE, etc. all
+    ship or depend on it), the closest Linux equivalent to os.startfile()/macOS's `open`."""
+    subprocess.run(["xdg-open", path])
+
+
+def process_audio_tap_available():
+    """False -- the process-tap Game Audio device is macOS only."""
+    return False
+
+
+def game_audio_device_installed():
+    return False
+
+
+def install_game_audio_device(driver_path=None):
+    return False
+
+
+def uninstall_game_audio_device():
+    return True
+
+
+def start_process_audio_tap(pids):
+    return None
+
+
+def stop_process_audio_tap(handle):
+    pass
+
+
+def request_system_audio_recording_permission():
+    return False
+
+
+def open_system_audio_recording_settings():
+    pass
+
+
+def screen_recording_permission_granted():
+    return True
+
+
+def request_screen_recording_permission():
+    pass
+
+
+def accessibility_permission_granted():
+    """Always True -- only macOS gates global key listening behind a per-app permission."""
+    return True
+
+
+def request_accessibility_permission():
+    """No-op -- only macOS gates global key listening behind a per-app permission."""
+    pass
+
+
+def open_accessibility_settings():
+    """No-op -- only macOS gates global key listening behind a per-app permission."""
+    pass
+
+
+def open_screen_recording_settings():
+    """No-op -- Linux has no equivalent OS-level screen-recording consent system an app needs to
+    be granted into (a Wayland portal's own per-session capture prompt is the closest analogue,
+    but it's handled entirely by the portal/compositor, not something this app could deep-link
+    to); only accepted for signature parity with the macOS backend, which does real work here."""
+    pass

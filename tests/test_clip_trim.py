@@ -4,10 +4,12 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
+from tests.fakes import FakeObsClient
 
 
 class ParseTimestampTests(unittest.TestCase):
@@ -1361,6 +1363,66 @@ class ListRecentRecordingsTests(unittest.TestCase):
             self.assertEqual(len(a.list_recent_recordings(tmp, limit=3)), 3)
 
 
+class ResolveRecentRecordingsFolderTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._cache_dir.cleanup)
+        patcher = unittest.mock.patch.object(a, "OBS_STATE_CACHE_PATH", os.path.join(self._cache_dir.name, "cache.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    # Found as a real bug: obs.output_folder only exists as an override, and most users (this
+    # app's own real user included) never set it -- without this fallback to OBS's own live
+    # record_directory, list_recent_recordings(None) always returns [], and the clip editor's
+    # "recent recordings" dropdown is never even created at all, no matter how many real
+    # recordings exist (see _run_clip_editor's `if recent_recordings:` guard).
+    def test_explicit_output_folder_wins_without_connecting_to_obs(self):
+        with patch.object(a, "connect_obs") as mock_connect:
+            result = a.resolve_recent_recordings_folder({"output_folder": r"D:\Clips", "websocket": {}})
+        self.assertEqual(result, r"D:\Clips")
+        mock_connect.assert_not_called()
+
+    def test_falls_back_to_obs_live_record_directory(self):
+        client = FakeObsClient()
+        client.set_record_directory("/Users/someone/Movies")
+        with patch.object(a, "connect_obs", return_value=client):
+            result = a.resolve_recent_recordings_folder({"output_folder": None, "websocket": {}})
+        self.assertEqual(result, "/Users/someone/Movies")
+        self.assertIn(("disconnect",), client.calls)
+
+    def test_blank_output_folder_also_falls_back(self):
+        client = FakeObsClient()
+        client.set_record_directory("/Users/someone/Movies")
+        with patch.object(a, "connect_obs", return_value=client):
+            result = a.resolve_recent_recordings_folder({"output_folder": "", "websocket": {}})
+        self.assertEqual(result, "/Users/someone/Movies")
+
+    def test_returns_none_when_obs_unreachable(self):
+        with patch.object(a, "connect_obs", return_value=None):
+            result = a.resolve_recent_recordings_folder({"output_folder": None, "websocket": {}})
+        self.assertIsNone(result)
+
+    def test_returns_none_when_obs_raises_rather_than_propagating(self):
+        class BrokenClient(FakeObsClient):
+            def get_record_directory(self):
+                raise RuntimeError("boom")
+
+        client = BrokenClient()
+        with patch.object(a, "connect_obs", return_value=client):
+            result = a.resolve_recent_recordings_folder({"output_folder": None, "websocket": {}})
+        self.assertIsNone(result)
+        self.assertIn(("disconnect",), client.calls)
+
+    def test_connects_with_a_single_fast_attempt_not_the_slow_default_retry_window(self):
+        # The editor's own UI construction runs on this call synchronously -- it must never block
+        # for connect_obs's default ~10s retry window just because OBS happens to be unreachable
+        # right when the editor opens.
+        with patch.object(a, "connect_obs", return_value=None) as mock_connect:
+            a.resolve_recent_recordings_folder({"output_folder": None, "websocket": {"host": "localhost"}})
+        mock_connect.assert_called_once_with({"host": "localhost"}, retries=1, delay=0)
+
+
 class RunFfmpegWithProgressTests(unittest.TestCase):
     class _FakeProc:
         def __init__(self, out_lines, stderr_lines=None, returncode=0):
@@ -1508,8 +1570,11 @@ class TrimClipProgressCallbackTests(unittest.TestCase):
                 # the whole clip too (its output is thrown away), so it takes just as long as
                 # pass 2 and needs its own real progress rather than a single frozen 0% call.
                 on_progress(0.5)
-                with open(cmd[-1], "wb") as f:
-                    f.write(b"data")
+                # Pass 1's "NUL" is Windows' null device; written to here it left a stray NUL
+                # file in the working directory on macOS/Linux.
+                if cmd[-1] != "NUL":
+                    with open(cmd[-1], "wb") as f:
+                        f.write(b"data")
                 return 0, "", False
 
             calls = []
@@ -1543,3 +1608,42 @@ class TrimClipProgressCallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ObsStateCacheFallbackTests(unittest.TestCase):
+    # Confirmed live: with OBS closed between games on macOS, the clip editor's recordings
+    # dropdown disappeared -- it could only learn the folder from a running OBS.
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = patch.object(a, "OBS_STATE_CACHE_PATH", os.path.join(self._tmp.name, "cache.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_folder_comes_from_the_cache_while_obs_is_closed(self):
+        client = FakeObsClient()
+        client.set_record_directory("/Users/someone/Movies")
+        with patch.object(a, "connect_obs", return_value=client):
+            a.resolve_recent_recordings_folder({"websocket": {}})
+        with patch.object(a, "connect_obs", return_value=None):
+            self.assertEqual(a.resolve_recent_recordings_folder({"websocket": {}}), "/Users/someone/Movies")
+
+    def test_input_kinds_come_from_the_cache_while_obs_is_closed(self):
+        client = FakeObsClient(inputs={"macOS Screen Capture": {"kind": "screen_capture", "tracks": {}}})
+        with patch.object(a, "connect_obs", return_value=client):
+            a.resolve_input_kinds({"websocket": {}})
+        with patch.object(a, "connect_obs", return_value=None):
+            self.assertEqual(a.resolve_input_kinds({"websocket": {}}), {"macOS Screen Capture": "screen_capture"})
+
+    def test_remember_obs_state_records_both(self):
+        client = FakeObsClient(inputs={"Mic/Aux": {"kind": "coreaudio_input_capture", "tracks": {}}})
+        client.set_record_directory("/rec")
+        a.remember_obs_state(client)
+        cache = a.read_obs_state_cache()
+        self.assertEqual(cache["recording_folder"], "/rec")
+        self.assertEqual(cache["input_kinds"], {"Mic/Aux": "coreaudio_input_capture"})
+
+    def test_empty_values_never_overwrite_what_was_known(self):
+        a.update_obs_state_cache(recording_folder="/rec")
+        a.update_obs_state_cache(recording_folder=None, input_kinds={})
+        self.assertEqual(a.read_obs_state_cache().get("recording_folder"), "/rec")

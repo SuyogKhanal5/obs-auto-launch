@@ -1,4 +1,5 @@
 import os
+import plistlib
 import shutil
 import sys
 import tempfile
@@ -198,6 +199,28 @@ class AutostartTests(unittest.TestCase):
             self.assertTrue(pmac.disable_autostart())
         self.assertFalse(pmac.is_autostart_enabled())
 
+    def test_extra_args_appended_to_program_arguments(self):
+        # Running from source: target_path is just the Python interpreter, with the script's own
+        # path passed as extra_args -- the same shape set_startup_shortcut_enabled uses in that
+        # case (see its own docstring). launchd execs ProgramArguments directly, no shell
+        # involved, so this is just a plain list append, no quoting to worry about.
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0)
+            self.assertTrue(
+                pmac.enable_autostart(
+                    "/usr/bin/python3", "/Users/test/obs-auto-launch",
+                    extra_args=["/Users/test/obs-auto-launch/autostart_script.py"],
+                )
+            )
+        plist_path = pmac._launch_agent_plist_path()
+        with open(plist_path, "rb") as f:
+            import plistlib
+            plist = plistlib.load(f)
+        self.assertEqual(
+            plist["ProgramArguments"],
+            ["/usr/bin/python3", "/Users/test/obs-auto-launch/autostart_script.py"],
+        )
+
     def test_disable_when_never_enabled_is_a_no_op(self):
         self.assertTrue(pmac.disable_autostart())
 
@@ -216,24 +239,194 @@ class AutostartTests(unittest.TestCase):
         self.assertFalse(pmac.is_autostart_enabled())
 
 
-class EmbedVideoPlayerTests(unittest.TestCase):
-    def test_wraps_winfo_id_as_ns_view_and_calls_set_nsobject(self):
-        fake_objc = unittest.mock.MagicMock()
-        fake_ns_view = object()
-        fake_objc.objc_object.return_value = fake_ns_view
+class FindLibtkDylibTests(unittest.TestCase):
+    # Real filesystem, real temp dirs -- this is pure path-searching logic with no macOS-specific
+    # API involved, so (like ResolveBundleIdentifierTests) it's exercisable on any real OS.
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+        self.lib_name = f"libtk{pmac.tkinter.TkVersion}.dylib"
 
+    def test_finds_a_dylib_under_sys_prefix(self):
+        lib_dir = os.path.join(self.tmp_dir, "lib")
+        os.makedirs(lib_dir)
+        lib_path = os.path.join(lib_dir, self.lib_name)
+        open(lib_path, "w").close()
+
+        with unittest.mock.patch.object(pmac.sys, "prefix", self.tmp_dir), \
+             unittest.mock.patch.object(pmac.sys, "base_prefix", self.tmp_dir), \
+             unittest.mock.patch.object(pmac.ctypes.util, "find_library", return_value=None):
+            self.assertEqual(pmac._find_libtk_dylib(), lib_path)
+
+    def test_finds_a_dylib_via_ctypes_find_library(self):
+        lib_path = os.path.join(self.tmp_dir, self.lib_name)
+        open(lib_path, "w").close()
+
+        with unittest.mock.patch.object(pmac.sys, "prefix", "/nonexistent"), \
+             unittest.mock.patch.object(pmac.sys, "base_prefix", "/nonexistent"), \
+             unittest.mock.patch.object(pmac.ctypes.util, "find_library", return_value=lib_path):
+            self.assertEqual(pmac._find_libtk_dylib(), lib_path)
+
+    def test_returns_none_when_not_found_anywhere(self):
+        with unittest.mock.patch.object(pmac.sys, "prefix", "/nonexistent"), \
+             unittest.mock.patch.object(pmac.sys, "base_prefix", "/nonexistent"), \
+             unittest.mock.patch.object(pmac.ctypes.util, "find_library", return_value=None), \
+             unittest.mock.patch.object(pmac.glob, "glob", return_value=[]):
+            self.assertIsNone(pmac._find_libtk_dylib())
+
+
+class EmbedVideoPlayerTests(unittest.TestCase):
+    # Confirmed live with a minimal reproduction script: winfo_id()'s raw value is NOT a real
+    # NSView pointer (wrapping it via objc.objc_object, this function's old behavior, segfaulted
+    # the instant anything tried to use it as one) -- the real, confirmed-correct conversion is
+    # Tk's own TkMacOSXGetRootControl C function, called via ctypes, per python-vlc's own
+    # official tkvlc.py example.
+    #
+    # A second, separate finding (also confirmed live, via screenshots of a minimal repro): that
+    # resolved NSView is the TOPLEVEL WINDOW's own single shared content view, not one scoped to
+    # tk_widget specifically -- Tk's Cocoa port draws every child widget of a toplevel into that
+    # one view. Handing it to set_nsobject() directly makes VLC paint over the whole window,
+    # hiding every sibling widget (e.g. a clip editor's transport controls) the moment video
+    # actually starts playing. The fix creates a second, real NSView scoped to tk_widget's own
+    # on-screen rectangle and adds it as a subview of that root view instead.
+    def _make_widget_and_toplevel(self, widget_id=4242):
+        widget = unittest.mock.Mock()
+        widget.winfo_id.return_value = widget_id
+        widget.winfo_rootx.return_value = 110
+        widget.winfo_rooty.return_value = 124
+        widget.winfo_width.return_value = 620
+        widget.winfo_height.return_value = 400
+        toplevel = unittest.mock.Mock()
+        toplevel.winfo_rootx.return_value = 100
+        toplevel.winfo_rooty.return_value = 100
+        toplevel.winfo_height.return_value = 480
+        widget.winfo_toplevel.return_value = toplevel
+        return widget, toplevel
+
+    def _fake_libtk(self, root_view_ptr=999999):
+        fake_lib = unittest.mock.Mock()
+        fake_lib.TkMacOSXGetRootControl.return_value = root_view_ptr
+        return fake_lib
+
+    def test_creates_a_scoped_subview_and_calls_set_nsobject_with_it(self):
+        player = unittest.mock.Mock()
+        widget, toplevel = self._make_widget_and_toplevel()
+        fake_lib = self._fake_libtk()
+
+        fake_objc = unittest.mock.MagicMock()
+        fake_root_view = unittest.mock.MagicMock()
+        fake_objc.objc_object.return_value = fake_root_view
+        fake_child_view = unittest.mock.MagicMock()
+        fake_appkit = unittest.mock.MagicMock()
+        fake_appkit.NSView.alloc.return_value.initWithFrame_.return_value = fake_child_view
+        fake_objc.pyobjc_id.return_value = 555555
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll, \
+             unittest.mock.patch.dict(sys.modules, {"objc": fake_objc, "AppKit": fake_appkit}):
+            mock_cdll.LoadLibrary.return_value = fake_lib
+            pmac.embed_video_player(player, widget)
+
+        fake_lib.TkMacOSXGetRootControl.assert_called_once_with(4242)
+        fake_objc.objc_object.assert_called_once_with(c_void_p=999999)
+        fake_root_view.addSubview_.assert_called_once_with(fake_child_view)
+        self.assertEqual(widget.bind.call_args[0][0], "<Configure>")
+        player.set_nsobject.assert_called_once_with(555555)
+        player.set_xwindow.assert_not_called()
+
+    def test_resize_binding_resyncs_the_subview_frame(self):
+        player = unittest.mock.Mock()
+        widget, toplevel = self._make_widget_and_toplevel()
+        fake_lib = self._fake_libtk()
+
+        fake_objc = unittest.mock.MagicMock()
+        fake_objc.objc_object.return_value = unittest.mock.MagicMock()
+        fake_child_view = unittest.mock.MagicMock()
+        fake_appkit = unittest.mock.MagicMock()
+        fake_appkit.NSView.alloc.return_value.initWithFrame_.return_value = fake_child_view
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll, \
+             unittest.mock.patch.dict(sys.modules, {"objc": fake_objc, "AppKit": fake_appkit}):
+            mock_cdll.LoadLibrary.return_value = fake_lib
+            pmac.embed_video_player(player, widget)
+            resync = widget.bind.call_args[0][1]
+            widget.winfo_width.return_value = 900
+            toplevel.winfo_height.return_value = 650
+            resync()
+
+        self.assertEqual(fake_child_view.setFrame_.call_count, 1)
+
+    def test_falls_back_to_whole_window_view_when_subview_creation_fails(self):
+        player = unittest.mock.Mock()
+        widget, toplevel = self._make_widget_and_toplevel()
+        fake_lib = self._fake_libtk()
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll, \
+             unittest.mock.patch.dict(sys.modules, {"objc": None}):
+            mock_cdll.LoadLibrary.return_value = fake_lib
+            with self.assertLogs(level="WARNING"):
+                pmac.embed_video_player(player, widget)
+
+        player.set_nsobject.assert_called_once_with(999999)
+        player.set_xwindow.assert_not_called()
+
+    def test_falls_back_to_audio_only_when_libtk_cannot_be_found(self):
         player = unittest.mock.Mock()
         widget = unittest.mock.Mock()
         widget.winfo_id.return_value = 4242
 
-        with unittest.mock.patch.dict(sys.modules, {"objc": fake_objc}):
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value=None):
+            with self.assertLogs(level="WARNING"):
+                pmac.embed_video_player(player, widget)
+
+        # Audio-only: no drawing target for VLC (it logged errors every frame), media opens with :no-video.
+        player.set_xwindow.assert_not_called()
+        self.assertTrue(player.oar_audio_only)
+        player.set_nsobject.assert_not_called()
+
+    def test_falls_back_to_audio_only_when_loading_libtk_fails(self):
+        player = unittest.mock.Mock()
+        widget = unittest.mock.Mock()
+        widget.winfo_id.return_value = 4242
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll:
+            mock_cdll.LoadLibrary.side_effect = OSError("boom")
+            with self.assertLogs(level="WARNING"):
+                pmac.embed_video_player(player, widget)
+
+        # Audio-only: no drawing target for VLC (it logged errors every frame), media opens with :no-video.
+        player.set_xwindow.assert_not_called()
+        self.assertTrue(player.oar_audio_only)
+        player.set_nsobject.assert_not_called()
+
+    def test_falls_back_to_audio_only_when_ns_view_is_null(self):
+        player = unittest.mock.Mock()
+        widget = unittest.mock.Mock()
+        widget.winfo_id.return_value = 4242
+        fake_lib = unittest.mock.Mock()
+        fake_lib.TkMacOSXGetRootControl.return_value = 0
+
+        with unittest.mock.patch.object(pmac, "_find_libtk_dylib", return_value="/fake/libtk8.6.dylib"), \
+             unittest.mock.patch.object(pmac.ctypes, "cdll") as mock_cdll:
+            mock_cdll.LoadLibrary.return_value = fake_lib
             pmac.embed_video_player(player, widget)
 
-        fake_objc.objc_object.assert_called_once_with(c_void_p=4242)
-        player.set_nsobject.assert_called_once_with(fake_ns_view)
+        # Audio-only: no drawing target for VLC (it logged errors every frame), media opens with :no-video.
+        player.set_xwindow.assert_not_called()
+        self.assertTrue(player.oar_audio_only)
+        player.set_nsobject.assert_not_called()
 
 
 def make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=True):
+    # accessibility_trusted is accepted (rather than only on make_fake_application_services
+    # below) purely so every existing call site reads the same way it always has -- AXIsProcess
+    # Trusted/AXIsProcessTrustedWithOptions are NOT actually part of Quartz at all (confirmed
+    # live -- see accessibility_permission_granted's own docstring), so this fake intentionally
+    # no longer defines them; real code reaching for them on the real Quartz module would get a
+    # real AttributeError, exactly like it did before that bug was found and fixed.
     fake = unittest.mock.MagicMock()
     fake.kCGEventFlagMaskControl = 0x40000
     fake.kCGEventFlagMaskAlternate = 0x80000
@@ -242,14 +435,25 @@ def make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=True):
     fake.kCGSessionEventTap = 1
     fake.kCGHeadInsertEventTap = 0
     fake.kCGEventTapOptionListenOnly = 1
+    fake.kCGEventTapOptionDefault = 0
+    fake.kCGEventTapDisabledByTimeout = 0xFFFFFFFE
+    fake.kCGEventTapDisabledByUserInput = 0xFFFFFFFF
     fake.kCGEventKeyDown = 10
     fake.kCGKeyboardEventKeycode = 9
     fake.kCFRunLoopCommonModes = "kCFRunLoopCommonModes"
-    fake.kAXTrustedCheckOptionPrompt = "AXTrustedCheckOptionPrompt"
-    fake.AXIsProcessTrusted.return_value = accessibility_trusted
     fake.CGEventMaskBit.side_effect = lambda event_type: 1 << event_type
     fake.CGEventTapCreate.return_value = object() if tap_creation_succeeds else None
     fake.CFRunLoopGetCurrent.return_value = "run_loop"
+    del fake.AXIsProcessTrusted
+    del fake.AXIsProcessTrustedWithOptions
+    del fake.kAXTrustedCheckOptionPrompt
+    return fake
+
+
+def make_fake_application_services(accessibility_trusted=True):
+    fake = unittest.mock.MagicMock()
+    fake.kAXTrustedCheckOptionPrompt = "AXTrustedCheckOptionPrompt"
+    fake.AXIsProcessTrusted.return_value = accessibility_trusted
     return fake
 
 
@@ -271,45 +475,48 @@ class MacosKeycodeForKeyTests(unittest.TestCase):
 
 
 class AccessibilityPermissionGrantedTests(unittest.TestCase):
+    # AXIsProcessTrusted lives in ApplicationServices, not Quartz (confirmed live -- see
+    # accessibility_permission_granted's own docstring) -- these patch ApplicationServices
+    # directly, matching what the real code actually imports.
     def test_missing_pyobjc_returns_false(self):
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": None}):
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": None}):
             self.assertFalse(pmac.accessibility_permission_granted())
 
     def test_granted(self):
-        fake_quartz = make_fake_quartz(accessibility_trusted=True)
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             self.assertTrue(pmac.accessibility_permission_granted())
 
     def test_not_granted(self):
-        fake_quartz = make_fake_quartz(accessibility_trusted=False)
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services(accessibility_trusted=False)
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             self.assertFalse(pmac.accessibility_permission_granted())
 
     def test_exception_returns_false_not_raised(self):
-        fake_quartz = make_fake_quartz()
-        fake_quartz.AXIsProcessTrusted.side_effect = RuntimeError("boom")
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services()
+        fake_application_services.AXIsProcessTrusted.side_effect = RuntimeError("boom")
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             with self.assertLogs(level="ERROR"):
                 self.assertFalse(pmac.accessibility_permission_granted())
 
 
 class RequestAccessibilityPermissionTests(unittest.TestCase):
     def test_missing_pyobjc_is_a_no_op(self):
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": None}):
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": None}):
             pmac.request_accessibility_permission()  # must not raise
 
     def test_prompts_via_ax_is_process_trusted_with_options(self):
-        fake_quartz = make_fake_quartz()
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services()
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             pmac.request_accessibility_permission()
-        fake_quartz.AXIsProcessTrustedWithOptions.assert_called_once_with(
-            {fake_quartz.kAXTrustedCheckOptionPrompt: True}
+        fake_application_services.AXIsProcessTrustedWithOptions.assert_called_once_with(
+            {fake_application_services.kAXTrustedCheckOptionPrompt: True}
         )
 
     def test_exception_is_swallowed(self):
-        fake_quartz = make_fake_quartz()
-        fake_quartz.AXIsProcessTrustedWithOptions.side_effect = RuntimeError("boom")
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services()
+        fake_application_services.AXIsProcessTrustedWithOptions.side_effect = RuntimeError("boom")
+        with unittest.mock.patch.dict(sys.modules, {"ApplicationServices": fake_application_services}):
             with self.assertLogs(level="ERROR"):
                 pmac.request_accessibility_permission()  # must not raise
 
@@ -326,21 +533,23 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
 
     def test_permission_not_granted_requests_and_notifies(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=False)
+        fake_application_services = make_fake_application_services(accessibility_trusted=False)
         notify = unittest.mock.Mock()
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with self.assertLogs(level="WARNING"):
                 pmac.run_custom_keybind_listener(
                     [{"enabled": True, "key": "S", "modifiers": []}], get_client=lambda: None,
                     get_manual_split_buffer_seconds=lambda: 0, fire_keybind=unittest.mock.Mock(),
                     describe_keybind=unittest.mock.Mock(), notify=notify,
                 )
-        fake_quartz.AXIsProcessTrustedWithOptions.assert_called_once()
+        fake_application_services.AXIsProcessTrustedWithOptions.assert_called_once()
         notify.assert_called_once()
         fake_quartz.CGEventTapCreate.assert_not_called()
 
     def test_invalid_key_is_skipped_and_no_tap_is_created(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with self.assertLogs(level="WARNING"):
                 pmac.run_custom_keybind_listener(
                     [{"enabled": True, "key": "NotAKey", "modifiers": []}], get_client=lambda: None,
@@ -351,16 +560,18 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
 
     def test_fires_matching_binding_on_a_dedicated_thread(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         binding = {"enabled": True, "key": "S", "modifiers": ["ctrl"], "action": "save_replay_buffer"}
         fire_keybind = unittest.mock.Mock()
         fake_thread = unittest.mock.MagicMock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with unittest.mock.patch.object(pmac.threading, "Thread", return_value=fake_thread) as mock_thread_cls:
                 pmac.run_custom_keybind_listener(
                     [binding], get_client="get_client", get_manual_split_buffer_seconds="get_seconds",
                     fire_keybind=fire_keybind, describe_keybind=unittest.mock.Mock(return_value="Ctrl+S"),
                     notify=unittest.mock.Mock(), icon="icon", notifications_config="notif_cfg", status="status",
+                    recording_state="rec_state",
                 )
 
                 fake_quartz.CGEventTapCreate.assert_called_once()
@@ -374,21 +585,48 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
                 fake_quartz.CGEventGetFlags.return_value = fake_quartz.kCGEventFlagMaskControl
                 result = tap_callback(None, fake_quartz.kCGEventKeyDown, fake_event, None)
 
-                self.assertIs(result, fake_event)
+                # Swallowed, so the frontmost app (and macOS's alert sound) never sees it.
+                self.assertIsNone(result)
+                self.assertEqual(fake_quartz.CGEventTapCreate.call_args[0][2], fake_quartz.kCGEventTapOptionDefault)
                 mock_thread_cls.assert_called_once_with(
                     target=fire_keybind,
-                    args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status"),
+                    args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status", "rec_state"),
                     daemon=True,
                 )
                 fake_thread.start.assert_called_once()
         fake_quartz.CFRunLoopRun.assert_called_once()
 
+    def test_callback_does_no_lazy_quartz_lookups(self):
+        # pyobjc's lazy name resolution isn't thread-safe: two taps' callbacks resolving the same
+        # function on one keypress raised KeyError (confirmed live). Every name the callback uses
+        # must already be resolved at setup -- removing them afterward must not matter.
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
+        binding = {"enabled": True, "key": "S", "modifiers": ["ctrl"], "action": "save_replay_buffer"}
+        fire_keybind = unittest.mock.Mock()
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
+            with unittest.mock.patch.object(pmac.threading, "Thread") as mock_thread_cls:
+                pmac.run_custom_keybind_listener(
+                    [binding], get_client="get_client", get_manual_split_buffer_seconds="get_seconds",
+                    fire_keybind=fire_keybind, describe_keybind=unittest.mock.Mock(return_value="Ctrl+S"),
+                    notify=unittest.mock.Mock(),
+                )
+                tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
+                fake_quartz.CGEventGetIntegerValueField.return_value = pmac.macos_keycode_for_key("S")
+                fake_quartz.CGEventGetFlags.return_value = fake_quartz.kCGEventFlagMaskControl
+                key_down = fake_quartz.kCGEventKeyDown
+                for name in ("CGEventGetIntegerValueField", "CGEventGetFlags", "kCGKeyboardEventKeycode", "kCGEventKeyDown"):
+                    delattr(fake_quartz, name)
+                tap_callback(None, key_down, unittest.mock.Mock(), None)
+                mock_thread_cls.assert_called_once()
+
     def test_non_matching_key_press_does_not_fire(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         binding = {"enabled": True, "key": "S", "modifiers": ["ctrl"], "action": "save_replay_buffer"}
         fire_keybind = unittest.mock.Mock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with unittest.mock.patch.object(pmac.threading, "Thread") as mock_thread_cls:
                 pmac.run_custom_keybind_listener(
                     [binding], get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
@@ -404,8 +642,9 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
 
     def test_tap_creation_failure_is_logged_not_raised(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True, tap_creation_succeeds=False)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         binding = {"enabled": True, "key": "S", "modifiers": []}
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with self.assertLogs(level="WARNING"):
                 pmac.run_custom_keybind_listener(
                     [binding], get_client=lambda: None, get_manual_split_buffer_seconds=lambda: 0,
@@ -425,7 +664,8 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
 
     def test_permission_not_granted_is_logged_not_raised(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=False)
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        fake_application_services = make_fake_application_services(accessibility_trusted=False)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with self.assertLogs(level="WARNING"):
                 pmac.run_clip_editor_space_bar_listener(
                     None, unittest.mock.Mock(), unittest.mock.Mock(),
@@ -434,12 +674,13 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
 
     def test_toggles_when_this_process_is_frontmost(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         fake_frontmost_app = unittest.mock.Mock()
         fake_frontmost_app.processIdentifier.return_value = os.getpid()
         fake_quartz.NSWorkspace.sharedWorkspace.return_value.frontmostApplication.return_value = fake_frontmost_app
         on_toggle = unittest.mock.Mock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             pmac.run_clip_editor_space_bar_listener(None, on_toggle, unittest.mock.Mock())
 
         tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
@@ -450,12 +691,13 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
 
     def test_does_not_toggle_when_a_different_process_is_frontmost(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         fake_frontmost_app = unittest.mock.Mock()
         fake_frontmost_app.processIdentifier.return_value = os.getpid() + 1
         fake_quartz.NSWorkspace.sharedWorkspace.return_value.frontmostApplication.return_value = fake_frontmost_app
         on_toggle = unittest.mock.Mock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             pmac.run_clip_editor_space_bar_listener(None, on_toggle, unittest.mock.Mock())
 
         tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
@@ -466,9 +708,10 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
 
     def test_non_space_key_does_not_toggle(self):
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         on_toggle = unittest.mock.Mock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             pmac.run_clip_editor_space_bar_listener(None, on_toggle, unittest.mock.Mock())
 
         tap_callback = fake_quartz.CGEventTapCreate.call_args[0][4]
@@ -484,6 +727,7 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
         # synchronously instead, making the effect of stop_event already being set deterministic
         # to observe here.
         fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_application_services = make_fake_application_services(accessibility_trusted=True)
         stop_event = threading.Event()
         stop_event.set()
 
@@ -491,12 +735,320 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
             target()
             return unittest.mock.MagicMock()
 
-        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz}):
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_application_services}):
             with unittest.mock.patch.object(pmac.threading, "Thread", side_effect=run_target_synchronously):
                 pmac.run_clip_editor_space_bar_listener(None, unittest.mock.Mock(), stop_event)
 
         fake_quartz.CFRunLoopStop.assert_called_once_with("run_loop")
 
 
+class ResolveBundleIdentifierTests(unittest.TestCase):
+    # Fake .app bundles built with real tempfile dirs and a real plistlib-written Info.plist --
+    # this is pure file I/O with no macOS-specific API involved, so it's exercisable (and
+    # confirmed correct) on any real OS running the test, not just macOS.
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp_dir, ignore_errors=True)
+
+    def make_app_bundle(self, app_name, bundle_id):
+        app_dir = os.path.join(self.tmp_dir, f"{app_name}.app")
+        contents_dir = os.path.join(app_dir, "Contents")
+        macos_dir = os.path.join(contents_dir, "MacOS")
+        os.makedirs(macos_dir)
+        exe_path = os.path.join(macos_dir, app_name)
+        with open(exe_path, "w") as f:
+            f.write("")
+        with open(os.path.join(contents_dir, "Info.plist"), "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
+        return exe_path
+
+    def test_resolves_a_real_looking_app_bundle(self):
+        exe_path = self.make_app_bundle("Balatro", "com.playstack.balatro")
+        self.assertEqual(pmac.resolve_bundle_identifier(exe_path), "com.playstack.balatro")
+
+    def test_none_when_exe_path_is_none(self):
+        self.assertIsNone(pmac.resolve_bundle_identifier(None))
+
+    def test_none_for_a_program_the_app_only_ships(self):
+        # Wizard101.app runs its game through Wine's preloader in Contents/SharedSupport; macOS
+        # doesn't list that process under the app's bundle id, so it must go to the process tap.
+        exe_path = self.make_app_bundle("Wizard101", "com.kingsisle.wizard101")
+        wine_dir = os.path.join(os.path.dirname(os.path.dirname(exe_path)), "SharedSupport", "wizard101", "Wizard101")
+        os.makedirs(wine_dir)
+        preloader = os.path.join(wine_dir, "wine64-preloader")
+        open(preloader, "w").close()
+        self.assertIsNone(pmac.resolve_bundle_identifier(preloader))
+        self.assertEqual(pmac.resolve_bundle_identifier(exe_path), "com.kingsisle.wizard101")
+
+    def test_none_when_exe_path_is_not_inside_an_app_bundle(self):
+        bare_exe = os.path.join(self.tmp_dir, "bare-binary")
+        with open(bare_exe, "w") as f:
+            f.write("")
+        self.assertIsNone(pmac.resolve_bundle_identifier(bare_exe))
+
+    def test_none_when_info_plist_is_missing(self):
+        macos_dir = os.path.join(self.tmp_dir, "Broken.app", "Contents", "MacOS")
+        os.makedirs(macos_dir)
+        exe_path = os.path.join(macos_dir, "Broken")
+        with open(exe_path, "w") as f:
+            f.write("")
+        self.assertIsNone(pmac.resolve_bundle_identifier(exe_path))
+
+    def test_none_when_info_plist_is_corrupt(self):
+        app_dir = os.path.join(self.tmp_dir, "Corrupt.app")
+        os.makedirs(os.path.join(app_dir, "Contents", "MacOS"))
+        exe_path = os.path.join(app_dir, "Contents", "MacOS", "Corrupt")
+        with open(exe_path, "w") as f:
+            f.write("")
+        with open(os.path.join(app_dir, "Contents", "Info.plist"), "w") as f:
+            f.write("not a real plist")
+        self.assertIsNone(pmac.resolve_bundle_identifier(exe_path))
+
+    def test_none_when_plist_has_no_bundle_identifier_key(self):
+        app_dir = os.path.join(self.tmp_dir, "NoId.app")
+        os.makedirs(os.path.join(app_dir, "Contents", "MacOS"))
+        exe_path = os.path.join(app_dir, "Contents", "MacOS", "NoId")
+        with open(exe_path, "w") as f:
+            f.write("")
+        with open(os.path.join(app_dir, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump({"SomeOtherKey": "value"}, f)
+        self.assertIsNone(pmac.resolve_bundle_identifier(exe_path))
+
+
+class ProcessAudioCaptureSettingsTests(unittest.TestCase):
+    # Confirmed live against a real OBS 30.2.3 instance on macOS 15.5 -- see
+    # platform_macos.py's own PROCESS_AUDIO_CAPTURE_KIND comment for the full empirical findings
+    # (GetInputKindList, GetInputDefaultSettings, and GetInputPropertiesListPropertyItems output).
+    def test_kind_is_sck_audio_capture(self):
+        self.assertEqual(pmac.PROCESS_AUDIO_CAPTURE_KIND, "sck_audio_capture")
+
+    def test_builds_application_mode_settings_when_bundle_id_resolves(self):
+        with unittest.mock.patch.object(pmac, "resolve_bundle_identifier", return_value="com.hnc.Discord"):
+            settings = pmac.process_audio_capture_settings("Discord", "/Applications/Discord.app/Contents/MacOS/Discord")
+        self.assertEqual(settings, {"type": 1, "application": "com.hnc.Discord"})
+        self.assertEqual(settings["type"], pmac.SCK_AUDIO_CAPTURE_TYPE_APPLICATION)
+
+    def test_none_when_bundle_id_cannot_be_resolved(self):
+        with unittest.mock.patch.object(pmac, "resolve_bundle_identifier", return_value=None):
+            settings = pmac.process_audio_capture_settings("Balatro", None)
+        self.assertIsNone(settings)
+
+    def test_process_name_is_accepted_but_unused(self):
+        # macOS's "application" field needs a bundle identifier, which only exe_path can
+        # resolve -- process_name exists purely for signature parity with the Windows backend.
+        with unittest.mock.patch.object(pmac, "resolve_bundle_identifier", return_value="com.hnc.Discord"):
+            settings_a = pmac.process_audio_capture_settings("Discord", "/some/path")
+            settings_b = pmac.process_audio_capture_settings("SomethingElseEntirely", "/some/path")
+        self.assertEqual(settings_a, settings_b)
+
+
+class HideDockIconTests(unittest.TestCase):
+    def test_sets_accessory_activation_policy(self):
+        fake_appkit = unittest.mock.MagicMock()
+        fake_appkit.NSApplicationActivationPolicyAccessory = 1
+        fake_app = unittest.mock.MagicMock()
+        fake_appkit.NSApplication.sharedApplication.return_value = fake_app
+
+        with unittest.mock.patch.dict(sys.modules, {"AppKit": fake_appkit}):
+            pmac.hide_dock_icon()
+
+        fake_app.setActivationPolicy_.assert_called_once_with(1)
+
+    def test_missing_pyobjc_is_logged_not_raised(self):
+        with unittest.mock.patch.dict(sys.modules, {"AppKit": None}):
+            with self.assertLogs(level="WARNING"):
+                pmac.hide_dock_icon()  # must not raise
+
+
+class RunOnMainThreadTests(unittest.TestCase):
+    # Confirmed live: the game-watcher background thread setting the tray icon's image/title
+    # directly crashed the whole process (SIGABRT deep inside Tk's own Cocoa event dispatch) --
+    # AppKit forbids touching it off the main thread. See platform_macos.run_on_main_thread's own
+    # docstring for the full crash-report trail.
+    def test_runs_immediately_when_already_on_main_thread(self):
+        calls = []
+        self.assertIs(threading.current_thread(), threading.main_thread())
+        pmac.run_on_main_thread(lambda: calls.append(1))
+        self.assertEqual(calls, [1])
+
+    def test_marshals_via_callafter_when_off_main_thread(self):
+        fake_app_helper = unittest.mock.MagicMock()
+        fake_pyobjctools = unittest.mock.MagicMock(AppHelper=fake_app_helper)
+        func = lambda: None
+
+        errors = []
+
+        def run_off_main_thread():
+            try:
+                with unittest.mock.patch.dict(sys.modules, {
+                    "PyObjCTools": fake_pyobjctools,
+                    "PyObjCTools.AppHelper": fake_app_helper,
+                }):
+                    pmac.run_on_main_thread(func)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_off_main_thread)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(errors, [])
+        fake_app_helper.callAfter.assert_called_once_with(func)
+
+    def test_missing_pyobjc_off_main_thread_is_logged_not_raised(self):
+        errors = []
+
+        def run_off_main_thread():
+            try:
+                with unittest.mock.patch.dict(sys.modules, {"PyObjCTools": None}):
+                    with self.assertLogs(level="ERROR"):
+                        pmac.run_on_main_thread(lambda: None)  # must not raise
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_off_main_thread)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(errors, [])
+
+
+class OpenPathTests(unittest.TestCase):
+    def test_calls_open_command(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            pmac.open_path("/some/path")
+        mock_run.assert_called_once_with(["open", "/some/path"])
+
+
+class OpenScreenRecordingSettingsTests(unittest.TestCase):
+    # Confirmed live (real macOS 15.8.1): this exact URL opens System Settings directly to the
+    # Screen & System Audio Recording pane, not just the general Privacy & Security page.
+    def test_opens_the_screen_recording_settings_pane(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            pmac.open_screen_recording_settings()
+        mock_run.assert_called_once_with(
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"]
+        )
+
+    def test_failure_is_logged_not_raised(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run", side_effect=OSError("boom")):
+            with self.assertLogs(level="WARNING"):
+                pmac.open_screen_recording_settings()  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpenAccessibilitySettingsTests(unittest.TestCase):
+    def test_opens_the_accessibility_privacy_pane(self):
+        with unittest.mock.patch.object(pmac.subprocess, "run") as mock_run:
+            pmac.open_accessibility_settings()
+        self.assertEqual(
+            mock_run.call_args[0][0],
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+        )
+
+
+class ProcessAudioTapTests(unittest.TestCase):
+    def test_install_command_quotes_paths_and_restarts_core_audio(self):
+        command = pmac.game_audio_driver_install_command("/Apps/It's Here/OBSAutoRecorderGameAudio.driver")
+        self.assertIn("'/Apps/It'\\''s Here/OBSAutoRecorderGameAudio.driver'", command)
+        self.assertIn("'/Library/Audio/Plug-Ins/HAL/OBSAutoRecorderGameAudio.driver'", command)
+        self.assertTrue(command.endswith("killall coreaudiod"))
+
+    def test_available_needs_macos_14_2_helper_and_device(self):
+        def check(version, helper="/x/process_audio_tap", installed=True):
+            with unittest.mock.patch.object(pmac.platform, "mac_ver", return_value=(version, ("", "", ""), "")), \
+                    unittest.mock.patch.object(pmac, "process_audio_tap_helper_path", return_value=helper), \
+                    unittest.mock.patch.object(pmac, "game_audio_device_installed", return_value=installed):
+                return pmac.process_audio_tap_available()
+        self.assertTrue(check("15.8.1"))
+        self.assertTrue(check("14.2"))
+        self.assertFalse(check("14.1"))
+        self.assertFalse(check("15.0", helper=None))
+        self.assertFalse(check("15.0", installed=False))
+
+    def test_start_passes_every_pid_and_keeps_stdin_open(self):
+        with unittest.mock.patch.object(pmac, "process_audio_tap_helper_path", return_value="/x/process_audio_tap"), \
+                unittest.mock.patch.object(pmac.subprocess, "Popen") as popen:
+            pmac.start_process_audio_tap([7, 9])
+        self.assertEqual(popen.call_args[0][0], ["/x/process_audio_tap", "--pid", "7", "--pid", "9"])
+        self.assertEqual(popen.call_args[1]["stdin"], pmac.subprocess.PIPE)
+
+    def test_start_without_helper_does_nothing(self):
+        with unittest.mock.patch.object(pmac, "process_audio_tap_helper_path", return_value=None):
+            self.assertIsNone(pmac.start_process_audio_tap([7]))
+
+
+class KeybindTapConsumptionTests(unittest.TestCase):
+    """Custom keybinds swallow exactly their own key combination (an active tap); everything else,
+    and the clip editor's space bar listener, passes through untouched."""
+
+    def start_keybind_tap(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_services = make_fake_application_services(accessibility_trusted=True)
+        binding = {"enabled": True, "key": "F3", "modifiers": ["win"], "action": "add_marker"}
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_services}), \
+                unittest.mock.patch.object(pmac.threading, "Thread"):
+            pmac.run_custom_keybind_listener(
+                [binding], get_client=None, get_manual_split_buffer_seconds=None,
+                fire_keybind=unittest.mock.Mock(), describe_keybind=unittest.mock.Mock(return_value="Win+F3"),
+                notify=unittest.mock.Mock(),
+            )
+        return fake_quartz, fake_quartz.CGEventTapCreate.call_args[0][4]
+
+    def test_other_keys_pass_through(self):
+        fake_quartz, tap_callback = self.start_keybind_tap()
+        event = unittest.mock.Mock()
+        fake_quartz.CGEventGetIntegerValueField.return_value = pmac.macos_keycode_for_key("F3")
+        fake_quartz.CGEventGetFlags.return_value = 0  # F3 without Cmd
+        with unittest.mock.patch.object(pmac.threading, "Thread"):
+            self.assertIs(tap_callback(None, fake_quartz.kCGEventKeyDown, event, None), event)
+
+    def test_a_disabled_tap_is_switched_back_on(self):
+        fake_quartz, tap_callback = self.start_keybind_tap()
+        event = unittest.mock.Mock()
+        self.assertIs(tap_callback(None, fake_quartz.kCGEventTapDisabledByTimeout, event, None), event)
+        fake_quartz.CGEventTapEnable.assert_called_with(fake_quartz.CGEventTapCreate.return_value, True)
+
+    def test_space_bar_listener_stays_passive(self):
+        fake_quartz = make_fake_quartz(accessibility_trusted=True)
+        fake_services = make_fake_application_services(accessibility_trusted=True)
+        with unittest.mock.patch.dict(sys.modules, {"Quartz": fake_quartz, "ApplicationServices": fake_services}):
+            pmac.run_clip_editor_space_bar_listener(None, unittest.mock.Mock(), unittest.mock.Mock())
+        self.assertEqual(fake_quartz.CGEventTapCreate.call_args[0][2], fake_quartz.kCGEventTapOptionListenOnly)
+
+
+class UninstallGameAudioDeviceTests(unittest.TestCase):
+    def test_uninstall_command_removes_the_driver_and_restarts_core_audio(self):
+        self.assertEqual(
+            pmac.game_audio_driver_uninstall_command(),
+            "rm -rf '/Library/Audio/Plug-Ins/HAL/OBSAutoRecorderGameAudio.driver' && killall coreaudiod",
+        )
+
+    def test_nothing_to_do_when_not_installed(self):
+        with unittest.mock.patch.object(pmac, "game_audio_device_installed", return_value=False), \
+                unittest.mock.patch.object(pmac.subprocess, "run") as run:
+            self.assertTrue(pmac.uninstall_game_audio_device())
+        run.assert_not_called()
+
+    def test_cancelled_password_prompt_reports_failure(self):
+        with unittest.mock.patch.object(pmac, "game_audio_device_installed", return_value=True), \
+                unittest.mock.patch.object(pmac.subprocess, "run", return_value=unittest.mock.Mock(returncode=1, stderr="User canceled.")):
+            self.assertFalse(pmac.uninstall_game_audio_device())
+
+
+
+class FindLibtkInPackagedAppTests(unittest.TestCase):
+    def test_packaged_app_finds_it_directly_in_frameworks(self):
+        # Confirmed live: the packaged app has Contents/Frameworks/libtk8.6.dylib, with no lib/.
+        with tempfile.TemporaryDirectory() as tmp:
+            frameworks = os.path.join(tmp, "Contents", "Frameworks")
+            os.makedirs(frameworks)
+            lib = os.path.join(frameworks, f"libtk{pmac.tkinter.TkVersion}.dylib")
+            open(lib, "w").close()
+            with unittest.mock.patch.object(pmac.sys, "frozen", True, create=True), \
+                    unittest.mock.patch.object(pmac.sys, "_MEIPASS", frameworks, create=True), \
+                    unittest.mock.patch.object(pmac.sys, "executable", os.path.join(tmp, "Contents", "MacOS", "App")):
+                self.assertEqual(pmac._find_libtk_dylib(), lib)

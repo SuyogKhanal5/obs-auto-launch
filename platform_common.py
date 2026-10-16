@@ -49,6 +49,33 @@ def hide_console_subprocess_kwargs():
     return {}
 
 
+def prepare_calibration_player(ffplay_path, work_dir, platform_name=None):
+    """The ffplay executable to play the audio-sync calibration tone with -- wrapped in an app
+    bundle on macOS, where OBS can only capture apps that have a bundle identifier."""
+    return _select_backend(platform_name).prepare_calibration_player(ffplay_path, work_dir)
+
+
+def is_this_app_frontmost(platform_name=None):
+    return _select_backend(platform_name).is_this_app_frontmost()
+
+
+def display_top_inset_pixels(pixel_width, pixel_height, platform_name=None):
+    """Rows at the top of a captured display (of that pixel size) that fullscreen games leave
+    black -- a notched Mac's menu-bar strip; 0 everywhere else."""
+    return _select_backend(platform_name).display_top_inset_pixels(pixel_width, pixel_height)
+
+
+def obs_launch_command(path, launch_args, platform_name=None):
+    """The command that starts OBS at path with launch_args on this OS."""
+    return _select_backend(platform_name).obs_launch_command(path, list(launch_args or []))
+
+
+def quit_obs_gracefully(platform_name=None):
+    """Asks OBS to quit normally where that's wanted between game sessions (macOS only); returns
+    False where it's a no-op."""
+    return _select_backend(platform_name).quit_obs_gracefully()
+
+
 def find_obs_executable(configured_path=None, platform_name=None):
     """Best-effort search for an OBS Studio install on this machine. An explicit configured_path
     that still exists always wins as-is; otherwise falls back to this OS's own discovery
@@ -95,6 +122,21 @@ def find_ffprobe_executable(ffmpeg_path):
         ffprobe_name = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
     ffprobe_path = os.path.join(ffmpeg_dir, ffprobe_name)
     return ffprobe_path if os.path.isfile(ffprobe_path) else None
+
+
+def find_ffplay_executable(ffmpeg_path):
+    """Given a resolved ffmpeg binary path, returns the ffplay binary expected to sit alongside
+    it -- same derive-from-ffmpeg's-own-name approach as find_ffprobe_executable above, for the
+    same reason: correct on Windows (ffmpeg.exe -> ffplay.exe) and Linux/macOS (ffmpeg -> ffplay,
+    no extension) alike, instead of a hardcoded "ffplay.exe" that's only ever right on Windows."""
+    ffmpeg_dir = os.path.dirname(ffmpeg_path)
+    ffmpeg_name = os.path.basename(ffmpeg_path)
+    if ffmpeg_name.lower().startswith("ffmpeg"):
+        ffplay_name = "ffplay" + ffmpeg_name[len("ffmpeg"):]
+    else:
+        ffplay_name = "ffplay.exe" if sys.platform == "win32" else "ffplay"
+    ffplay_path = os.path.join(ffmpeg_dir, ffplay_name)
+    return ffplay_path if os.path.isfile(ffplay_path) else None
 
 
 def libvlc_filename(platform_name=None):
@@ -187,7 +229,8 @@ def global_hotkeys_supported(platform_name=None):
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None, stop_event=None, hotkey_mode=None, platform_name=None,
+    icon=None, notifications_config=None, status=None, recording_state=None, stop_event=None,
+    hotkey_mode=None, platform_name=None,
 ):
     """Dispatches to this OS's own full custom-keybind listener implementation -- unlike most of
     this module's other functions, the entire mechanism (registration AND its event loop) differs
@@ -196,7 +239,9 @@ def run_custom_keybind_listener(
     one generic shape here; see CROSS_PLATFORM_PLAN.md Phase 3. fire_keybind/describe_keybind/notify
     are passed through rather than imported by the backend modules themselves, so backends never
     depend on autostart_script.py (the dependency only ever goes the other way -- see this
-    module's own docstring).
+    module's own docstring). recording_state is passed through unexamined -- only
+    add_recording_marker (via fire_keybind) ever reads it, to record a marker's timestamp
+    independently of OBS's own chapter mechanism; see autostart_script.py's add_recording_marker.
 
     stop_event: only platform_windows.py's own backend currently uses this (see its docstring for
     why -- releasing its hook near-instantly on a graceful shutdown, rather than only whenever
@@ -210,8 +255,8 @@ def run_custom_keybind_listener(
     choice to make."""
     return _select_backend(platform_name).run_custom_keybind_listener(
         bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-        icon=icon, notifications_config=notifications_config, status=status, stop_event=stop_event,
-        hotkey_mode=hotkey_mode,
+        icon=icon, notifications_config=notifications_config, status=status, recording_state=recording_state,
+        stop_event=stop_event, hotkey_mode=hotkey_mode,
     )
 
 
@@ -223,16 +268,23 @@ def is_autostart_enabled(platform_name=None):
     return _select_backend(platform_name).is_autostart_enabled()
 
 
-def enable_autostart(target_path=None, working_dir=None, platform_name=None):
+def enable_autostart(target_path=None, working_dir=None, extra_args=None, platform_name=None):
     """Configures this app to launch automatically at login. target_path/working_dir default to
     sys.executable and its own directory (this app enabling autostart for itself, e.g. from its
     own Settings toggle) -- pass them explicitly when a DIFFERENT process needs to enable it for
     an app it just installed elsewhere (e.g. installer.py, a separate running process from the
     app it just wrote to disk). Returns False (logged) rather than raising on any failure --
-    autostart has always been opt-in, best-effort, never something this app hard-requires."""
+    autostart has always been opt-in, best-effort, never something this app hard-requires.
+
+    extra_args: command-line arguments appended after target_path -- needed when target_path
+    alone isn't a directly-runnable program, e.g. running from source, where target_path is just
+    the Python interpreter and the actual script path has to be passed as its own argument (the
+    same [sys.executable, abspath(__file__)] shape autostart_script.py's own do_restart() already
+    uses to relaunch itself). None (the default) means "target_path alone is the whole command",
+    matching every existing caller's behavior unchanged."""
     target_path = target_path or sys.executable
     working_dir = working_dir or os.path.dirname(target_path)
-    return _select_backend(platform_name).enable_autostart(target_path, working_dir)
+    return _select_backend(platform_name).enable_autostart(target_path, working_dir, extra_args)
 
 
 def disable_autostart(platform_name=None):
@@ -321,3 +373,155 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
     frontmost process instead (see platform_macos.run_clip_editor_space_bar_listener's own
     docstring for why)."""
     return _select_backend(platform_name).run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_event)
+
+
+def process_audio_capture_kind(platform_name=None):
+    """Returns the OBS input kind used for per-process/per-application audio capture on this OS
+    (e.g. isolating one game's audio onto its own recording track), or None if this OS has no
+    confirmed capability of that kind at all -- Linux is a confirmed negative finding, not an
+    unimplemented one (CROSS_PLATFORM_PLAN.md §6.1: a real CI spike against PulseAudio found no
+    per-app capture kind exists there). Never guessed from documentation -- every non-None value
+    here was confirmed empirically against a real, running OBS instance."""
+    return _select_backend(platform_name).PROCESS_AUDIO_CAPTURE_KIND
+
+
+def process_audio_capture_settings(process_name, exe_path, platform_name=None):
+    """Builds the OBS input-settings dict that points process_audio_capture_kind()'s input at
+    process_name/exe_path on this OS -- a Windows "window" field formatted "::process_name" (an
+    exe-only match, no title/class needed), a macOS sck_audio_capture "application" field (a
+    bundle identifier resolved from exe_path -- see platform_macos.resolve_bundle_identifier).
+    Returns None if this OS has no such kind at all (process_audio_capture_kind() is None), or if
+    process_name/exe_path can't be resolved to whatever that kind's target identifier actually
+    needs (e.g. exe_path is None because the process isn't running right now, or -- macOS only --
+    it isn't inside a normal .app bundle at all)."""
+    return _select_backend(platform_name).process_audio_capture_settings(process_name, exe_path)
+
+
+def process_audio_capture_placeholder_settings(platform_name=None):
+    """Settings to give a process_audio_capture_kind() input that has no target yet, so it
+    records nothing instead of whatever its defaults capture -- or None if this OS's defaults
+    already capture nothing. Only macOS needs one; see its backend's own constant."""
+    placeholder = _select_backend(platform_name).PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS
+    return dict(placeholder) if placeholder else None
+
+
+def gui_requires_main_thread(platform_name=None):
+    """True if this OS's GUI toolkit must run only on the real process main thread -- AppKit's
+    hard requirement on macOS. Confirmed live: this app's Tk GUI (the overlay, and everything
+    built as a Toplevel of its one tk.Tk() -- Settings, the clip editor) running on a background
+    thread while pystray's tray icon pumps the real main thread's Cocoa run loop (this app's
+    default architecture, fine on Windows/Linux) crashes the whole process outright the moment
+    anything actually triggers that run loop to spin -- an uncaught NSInvalidArgumentException
+    deep inside Tk's own color-handling code (GetRGBA/TkpGetColor), not a graceful failure or a
+    Python-catchable exception. False on Windows/Linux, where no such constraint exists."""
+    platform_name = sys.platform if platform_name is None else platform_name
+    return platform_name == "darwin"
+
+
+def hide_dock_icon(platform_name=None):
+    """Hides this process's Dock icon / Cmd-Tab entry, on whichever OS has one to hide at all --
+    macOS only (see platform_macos.hide_dock_icon). No-op everywhere else: a pystray tray icon on
+    Windows/Linux never puts an equivalent unwanted taskbar/dock entry alongside itself in the
+    first place, unlike a plain macOS process, which shows a generic, non-functional Python/
+    rocket Dock icon next to the real menu-bar tray icon unless told not to."""
+    return _select_backend(platform_name).hide_dock_icon()
+
+
+def run_on_main_thread(func, platform_name=None):
+    """Schedules func to run on the real process main thread and returns immediately, without
+    waiting for it to actually run there -- only macOS needs this at all (see
+    platform_macos.run_on_main_thread): confirmed live that the game-watcher background thread
+    setting the tray icon's image/title directly (icon.icon = .../icon.title = ..., both touching
+    AppKit's NSStatusItem under the hood) crashed the whole process with a SIGABRT deep inside
+    Tk's own Cocoa event dispatch a few seconds later -- a background thread is never allowed to
+    touch AppKit on macOS. Windows/Linux have no such constraint, so func() just runs immediately,
+    synchronously, on whichever thread called this."""
+    return _select_backend(platform_name).run_on_main_thread(func)
+
+
+def open_path(path, platform_name=None):
+    """Opens a file or folder with the OS's own default handler (Explorer on Windows, Finder on
+    macOS, whichever app xdg-open resolves to on Linux) -- the cross-platform equivalent of
+    os.startfile(), which only exists on Windows at all. Confirmed live: the tray menu's "Open Log
+    File" and "Open Recordings Folder" items called os.startfile() directly and had never been
+    exercised on macOS -- clicking either there raised AttributeError (no such function outside
+    Windows), caught and logged by the tray menu's own error handling, so from the user's side it
+    looked exactly like the menu item silently doing nothing."""
+    return _select_backend(platform_name).open_path(path)
+
+
+def open_accessibility_settings(platform_name=None):
+    """Opens macOS's Accessibility privacy pane (needed for custom keybinds); no-op elsewhere."""
+    return _select_backend(platform_name).open_accessibility_settings()
+
+
+def process_audio_tap_available(platform_name=None):
+    """Whether games without an app bundle (Wine, Java) can get their own game audio track:
+    macOS 14.2+ with the Game Audio device installed. False elsewhere."""
+    return _select_backend(platform_name).process_audio_tap_available()
+
+
+def game_audio_device_uid(platform_name=None):
+    """The Game Audio loopback device's UID (OBS's coreaudio "device_id"), or None."""
+    return getattr(_select_backend(platform_name), "GAME_AUDIO_DEVICE_UID", None)
+
+
+def game_audio_device_installed(platform_name=None):
+    return _select_backend(platform_name).game_audio_device_installed()
+
+
+def install_game_audio_device(driver_path=None, platform_name=None):
+    """Installs the Game Audio device (macOS asks for an admin password). True if installed.
+    driver_path defaults to the copy bundled with this app."""
+    return _select_backend(platform_name).install_game_audio_device(driver_path)
+
+
+def uninstall_game_audio_device(platform_name=None):
+    """Removes the Game Audio device (macOS asks for an admin password). True if it's gone."""
+    return _select_backend(platform_name).uninstall_game_audio_device()
+
+
+def start_process_audio_tap(pids, platform_name=None):
+    """Feeds pids' audio into the Game Audio device; returns a handle for stop_process_audio_tap."""
+    return _select_backend(platform_name).start_process_audio_tap(pids)
+
+
+def stop_process_audio_tap(handle, platform_name=None):
+    return _select_backend(platform_name).stop_process_audio_tap(handle)
+
+
+def request_system_audio_recording_permission(platform_name=None):
+    return _select_backend(platform_name).request_system_audio_recording_permission()
+
+
+def open_system_audio_recording_settings(platform_name=None):
+    return _select_backend(platform_name).open_system_audio_recording_settings()
+
+
+def screen_recording_permission_granted(platform_name=None):
+    """macOS: whether this app may read other apps' window titles. True elsewhere."""
+    return _select_backend(platform_name).screen_recording_permission_granted()
+
+
+def request_screen_recording_permission(platform_name=None):
+    return _select_backend(platform_name).request_screen_recording_permission()
+
+
+def accessibility_permission_granted(platform_name=None):
+    """True if this app may listen for global keys -- always True outside macOS, where no
+    per-app permission gates it."""
+    return _select_backend(platform_name).accessibility_permission_granted()
+
+
+def request_accessibility_permission(platform_name=None):
+    """Shows macOS's own Accessibility prompt for this app; no-op elsewhere."""
+    return _select_backend(platform_name).request_accessibility_permission()
+
+
+def open_screen_recording_settings(platform_name=None):
+    """Opens the OS's own Screen Recording privacy settings, macOS only -- see
+    platform_macos.open_screen_recording_settings's own docstring for why this exists (OBS, not
+    this app, needs that permission, and there's no API to check or grant it on another app's
+    behalf) and exactly what URL it opens. No-op everywhere else: Windows and Linux have no
+    equivalent OS-level screen-recording consent system an app needs to be granted into."""
+    return _select_backend(platform_name).open_screen_recording_settings()

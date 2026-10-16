@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
@@ -128,6 +129,108 @@ class ComputeReferenceTrackTests(unittest.TestCase):
         obs_config = {"multi_track_audio": {"tracks": [{"input_name": "Line In", "track": 4}]}}
         self.assertEqual(a.compute_reference_track(obs_config, reference_input_name="Line In"), 4)
 
+    def test_never_falls_back_to_a_mic(self):
+        # The sync fix aligns process-capture tracks to desktop audio by cross-correlating the
+        # same sound captured two ways -- a mic doesn't carry that sound, so it's never a valid
+        # reference, kinds known or not.
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "Discord", "track": 4},
+                ],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
+            },
+        }
+        self.assertIsNone(a.compute_reference_track(obs_config))
+        self.assertIsNone(a.compute_reference_track(
+            obs_config, input_kinds={"Mic/Aux": "coreaudio_input_capture"},
+        ))
+
+    def test_macos_screen_capture_is_the_reference_via_input_kinds(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "macOS Screen Capture", "track": 1},
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "Mic/Aux", "track": 2},
+                    {"input_name": "Discord", "track": 4},
+                ],
+                "app_captures": [{"input_name": "Discord", "process_name": "Discord"}],
+            },
+        }
+        input_kinds = {"Mic/Aux": "coreaudio_input_capture", "macOS Screen Capture": "screen_capture"}
+        self.assertEqual(a.compute_reference_track(obs_config, input_kinds=input_kinds), 1)
+
+    def test_desktop_kind_needs_live_kinds_to_be_recognized(self):
+        # Without input_kinds there's no way to know "macOS Screen Capture" is desktop audio --
+        # only the literal reference_input_name can be matched offline.
+        obs_config = {"multi_track_audio": {"tracks": [{"input_name": "macOS Screen Capture", "track": 1}]}}
+        self.assertIsNone(a.compute_reference_track(obs_config, input_kinds=None))
+
+    def test_desktop_audio_by_name_wins_without_live_kinds(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Mic/Aux", "track": 1},
+                    {"input_name": "Desktop Audio", "track": 2},
+                ],
+            },
+        }
+        self.assertEqual(a.compute_reference_track(obs_config), 2)
+
+    def test_lowest_desktop_kind_track_wins_when_several(self):
+        obs_config = {
+            "multi_track_audio": {
+                "tracks": [
+                    {"input_name": "Loopback", "track": 3},
+                    {"input_name": "macOS Screen Capture", "track": 2},
+                ],
+            },
+        }
+        input_kinds = {"Loopback": "coreaudio_output_capture", "macOS Screen Capture": "screen_capture"}
+        self.assertEqual(a.compute_reference_track(obs_config, input_kinds=input_kinds), 2)
+
+
+class ResolveInputKindsTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._cache_dir.cleanup)
+        patcher = unittest.mock.patch.object(a, "OBS_STATE_CACHE_PATH", os.path.join(self._cache_dir.name, "cache.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_returns_name_to_kind_map(self):
+        client = FakeObsClient(inputs={
+            "Mic/Aux": {"kind": "coreaudio_input_capture", "tracks": {}},
+            "macOS Screen Capture": {"kind": "screen_capture", "tracks": {}},
+        })
+        with unittest.mock.patch.object(a, "connect_obs", return_value=client):
+            result = a.resolve_input_kinds({"websocket": {}})
+        self.assertEqual(
+            result, {"Mic/Aux": "coreaudio_input_capture", "macOS Screen Capture": "screen_capture"},
+        )
+
+    def test_returns_empty_dict_when_obs_unreachable(self):
+        with unittest.mock.patch.object(a, "connect_obs", return_value=None):
+            result = a.resolve_input_kinds({"websocket": {}})
+        self.assertEqual(result, {})
+
+    def test_returns_empty_dict_on_failure_instead_of_raising(self):
+        class BrokenClient(FakeObsClient):
+            def get_input_list(self, kind=None):
+                raise RuntimeError("boom")
+
+        with unittest.mock.patch.object(a, "connect_obs", return_value=BrokenClient()):
+            result = a.resolve_input_kinds({"websocket": {}})
+        self.assertEqual(result, {})
+
+    def test_connects_with_a_single_fast_attempt(self):
+        with unittest.mock.patch.object(a, "connect_obs", return_value=None) as mock_connect:
+            a.resolve_input_kinds({"websocket": {"host": "localhost"}})
+        mock_connect.assert_called_once_with({"host": "localhost"}, retries=1, delay=0)
+
 
 class TrackNameHintsTests(unittest.TestCase):
     def test_maps_track_numbers_to_input_names(self):
@@ -251,6 +354,17 @@ class SyncMultiTrackOutputSettingsTests(unittest.TestCase):
             with self.assertLogs(level="WARNING"):
                 a.sync_multi_track_output_settings(self.client, [("Mic", 1)], "P")
 
+    def test_warns_on_hybrid_mp4(self):
+        # Confirmed live (CROSS_PLATFORM_PLAN.md §5.21) on a real OBS 30.2.3 instance: despite
+        # its name, hybrid_mp4 only ever embeds ONE audio track in the output file, the same
+        # broken behavior as plain mp4 -- it must warn exactly like mp4 does, not be treated as
+        # mkv-safe.
+        self.client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
+        self.client.set_profile_parameter("Output", "Mode", "Advanced")
+        with self.assertLogs(level="WARNING") as cm:
+            a.sync_multi_track_output_settings(self.client, [("Mic", 1)], "P")
+        self.assertTrue(any("recording format" in msg for msg in cm.output))
+
 
 class EnsureDedicatedProfileTests(unittest.TestCase):
     def test_creates_profile_and_clones_settings_from_source(self):
@@ -288,6 +402,23 @@ class SyncMultiTrackAudioAppCapturesTests(unittest.TestCase):
     used to only get that treatment once, at creation -- meaning the exact same OBS-side drift
     would leave them silently broken until someone noticed and fixed it by hand. This checks
     sync_multi_track_audio now re-asserts every configured app_captures entry on every call."""
+
+    def setUp(self):
+        # set_game_audio_capture_target's own orchestration is OS-agnostic -- mocking
+        # platform_common's two dispatch functions with Windows-shaped return values keeps these
+        # tests exercising that orchestration regardless of which real OS runs them, per
+        # platform_common.py's own testing philosophy (CROSS_PLATFORM_PLAN.md §3.2).
+        patcher1 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_kind", return_value="wasapi_process_output_capture",
+        )
+        patcher2 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_settings",
+            side_effect=lambda process_name, exe_path: {"window": f"::{process_name}", "priority": 2},
+        )
+        patcher1.start()
+        patcher2.start()
+        self.addCleanup(patcher1.stop)
+        self.addCleanup(patcher2.stop)
 
     def test_repoints_existing_app_capture_every_time(self):
         client = FakeObsClient(
@@ -375,3 +506,407 @@ class SyncMultiTrackAudioAppCapturesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReapplyMultiTrackRoutingTests(unittest.TestCase):
+    # A Game Audio input created mid-recording (set_game_audio_capture_target runs only once the
+    # game is known, after ensure_obs_ready's routing pass) starts on every track by OBS's
+    # default -- confirmed live, bleeding game audio into every isolated track.
+    ALL = {str(i): True for i in range(1, 7)}
+
+    def make_client(self):
+        return FakeObsClient(inputs={
+            "Game Audio": {"kind": "sck_audio_capture", "tracks": dict(self.ALL)},
+            "Discord": {"kind": "sck_audio_capture", "tracks": {**{str(i): False for i in range(1, 7)}, "4": True}},
+        })
+
+    def test_routes_a_freshly_created_input_to_its_configured_track(self):
+        client = self.make_client()
+        a.reapply_multi_track_routing(client, {
+            "enabled": True,
+            "tracks": [{"input_name": "Game Audio", "track": 3}, {"input_name": "Discord", "track": 4}],
+        })
+        self.assertEqual([k for k, v in client.inputs["Game Audio"]["tracks"].items() if v], ["3"])
+
+    def test_noop_when_multi_track_disabled(self):
+        client = self.make_client()
+        a.reapply_multi_track_routing(client, {"enabled": False, "tracks": [{"input_name": "Game Audio", "track": 3}]})
+        self.assertEqual(client.inputs["Game Audio"]["tracks"], self.ALL)
+
+    def test_noop_when_no_tracks_configured(self):
+        client = self.make_client()
+        a.reapply_multi_track_routing(client, {"enabled": True, "tracks": []})
+        self.assertEqual(client.inputs["Game Audio"]["tracks"], self.ALL)
+
+
+class EnsureGameAudioTrackTests(unittest.TestCase):
+    def setUp(self):
+        # Whether this machine has the macOS Game Audio device installed must not matter here.
+        patcher = unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_config(self, tracks, game_enabled=True, multi_enabled=True, input_name="Game Audio"):
+        return {"obs": {
+            "game_audio_capture": {"enabled": game_enabled, "input_name": input_name},
+            "multi_track_audio": {"enabled": multi_enabled, "tracks": tracks},
+        }}
+
+    def tracks_of(self, config):
+        return config["obs"]["multi_track_audio"]["tracks"]
+
+    def test_adds_game_audio_on_track_three(self):
+        config = self.make_config([{"input_name": "Mic/Aux", "track": 1}, {"input_name": "Discord", "track": 4}])
+        a.ensure_game_audio_track(config)
+        self.assertIn({"input_name": "Game Audio", "track": 3}, self.tracks_of(config))
+
+    def test_leaves_an_existing_mapping_alone(self):
+        config = self.make_config([{"input_name": "Game Audio", "track": 5}])
+        a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), [{"input_name": "Game Audio", "track": 5}])
+
+    def test_uses_the_configured_input_name(self):
+        config = self.make_config([], input_name="Isolated Game")
+        a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), [{"input_name": "Isolated Game", "track": 3}])
+
+    def test_falls_back_to_lowest_free_track_when_three_is_taken(self):
+        config = self.make_config([
+            {"input_name": "Mic/Aux", "track": 1}, {"input_name": "Line In", "track": 3},
+        ])
+        a.ensure_game_audio_track(config)
+        self.assertIn({"input_name": "Game Audio", "track": 2}, self.tracks_of(config))
+
+    def test_all_tracks_taken_leaves_config_unchanged(self):
+        tracks = [{"input_name": f"Input {n}", "track": n} for n in range(1, 7)]
+        config = self.make_config(list(tracks))
+        with self.assertLogs(level="WARNING"):
+            a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), tracks)
+
+    def test_noop_when_game_audio_disabled(self):
+        config = self.make_config([], game_enabled=False)
+        a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), [])
+
+    def test_noop_when_multi_track_disabled(self):
+        config = self.make_config([], multi_enabled=False)
+        a.ensure_game_audio_track(config)
+        self.assertEqual(self.tracks_of(config), [])
+
+    def test_load_config_applies_it(self):
+        import json
+        import tempfile
+        config = self.make_config([{"input_name": "Mic/Aux", "track": 1}])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(config, f)
+            with unittest.mock.patch.object(a, "CONFIG_PATH", path):
+                loaded = a.load_config()
+        self.assertIn({"input_name": "Game Audio", "track": 3}, self.tracks_of(loaded))
+
+
+class EnsureGameAudioInputExistsTests(unittest.TestCase):
+    def setUp(self):
+        patcher = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        tap_patcher = unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=False)
+        tap_patcher.start()
+        self.addCleanup(tap_patcher.stop)
+
+    def test_creates_the_wine_and_java_input_even_when_game_audio_exists(self):
+        # Confirmed live: an early return when Game Audio existed skipped this input entirely.
+        client = FakeObsClient(current_scene="Scene", inputs={"Game Audio": {"kind": "sck_audio_capture", "tracks": {}}})
+        with unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=True), \
+                unittest.mock.patch.object(a.platform_common, "game_audio_device_uid", return_value="OBSAutoRecorderGameAudio_UID"):
+            a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
+        self.assertIn(
+            ("create_input", "Scene", "Game Audio (Wine & Java)", "coreaudio_input_capture",
+             {"device_id": "OBSAutoRecorderGameAudio_UID"}),
+            client.calls,
+        )
+
+    def test_creates_missing_input_in_current_scene_capturing_nothing(self):
+        client = FakeObsClient(current_scene="Scene")
+        with unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_placeholder_settings", return_value={"type": 1},
+        ):
+            a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
+        self.assertEqual(client.inputs["Game Audio"]["kind"], "sck_audio_capture")
+        self.assertIn(("create_input", "Scene", "Game Audio", "sck_audio_capture", {"type": 1}), client.calls)
+
+    def test_creates_with_empty_settings_where_no_placeholder_is_needed(self):
+        client = FakeObsClient(current_scene="Scene")
+        with unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_placeholder_settings", return_value=None,
+        ):
+            a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
+        self.assertIn(("create_input", "Scene", "Game Audio", "sck_audio_capture", {}), client.calls)
+
+    def test_leaves_an_existing_input_alone(self):
+        client = FakeObsClient(inputs={"Game Audio": {"kind": "sck_audio_capture", "tracks": {}}})
+        a.ensure_game_audio_input_exists(client, {"enabled": True, "input_name": "Game Audio"})
+        self.assertNotIn("create_input", [c[0] for c in client.calls])
+
+    def test_noop_when_disabled(self):
+        client = FakeObsClient()
+        a.ensure_game_audio_input_exists(client, {"enabled": False})
+        self.assertEqual(client.inputs, {})
+
+    def test_noop_on_an_os_without_per_app_capture(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value=None):
+            a.ensure_game_audio_input_exists(client, {"enabled": True})
+        self.assertEqual(client.inputs, {})
+
+
+class UntargetedAppAudioCaptureTests(unittest.TestCase):
+    # Confirmed live on macOS: sck_audio_capture's default type 0 is "Desktop Audio Capture", so a
+    # never-targeted "Safari" input recorded the whole system mix -- Spotify on the browser track.
+    def setUp(self):
+        patchers = [
+            unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"),
+            unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", return_value=None),
+            unittest.mock.patch.object(
+                a.platform_common, "process_audio_capture_placeholder_settings", return_value={"type": 1},
+            ),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_unresolvable_target_resets_input_to_capture_nothing(self):
+        client = FakeObsClient(inputs={"Safari": {"kind": "sck_audio_capture", "tracks": {}, "settings": {}}})
+        with self.assertLogs(level="WARNING"):
+            a.set_game_audio_capture_target(client, "Safari", "Safari")
+        self.assertEqual(client.inputs["Safari"]["settings"], {"type": 1})
+
+    def test_reset_keeps_a_previous_target(self):
+        client = FakeObsClient(inputs={"Safari": {
+            "kind": "sck_audio_capture", "tracks": {},
+            "settings": {"type": 1, "application": "com.apple.Safari"},
+        }})
+        with self.assertLogs(level="WARNING"):
+            a.set_game_audio_capture_target(client, "Safari", "Safari")
+        self.assertEqual(client.inputs["Safari"]["settings"], {"type": 1, "application": "com.apple.Safari"})
+
+    def test_quick_setup_creates_a_not_running_app_capturing_nothing(self):
+        client = FakeObsClient()
+        safari = {"name": "Safari", "process_name": "Safari", "category": "Browser"}
+        a.compute_quick_setup_tracks(client, None, None, None, [safari])
+        self.assertEqual(client.inputs["Safari"]["settings"], {"type": 1})
+
+
+class ProcessAudioCapturePlaceholderTests(unittest.TestCase):
+    def test_macos_uses_application_mode(self):
+        self.assertEqual(a.platform_common.process_audio_capture_placeholder_settings("darwin"), {"type": 1})
+
+    def test_other_oses_need_none(self):
+        self.assertIsNone(a.platform_common.process_audio_capture_placeholder_settings("win32"))
+        self.assertIsNone(a.platform_common.process_audio_capture_placeholder_settings("linux"))
+
+    def test_returns_a_copy(self):
+        first = a.platform_common.process_audio_capture_placeholder_settings("darwin")
+        first["application"] = "x"
+        self.assertEqual(a.platform_common.process_audio_capture_placeholder_settings("darwin"), {"type": 1})
+
+
+class MacAppCaptureRefreshTests(unittest.TestCase):
+    # Confirmed live: OBS's sck_audio_capture only finds apps that were running when it last
+    # listed them -- re-pointing at a since-launched app recorded silence until its app list was
+    # re-read. Reading it, clearing the target, then re-pointing captured the app (-8.9 dB).
+    def setUp(self):
+        for target, value in (
+            ("process_audio_capture_kind", "sck_audio_capture"),
+            ("process_audio_capture_settings", {"type": 1, "application": "com.hnc.Discord"}),
+        ):
+            p = unittest.mock.patch.object(a.platform_common, target, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_refreshes_the_app_list_and_clears_before_pointing(self):
+        client = FakeObsClient(inputs={"Discord": {"kind": "sck_audio_capture", "tracks": {}, "settings": {}}})
+        a.set_game_audio_capture_target(client, "Discord", "Discord")
+        names = [c[0] for c in client.calls]
+        self.assertEqual(names, ["get_input_properties_list_property_items", "set_input_settings", "set_input_settings"])
+        self.assertEqual(client.calls[1][2], {"application": ""})
+        self.assertEqual(client.inputs["Discord"]["settings"], {"type": 1, "application": "com.hnc.Discord"})
+
+    def test_missing_input_is_still_created(self):
+        client = FakeObsClient()
+        a.set_game_audio_capture_target(client, "Discord", "Discord")
+        self.assertEqual(client.inputs["Discord"]["settings"], {"type": 1, "application": "com.hnc.Discord"})
+
+
+class PointNewlyRunningAppCapturesTests(unittest.TestCase):
+    CONFIG = {
+        "enabled": True,
+        "app_captures": [
+            {"input_name": "Discord", "process_name": "Discord"},
+            {"input_name": "Safari", "process_name": "Safari"},
+        ],
+    }
+
+    def run_check(self, previously_running, processes):
+        with unittest.mock.patch.object(a, "set_game_audio_capture_target") as mock_point, \
+                unittest.mock.patch.object(a, "apply_process_capture_sync_offset"):
+            running = a.point_newly_running_app_captures(
+                FakeObsClient(), self.CONFIG, previously_running, processes, -27,
+            )
+        return running, [c.args[1] for c in mock_point.call_args_list]
+
+    def test_points_an_app_that_started_mid_recording(self):
+        running, pointed = self.run_check({"Discord"}, [("Discord", "", 1), ("Safari", "", 2)])
+        self.assertEqual(pointed, ["Safari"])
+        self.assertEqual(running, {"Discord", "Safari"})
+
+    def test_nothing_new_means_no_writes(self):
+        running, pointed = self.run_check({"Discord"}, [("Discord", "", 1), ("Finder", "", 3)])
+        self.assertEqual(pointed, [])
+        self.assertEqual(running, {"Discord"})
+
+    def test_an_app_that_quit_and_relaunched_is_pointed_again(self):
+        running, _ = self.run_check({"Discord", "Safari"}, [("Discord", "", 1)])
+        self.assertEqual(running, {"Discord"})
+        _, pointed = self.run_check(running, [("Discord", "", 1), ("Safari", "", 4)])
+        self.assertEqual(pointed, ["Safari"])
+
+    def test_disabled_multi_track_does_nothing(self):
+        with unittest.mock.patch.object(a, "set_game_audio_capture_target") as mock_point:
+            running = a.point_newly_running_app_captures(
+                FakeObsClient(), dict(self.CONFIG, enabled=False), set(), [("Safari", "", 2)], -27,
+            )
+        self.assertEqual(running, set())
+        mock_point.assert_not_called()
+
+
+class MacAppCaptureRefreshFailureTests(unittest.TestCase):
+    # Confirmed live: with the screen locked, listing the source's apps fails with "not found",
+    # which used to send the existing source down the "create it" path (601 already exists).
+    def test_failed_app_listing_still_points_the_existing_source(self):
+        class LockedScreenClient(FakeObsClient):
+            def get_input_properties_list_property_items(self, name, prop):
+                raise a.obsws.error.OBSSDKRequestError("GetInputPropertiesListPropertyItems", 600, "")
+        client = LockedScreenClient(inputs={"Discord": {"kind": "sck_audio_capture", "tracks": {}, "settings": {}}})
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+                unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings",
+                                           return_value={"type": 1, "application": "com.hnc.Discord"}):
+            a.set_game_audio_capture_target(client, "Discord", "Discord")
+        self.assertEqual(client.inputs["Discord"]["settings"], {"type": 1, "application": "com.hnc.Discord"})
+        self.assertNotIn("create_input", [c[0] for c in client.calls])
+
+
+class ProcessTapTrackTests(unittest.TestCase):
+    """macOS: the Wine & Java input follows Game Audio's track when the device is installed."""
+
+    def setUp(self):
+        patcher = unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def config(self, tracks):
+        return {"obs": {
+            "game_audio_capture": {"enabled": True, "input_name": "Game Audio"},
+            "multi_track_audio": {"enabled": True, "tracks": tracks},
+        }}
+
+    def test_added_on_game_audios_track(self):
+        config = a.ensure_game_audio_track(self.config([{"input_name": "Mic/Aux", "track": 1}]))
+        tracks = config["obs"]["multi_track_audio"]["tracks"]
+        self.assertIn({"input_name": "Game Audio (Wine & Java)", "track": 3}, tracks)
+
+    def test_follows_game_audio_to_a_new_track(self):
+        config = a.ensure_game_audio_track(self.config([
+            {"input_name": "Game Audio", "track": 5}, {"input_name": "Game Audio (Wine & Java)", "track": 3},
+        ]))
+        tracks = config["obs"]["multi_track_audio"]["tracks"]
+        self.assertEqual([t for t in tracks if t["input_name"] == "Game Audio (Wine & Java)"],
+                         [{"input_name": "Game Audio (Wine & Java)", "track": 5}])
+
+    def test_not_added_without_the_device(self):
+        with unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=False):
+            config = a.ensure_game_audio_track(self.config([{"input_name": "Game Audio", "track": 3}]))
+        self.assertEqual(config["obs"]["multi_track_audio"]["tracks"], [{"input_name": "Game Audio", "track": 3}])
+
+
+class StartGameAudioTapTests(unittest.TestCase):
+    enabled = {"enabled": True, "input_name": "Game Audio"}
+
+    def run_with(self, available=True, settings=None, config=None):
+        with unittest.mock.patch.object(a.platform_common, "process_audio_tap_available", return_value=available), \
+                unittest.mock.patch.object(a, "resolve_process_audio_capture", return_value=("sck_audio_capture", settings)), \
+                unittest.mock.patch.object(a.platform_common, "start_process_audio_tap", return_value="handle") as start:
+            result = a.start_game_audio_tap_if_needed(config or self.enabled, "WizardGraphicalClient.exe", 42)
+        return result, start
+
+    def test_taps_a_game_without_an_app_bundle(self):
+        result, start = self.run_with(settings=None)
+        self.assertEqual(result, "handle")
+        start.assert_called_once_with([42])
+
+    def test_leaves_bundled_games_to_per_app_capture(self):
+        result, start = self.run_with(settings={"type": 1, "application": "com.example.game"})
+        self.assertIsNone(result)
+        start.assert_not_called()
+
+    def test_needs_the_device_and_isolation_on(self):
+        self.assertIsNone(self.run_with(available=False)[0])
+        self.assertIsNone(self.run_with(config={"enabled": False})[0])
+
+
+class CaptureListingRetryTests(unittest.TestCase):
+    """macOS lists an app as capturable only once it has a window; an app pointed before that
+    records silence (confirmed live: Safari, pointed 0.5s after launch, was silent all session)."""
+
+    def setUp(self):
+        for target, value in (
+            ("process_audio_capture_kind", "sck_audio_capture"),
+            ("process_audio_capture_settings", {"type": 1, "application": "com.apple.Safari"}),
+        ):
+            p = unittest.mock.patch.object(a.platform_common, target, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def client(self, listed):
+        return FakeObsClient(
+            inputs={"Safari": {"kind": "sck_audio_capture", "tracks": {}, "settings": {}}},
+            listed_apps=["com.apple.Safari"] if listed else [],
+        )
+
+    def test_reports_whether_the_app_is_capturable(self):
+        self.assertIs(a.set_game_audio_capture_target(self.client(True), "Safari", "Safari"), True)
+        self.assertIs(a.set_game_audio_capture_target(self.client(False), "Safari", "Safari"), False)
+
+    def test_unlisted_app_is_still_pointed(self):
+        client = self.client(False)
+        a.set_game_audio_capture_target(client, "Safari", "Safari")
+        self.assertEqual(client.inputs["Safari"]["settings"], {"type": 1, "application": "com.apple.Safari"})
+
+    def test_session_start_only_counts_capturable_apps(self):
+        config = {"enabled": True, "app_captures": [{"input_name": "Safari", "process_name": "Safari"}]}
+        processes = [("Safari", "", 1)]
+        self.assertEqual(a.captured_app_captures(self.client(True), config, processes), {"Safari"})
+        self.assertEqual(a.captured_app_captures(self.client(False), config, processes), set())
+
+    def test_unlisted_app_is_retried_after_the_interval_until_capturable(self):
+        config = {"enabled": True, "app_captures": [{"input_name": "Safari", "process_name": "Safari"}]}
+        processes = [("Safari", "", 1)]
+        retry_state = {}
+        with unittest.mock.patch.object(a, "apply_process_capture_sync_offset"), \
+                unittest.mock.patch.object(a.time, "time", side_effect=[100.0, 101.0, 106.0]):
+            client = self.client(False)
+            captured = a.point_newly_running_app_captures(client, config, set(), processes, 0, retry_state)
+            self.assertEqual(captured, set())
+            # Too soon: not pointed again.
+            calls_before = len(client.calls)
+            captured = a.point_newly_running_app_captures(client, config, captured, processes, 0, retry_state)
+            self.assertEqual(len(client.calls), calls_before)
+            # Window open now, interval passed: pointed and captured.
+            client.listed_apps = ["com.apple.Safari"]
+            captured = a.point_newly_running_app_captures(client, config, captured, processes, 0, retry_state)
+        self.assertEqual(captured, {"Safari"})
+        self.assertEqual(retry_state, {})

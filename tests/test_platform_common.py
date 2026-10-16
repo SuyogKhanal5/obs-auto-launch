@@ -139,6 +139,39 @@ class FindFfprobeExecutableTests(unittest.TestCase):
         self.assertEqual(result, r"C:\tools\ffprobe.exe")
 
 
+class FindFfplayExecutableTests(unittest.TestCase):
+    # Same shape as FindFfprobeExecutableTests -- find_ffplay_executable exists specifically to
+    # fix a real bug found on real Mac hardware: run_audio_sync_calibration used to hardcode
+    # "ffplay.exe", which doesn't exist on macOS/Linux (plain "ffplay", no extension).
+    @unittest.skipUnless(os.name == "nt", "exercises real Windows (ntpath) path-splitting semantics")
+    def test_windows_style_exe_suffix_preserved(self):
+        with unittest.mock.patch("os.path.isfile", return_value=True):
+            result = pc.find_ffplay_executable(r"C:\ffmpeg\bin\ffmpeg.exe")
+        self.assertEqual(result, r"C:\ffmpeg\bin\ffplay.exe")
+
+    def test_no_extension_preserved(self):
+        with unittest.mock.patch("os.path.isfile", return_value=True):
+            result = pc.find_ffplay_executable("/usr/bin/ffmpeg")
+        self.assertEqual(result, os.path.join("/usr/bin", "ffplay"))
+
+    def test_returns_none_when_ffplay_missing(self):
+        with unittest.mock.patch("os.path.isfile", return_value=False):
+            self.assertIsNone(pc.find_ffplay_executable("/usr/bin/ffmpeg"))
+
+    def test_unusual_ffmpeg_name_falls_back_to_os_default_on_linux(self):
+        with unittest.mock.patch.object(pc.sys, "platform", "linux"):
+            with unittest.mock.patch("os.path.isfile", return_value=True):
+                result = pc.find_ffplay_executable("/usr/bin/my-custom-build")
+        self.assertEqual(result, os.path.join("/usr/bin", "ffplay"))
+
+    @unittest.skipUnless(os.name == "nt", "exercises real Windows (ntpath) path-splitting semantics")
+    def test_unusual_ffmpeg_name_falls_back_to_os_default_on_windows(self):
+        with unittest.mock.patch.object(pc.sys, "platform", "win32"):
+            with unittest.mock.patch("os.path.isfile", return_value=True):
+                result = pc.find_ffplay_executable(r"C:\tools\my-custom-build.exe")
+        self.assertEqual(result, r"C:\tools\ffplay.exe")
+
+
 class LibvlcFilenameTests(unittest.TestCase):
     def test_windows(self):
         self.assertEqual(pc.libvlc_filename(platform_name="win32"), "libvlc.dll")
@@ -201,17 +234,29 @@ class EnableAutostartTests(unittest.TestCase):
         with unittest.mock.patch.object(pc.sys, "executable", "/usr/bin/myapp"):
             with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
                 pc.enable_autostart(platform_name="linux")
-        mock_select.return_value.enable_autostart.assert_called_once_with("/usr/bin/myapp", "/usr/bin")
+        mock_select.return_value.enable_autostart.assert_called_once_with("/usr/bin/myapp", "/usr/bin", None)
 
     def test_uses_explicit_target_and_working_dir(self):
         with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
             pc.enable_autostart(target_path="/opt/app/app", working_dir="/opt/app", platform_name="linux")
-        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app")
+        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app", None)
 
     def test_working_dir_derived_from_target_path_when_omitted(self):
         with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
             pc.enable_autostart(target_path="/opt/app/app", platform_name="linux")
-        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app")
+        mock_select.return_value.enable_autostart.assert_called_once_with("/opt/app/app", "/opt/app", None)
+
+    def test_passes_extra_args_through_to_backend(self):
+        # Running from source: target_path is just the interpreter, extra_args carries the
+        # script's own path -- the same shape set_startup_shortcut_enabled uses in that case.
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.enable_autostart(
+                target_path="/usr/bin/python3", working_dir="/opt/app",
+                extra_args=["/opt/app/autostart_script.py"], platform_name="linux",
+            )
+        mock_select.return_value.enable_autostart.assert_called_once_with(
+            "/usr/bin/python3", "/opt/app", ["/opt/app/autostart_script.py"],
+        )
 
 
 class DisableAutostartTests(unittest.TestCase):
@@ -335,6 +380,22 @@ class ExecutableFiletypesTests(unittest.TestCase):
         self.assertEqual(filetypes, (("All files", "*.*"),))
 
 
+class GuiRequiresMainThreadTests(unittest.TestCase):
+    # Confirmed live: running Tk off the real process main thread while pystray's tray icon pumps
+    # it (this app's default architecture, fine on Windows/Linux) crashes the whole process
+    # outright on macOS -- AppKit's hard main-thread-only requirement. See main()'s own use of
+    # this in autostart_script.py for the actual fix (icon.run_detached() + running the overlay's
+    # Tk mainloop directly on the real main thread, macOS only).
+    def test_true_on_macos(self):
+        self.assertTrue(pc.gui_requires_main_thread(platform_name="darwin"))
+
+    def test_false_on_windows(self):
+        self.assertFalse(pc.gui_requires_main_thread(platform_name="win32"))
+
+    def test_false_on_linux(self):
+        self.assertFalse(pc.gui_requires_main_thread(platform_name="linux"))
+
+
 class BackendModulesAreSafelyImportableFromAnyOsTests(unittest.TestCase):
     """CROSS_PLATFORM_PLAN.md §3.2's whole premise: a test on ANY one real OS can still exercise
     what another OS's backend module would do, via mocking -- which requires every backend module
@@ -351,6 +412,74 @@ class BackendModulesAreSafelyImportableFromAnyOsTests(unittest.TestCase):
                 self.assertTrue(hasattr(backend, "find_vlc_directory"))
                 self.assertTrue(hasattr(backend, "ffmpeg_candidates"))
                 self.assertTrue(hasattr(backend, "LIBVLC_FILENAME"))
+                self.assertTrue(hasattr(backend, "PROCESS_AUDIO_CAPTURE_KIND"))
+                self.assertTrue(hasattr(backend, "process_audio_capture_settings"))
+                self.assertTrue(hasattr(backend, "hide_dock_icon"))
+                self.assertTrue(hasattr(backend, "run_on_main_thread"))
+                self.assertTrue(hasattr(backend, "open_path"))
+                self.assertTrue(hasattr(backend, "open_screen_recording_settings"))
+
+
+class HideDockIconDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.hide_dock_icon(platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        mock_select.return_value.hide_dock_icon.assert_called_once_with()
+
+
+class RunOnMainThreadDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        def func():
+            pass
+
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.run_on_main_thread(func, platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        mock_select.return_value.run_on_main_thread.assert_called_once_with(func)
+
+
+class OpenPathDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.open_path("/some/path", platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        mock_select.return_value.open_path.assert_called_once_with("/some/path")
+
+
+class OpenScreenRecordingSettingsDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            pc.open_screen_recording_settings(platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        mock_select.return_value.open_screen_recording_settings.assert_called_once_with()
+
+
+class ProcessAudioCaptureKindDispatchTests(unittest.TestCase):
+    def test_dispatches_to_backend(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.PROCESS_AUDIO_CAPTURE_KIND = "sck_audio_capture"
+            result = pc.process_audio_capture_kind(platform_name="darwin")
+        mock_select.assert_called_once_with("darwin")
+        self.assertEqual(result, "sck_audio_capture")
+
+    def test_none_on_linux_is_a_confirmed_negative_finding_not_a_dispatch_bug(self):
+        result = pc.process_audio_capture_kind(platform_name="linux")
+        self.assertIsNone(result)
+
+
+class ProcessAudioCaptureSettingsDispatchTests(unittest.TestCase):
+    def test_dispatches_with_process_name_and_exe_path(self):
+        with unittest.mock.patch.object(pc, "_select_backend") as mock_select:
+            mock_select.return_value.process_audio_capture_settings.return_value = {"window": "::Balatro.exe"}
+            result = pc.process_audio_capture_settings(
+                "Balatro.exe", "C:\\Games\\Balatro.exe", platform_name="win32",
+            )
+        mock_select.assert_called_once_with("win32")
+        mock_select.return_value.process_audio_capture_settings.assert_called_once_with(
+            "Balatro.exe", "C:\\Games\\Balatro.exe",
+        )
+        self.assertEqual(result, {"window": "::Balatro.exe"})
 
 
 if __name__ == "__main__":

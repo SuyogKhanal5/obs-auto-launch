@@ -11,6 +11,12 @@
             "process_name": "javaw.exe",
             "title_contains": "minecraft",
             "display_name": "Minecraft"
+        },
+        {
+            "process_name": "GeForceNOW",
+            "title_contains": "on GeForce NOW",
+            "display_name": "GeForce NOW",
+            "use_title_as_display_name": true
         }
     ],
     "poll_interval_seconds": 1.5,
@@ -99,6 +105,7 @@
     },
     "clip_editor": {
         "output_folder": "",
+        "markers_folder": "",
         "output_suffix": "_trimmed",
         "delete_original_after_trim": false,
         "auto_fix_audio_sync": false,
@@ -136,12 +143,14 @@
         "custom_keybind_hotkey_mode": "raw_input",
         "recovery": {
             "memory_limit_gb": 5,
-            "cooldown_seconds": 30
+            "cooldown_seconds": 30,
+            "frozen_capture_seconds": 180
         },
         "game_audio_capture": {
             "enabled": false,
             "input_name": "Game Audio"
         },
+        "screen_fit": "match_screen",
         "mic_boost": {
             "enabled": false,
             "input_name": "",

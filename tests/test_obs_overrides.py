@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -111,49 +112,6 @@ class ApplyRecordingFormatTests(unittest.TestCase):
         client = FakeObsClient()
         a.apply_recording_format(client, "some_future_format_code")
         self.assertEqual(a.get_profile_parameter_value(client, "AdvOut", "RecFormat2"), "some_future_format_code")
-
-
-class WantsMarkersTests(unittest.TestCase):
-    def test_no_keybinds_returns_false(self):
-        self.assertFalse(a.wants_markers([]))
-        self.assertFalse(a.wants_markers(None))
-
-    def test_enabled_add_marker_keybind_returns_true(self):
-        self.assertTrue(a.wants_markers([{"enabled": True, "action": "add_marker"}]))
-
-    def test_disabled_add_marker_keybind_returns_false(self):
-        self.assertFalse(a.wants_markers([{"enabled": False, "action": "add_marker"}]))
-
-    def test_missing_enabled_key_defaults_to_true(self):
-        self.assertTrue(a.wants_markers([{"action": "add_marker"}]))
-
-    def test_other_actions_do_not_count(self):
-        self.assertFalse(a.wants_markers([{"enabled": True, "action": "split_record_file"}]))
-
-
-class EnsureHybridMp4ForMarkersTests(unittest.TestCase):
-    def test_sets_format_and_reports_restart_needed(self):
-        client = FakeObsClient()
-        needs_restart = a.ensure_hybrid_mp4_for_markers(client)
-        self.assertEqual(a.get_profile_parameter_value(client, "AdvOut", "RecFormat2"), "hybrid_mp4")
-        self.assertTrue(needs_restart)
-
-    def test_already_hybrid_mp4_does_not_rewrite_or_need_restart(self):
-        client = FakeObsClient()
-        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
-        client.calls.clear()
-        needs_restart = a.ensure_hybrid_mp4_for_markers(client)
-        self.assertEqual(client.calls, [])
-        self.assertFalse(needs_restart)
-
-    def test_never_raises_when_client_errors(self):
-        class RaisingClient(FakeObsClient):
-            def set_profile_parameter(self, category, name, value):
-                raise RuntimeError("boom")
-
-        client = RaisingClient()
-        needs_restart = a.ensure_hybrid_mp4_for_markers(client)  # must not raise
-        self.assertFalse(needs_restart)
 
 
 class ComputeMicBoostDbFromSamplesTests(unittest.TestCase):
@@ -549,34 +507,82 @@ class GetReplayBufferModeTests(unittest.TestCase):
 
 
 class AddRecordingMarkerTests(unittest.TestCase):
-    def test_success_calls_create_record_chapter(self):
+    # add_recording_marker's primary mechanism is its own recording_state["markers"] list (read
+    # from OBS's own GetRecordStatus elapsed time, not tied to recording format at all) --
+    # CreateRecordChapter is only ever a best-effort bonus now, never required for success. See
+    # CROSS_PLATFORM_PLAN.md §5.21 for why that forcing was removed.
+    def test_success_appends_elapsed_seconds_to_recording_state(self):
         client = FakeObsClient()
-        result = a.add_recording_marker(client)
+        client.record_duration_ms = 12500
+        recording_state = {}
+        result = a.add_recording_marker(client, recording_state=recording_state)
         self.assertTrue(result)
+        self.assertEqual(recording_state["markers"], [12.5])
+
+    def test_multiple_markers_accumulate_in_order(self):
+        client = FakeObsClient()
+        recording_state = {}
+        client.record_duration_ms = 1000
+        a.add_recording_marker(client, recording_state=recording_state)
+        client.record_duration_ms = 5000
+        a.add_recording_marker(client, recording_state=recording_state)
+        self.assertEqual(recording_state["markers"], [1.0, 5.0])
+
+    def test_none_recording_state_does_not_raise(self):
+        client = FakeObsClient()
+        result = a.add_recording_marker(client, recording_state=None)
+        self.assertTrue(result)
+
+    def test_also_adds_a_native_obs_chapter_on_hybrid_mp4(self):
+        client = FakeObsClient()
+        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
+        a.add_recording_marker(client, recording_state={})
         self.assertIn(("create_record_chapter", None), client.calls)
 
-    def test_unsupported_format_toasts_and_returns_false(self):
+    def test_skips_the_native_chapter_on_other_formats(self):
+        # OBS rejects it anywhere else, and obsws_python logs that rejection as an ERROR with a
+        # traceback on every marker before it can be caught.
+        client = FakeObsClient()
+        client.set_profile_parameter("AdvOut", "RecFormat2", "mkv")
+        recording_state = {}
+        self.assertTrue(a.add_recording_marker(client, recording_state=recording_state))
+        self.assertNotIn(("create_record_chapter", None), client.calls)
+        self.assertEqual(recording_state["markers"], [0.0])
+
+    def test_unsupported_format_is_non_fatal(self):
+        # A non-Hybrid-MP4 recording is the common case now that markers don't need that format
+        # at all -- CreateRecordChapter failing this way must not affect the overall result.
         class RejectingClient(FakeObsClient):
             def create_record_chapter(self, chapter_name=None):
                 raise a.obsws.error.OBSSDKRequestError("CreateRecordChapter", a.OBS_CHAPTER_NOT_SUPPORTED_CODE, "")
 
         client = RejectingClient()
-        with unittest.mock.patch.object(a, "notify") as mock_notify:
-            result = a.add_recording_marker(client, icon=None, notifications_config={"enabled": True})
-        self.assertFalse(result)
-        mock_notify.assert_called_once()
-        self.assertIn("format", mock_notify.call_args[0][3].lower())
+        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
+        recording_state = {}
+        result = a.add_recording_marker(client, recording_state=recording_state)
+        self.assertTrue(result)
+        self.assertEqual(recording_state["markers"], [0.0])
 
-    def test_other_error_does_not_toast(self):
+    def test_other_create_record_chapter_error_is_also_non_fatal(self):
         class RejectingClient(FakeObsClient):
             def create_record_chapter(self, chapter_name=None):
                 raise a.obsws.error.OBSSDKRequestError("CreateRecordChapter", 500, "")
 
         client = RejectingClient()
-        with unittest.mock.patch.object(a, "notify") as mock_notify:
-            result = a.add_recording_marker(client)
+        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
+        result = a.add_recording_marker(client, recording_state={})
+        self.assertTrue(result)
+
+    def test_cannot_read_record_status_returns_false_without_recording_a_marker(self):
+        class BrokenClient(FakeObsClient):
+            def get_record_status(self):
+                raise RuntimeError("boom")
+
+        client = BrokenClient()
+        recording_state = {}
+        result = a.add_recording_marker(client, recording_state=recording_state)
         self.assertFalse(result)
-        mock_notify.assert_not_called()
+        self.assertNotIn("markers", recording_state)
 
     def test_success_flashes_the_tray_icon_when_icon_and_status_given(self):
         # Same "something just happened" flash as a manual split or a replay-buffer save --
@@ -699,6 +705,26 @@ class IsEventClientConnectedTests(unittest.TestCase):
 
 
 class SetGameAudioCaptureTargetTests(unittest.TestCase):
+    # set_game_audio_capture_target's own orchestration (repoint-vs-create, error handling) is
+    # OS-agnostic -- mocking platform_common's two dispatch functions with Windows-shaped return
+    # values makes these tests exercise that same orchestration regardless of which real OS runs
+    # them, per platform_common.py's own testing philosophy (CROSS_PLATFORM_PLAN.md §3.2). The
+    # platform backends themselves (Windows/macOS/Linux) have their own dedicated tests.
+    def setUp(self):
+        patcher1 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_kind", return_value="wasapi_process_output_capture",
+        )
+        patcher2 = unittest.mock.patch.object(
+            a.platform_common, "process_audio_capture_settings",
+            side_effect=lambda process_name, exe_path: {
+                "window": f"::{process_name}", "priority": a.WINDOW_MATCH_PRIORITY_EXE_FALLBACK,
+            },
+        )
+        patcher1.start()
+        patcher2.start()
+        self.addCleanup(patcher1.stop)
+        self.addCleanup(patcher2.stop)
+
     def test_repoints_an_existing_input(self):
         client = FakeObsClient(inputs={
             "Game Audio": {"kind": "wasapi_process_output_capture", "tracks": {}, "settings": {}},
@@ -768,6 +794,69 @@ class SetGameAudioCaptureTargetTests(unittest.TestCase):
         self.assertEqual(len([c for c in client.calls if c[0] == "set_input_settings"]), 1)
 
 
+class ResolveProcessAudioCaptureTests(unittest.TestCase):
+    def test_returns_none_kind_when_os_has_no_capture_kind(self):
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value=None):
+            kind, settings = a.resolve_process_audio_capture("Balatro.exe")
+        self.assertIsNone(kind)
+        self.assertIsNone(settings)
+
+    def test_returns_none_settings_when_process_cannot_be_resolved(self):
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", return_value=None):
+            kind, settings = a.resolve_process_audio_capture("Balatro")
+        self.assertEqual(kind, "sck_audio_capture")
+        self.assertIsNone(settings)
+
+    def test_looks_up_the_live_exe_path_for_a_running_process(self):
+        # Only macOS's real backend actually uses exe_path (to resolve a bundle identifier), but
+        # this orchestration function should always try to find it regardless of OS, rather than
+        # assuming it's never needed.
+        fake_processes = [("Balatro", "/Applications/Balatro.app/Contents/MacOS/Balatro", 123)]
+        captured = {}
+
+        def fake_settings(process_name, exe_path):
+            captured["process_name"] = process_name
+            captured["exe_path"] = exe_path
+            return {"type": 1, "application": "com.playstack.balatro"}
+
+        with unittest.mock.patch.object(a, "get_running_processes", return_value=fake_processes), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", side_effect=fake_settings):
+            kind, settings = a.resolve_process_audio_capture("Balatro")
+        self.assertEqual(kind, "sck_audio_capture")
+        self.assertEqual(settings, {"type": 1, "application": "com.playstack.balatro"})
+        self.assertEqual(captured["exe_path"], "/Applications/Balatro.app/Contents/MacOS/Balatro")
+
+    def test_exe_path_is_none_when_process_is_not_running(self):
+        captured = {}
+
+        def fake_settings(process_name, exe_path):
+            captured["exe_path"] = exe_path
+            return None
+
+        with unittest.mock.patch.object(a, "get_running_processes", return_value=[]), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", side_effect=fake_settings):
+            a.resolve_process_audio_capture("Balatro")
+        self.assertIsNone(captured["exe_path"])
+
+    def test_logs_and_leaves_input_unchanged_when_os_has_no_capture_kind(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value=None):
+            with self.assertLogs(level="WARNING"):
+                a.set_game_audio_capture_target(client, "Game Audio", "Balatro")  # must not raise
+        self.assertEqual(client.calls, [])
+
+    def test_logs_and_leaves_input_unchanged_when_process_cannot_be_resolved(self):
+        client = FakeObsClient()
+        with unittest.mock.patch.object(a.platform_common, "process_audio_capture_kind", return_value="sck_audio_capture"), \
+             unittest.mock.patch.object(a.platform_common, "process_audio_capture_settings", return_value=None):
+            with self.assertLogs(level="WARNING"):
+                a.set_game_audio_capture_target(client, "Game Audio", "Balatro")  # must not raise
+        self.assertEqual(client.calls, [])
+
+
 class ActiveSessionMarkerTests(unittest.TestCase):
     def setUp(self):
         tmp_dir = tempfile.mkdtemp()
@@ -792,6 +881,82 @@ class ActiveSessionMarkerTests(unittest.TestCase):
         a.clear_active_session_marker()  # must not raise
 
 
+class RecordingMarkersSidecarTests(unittest.TestCase):
+    # write_recording_markers/read_recording_markers back the clip editor's own marker display
+    # (see refresh_markers) independently of OBS's recording format -- see
+    # CROSS_PLATFORM_PLAN.md §5.21.
+    def setUp(self):
+        self._tmp_ctx = tempfile.TemporaryDirectory()
+        self.recording_path = os.path.join(self._tmp_ctx.name, "Balatro - 2026-10-06 09-53-29.mov")
+        self.addCleanup(self._tmp_ctx.cleanup)
+
+    def test_sidecar_path_appends_suffix(self):
+        self.assertEqual(a.marker_sidecar_path(self.recording_path), self.recording_path + ".markers.json")
+
+    def test_read_returns_none_when_no_sidecar_written(self):
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
+
+    def test_write_then_read_round_trips_sorted_markers(self):
+        a.write_recording_markers(self.recording_path, [47.0, 12.5, 103.2])
+        self.assertEqual(a.read_recording_markers(self.recording_path), [12.5, 47.0, 103.2])
+
+    def test_empty_markers_list_writes_no_sidecar_at_all(self):
+        a.write_recording_markers(self.recording_path, [])
+        self.assertFalse(os.path.isfile(a.marker_sidecar_path(self.recording_path)))
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
+
+    def test_none_markers_does_not_raise(self):
+        a.write_recording_markers(self.recording_path, None)  # must not raise
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
+
+    def test_none_recording_path_does_not_raise(self):
+        a.write_recording_markers(None, [1.0])  # must not raise
+
+    def test_corrupt_sidecar_returns_none_instead_of_raising(self):
+        with open(a.marker_sidecar_path(self.recording_path), "w", encoding="utf-8") as f:
+            f.write("not valid json")
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
+
+    def test_non_numeric_markers_returns_none_instead_of_raising(self):
+        with open(a.marker_sidecar_path(self.recording_path), "w", encoding="utf-8") as f:
+            json.dump({"markers": ["not", "numbers"]}, f)
+        self.assertIsNone(a.read_recording_markers(self.recording_path))
+
+
+class MarkersFolderTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.recordings = os.path.join(self._tmp.name, "Movies")
+        self.markers = os.path.join(self._tmp.name, "Markers")
+        os.makedirs(self.recordings)
+        self.recording = os.path.join(self.recordings, "Balatro - 2026-10-08 13-27-41.mkv")
+
+    def test_configured_folder_holds_the_file_named_after_the_recording(self):
+        self.assertEqual(
+            a.marker_sidecar_path(self.recording, self.markers),
+            os.path.join(self.markers, "Balatro - 2026-10-08 13-27-41.mkv.markers.json"),
+        )
+
+    def test_writes_into_the_configured_folder_creating_it(self):
+        a.write_recording_markers(self.recording, [5.0], self.markers)
+        self.assertTrue(os.path.isfile(a.marker_sidecar_path(self.recording, self.markers)))
+        self.assertFalse(os.path.isfile(a.marker_sidecar_path(self.recording)))
+        self.assertEqual(a.read_recording_markers(self.recording, self.markers), [5.0])
+
+    def test_reads_markers_saved_next_to_the_recording_before_the_folder_was_set(self):
+        a.write_recording_markers(self.recording, [3.0, 1.0])
+        self.assertEqual(a.read_recording_markers(self.recording, self.markers), [1.0, 3.0])
+
+    def test_configured_folder_wins_over_an_older_file_next_to_the_recording(self):
+        a.write_recording_markers(self.recording, [1.0])
+        a.write_recording_markers(self.recording, [9.0], self.markers)
+        self.assertEqual(a.read_recording_markers(self.recording, self.markers), [9.0])
+
+    def test_none_when_neither_exists(self):
+        self.assertIsNone(a.read_recording_markers(self.recording, self.markers))
+
+
 class ResolveRecordingResolutionTests(unittest.TestCase):
     def test_match_canvas_returns_base_resolution_unchanged(self):
         self.assertEqual(a.resolve_recording_resolution(1920, 1080, "Match canvas (no scaling)"), (1920, 1080))
@@ -805,12 +970,12 @@ class ResolveRecordingResolutionTests(unittest.TestCase):
     def test_720p_preset_scales_width_from_canvas_aspect_ratio(self):
         self.assertEqual(a.resolve_recording_resolution(1920, 1080, "720p"), (1280, 720))
 
-    def test_ultrawide_canvas_still_rounds_width_to_even(self):
-        # 3440x1440 at height 720 -> width 1720.0 exactly, but exercised with a canvas whose
-        # ratio doesn't divide evenly to confirm the even-rounding actually does something.
+    def test_ultrawide_canvas_rounds_width_to_a_multiple_of_4(self):
+        # A canvas whose ratio doesn't divide evenly, to confirm the rounding actually does
+        # something -- OBS itself rounds output sizes to multiples of 4.
         width, height = a.resolve_recording_resolution(3441, 1440, "720p")
         self.assertEqual(height, 720)
-        self.assertEqual(width % 2, 0)
+        self.assertEqual(width % 4, 0)
 
 
 class ApplyRecordingResolutionTests(unittest.TestCase):
@@ -879,3 +1044,38 @@ class ApplyProcessCaptureSyncOffsetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NotifyTests(unittest.TestCase):
+    def test_disabled_notifications_do_nothing(self):
+        icon = unittest.mock.Mock()
+        a.notify(icon, {"enabled": False}, "t", "m")
+        icon.notify.assert_not_called()
+
+    def test_shown_immediately_by_default(self):
+        icon = unittest.mock.Mock()
+        a.notify(icon, {"enabled": True}, "Recording started", "Balatro")
+        icon.notify.assert_called_once_with("Balatro", "Recording started")
+
+    def test_post_game_notification_is_delayed_on_macos(self):
+        # Confirmed live: macOS hides banners while a fullscreen game's Space is closing.
+        icon = unittest.mock.Mock()
+        with unittest.mock.patch.object(a.sys, "platform", "darwin"), \
+                unittest.mock.patch.object(a.threading, "Timer") as mock_timer:
+            a.notify(icon, {"enabled": True}, "Recording stopped", "Balatro", after_game_exit=True)
+        icon.notify.assert_not_called()
+        self.assertEqual(mock_timer.call_args[0][0], a.MACOS_POST_GAME_NOTIFICATION_DELAY_SECONDS)
+        mock_timer.call_args[0][1]()
+        icon.notify.assert_called_once_with("Balatro", "Recording stopped")
+
+    def test_post_game_notification_is_immediate_elsewhere(self):
+        icon = unittest.mock.Mock()
+        with unittest.mock.patch.object(a.sys, "platform", "win32"):
+            a.notify(icon, {"enabled": True}, "Recording stopped", "Balatro", after_game_exit=True)
+        icon.notify.assert_called_once()
+
+    def test_failures_are_logged_as_warnings(self):
+        icon = unittest.mock.Mock()
+        icon.notify.side_effect = RuntimeError("boom")
+        with self.assertLogs(level="WARNING"):
+            a.notify(icon, {"enabled": True}, "t", "m")

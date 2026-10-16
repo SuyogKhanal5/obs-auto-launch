@@ -2,12 +2,19 @@
 schedule.
 
 Minimum target: macOS 14.4 (Sonoma) -- see CROSS_PLATFORM_PLAN.md §2.6."""
+import ctypes
+import ctypes.util
 import glob
 import logging
 import os
+import platform
+import plistlib
+import posixpath
 import shutil
 import subprocess
+import sys
 import threading
+import tkinter
 
 # The canonical libvlc shared-library name on macOS. Only used as a presence signal by
 # platform_common.find_vlc_directory() -- see that function's own docstring for why the exact
@@ -25,6 +32,111 @@ def ffmpeg_candidates():
         "/usr/local/bin/ffmpeg",  # Homebrew on Intel
         "/opt/local/bin/ffmpeg",  # MacPorts
     ]
+
+
+CALIBRATION_PLAYER_BUNDLE_ID = "com.obsautorecorder.calibrationtone"
+
+
+def prepare_calibration_player(ffplay_path, work_dir):
+    """Wraps ffplay in a throwaway .app bundle inside work_dir and returns the executable to run.
+    OBS's per-app capture targets apps only by bundle identifier, and a plain ffplay has none --
+    confirmed live, OBS lists it with an empty id and can't be pointed at it. Bundled, it's
+    listed as its own app and captured normally (confirmed: -16.6 dB on the target track).
+    Falls back to ffplay_path itself if the bundle can't be built."""
+    try:
+        app = os.path.join(work_dir, "OBS Auto Recorder Calibration.app")
+        macos_dir = os.path.join(app, "Contents", "MacOS")
+        os.makedirs(macos_dir, exist_ok=True)
+        player = os.path.join(macos_dir, "ffplay")
+        shutil.copy2(os.path.realpath(ffplay_path), player)
+        with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump({
+                "CFBundleIdentifier": CALIBRATION_PLAYER_BUNDLE_ID,
+                "CFBundleExecutable": "ffplay",
+                "CFBundleName": "OBS Auto Recorder Calibration",
+                "CFBundlePackageType": "APPL",
+            }, f)
+        subprocess.run(["codesign", "--force", "-s", "-", app], capture_output=True, timeout=30)
+        return player
+    except Exception as exc:
+        logging.warning("Could not prepare the calibration player: %s", exc)
+        return ffplay_path
+
+
+def is_this_app_frontmost():
+    """True if this app's own process is the frontmost app."""
+    try:
+        import AppKit
+        with _QUARTZ_LOOKUP_LOCK:
+            workspace = AppKit.NSWorkspace.sharedWorkspace()
+        frontmost = workspace.frontmostApplication()
+        return frontmost is not None and frontmost.processIdentifier() == os.getpid()
+    except Exception:
+        return True  # unknown -- don't act on it
+
+
+def display_top_inset_pixels(pixel_width, pixel_height):
+    """How many pixel rows at the top of a captured display a fullscreen game leaves black, for
+    the screen whose pixel size is pixel_width x pixel_height -- the area beside a built-in
+    display's camera notch. Confirmed live on a 14" MacBook Pro: the captured frame is black
+    (apart from menu-bar items drawn over it) down to roughly the menu bar's height, a bit more
+    than the notch safe-area inset alone (32pt vs. ~37pt), so this uses the larger of the two
+    -- over-cropping a row or two of game beats leaving a thin black line. 0 for a screen with no
+    notch, or if the screen can't be identified unambiguously (two screens of the same size)."""
+    try:
+        import AppKit
+        matches = []
+        for screen in AppKit.NSScreen.screens():
+            scale = screen.backingScaleFactor()
+            frame = screen.frame()
+            if (round(frame.size.width * scale), round(frame.size.height * scale)) == (pixel_width, pixel_height):
+                matches.append(screen)
+        if len(matches) != 1:
+            return 0
+        screen = matches[0]
+        safe_top = screen.safeAreaInsets().top
+        if safe_top <= 0:
+            return 0
+        frame, visible = screen.frame(), screen.visibleFrame()
+        menu_bar = (frame.origin.y + frame.size.height) - (visible.origin.y + visible.size.height)
+        return int(round(max(safe_top, menu_bar) * screen.backingScaleFactor()))
+    except Exception as exc:
+        logging.warning("Could not read the display's notch area: %s", exc)
+        return 0
+
+
+def obs_launch_command(path, launch_args):
+    """Launches OBS through LaunchServices (`open`) rather than as this app's child process.
+    Confirmed live: started as a child, macOS attributes OBS's screen capture to this app --
+    the menu-bar sharing indicator lists "Python", clicking its Stop Sharing targets this app
+    (and crashed it), and OBS's Screen Recording permission is charged to the wrong app. -g keeps
+    OBS from taking focus from a fullscreen game. Falls back to a direct launch for an executable
+    that isn't inside an .app bundle."""
+    bundle = path
+    while bundle and bundle != os.path.dirname(bundle):
+        if bundle.endswith(".app"):
+            return ["open", "-g", "-a", bundle, "--args", *launch_args]
+        bundle = os.path.dirname(bundle)
+    return [path, *launch_args]
+
+
+OBS_BUNDLE_ID = "com.obsproject.obs-studio"
+
+
+def quit_obs_gracefully():
+    """Asks OBS to quit the normal way (never a kill, which leaves OBS's unclean-shutdown marker
+    and its "Run in Safe Mode?" prompt behind). Closing OBS while no game is running is the only
+    way to clear macOS's screen-sharing indicator -- confirmed live, hiding its capture sources
+    leaves their ScreenCaptureKit streams running. Returns True if the request was delivered."""
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'tell application id "{OBS_BUNDLE_ID}" to quit'],
+            capture_output=True, timeout=20,
+        )
+        return True
+    except Exception as exc:
+        logging.warning("Could not ask OBS to quit: %s", exc)
+        return False
 
 
 def find_obs_executable():
@@ -89,9 +201,10 @@ def epic_manifest_dir():
 def get_window_titles():
     """Maps each visible top-level window's owning PID to its titles via Quartz's
     CGWindowListCopyWindowInfo -- returns metadata (including title and owning PID) for every
-    window currently on screen; unlike some other macOS window-introspection APIs, this
-    particular call needs no special Accessibility/Screen-Recording permission grant from the
-    user. Returns {} (never raises) if pyobjc isn't installed, or for any other reason this can't
+    window currently on screen. Titles of other apps' windows need this app to have Screen
+    Recording permission -- without it every title comes back empty (confirmed live: 28 windows,
+    0 titles), so window-title rules never match; see screen_recording_permission_granted.
+    Returns {} (never raises) if pyobjc isn't installed, or for any other reason this can't
     complete -- window-title-based game detection is one optional input to a bigger detection
     pipeline (see autostart_script.py's find_target_process), not something worth this app
     crashing over.
@@ -133,7 +246,9 @@ def get_window_titles():
 # macOS has no API for a true exclusive OS-level hotkey reservation the way Win32's RegisterHotKey
 # or X11's XGrabKey have -- the standard approach (used by essentially every third-party macOS
 # hotkey utility) is a session-level CGEventTap: a passive, non-consuming observer of every
-# keystroke system-wide, matched against the configured bindings in the callback itself. This is
+# keystroke system-wide, matched against the configured bindings in the callback itself. Custom
+# keybinds use an active tap that swallows exactly the configured combinations (see
+# run_custom_keybind_listener); the clip editor's space bar stays passive. This is
 # actually the SAME shape Windows' WH_KEYBOARD_LL space-bar hook already uses in this app (see
 # platform_windows.py's run_clip_editor_space_bar_listener) -- here it does double duty for BOTH
 # custom keybinds and the space bar, unlike Windows/X11 which use two different mechanisms
@@ -176,13 +291,24 @@ def accessibility_permission_granted():
     """True if this process currently holds Accessibility permission -- required before
     CGEventTapCreate will do anything at all (it returns None silently otherwise, which is why
     this is checked and reported explicitly up front rather than left to look like an unexplained
-    dead hotkey)."""
+    dead hotkey).
+
+    Confirmed live that AXIsProcessTrusted is NOT exposed under the Quartz module at all despite
+    living in the same Accessibility/CoreGraphics conceptual family -- it's declared in
+    ApplicationServices (HIServices.framework), a separate pyobjc binding
+    (pyobjc-framework-ApplicationServices, added to requirements.txt alongside this fix). The old
+    Quartz.AXIsProcessTrusted() call raised AttributeError on every single real invocation this
+    was exercised against -- caught by the try/except below and logged, so it silently always
+    reported "not granted" instead of ever actually working, and the unit tests never caught it
+    because they mocked Quartz as a plain MagicMock, which auto-creates any attribute accessed
+    (including ones the real module doesn't have) rather than failing the way the real import
+    does."""
     try:
-        import Quartz
+        import ApplicationServices
     except ImportError:
         return False
     try:
-        return bool(Quartz.AXIsProcessTrusted())
+        return bool(ApplicationServices.AXIsProcessTrusted())
     except Exception:
         logging.exception("Could not check macOS Accessibility permission status.")
         return False
@@ -193,13 +319,18 @@ def request_accessibility_permission():
     features" prompt, which deep-links to the right System Settings pane. Safe to call more than
     once -- macOS only actually shows the dialog the first time it's asked for a given app; after
     a decision has been recorded, granting it later requires the user to do so manually in System
-    Settings (there's no way for this app to re-trigger the dialog itself)."""
+    Settings (there's no way for this app to re-trigger the dialog itself).
+
+    See accessibility_permission_granted's own docstring for why this imports ApplicationServices
+    rather than Quartz -- the same real, confirmed bug applied here too."""
     try:
-        import Quartz
+        import ApplicationServices
     except ImportError:
         return
     try:
-        Quartz.AXIsProcessTrustedWithOptions({Quartz.kAXTrustedCheckOptionPrompt: True})
+        ApplicationServices.AXIsProcessTrustedWithOptions(
+            {ApplicationServices.kAXTrustedCheckOptionPrompt: True}
+        )
     except Exception:
         logging.exception("Could not show the macOS Accessibility permission prompt.")
 
@@ -215,7 +346,27 @@ def _macos_mod_flags_for(modifiers, Quartz):
     return mask
 
 
-def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_event=None):
+# pyobjc resolves Quartz names lazily on first attribute access, and that resolution isn't
+# thread-safe: one keypress fires the custom-keybind tap and the clip editor's space bar tap
+# at the same moment, each on its own thread, and the two racing first lookups of
+# CGEventGetIntegerValueField raised KeyError inside pyobjc (confirmed live). Resolving
+# everything the callbacks use once, under a lock, at listener setup avoids that entirely.
+_QUARTZ_LOOKUP_LOCK = threading.Lock()
+
+
+def _resolve_event_tap_names(Quartz):
+    with _QUARTZ_LOOKUP_LOCK:
+        return {
+            "key_down": Quartz.kCGEventKeyDown,
+            "keycode_field": Quartz.kCGKeyboardEventKeycode,
+            "get_field": Quartz.CGEventGetIntegerValueField,
+            "get_flags": Quartz.CGEventGetFlags,
+            "tap_disabled_types": (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput),
+            "tap_enable": Quartz.CGEventTapEnable,
+        }
+
+
+def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_event=None, consume=False):
     """Shared by run_custom_keybind_listener and run_clip_editor_space_bar_listener below --
     both need the exact same CGEventTapCreate/CFRunLoop wiring, differing only in which keydowns
     the callback itself cares about. Blocks in CFRunLoopRun() for this thread's whole lifetime (or
@@ -231,7 +382,11 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
     purpose). When stop_event is given, a small watcher daemon thread blocks on stop_event.wait()
     and stops this run loop the moment it fires, so a stop_event.set() from elsewhere (e.g. the
     clip editor window closing) actually tears this listener down instead of leaking a
-    permanently-running tap thread until process exit."""
+    permanently-running tap thread until process exit.
+
+    consume=True makes it an active tap: an event the callback returns None for is swallowed
+    instead of reaching the frontmost app. macOS switches an active tap off if a callback is ever
+    too slow; it's switched straight back on here."""
     if not accessibility_permission_granted():
         logging.warning(
             "This feature needs Accessibility permission, which hasn't been granted yet -- "
@@ -242,10 +397,21 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
         on_permission_denied()
         return
 
+    names = _resolve_event_tap_names(Quartz)
+    tap_holder = []
+
+    def callback(proxy, event_type, event, refcon):
+        if event_type in names["tap_disabled_types"]:
+            if tap_holder:
+                names["tap_enable"](tap_holder[0], True)
+            return event
+        return tap_callback(proxy, event_type, event, refcon)
+
     try:
         tap = Quartz.CGEventTapCreate(
-            Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap, Quartz.kCGEventTapOptionListenOnly,
-            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown), tap_callback, None,
+            Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault if consume else Quartz.kCGEventTapOptionListenOnly,
+            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown), callback, None,
         )
         if not tap:
             logging.warning(
@@ -253,6 +419,7 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
                 "taken effect yet; try restarting the app."
             )
             return
+        tap_holder.append(tap)
         run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
         run_loop = Quartz.CFRunLoopGetCurrent()
         Quartz.CFRunLoopAddSource(run_loop, run_loop_source, Quartz.kCFRunLoopCommonModes)
@@ -272,7 +439,8 @@ def _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_e
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None, stop_event=None, hotkey_mode=None,
+    icon=None, notifications_config=None, status=None, recording_state=None, stop_event=None,
+    hotkey_mode=None,
 ):
     """macOS counterpart of platform_windows.run_custom_keybind_listener -- see the module
     comment above for why this uses a passive CGEventTap rather than an exclusive-grab API.
@@ -313,18 +481,27 @@ def run_custom_keybind_listener(
         | Quartz.kCGEventFlagMaskShift | Quartz.kCGEventFlagMaskCommand
     )
 
+    names = _resolve_event_tap_names(Quartz)
+
     def tap_callback(proxy, event_type, event, refcon):
         try:
-            if event_type == Quartz.kCGEventKeyDown:
-                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
-                mask = Quartz.CGEventGetFlags(event) & relevant_flags_mask
+            if event_type == names["key_down"]:
+                keycode = names["get_field"](event, names["keycode_field"])
+                mask = names["get_flags"](event) & relevant_flags_mask
                 binding = lookup.get((keycode, mask))
                 if binding:
                     threading.Thread(
                         target=fire_keybind,
-                        args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                        args=(
+                            binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config,
+                            status, recording_state,
+                        ),
                         daemon=True,
                     ).start()
+                    # Swallowed, as Windows' RegisterHotKey does: passed on, the frontmost app
+                    # got Cmd+F3 too and macOS played its alert sound into the recording at
+                    # every marker (confirmed live).
+                    return None
         except Exception:
             logging.exception("Custom keybind macOS event tap callback failed.")
         return event
@@ -336,7 +513,7 @@ def run_custom_keybind_listener(
             "& Security > Accessibility, then restart the app.",
         )
 
-    _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied)
+    _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, consume=True)
 
 
 # --- Autostart (LaunchAgents .plist) ---
@@ -351,18 +528,23 @@ def is_autostart_enabled():
     return os.path.isfile(_launch_agent_plist_path())
 
 
-def enable_autostart(target_path, working_dir):
+def enable_autostart(target_path, working_dir, extra_args=None):
     """Writes a per-user LaunchAgent .plist and loads it via launchctl -- no elevation needed,
     unlike a system-level LaunchDaemon, since this only ever needs to run in the logged-in user's
     own session. RunAtLoad makes launchd start it once immediately at login (matching "start at
     login" as understood on Windows/Linux); KeepAlive is deliberately NOT set, since this should
-    run once at login like a normal app, not be relaunched by launchd every time it exits."""
+    run once at login like a normal app, not be relaunched by launchd every time it exits.
+
+    extra_args (e.g. the script path when running from source, target_path then being just the
+    Python interpreter) are appended to ProgramArguments as their own separate list entries --
+    launchd execs that list directly, no shell involved, so there's no quoting to worry about
+    the way a shell command line would need."""
     import plistlib
 
     path = _launch_agent_plist_path()
     plist = {
         "Label": _LAUNCH_AGENT_LABEL,
-        "ProgramArguments": [target_path],
+        "ProgramArguments": [target_path, *(extra_args or [])],
         "WorkingDirectory": working_dir,
         "RunAtLoad": True,
     }
@@ -433,26 +615,136 @@ def install_optional_dependency(package, timeout=600):
     return False, (result.stdout or result.stderr or f"brew exited with code {result.returncode}")[-500:].strip()
 
 
+def _find_libtk_dylib():
+    """Locates the libtkX.Y.dylib actually bundled with THIS Python interpreter -- must match
+    tkinter.TkVersion exactly, since a different build's exported symbols could differ or not
+    exist at all. Mirrors the search order in python-vlc's own official tkvlc.py example
+    (https://github.com/oaubert/python-vlc/blob/master/examples/tkvlc.py), which is the
+    confirmed-correct source for this whole mechanism (see embed_video_player's own docstring for
+    why that matters here). Returns None if it can't be found anywhere searched."""
+    lib_name = f"libtk{tkinter.TkVersion}.dylib"
+    candidates = [
+        os.path.join(getattr(sys, "base_prefix", ""), "lib", lib_name),
+        os.path.join(sys.prefix, "lib", lib_name),
+    ]
+    if getattr(sys, "frozen", False):
+        # The packaged app keeps it directly in Contents/Frameworks (sys._MEIPASS), with no lib/
+        # folder -- confirmed live: missing it here left the packaged clip editor audio-only.
+        candidates.insert(0, os.path.join(getattr(sys, "_MEIPASS", ""), lib_name))
+        candidates.insert(1, os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "Frameworks", lib_name))
+    found = ctypes.util.find_library(lib_name)
+    if found:
+        candidates.append(found)
+    for cellar_root in ("/opt/homebrew/Cellar", "/usr/local/Cellar", "/opt/local/Cellar"):
+        candidates.extend(glob.glob(os.path.join(cellar_root, "tcl-tk", "*", "lib", lib_name)))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _resolve_root_ns_view(tk_widget):
+    """Returns the raw NSView* pointer (a plain int, not a PyObjC object) of tk_widget's
+    TOPLEVEL's own Cocoa content view, or None if it can't be resolved. See embed_video_player's
+    docstring for why this goes through Tk's own TkMacOSXGetRootControl rather than winfo_id()
+    directly."""
+    libtk_path = _find_libtk_dylib()
+    if not libtk_path:
+        logging.warning("Could not find libtk%s.dylib for video embedding.", tkinter.TkVersion)
+        return None
+    try:
+        lib = ctypes.cdll.LoadLibrary(libtk_path)
+        get_root_view = lib.TkMacOSXGetRootControl
+        get_root_view.restype = ctypes.c_void_p
+        get_root_view.argtypes = (ctypes.c_void_p,)
+        return get_root_view(tk_widget.winfo_id())
+    except Exception as exc:
+        logging.warning("Could not resolve a real NSView for video embedding: %s", exc)
+        return None
+
+
+def _tk_widget_rect_in_appkit_coords(tk_widget, toplevel):
+    """tk_widget's on-screen rectangle, in the coordinate system of toplevel's own root content
+    view -- Tk's y grows downward from the top-left corner; AppKit's non-flipped views (which is
+    what a plain NSView, like the one created below, defaults to) grow upward from the
+    bottom-left, so the y axis has to be flipped relative to the toplevel's current height."""
+    x = tk_widget.winfo_rootx() - toplevel.winfo_rootx()
+    y_tk = tk_widget.winfo_rooty() - toplevel.winfo_rooty()
+    w = tk_widget.winfo_width()
+    h = tk_widget.winfo_height()
+    y_appkit = toplevel.winfo_height() - y_tk - h
+    return x, y_appkit, w, h
+
+
 def embed_video_player(player, tk_widget):
     """Embeds a python-vlc player's output into tk_widget -- unlike Windows/Linux (which both
     hand set_hwnd/set_xwindow the plain numeric id winfo_id() already returns), python-vlc's
-    macOS set_nsobject() needs a real NSView Objective-C object, not a raw integer.
+    macOS set_nsobject() needs a real NSView pointer.
 
-    Modern Tk/Aqua (Cocoa-based -- what every current Tcl/Tk build uses; the old Carbon-based Tk
-    port is long deprecated) returns the NSView*'s own pointer value directly from winfo_id(), so
-    this wraps that raw pointer as a real PyObjC object via objc.objc_object(...) rather than
-    trying to locate/match an NSWindow through some other, less direct path (e.g. searching
-    NSApp's window list). This is the single least-confident piece of code in this phase (see
-    CROSS_PLATFORM_PLAN.md §5.5) -- not verified against real macOS hardware in this session; if
-    the pointer-cast assumption above turns out wrong for some Tk/macOS version combination, the
-    most likely real symptom is a blank/black video surface (set_nsobject's own argument
-    validation is lenient) rather than a crash, so this needs real-hardware confirmation, not
-    just "did it raise" CI coverage."""
-    import objc
+    Confirmed live (a real SIGSEGV, reproduced with a minimal script) that winfo_id()'s own
+    return value is NOT that pointer at all -- it's an opaque Tk-internal "drawable" handle, and
+    passing it to set_nsobject() directly (or wrapping it as a PyObjC object first, which is what
+    this function used to do) crashes the instant anything tries to use it as a real Objective-C
+    object, since it isn't one. The actual, correct conversion -- confirmed against python-vlc's
+    own official tkvlc.py example, not guessed -- is Tk's own (non-public, but exported) C
+    function TkMacOSXGetRootControl, called via ctypes against the real libtk dylib this
+    interpreter loaded.
 
-    view_ptr = tk_widget.winfo_id()
-    ns_view = objc.objc_object(c_void_p=view_ptr)
-    player.set_nsobject(ns_view)
+    That resolves a real NSView* -- but confirmed live (screenshots of a minimal repro, both
+    with and without the fix below) that it is specifically the TOPLEVEL WINDOW's own single
+    shared Cocoa content view, the same one no matter which descendant widget's winfo_id() is
+    passed in -- Tk's Cocoa port draws every child widget of a toplevel into that one NSView
+    itself, rather than giving each child widget its own. Handing that raw pointer straight to
+    set_nsobject() (as this function used to) therefore doesn't confine VLC's video to
+    tk_widget's own rectangle at all: VLC paints over the *entire* window, hiding every other Tk
+    widget sharing it (confirmed live: a clip editor's transport controls and timeline visually
+    vanished the instant a video actually started playing, once the prior SIGSEGV above was
+    fixed and this became reachable for the first time). python-vlc's own official tkvlc.py
+    example never hits this, because it never puts the video in the same window as any other
+    widget in the first place -- it uses one Toplevel exclusively for video and a second,
+    completely separate Toplevel for all the playback controls.
+
+    Rather than restructure this app's clip editor into two windows to match, this creates a
+    second, real NSView scoped to tk_widget's own on-screen rectangle and adds it as a subview
+    of the toplevel's root view -- confirmed live (same repro, screenshotted again after this
+    fix) that this keeps the video correctly confined to tk_widget's own bounds while every
+    sibling widget in the same window stays visible. A <Configure> binding on tk_widget keeps
+    the subview's frame in sync if the window is later resized (the clip editor's window is
+    resizable, so tk_widget's own size/position aren't fixed for the widget's lifetime)."""
+    toplevel = tk_widget.winfo_toplevel()
+    root_view_ptr = _resolve_root_ns_view(tk_widget)
+    if not root_view_ptr:
+        logging.warning("Falling back to audio-only playback (no video preview) for this clip.")
+        # Without anywhere to draw, VLC logged a "No drawable-nsobject found" error several times
+        # per frame (confirmed live: thousands of log lines); the caller opens media with
+        # ":no-video" while this is set, so VLC doesn't try.
+        player.oar_audio_only = True
+        return
+
+    try:
+        import objc
+        import AppKit
+
+        root_view = objc.objc_object(c_void_p=root_view_ptr)
+        x, y, w, h = _tk_widget_rect_in_appkit_coords(tk_widget, toplevel)
+        child_view = AppKit.NSView.alloc().initWithFrame_(AppKit.NSMakeRect(x, y, w, h))
+        root_view.addSubview_(child_view)
+
+        def _sync_frame(_event=None):
+            try:
+                x, y, w, h = _tk_widget_rect_in_appkit_coords(tk_widget, toplevel)
+                child_view.setFrame_(AppKit.NSMakeRect(x, y, w, h))
+            except Exception:
+                logging.exception("Could not resync the video subview's frame after a resize.")
+
+        tk_widget.bind("<Configure>", _sync_frame, add="+")
+        player.set_nsobject(objc.pyobjc_id(child_view))
+    except Exception as exc:
+        logging.warning(
+            "Could not create a properly-bounded video subview (%s); falling back to the "
+            "whole window's view -- video will show, but may cover other controls.", exc,
+        )
+        player.set_nsobject(root_view_ptr)
 
 
 def resolve_editor_top_level_window(tk_window_id):
@@ -492,18 +784,21 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
         return
 
     this_pid = os.getpid()
+    names = _resolve_event_tap_names(Quartz)
+    with _QUARTZ_LOOKUP_LOCK:
+        workspace_cls = Quartz.NSWorkspace
 
     def is_this_app_frontmost():
         try:
-            frontmost = Quartz.NSWorkspace.sharedWorkspace().frontmostApplication()
+            frontmost = workspace_cls.sharedWorkspace().frontmostApplication()
             return frontmost is not None and frontmost.processIdentifier() == this_pid
         except Exception:
             return False
 
     def tap_callback(proxy, event_type, event, refcon):
         try:
-            if event_type == Quartz.kCGEventKeyDown:
-                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+            if event_type == names["key_down"]:
+                keycode = names["get_field"](event, names["keycode_field"])
                 if keycode == MACOS_SPACE_KEYCODE and is_this_app_frontmost():
                     on_toggle()
         except Exception:
@@ -517,3 +812,376 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
         )
 
     _create_and_run_event_tap(Quartz, tap_callback, on_permission_denied, stop_event=stop_event)
+
+
+# Confirmed empirically against a real OBS 30.2.3 on macOS 15.5 (Apple Silicon), obs-websocket
+# 5.5.2 -- CROSS_PLATFORM_PLAN.md §6.1. GetInputKindList surfaced "sck_audio_capture" (built on
+# ScreenCaptureKit's per-app audio taps, the macOS 14.4+ capability this app's macOS floor was
+# raised for); GetInputDefaultSettings gave {"application": "", "type": 0}. Its "type" property
+# is an enum with exactly two confirmed-safe values -- querying
+# GetInputPropertiesListPropertyItems(name, "type") on a real created input returned:
+#   0 -> "Desktop Audio Capture"
+#   1 -> "Application Audio Capture"
+# Only with type=1 does the "application" property's own live item list populate (confirmed with
+# real running apps, e.g. {"itemName": "Discord", "itemValue": "com.hnc.Discord"} -- a bundle
+# identifier, not a process/executable name); at type=0 it's an empty list (desktop audio needs
+# no target). A third value (2) was tried once to see whether a third meaningful mode existed --
+# OBS's whole process disappeared instantly, no crash report, no error surfaced over the
+# websocket first. Never pass "type" anything but 0 or 1.
+PROCESS_AUDIO_CAPTURE_KIND = "sck_audio_capture"
+SCK_AUDIO_CAPTURE_TYPE_APPLICATION = 1
+
+
+def resolve_bundle_identifier(exe_path):
+    """Walks up from a running process's own executable path (e.g.
+    /Applications/Balatro.app/Contents/MacOS/Balatro, the "exe" psutil reports) to find the
+    owning .app bundle's Info.plist and reads CFBundleIdentifier out of it -- the value
+    sck_audio_capture's "application" setting actually needs (confirmed live, see
+    PROCESS_AUDIO_CAPTURE_KIND above), not the process/executable name itself. Returns None if
+    exe_path isn't inside a .app bundle at all (a bare command-line binary, for instance -- rare
+    for an actual game, but not impossible), or if the plist can't be read/parsed for any reason
+    (a damaged bundle, unreadable permissions, etc.) -- this is a best-effort resolution, not
+    something callers should ever treat as guaranteed to succeed."""
+    if not exe_path:
+        return None
+    path = os.path.normpath(exe_path)
+    exe = path
+    while True:
+        parent = os.path.dirname(path)
+        if path.endswith(".app"):
+            # Only the bundle's own executables (Contents/MacOS) are that app for capture. A
+            # program it merely ships elsewhere isn't: Wizard101.app runs its game as Wine's
+            # Contents/SharedSupport/.../wine64-preloader, which macOS lists under no bundle id --
+            # resolving it to com.kingsisle.wizard101 left Game Audio silent (confirmed live).
+            if not exe.startswith(os.path.join(path, "Contents", "MacOS") + os.sep):
+                return None
+            plist_path = os.path.join(path, "Contents", "Info.plist")
+            try:
+                with open(plist_path, "rb") as f:
+                    plist = plistlib.load(f)
+                return plist.get("CFBundleIdentifier")
+            except Exception:
+                return None
+        if parent == path:
+            return None
+        path = parent
+
+
+# Settings for an app-audio input with no target yet (app not running). sck_audio_capture's own
+# default is type 0, "Desktop Audio Capture" -- the whole system mix -- so an untargeted input
+# left on defaults records everything (confirmed live: a never-targeted "Safari" input put
+# Spotify on the browser track). Application mode with no application records silence.
+PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS = {"type": SCK_AUDIO_CAPTURE_TYPE_APPLICATION}
+
+
+def process_audio_capture_settings(process_name, exe_path):
+    """Builds sck_audio_capture's settings dict for capturing one application's own audio -- the
+    macOS counterpart to Windows's wasapi_process_output_capture "window" field. process_name is
+    accepted for signature parity with the Windows backend but unused: macOS's "application"
+    field needs a bundle identifier, which only exe_path can resolve (see
+    resolve_bundle_identifier). Returns None if that resolution fails (the process isn't
+    currently running -- exe_path is None -- or its executable isn't inside a normal .app bundle
+    at all), so callers can leave whatever's already configured alone rather than writing a
+    setting guaranteed not to match anything real."""
+    bundle_id = resolve_bundle_identifier(exe_path)
+    if not bundle_id:
+        return None
+    return {"type": SCK_AUDIO_CAPTURE_TYPE_APPLICATION, "application": bundle_id}
+
+
+def hide_dock_icon():
+    """Hides this process's Dock icon and Cmd-Tab/App-Switcher entry, making it behave as a
+    proper macOS menu-bar-only "accessory" app instead of showing a generic, non-functional
+    Python/rocket Dock icon alongside the real tray icon in the menu bar. Confirmed live: without
+    this, the app (whether run from source or from a --windowed PyInstaller build with no custom
+    Info.plist LSUIElement key) shows an unusable Dock icon next to its real, working menu-bar
+    icon -- clicking it does nothing meaningful, since this app has no main window of its own.
+
+    Must be called AFTER Tk has already initialized its own Cocoa integration (see main()'s own
+    throwaway-Tk() priming step and its docstring) -- this also touches the shared NSApplication,
+    and doing so before Tk gets to register itself reproduces the exact startup crash that
+    priming step exists to avoid. Best-effort: logs and continues on any failure (pyobjc missing,
+    or anything else) since running with a Dock icon present is a cosmetic annoyance, not
+    something worth crashing over."""
+    try:
+        import AppKit
+        AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+            AppKit.NSApplicationActivationPolicyAccessory
+        )
+    except Exception as exc:
+        logging.warning("Could not hide the Dock icon: %s", exc)
+
+
+def run_on_main_thread(func):
+    """Schedules func to run (asynchronously) on the real process main thread, from any thread.
+
+    Confirmed live: this app's game-watcher loop runs on its own background thread (started from
+    pystray's setup callback, which pystray itself documents as running "in a separate thread"),
+    and it directly sets the tray icon's image/title (icon.icon = .../icon.title = ...) whenever
+    recording state changes. Those property setters end up calling pystray's macOS backend's
+    _update_icon()/_update_title(), which touch AppKit's NSStatusItem/NSImage directly -- and
+    AppKit forbids that from any thread but the main one. A real crash report from this exact
+    sequence (detecting a watched game, then failing to reach OBS, then updating the tray icon to
+    show the error) showed a SIGABRT a few seconds later, deep inside Tk's own Cocoa event
+    dispatch (PythonCmd -> PyEval_RestoreThread -> fatal_error) -- the same class of "any AppKit
+    misuse anywhere in the process can corrupt Tk's own fragile macOS backend" finding as the
+    tray-menu-crash bug (see CROSS_PLATFORM_PLAN.md).
+
+    PyObjCTools.AppHelper.callAfter is PyObjC's own documented mechanism for handing a callable to
+    the main thread's run loop from any other thread, without going through Tkinter at all (Tk's
+    own .after() is itself a Tcl/Tk call, and making *that* safe to call cross-thread is exactly
+    the kind of misuse this function exists to avoid). If already on the main thread, func() just
+    runs immediately -- callAfter would still work, but there's no reason to round-trip through
+    the run loop when nothing needs marshaling."""
+    if threading.current_thread() is threading.main_thread():
+        func()
+        return
+    try:
+        from PyObjCTools import AppHelper
+        AppHelper.callAfter(func)
+    except Exception:
+        logging.exception("Could not marshal a callback onto the macOS main thread.")
+
+
+def open_path(path):
+    """macOS has no os.startfile() equivalent function -- `open` (the same command Terminal's own
+    `open` runs) is the real, documented way to hand a file or folder to Finder/whatever app owns
+    that file type. Confirmed live: this app's "Open Log File"/"Open Recordings Folder" tray menu
+    items called os.startfile() directly and had never been exercised on macOS -- AttributeError
+    (no such function outside Windows), silently swallowed by the tray menu's own error handling,
+    so clicking either looked exactly like nothing happened at all."""
+    subprocess.run(["open", path])
+
+
+# ---------- Game audio for games without an app bundle (Wine, Java) ----------
+#
+# OBS's per-app capture (sck_audio_capture) targets apps by bundle id only, so a Wine game or
+# Java Minecraft can't get its own track. A Core Audio process tap can capture them by pid, but
+# OBS can't read a tap itself (macOS hands tap audio only to apps declaring
+# NSAudioCaptureUsageDescription, and OBS doesn't -- confirmed live: silence). So this app's
+# helper (macos/process_audio_tap.swift) reads the tap and plays it into a loopback device
+# (macos/game_audio_driver), which OBS records like a microphone. Confirmed live end to end:
+# -44.1 dB in OBS from a tapped test tone; -43.6 dB from Wizard101's own client.
+GAME_AUDIO_DEVICE_UID = "OBSAutoRecorderGameAudio_UID"
+GAME_AUDIO_DRIVER_NAME = "OBSAutoRecorderGameAudio.driver"
+GAME_AUDIO_DRIVER_DIR = "/Library/Audio/Plug-Ins/HAL"
+PROCESS_AUDIO_TAP_HELPER_NAME = "process_audio_tap"
+SYSTEM_AUDIO_RECORDING_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+
+
+def _bundled_macos_file(name):
+    """A file built from macos/ that ships with the app: Contents/Resources/<name> in the
+    packaged app, macos/build/<name> when running from source (see macos/build.sh)."""
+    if getattr(sys, "frozen", False):
+        base = os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "Resources")
+    else:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "macos", "build")
+    path = os.path.join(base, name)
+    return path if os.path.exists(path) else None
+
+
+def process_audio_tap_helper_path():
+    return _bundled_macos_file(PROCESS_AUDIO_TAP_HELPER_NAME)
+
+
+def bundled_game_audio_driver_path():
+    return _bundled_macos_file(GAME_AUDIO_DRIVER_NAME)
+
+
+def game_audio_device_installed():
+    """Whether the Game Audio loopback driver is installed (it loads at the next Core Audio
+    restart, which installing does itself)."""
+    return os.path.isdir(posixpath.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME))
+
+
+def process_audio_tap_available():
+    """Process taps need macOS 14.2+, the helper, and the installed loopback device."""
+    try:
+        major, minor = (int(p) for p in ((platform.mac_ver()[0] or "0") + ".0").split(".")[:2])
+    except ValueError:
+        return False
+    if (major, minor) < (14, 2):
+        return False
+    return bool(process_audio_tap_helper_path()) and game_audio_device_installed()
+
+
+def game_audio_driver_install_command(driver_path):
+    """Shell command that installs driver_path as the Game Audio device and restarts Core Audio
+    so it loads (all sound cuts out for a second or two)."""
+    # posixpath, not os.path: this always runs on macOS, but the tests also run on Windows CI.
+    target = posixpath.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME)
+    return (
+        f"rm -rf {_shell_quote(target)} && mkdir -p {_shell_quote(GAME_AUDIO_DRIVER_DIR)} && "
+        f"ditto {_shell_quote(driver_path)} {_shell_quote(target)} && "
+        f"chown -R root:wheel {_shell_quote(target)} && killall coreaudiod"
+    )
+
+
+def _shell_quote(text):
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def install_game_audio_device(driver_path=None):
+    """Installs the Game Audio device, asking for an administrator password through macOS's own
+    prompt. Returns True once installed; False if cancelled or it failed."""
+    driver_path = driver_path or bundled_game_audio_driver_path()
+    if not driver_path:
+        logging.warning("The Game Audio device isn't bundled with this copy of the app.")
+        return False
+    command = game_audio_driver_install_command(driver_path).replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'do shell script "{command}" with prompt "OBS Auto Recorder wants to install its Game '
+        'Audio device, so audio from Wine and Java games can be recorded on its own track." '
+        "with administrator privileges"
+    )
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    except OSError as exc:
+        logging.warning("Could not install the Game Audio device: %s", exc)
+        return False
+    if result.returncode != 0:
+        logging.info("Game Audio device install didn't complete: %s", result.stderr.strip())
+        return False
+    logging.info("Installed the Game Audio device.")
+    return True
+
+
+def game_audio_driver_uninstall_command():
+    """Shell command that removes the Game Audio device and restarts Core Audio so it's gone."""
+    target = posixpath.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME)
+    return f"rm -rf {_shell_quote(target)} && killall coreaudiod"
+
+
+def uninstall_game_audio_device():
+    """Removes the Game Audio device, asking for an administrator password through macOS's own
+    prompt. Returns True if it's gone (or was never installed); False if cancelled or failed."""
+    if not game_audio_device_installed():
+        return True
+    command = game_audio_driver_uninstall_command().replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'do shell script "{command}" with prompt "OBS Auto Recorder wants to remove its Game Audio '
+        'device." with administrator privileges'
+    )
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    except OSError as exc:
+        logging.warning("Could not remove the Game Audio device: %s", exc)
+        return False
+    if result.returncode != 0:
+        logging.info("Game Audio device removal didn't complete: %s", result.stderr.strip())
+        return False
+    return not game_audio_device_installed()
+
+
+def start_process_audio_tap(pids):
+    """Starts feeding pids' audio into the Game Audio device. Returns the helper process (pass
+    it to stop_process_audio_tap), or None if it couldn't start. The helper waits for a process
+    that hasn't opened audio yet, and exits on its own once every pid has."""
+    helper = process_audio_tap_helper_path()
+    if not helper or not pids:
+        return None
+    command = [helper]
+    for pid in pids:
+        command += ["--pid", str(pid)]
+    try:
+        # stdin stays open: the helper stops when it closes, so it never outlives this app.
+        return subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+    except OSError as exc:
+        logging.warning("Could not start the game audio tap: %s", exc)
+        return None
+
+
+def stop_process_audio_tap(process):
+    if process is None:
+        return
+    try:
+        process.stdin.close()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        process.kill()
+        return
+    if process.returncode:
+        error = (process.stderr.read() if process.stderr else "").strip()
+        logging.warning("The game audio tap stopped with an error: %s", error or process.returncode)
+
+
+def request_system_audio_recording_permission():
+    """Shows macOS's "record system audio" prompt for this app by briefly tapping all audio
+    (the permission belongs to whichever app reads a tap -- here, this app's helper). Returns
+    True if the probe ran; macOS gives no way to read the answer, a denied tap just hears
+    silence."""
+    helper = process_audio_tap_helper_path()
+    if not helper:
+        return False
+    try:
+        return subprocess.run([helper, "--probe", "1"], stdin=subprocess.PIPE, capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        logging.warning("Could not ask for System Audio Recording permission: %s", exc)
+        return False
+
+
+def open_system_audio_recording_settings():
+    try:
+        subprocess.run(["open", SYSTEM_AUDIO_RECORDING_SETTINGS_URL], check=False)
+    except Exception as exc:
+        logging.warning("Could not open System Audio Recording settings: %s", exc)
+
+
+def screen_recording_permission_granted():
+    """True if this app may see other apps' window titles (macOS's Screen Recording permission;
+    reading titles needs it -- confirmed live, see autostart_script.SCREEN_RECORDING_REQUEST_FLAG)."""
+    try:
+        import Quartz
+        return bool(Quartz.CGPreflightScreenCaptureAccess())
+    except Exception:
+        return True  # unknown -- don't nag
+
+
+def request_screen_recording_permission():
+    """Shows macOS's Screen Recording prompt for this app and adds it to that list. macOS applies
+    a grant only after the app restarts."""
+    try:
+        import Quartz
+        Quartz.CGRequestScreenCaptureAccess()
+    except Exception:
+        logging.exception("Could not show the macOS Screen Recording permission prompt.")
+
+
+def open_accessibility_settings():
+    """Deep-links to System Settings' Accessibility pane, where this app has to be allowed for its
+    custom keybinds and the clip editor's space bar to see key presses (see
+    accessibility_permission_granted). Like Screen Recording, it's granted per app by the user;
+    the installed app also asks on first use."""
+    try:
+        subprocess.run(
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+            check=False,
+        )
+    except Exception as exc:
+        logging.warning("Could not open Accessibility settings: %s", exc)
+
+
+def open_screen_recording_settings():
+    """Deep-links straight to System Settings' own Screen & System Audio Recording pane --
+    confirmed live (real macOS 15.8.1) that this exact URL opens that specific pane, not just the
+    general Privacy & Security page the user would then have to find it from.
+
+    There is deliberately no way to check or grant this from here: Screen Recording (TCC) access
+    is decided per *app* by the user, in System Settings, and OBS -- not this app -- is the one
+    that actually needs it (it's the one capturing the screen; this app only starts/stops OBS's
+    recording over its WebSocket API, it never touches a display itself). CGPreflight/
+    CGRequestScreenCaptureAccess (real, confirmed-available Quartz functions) only report on and
+    prompt for *this calling process's own* access, which is a different, irrelevant permission
+    here -- there's no public API for one app to check or trigger another app's TCC prompt. This
+    is a navigation convenience only: pointing the user at the right place, once, during install,
+    rather than leaving them to discover on their own -- after a failed recording, or not at all
+    -- that this permission is what's missing."""
+    try:
+        subprocess.run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"])
+    except Exception as exc:
+        logging.warning("Could not open Screen Recording settings: %s", exc)

@@ -54,6 +54,31 @@ DEFAULT_OBS_PATHS = [
 ]
 
 
+def prepare_calibration_player(ffplay_path, work_dir):
+    """ffplay itself -- this OS's per-app capture can target it directly."""
+    return ffplay_path
+
+
+def is_this_app_frontmost():
+    """Always True: only macOS's custom tray popup asks this."""
+    return True
+
+
+def display_top_inset_pixels(pixel_width, pixel_height):
+    """0: only macOS built-in displays have a notch strip to crop."""
+    return 0
+
+
+def obs_launch_command(path, launch_args):
+    return [path, *launch_args]
+
+
+def quit_obs_gracefully():
+    """No-op: only macOS shows a screen-sharing indicator while OBS idles, so only there is OBS
+    closed between game sessions."""
+    return False
+
+
 def find_obs_executable():
     """Moved unchanged from installer.py's old find_obs_exe()."""
     for path in DEFAULT_OBS_PATHS:
@@ -334,7 +359,8 @@ def find_matching_custom_keybind(vk_code, is_key_down, bindings_by_vk):
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None, stop_event=None, hotkey_mode=None,
+    icon=None, notifications_config=None, status=None, recording_state=None, stop_event=None,
+    hotkey_mode=None,
 ):
     """Dispatches to one of three mechanisms based on hotkey_mode -- see the module comment above
     this whole section for the full three-way tradeoff. "register_hotkey" and "low_level_hook"
@@ -349,13 +375,14 @@ def run_custom_keybind_listener(
         impl = _run_custom_keybind_listener_raw_input
     impl(
         bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-        icon=icon, notifications_config=notifications_config, status=status, stop_event=stop_event,
+        icon=icon, notifications_config=notifications_config, status=status, recording_state=recording_state,
+        stop_event=stop_event,
     )
 
 
 def _run_custom_keybind_listener_register_hotkey(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None, stop_event=None,
+    icon=None, notifications_config=None, status=None, recording_state=None, stop_event=None,
 ):
     """The default, safe mechanism -- see the module comment above this section for the full
     RegisterHotKey-vs-low-level-hook tradeoff this exists alongside.
@@ -434,7 +461,10 @@ def _run_custom_keybind_listener_register_hotkey(
             if binding:
                 threading.Thread(
                     target=fire_keybind,
-                    args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                    args=(
+                        binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status,
+                        recording_state,
+                    ),
                     daemon=True,
                 ).start()
         user32.TranslateMessage(ctypes.byref(msg))
@@ -458,7 +488,7 @@ def _run_custom_keybind_listener_register_hotkey(
 
 def _run_custom_keybind_listener_low_level_hook(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None, stop_event=None,
+    icon=None, notifications_config=None, status=None, recording_state=None, stop_event=None,
 ):
     """The opt-in, fullscreen-compatible mechanism -- see the module comment above this section
     for the full tradeoff (real, perceptible input-lag risk system-wide) this carries relative to
@@ -532,7 +562,10 @@ def _run_custom_keybind_listener_low_level_hook(
                     if binding:
                         threading.Thread(
                             target=fire_keybind,
-                            args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                            args=(
+                        binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status,
+                        recording_state,
+                    ),
                             daemon=True,
                         ).start()
         except Exception:
@@ -582,7 +615,7 @@ def _run_custom_keybind_listener_low_level_hook(
 
 def _run_custom_keybind_listener_raw_input(
     bindings, get_client, get_manual_split_buffer_seconds, fire_keybind, describe_keybind, notify,
-    icon=None, notifications_config=None, status=None, stop_event=None,
+    icon=None, notifications_config=None, status=None, recording_state=None, stop_event=None,
 ):
     """The default mechanism -- see the module comment above this whole section for why raw input
     is the one that actually avoids both the register_hotkey and low_level_hook tradeoffs.
@@ -677,7 +710,10 @@ def _run_custom_keybind_listener_raw_input(
             if binding:
                 threading.Thread(
                     target=fire_keybind,
-                    args=(binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status),
+                    args=(
+                        binding, get_client, get_manual_split_buffer_seconds, icon, notifications_config, status,
+                        recording_state,
+                    ),
                     daemon=True,
                 ).start()
 
@@ -820,16 +856,25 @@ def _ps_single_quote(value):
     return "'" + value.replace("'", "''") + "'"
 
 
-def create_shortcut(link_path, target, working_dir):
+def create_shortcut(link_path, target, working_dir, extra_args=None):
     try:
         os.makedirs(os.path.dirname(link_path), exist_ok=True)
     except OSError:
         pass
+    # A .lnk's own Arguments property is a single command-line string (the same way a user would
+    # type them after the target on a command line), not a list -- each arg gets Windows-style
+    # double-quoting (safe even for ones with no spaces) so e.g. a from-source script path
+    # containing a space still comes through as one argument, not split apart.
+    arguments_line = ""
+    if extra_args:
+        quoted_args = " ".join('"' + str(arg).replace('"', '""') + '"' for arg in extra_args)
+        arguments_line = f"$Shortcut.Arguments = {_ps_single_quote(quoted_args)}; "
     ps_script = (
         "$WshShell = New-Object -ComObject WScript.Shell; "
         f"$Shortcut = $WshShell.CreateShortcut({_ps_single_quote(link_path)}); "
         f"$Shortcut.TargetPath = {_ps_single_quote(target)}; "
         f"$Shortcut.WorkingDirectory = {_ps_single_quote(working_dir)}; "
+        + arguments_line +
         "$Shortcut.Save()"
     )
     try:
@@ -860,12 +905,12 @@ def is_autostart_enabled():
     return bool(path and os.path.isfile(path))
 
 
-def enable_autostart(target_path, working_dir):
+def enable_autostart(target_path, working_dir, extra_args=None):
     path = get_startup_shortcut_path()
     if not path:
         logging.warning("Could not resolve the Startup folder; cannot manage the startup shortcut.")
         return False
-    if create_shortcut(path, target_path, working_dir):
+    if create_shortcut(path, target_path, working_dir, extra_args=extra_args):
         logging.info("Created startup shortcut at %s", path)
         return True
     logging.error("Failed to create startup shortcut at %s", path)
@@ -1105,3 +1150,107 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
             "Clip editor: space bar play/pause hook failed unexpectedly -- use the on-screen "
             "play/pause button instead."
         )
+
+
+PROCESS_AUDIO_CAPTURE_KIND = "wasapi_process_output_capture"
+
+# An untargeted input's defaults already capture nothing here -- no placeholder needed (see
+# platform_macos.PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS for why macOS needs one).
+PROCESS_AUDIO_CAPTURE_PLACEHOLDER_SETTINGS = None
+
+# OBS's own "match priority" enum for a wasapi_process_output_capture "window" field: 2 means
+# "match executable only" (no title/class needed), the fallback used when only a process name is
+# known. Deliberately a plain local constant, not a shared import from autostart_script.py's own
+# WINDOW_MATCH_PRIORITY_EXE_FALLBACK -- platform_windows.py sits below autostart_script.py in the
+# dependency direction (see platform_common.py's own module docstring) and must not import from
+# it; both constants encode the same OBS-protocol fact independently.
+WINDOW_MATCH_PRIORITY_EXE_FALLBACK = 2
+
+
+def process_audio_capture_settings(process_name, exe_path):
+    """Windows resolves a wasapi_process_output_capture target purely by process/executable name
+    -- exe_path is accepted (for signature parity with the macOS backend, which needs it to
+    resolve an app bundle identifier) but unused here."""
+    return {"window": f"::{process_name}", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}
+
+
+def hide_dock_icon():
+    """No-op -- Windows has no Dock/Cmd-Tab equivalent that a pystray tray icon needs hiding
+    from; only accepted for signature parity with the macOS backend, which does real work here."""
+    pass
+
+
+def run_on_main_thread(func):
+    """No-op marshaling -- Windows' tray/GUI toolkits have no macOS-style main-thread-only AppKit
+    constraint, so func() just runs immediately on whichever thread called this. Only accepted for
+    signature parity with the macOS backend, which does real work here."""
+    func()
+
+
+def open_path(path):
+    """os.startfile() -- Windows' own "open with whatever's registered for this file type"
+    mechanism, the one every other backend's open_path() is emulating via a subprocess."""
+    os.startfile(path)
+
+
+def process_audio_tap_available():
+    """False -- the process-tap Game Audio device is macOS only."""
+    return False
+
+
+def game_audio_device_installed():
+    return False
+
+
+def install_game_audio_device(driver_path=None):
+    return False
+
+
+def uninstall_game_audio_device():
+    return True
+
+
+def start_process_audio_tap(pids):
+    return None
+
+
+def stop_process_audio_tap(handle):
+    pass
+
+
+def request_system_audio_recording_permission():
+    return False
+
+
+def open_system_audio_recording_settings():
+    pass
+
+
+def screen_recording_permission_granted():
+    return True
+
+
+def request_screen_recording_permission():
+    pass
+
+
+def accessibility_permission_granted():
+    """Always True -- only macOS gates global key listening behind a per-app permission."""
+    return True
+
+
+def request_accessibility_permission():
+    """No-op -- only macOS gates global key listening behind a per-app permission."""
+    pass
+
+
+def open_accessibility_settings():
+    """No-op -- only macOS gates global key listening behind a per-app permission."""
+    pass
+
+
+def open_screen_recording_settings():
+    """No-op -- Windows has no equivalent OS-level screen-recording consent system an app needs
+    to be granted into; only accepted for signature parity with the macOS backend, which does
+    real work here."""
+    pass

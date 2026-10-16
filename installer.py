@@ -17,6 +17,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 import webbrowser
@@ -53,6 +54,53 @@ def app_relative_path():
     return EXE_NAME
 
 
+def app_launch_command(install_dir, args=()):
+    """Command that starts the installed app. On macOS it goes through `open` so the app runs as
+    itself: started as this installer's child, macOS would attribute its permission requests
+    (Accessibility, Screen Recording) to the installer instead."""
+    if sys.platform == "darwin":
+        bundle = os.path.join(install_dir, APP_BUNDLE_NAME)
+        if not args:
+            return ["open", "-a", bundle]
+        # -n: a separate copy even if the app is already running, which would otherwise just be
+        # brought forward with these arguments dropped.
+        return ["open", "-n", "-a", bundle, "--args", *args]
+    return [os.path.join(install_dir, app_relative_path()), *args]
+
+
+# Mirrors autostart_script.ACCESSIBILITY_REQUEST_FLAG.
+ACCESSIBILITY_REQUEST_FLAG = "--request-accessibility"
+
+
+# Mirrors autostart_script.SYSTEM_AUDIO_RECORDING_REQUEST_FLAG.
+SYSTEM_AUDIO_RECORDING_REQUEST_FLAG = "--request-system-audio-recording"
+GAME_AUDIO_DRIVER_NAME = "OBSAutoRecorderGameAudio.driver"
+
+
+def installed_game_audio_driver_path(install_dir):
+    """The Game Audio device's driver shipped inside the installed app (macOS)."""
+    return os.path.join(install_dir, APP_BUNDLE_NAME, "Contents", "Resources", GAME_AUDIO_DRIVER_NAME)
+
+
+# Mirrors autostart_script's permission request flags.
+PERMISSION_REQUEST_FLAGS = {
+    "accessibility": "--request-accessibility",
+    "screen_recording": "--request-screen-recording",
+}
+
+
+def app_permission_request_command(install_dir, kind, status_path):
+    """Opens the installed app just to ask macOS for one of its permissions (see
+    autostart_script.run_permission_request); it writes "granted" to status_path once allowed."""
+    return app_launch_command(install_dir, [PERMISSION_REQUEST_FLAGS[kind], status_path])
+
+
+def accessibility_request_command(install_dir, status_path):
+    """Opens the installed app just to ask macOS for its Accessibility permission (see
+    autostart_script.run_accessibility_request); it writes "granted" to status_path once allowed."""
+    return app_launch_command(install_dir, [ACCESSIBILITY_REQUEST_FLAG, status_path])
+
+
 # Per-user install locations (CROSS_PLATFORM_PLAN.md §2.8) -- none of the 3 need elevation for
 # the app install itself (a separate concern from installing system packages like ffmpeg/OBS via
 # platform_common.install_optional_dependency/run_linux_install_command, which does need root on
@@ -71,7 +119,7 @@ FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
 # games with at least one launch path this app can't auto-discover belong here -- Steam, Epic,
 # GOG, Xbox, and Battle.net installs are all found automatically once those launchers are enabled
 # in Settings, so a Steam-only title would just be redundant clutter on this page.
-COMMON_GAMES = [
+_COMMON_GAMES_WINDOWS = [
     {"name": "League of Legends", "process_name": "league of legends.exe"},
     {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
     {"name": "Valorant", "process_name": "VALORANT-Win64-Shipping.exe"},
@@ -81,6 +129,20 @@ COMMON_GAMES = [
     {"name": "Roblox", "process_name": "RobloxPlayerBeta.exe"},
     {"name": "Genshin Impact", "process_name": "GenshinImpact.exe"},
 ]
+# Per OS, mirroring autostart_script.py's own lists -- one shared Windows list put .exe names in
+# Mac configs that could never match (confirmed live: League of Legends picked in the Mac
+# installer saved "league of legends.exe"). Wizard101 keeps its .exe name: its Mac app runs the
+# Windows client under a bundled Wine, which the app reports by the .exe's own name.
+_COMMON_GAMES_MACOS = [
+    {"name": "League of Legends", "process_name": "LeagueofLegends"},
+    {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
+    {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
+    {"name": "Roblox", "process_name": "RobloxPlayer"},
+]
+_COMMON_GAMES_LINUX = [
+    {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
+]
+COMMON_GAMES = {"win32": _COMMON_GAMES_WINDOWS, "darwin": _COMMON_GAMES_MACOS}.get(sys.platform, _COMMON_GAMES_LINUX)
 
 
 def is_ffmpeg_installed():
@@ -144,26 +206,26 @@ def find_obs_exe():
 _OBS_PROCESS_NAMES = {"obs64.exe", "obs32.exe", "obs"}  # Windows / Windows / Linux+macOS
 
 
-def is_obs_running():
-    for proc in psutil.process_iter(["name"]):
+def running_process_names():
+    """Lowercased names of every running process. Reads each name inside its own try rather than
+    via process_iter(["name"]): that resolves names while advancing the iterator, outside any
+    try, and on macOS a sandboxed helper process can make it raise SystemError (confirmed live in
+    the app itself -- see autostart_script.get_running_processes)."""
+    names = set()
+    for proc in psutil.process_iter():
         try:
-            name = (proc.info.get("name") or "").lower()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            names.add((proc.name() or "").lower())
+        except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError, PermissionError):
             continue
-        if name in _OBS_PROCESS_NAMES:
-            return True
-    return False
+    return names
+
+
+def is_obs_running():
+    return bool(running_process_names() & _OBS_PROCESS_NAMES)
 
 
 def is_app_running():
-    for proc in psutil.process_iter(["name"]):
-        try:
-            name = (proc.info.get("name") or "").lower()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        if name == EXE_NAME.lower():
-            return True
-    return False
+    return EXE_NAME.lower() in running_process_names()
 
 
 def close_obs_for_setup():
@@ -225,6 +287,17 @@ def try_configure_obs_websocket(password):
         return False, str(exc)
 
 
+def template_config_path():
+    """The example config new installs start from -- macOS has its own (OBS's Mac process name
+    and path, its screen-capture desktop audio on track 1, no Windows-only launchers or .exe
+    game names); falls back to the general one if it wasn't bundled."""
+    if sys.platform == "darwin":
+        mac = resource_path("config.example.mac.json")
+        if os.path.isfile(mac):
+            return mac
+    return resource_path("config.example.json")
+
+
 def build_config(template, obs_path, password, options):
     config = json.loads(json.dumps(template))
     watched_games = []
@@ -241,7 +314,12 @@ def build_config(template, obs_path, password, options):
         else:
             watched_games.append(game["process_name"])
     config["watched_games"] = watched_games
-    config["watched_windows"] = watched_windows
+    # Added to the template's own entries (e.g. GeForce NOW), not in place of them -- replacing
+    # them silently dropped GeForce NOW support from every fresh install (confirmed live).
+    existing = {(w.get("process_name"), w.get("title_contains")) for w in template.get("watched_windows", [])}
+    config["watched_windows"] = list(template.get("watched_windows", [])) + [
+        w for w in watched_windows if (w["process_name"], w["title_contains"]) not in existing
+    ]
     config["obs"]["path"] = obs_path or template["obs"]["path"]
     config["obs"]["websocket"]["password"] = password
     config["obs"]["auto_split"]["enabled"] = options["split_long_recordings"]
@@ -297,10 +375,20 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
     on_progress("Copying application files...")
     if sys.platform == "darwin":
         # The .app bundle is embedded as a zip, not a plain data directory -- see
-        # APP_BUNDLE_ZIP_NAME's own docstring for why. Extracting overwrites an existing install
-        # in place, same as copytree's dirs_exist_ok=True does for the other two OSes below.
-        with zipfile.ZipFile(resource_path(APP_BUNDLE_ZIP_NAME)) as zf:
-            zf.extractall(install_dir)
+        # APP_BUNDLE_ZIP_NAME's own docstring for why. Extracted with macOS's own ditto, not
+        # zipfile: confirmed with a real build, zipfile.extractall dropped the executable's +x
+        # bit and all 65 of the bundle's symlinks (breaking its code signature), so the installed
+        # app refused to launch at all. ditto preserves permissions, symlinks and signatures, and
+        # overwrites an existing install in place.
+        subprocess.run(["ditto", "-x", "-k", resource_path(APP_BUNDLE_ZIP_NAME), install_dir], check=True)
+        # The user already approved this installer in Gatekeeper (README, Quick install); clear
+        # the "downloaded from the internet" flag from the app it installs, in case it was
+        # carried over, so the app doesn't need approving a second time. Best-effort: nothing
+        # to clear is the normal case.
+        subprocess.run(
+            ["xattr", "-dr", "com.apple.quarantine", os.path.join(install_dir, APP_BUNDLE_NAME)],
+            capture_output=True,
+        )
     else:
         # The app ships as a PyInstaller onedir build (an exe plus an _internal/ folder of
         # support files) rather than onefile -- deliberately, since onefile re-extracts itself to
@@ -325,7 +413,7 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
     obs_ws_reason = None
     if write_config:
         on_progress("Writing your settings...")
-        with open(resource_path("config.example.json"), "r", encoding="utf-8") as f:
+        with open(template_config_path(), "r", encoding="utf-8") as f:
             template = json.load(f)
         password = secrets.token_urlsafe(12)
         config = build_config(template, obs_path, password, options)
@@ -408,16 +496,65 @@ def do_uninstall(install_dir, keep_config, on_progress):
             os.rmdir(install_dir)
     except OSError:
         pass
-    on_progress("Done.")
 
+    # macOS: the Wine & Java game audio device lives outside the install folder, in the system's
+    # audio plug-ins, and removing it needs an administrator password like installing it did.
+    game_audio_device_left = False
+    if platform_common.game_audio_device_installed():
+        on_progress("Removing the Game Audio device (macOS will ask for your password)...")
+        game_audio_device_left = not platform_common.uninstall_game_audio_device()
+    on_progress("Done.")
+    return {"game_audio_device_left": game_audio_device_left}
+
+
+# Where the app's icon lives, and what OBS's executable is called, in this OS's own terms.
+TRAY_NAME = "menu bar" if sys.platform == "darwin" else "system tray"
+OBS_EXECUTABLE_EXAMPLE = {"win32": "obs64.exe", "darwin": "OBS.app"}.get(sys.platform, "obs")
 
 PAGE_BG = "#f4f4f4"
+PAGE_FG = "#111827"
+ENTRY_BG = "#ffffff"
 HEADER_BG = "#1f2937"
 HEADER_FG = "#ffffff"
 
 
+def apply_light_theme_defaults(root):
+    """The pages are drawn light (PAGE_BG) regardless of the OS theme, but any widget without an
+    explicit text color takes the OS's -- confirmed live on macOS in Dark Mode: white text on the
+    light pages, so the whole installer looked blank. Default every text-bearing widget to dark
+    text (and entries to white fields) to match; colors set explicitly on a widget still win."""
+    for widget_class in ("Label", "Checkbutton", "Radiobutton", "Message"):
+        root.option_add(f"*{widget_class}.foreground", PAGE_FG)
+        root.option_add(f"*{widget_class}.activeForeground", PAGE_FG)
+    for widget_class in ("Entry", "Listbox", "Text"):
+        root.option_add(f"*{widget_class}.foreground", PAGE_FG)
+        root.option_add(f"*{widget_class}.background", ENTRY_BG)
+        root.option_add(f"*{widget_class}.insertBackground", PAGE_FG)
+    root.option_add("*Entry.readonlyBackground", ENTRY_BG)
+    root.option_add("*Entry.disabledForeground", "#6b7280")
+
+
+def use_light_appearance_on_macos():
+    """Draws the installer's native parts (window background, button bar, checkboxes, buttons)
+    light too, matching its light pages -- in Dark Mode they rendered dark, leaving the bottom
+    buttons blank and unchecked checkboxes nearly invisible (confirmed live). Must run after
+    tk.Tk(): touching NSApplication before Tk registers with it crashes on startup (see
+    CROSS_PLATFORM_PLAN.md §5.12)."""
+    if sys.platform != "darwin":
+        return
+    try:
+        import AppKit
+        AppKit.NSApplication.sharedApplication().setAppearance_(
+            AppKit.NSAppearance.appearanceNamed_(AppKit.NSAppearanceNameAqua)
+        )
+    except Exception:
+        pass
+
+
 def main():
     root = tk.Tk()
+    use_light_appearance_on_macos()
+    apply_light_theme_defaults(root)
     root.title(f"{APP_NAME} Setup")
     root.geometry("580x600")
     root.resizable(False, False)
@@ -476,8 +613,8 @@ def main():
     )
     for line in [
         "\u2713  Detects games automatically (Steam, Epic, GOG, Xbox) — nothing to set up",
-        "\u2713  Runs quietly in the system tray, out of your way",
-        "\u2713  Can start automatically when your PC turns on",
+        f"\u2713  Runs quietly in the {TRAY_NAME}, out of your way",
+        f"\u2713  Can start automatically when you log in",
     ]:
         tk.Label(welcome, text=line, bg=PAGE_BG, font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=2)
 
@@ -540,7 +677,7 @@ def main():
             obs_status.config(
                 text=(
                     "Couldn't find OBS automatically. If it's already installed, click Browse "
-                    "to find obs64.exe. Don't have OBS yet? That's fine — install it now with the "
+                    f"to find {OBS_EXECUTABLE_EXAMPLE}. Don't have OBS yet? That's fine — install it now with the "
                     "link below, or later from obsproject.com, then point to it from this app's Settings."
                 ),
                 fg="#b45309",
@@ -548,7 +685,7 @@ def main():
             download_link.pack(side="left", padx=(16, 0))
 
     def browse_obs():
-        example = platform_common.example_executable_name("obs64")
+        example = OBS_EXECUTABLE_EXAMPLE
         chosen = filedialog.askopenfilename(
             title=f"Locate {example}", filetypes=platform_common.executable_filetypes()
         )
@@ -595,7 +732,7 @@ def main():
     obs_buttons_row = tk.Frame(obs_page, bg=PAGE_BG)
     obs_buttons_row.pack(anchor="w", pady=(0, 8))
     tk.Button(
-        obs_buttons_row, text=f"Browse for {platform_common.example_executable_name('obs64')}...", command=browse_obs,
+        obs_buttons_row, text=f"Browse for {OBS_EXECUTABLE_EXAMPLE}...", command=browse_obs,
     ).pack(side="left")
     linux_install_command = platform_common.build_linux_install_command("obs") if sys.platform not in ("win32", "darwin") else None
     if sys.platform in ("win32", "darwin"):
@@ -628,6 +765,30 @@ def main():
         command_entry.pack(fill="x", pady=(2, 0))
 
     refresh_obs_status()
+
+    # macOS only: OBS can't capture anything at all without Screen Recording permission, granted
+    # per-app by the user in System Settings -- there's no API for this app (or this installer)
+    # to check or grant it on OBS's behalf (see platform_macos.open_screen_recording_settings's
+    # own docstring for why). Surfaced here, during install, rather than leaving the user to only
+    # discover it's missing after a recording silently captures nothing -- a real, confirmed
+    # failure mode distinct from this (see CROSS_PLATFORM_PLAN.md's frozen-capture finding), but
+    # with the exact same symptom from the user's side: OBS runs, nothing useful gets recorded.
+    if sys.platform == "darwin":
+        screen_recording_row = tk.Frame(obs_page, bg=PAGE_BG)
+        screen_recording_row.pack(fill="x", pady=(12, 0))
+        tk.Label(
+            screen_recording_row,
+            text=(
+                "macOS also requires OBS to be granted Screen Recording permission before it can "
+                "capture anything. Open OBS once after installing -- macOS should prompt you "
+                "automatically -- or grant it directly below."
+            ),
+            bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
+        ).pack(fill="x", pady=(0, 6))
+        tk.Button(
+            screen_recording_row, text="Open Screen Recording Settings",
+            command=platform_common.open_screen_recording_settings,
+        ).pack(anchor="w")
 
     # ---------- Quick options ----------
     options_page = page_frame()
@@ -842,6 +1003,132 @@ def main():
 
     tk.Button(password_row, text="Copy", command=copy_password).pack(side="left", padx=(8, 8))
     password_copied_label.pack(side="left")
+    # macOS only: permissions granted to the installed app itself, so each is requested by
+    # opening that app (see app_permission_request_command). Shown after install because the
+    # app has to exist first. Accessibility: custom keybinds (Add Marker), the clip editor's space
+    # bar. Screen Recording: reading other apps' window titles, which window-title rules (GeForce
+    # NOW, Minecraft) depend on -- OBS's own Screen Recording grant is separate.
+    def make_permission_row(kind, text, button_text, open_settings, on_granted=None):
+        row = tk.Frame(finish_page, bg=PAGE_BG)
+        tk.Label(
+            row, text=text, bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
+        ).pack(fill="x", pady=(0, 6))
+        buttons = tk.Frame(row, bg=PAGE_BG)
+        buttons.pack(fill="x")
+        button = tk.Button(buttons, text=button_text)
+        button.pack(side="left")
+        status = tk.Label(buttons, text="", bg=PAGE_BG, font=("Segoe UI", 10))
+        status.pack(side="left", padx=(10, 0))
+        state = {"status_path": None}
+
+        def watch():
+            status_path = state["status_path"]
+            if status_path and os.path.isfile(status_path):
+                status.config(text="\u2713 Allowed", fg="#15803d")
+                button.config(state="disabled")
+                try:
+                    os.remove(status_path)
+                except OSError:
+                    pass
+                if on_granted:
+                    on_granted()
+                return
+            root.after(1000, watch)
+
+        def request():
+            install_dir = current.get("install_dir")
+            if not install_dir:
+                return
+            status_path = os.path.join(tempfile.gettempdir(), f"obsautorecorder-{kind}-{os.getpid()}")
+            try:
+                os.remove(status_path)
+            except OSError:
+                pass
+            try:
+                subprocess.Popen(app_permission_request_command(install_dir, kind, status_path))
+            except OSError:
+                status.config(text="Couldn't open the app -- allow it in System Settings.", fg="#b91c1c")
+                open_settings()
+                return
+            status.config(text="Waiting for permission...", fg=PAGE_FG)
+            if state["status_path"] is None:
+                root.after(1000, watch)
+            state["status_path"] = status_path
+
+        button.config(command=request)
+        return row, request
+
+    screen_recording_row, request_screen_recording = make_permission_row(
+        "screen_recording",
+        f"Allow {APP_NAME} in Screen & System Audio Recording so it can see window titles -- "
+        "needed to detect games like GeForce NOW by their window. It never records your screen "
+        "itself (OBS does). macOS will ask; turn it on, and it takes effect when the app starts.",
+        "Allow Screen Recording...",
+        platform_common.open_screen_recording_settings,
+    )
+    accessibility_row, request_accessibility = make_permission_row(
+        "accessibility",
+        f"Allow {APP_NAME} in Accessibility so keybinds (like Add Marker) and the clip "
+        "editor's space bar work. macOS will ask -- click \"Open System Settings\", then turn "
+        f"on \"{APP_NAME}\".",
+        "Allow Accessibility...",
+        platform_common.open_accessibility_settings,
+        # One macOS prompt at a time: Screen Recording is asked once Accessibility is done.
+        on_granted=lambda: request_screen_recording(),
+    )
+
+    # macOS only, when game audio isolation was chosen: Wine games and Java Minecraft need the
+    # Game Audio device to get their own track (see platform_macos's process tap notes). Offered
+    # here, not done silently: it asks for an admin password and a system-audio permission.
+    process_tap_row = tk.Frame(finish_page, bg=PAGE_BG)
+    tk.Label(
+        process_tap_row,
+        text=(
+            "Optional: record Wine games (like Wizard101) and Java Minecraft on the Game Audio "
+            "track too. This installs a small \"OBS Auto Recorder Game Audio\" device (macOS asks "
+            "for your password) and asks to let the app record system audio."
+        ),
+        bg=PAGE_BG, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=510,
+    ).pack(fill="x", pady=(0, 6))
+    process_tap_buttons = tk.Frame(process_tap_row, bg=PAGE_BG)
+    process_tap_buttons.pack(fill="x")
+    process_tap_btn = tk.Button(process_tap_buttons, text="Set Up Wine & Java Game Audio...")
+    process_tap_btn.pack(side="left")
+    process_tap_status = tk.Label(process_tap_buttons, text="", bg=PAGE_BG, font=("Segoe UI", 10))
+    process_tap_status.pack(side="left", padx=(10, 0))
+
+    def set_up_process_tap():
+        install_dir = current.get("install_dir")
+        if not install_dir:
+            return
+        process_tap_btn.config(state="disabled")
+        process_tap_status.config(text="Waiting for your password...", fg=PAGE_FG)
+
+        def worker():
+            installed = platform_common.game_audio_device_installed() or platform_common.install_game_audio_device(
+                installed_game_audio_driver_path(install_dir)
+            )
+            if installed:
+                try:
+                    subprocess.Popen(app_launch_command(install_dir, [SYSTEM_AUDIO_RECORDING_REQUEST_FLAG]))
+                except OSError:
+                    pass
+
+            def finish():
+                if installed:
+                    process_tap_status.config(
+                        text="✓ Installed -- allow \"record system audio\" if macOS asks", fg="#15803d",
+                    )
+                else:
+                    process_tap_btn.config(state="normal")
+                    process_tap_status.config(text="Not installed (cancelled or failed).", fg="#b91c1c")
+
+            root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    process_tap_btn.config(command=set_up_process_tap)
+
     launch_var = tk.BooleanVar(value=True)
     launch_check = tk.Checkbutton(finish_page, text=f"Launch {APP_NAME} now", variable=launch_var, bg=PAGE_BG)
     launch_check.pack(anchor="w", pady=(8, 0))
@@ -854,7 +1141,15 @@ def main():
     next_btn = tk.Button(nav, text="Next >")
     cancel_btn = tk.Button(nav, text="Cancel", command=root.destroy)
 
+    nav_state = {"shown": None}
+
     def show_nav(back=True, next_=True, cancel=True):
+        # Only re-pack when which buttons are visible actually changes: on macOS, native buttons
+        # that were unpacked and packed again stayed invisible (confirmed live -- every page
+        # after the first showed an empty button bar).
+        if nav_state["shown"] == (back, next_, cancel):
+            return
+        nav_state["shown"] = (back, next_, cancel)
         for widget in (back_btn, next_btn, cancel_btn):
             widget.pack_forget()
         if cancel:
@@ -911,7 +1206,7 @@ def main():
                     f"OBS location: {obs_var.get() or 'not set yet'}\n"
                     f"Games to watch: {games_note}\n"
                     f"Desktop shortcut: {'Yes' if desktop_var.get() else 'No'}\n"
-                    f"Start with Windows: {'Yes' if startup_var.get() else 'No'}"
+                    f"Start automatically at login: {'Yes' if startup_var.get() else 'No'}"
                 )
             )
             # Checked here (before install starts) rather than only reported after the fact on
@@ -1042,18 +1337,34 @@ def main():
             password_row.pack(anchor="w", pady=(0, 12))
         else:
             password_row.pack_forget()
-        launch_check.pack(anchor="w", pady=(8, 0))
         current["install_dir"] = dir_var.get()
+        if sys.platform == "darwin":
+            accessibility_row.pack(fill="x", pady=(0, 12), before=launch_check)
+            screen_recording_row.pack(fill="x", pady=(0, 12), before=launch_check)
+            request_accessibility()
+            if game_audio_var.get() and result["password"] is not None:
+                process_tap_row.pack(fill="x", pady=(0, 12), before=launch_check)
+        launch_check.pack(anchor="w", pady=(8, 0))
         show("finish")
         show_nav(back=False, next_=True, cancel=False)
         next_btn.config(text="Finish", state="normal", command=finish)
 
-    def show_uninstall_finish():
+    def show_uninstall_finish(result):
         finish_heading.config(text="Uninstalled")
-        finish_body.config(text=f"{APP_NAME} has been removed from {dir_var.get()}.")
+        text = f"{APP_NAME} has been removed from {dir_var.get()}."
+        if result.get("game_audio_device_left"):
+            text += (
+                "\n\nThe Game Audio device (for Wine & Java games) is still installed -- removing it "
+                "needs your password. To remove it later, run this in Terminal:\n\n"
+                "    sudo rm -rf /Library/Audio/Plug-Ins/HAL/OBSAutoRecorderGameAudio.driver && sudo killall coreaudiod"
+            )
+        finish_body.config(text=text)
         launch_var.set(False)
         launch_check.pack_forget()
         password_row.pack_forget()
+        accessibility_row.pack_forget()
+        screen_recording_row.pack_forget()
+        process_tap_row.pack_forget()
         current["install_dir"] = None
         show("finish")
         show_nav(back=False, next_=True, cancel=False)
@@ -1062,7 +1373,7 @@ def main():
     def on_update_clicked():
         if is_app_running():
             existing_error.config(
-                text=f"Please quit {APP_NAME} from the system tray first, then try again."
+                text=f"Please quit {APP_NAME} from the {TRAY_NAME} first, then try again."
             )
             return
         update_btn.config(state="disabled")
@@ -1093,7 +1404,7 @@ def main():
     def on_uninstall_clicked():
         if is_app_running():
             existing_error.config(
-                text=f"Please quit {APP_NAME} from the system tray first, then try again."
+                text=f"Please quit {APP_NAME} from the {TRAY_NAME} first, then try again."
             )
             return
         update_btn.config(state="disabled")
@@ -1106,9 +1417,9 @@ def main():
             root.after(0, lambda: existing_progress_label.config(text=message))
 
         def worker():
-            do_uninstall(dir_var.get(), keep_config_var.get(), report_progress)
+            return do_uninstall(dir_var.get(), keep_config_var.get(), report_progress)
 
-        def done(_result, error):
+        def done(result, error):
             existing_progress_bar.stop()
             existing_progress_bar.pack_forget()
             existing_progress_label.config(text="")
@@ -1117,7 +1428,7 @@ def main():
             if error is not None:
                 messagebox.showerror("Uninstall failed", str(error), parent=root)
                 return
-            show_uninstall_finish()
+            show_uninstall_finish(result or {})
 
         run_async(worker, done)
 
@@ -1135,7 +1446,7 @@ def main():
     def finish():
         if launch_var.get() and current["install_dir"]:
             try:
-                subprocess.Popen([os.path.join(current["install_dir"], app_relative_path())], cwd=current["install_dir"])
+                subprocess.Popen(app_launch_command(current["install_dir"]), cwd=current["install_dir"])
             except OSError:
                 pass
         root.destroy()

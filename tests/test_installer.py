@@ -1,7 +1,9 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,31 +33,55 @@ class BuildConfigTests(unittest.TestCase):
         with open(template_path, encoding="utf-8") as f:
             self.template = json.load(f)
 
-    def test_watched_games_and_windows_start_empty(self):
+    def setUp_games(self, games):
+        patcher = patch.object(installer, "COMMON_GAMES", games)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_watched_games_start_empty_and_template_windows_are_kept(self):
         config = installer.build_config(self.template, None, "pw", base_options())
         self.assertEqual(config["watched_games"], [])
-        self.assertEqual(config["watched_windows"], [])
+        self.assertEqual(config["watched_windows"], self.template["watched_windows"])
 
     def test_selected_plain_exe_game_lands_in_watched_games(self):
+        self.setUp_games(installer._COMMON_GAMES_WINDOWS)
         options = base_options(selected_games=["Warframe"])
         config = installer.build_config(self.template, None, "pw", options)
         self.assertEqual(config["watched_games"], ["Warframe.x64.exe"])
-        self.assertEqual(config["watched_windows"], [])
+        self.assertEqual(config["watched_windows"], self.template["watched_windows"])
 
-    def test_selected_title_contains_game_lands_in_watched_windows(self):
+    def test_selected_title_contains_game_is_added_to_the_template_windows(self):
+        self.setUp_games(installer._COMMON_GAMES_LINUX)
         options = base_options(selected_games=["Minecraft: Java Edition"])
         config = installer.build_config(self.template, None, "pw", options)
         self.assertEqual(config["watched_games"], [])
-        self.assertEqual(
+        self.assertIn(
+            {"process_name": "java", "title_contains": "minecraft", "display_name": "Minecraft: Java Edition"},
             config["watched_windows"],
-            [{"process_name": "javaw.exe", "title_contains": "minecraft", "display_name": "Minecraft: Java Edition"}],
         )
+        self.assertIn(self.template["watched_windows"][-1], config["watched_windows"])
+
+    def test_a_game_already_in_the_template_is_not_duplicated(self):
+        self.setUp_games(installer._COMMON_GAMES_WINDOWS)
+        options = base_options(selected_games=["Minecraft: Java Edition"])
+        config = installer.build_config(self.template, None, "pw", options)
+        self.assertEqual(config["watched_windows"], self.template["watched_windows"])
 
     def test_unknown_selected_game_name_is_ignored(self):
         options = base_options(selected_games=["Some Game Not In The List"])
         config = installer.build_config(self.template, None, "pw", options)
         self.assertEqual(config["watched_games"], [])
-        self.assertEqual(config["watched_windows"], [])
+        self.assertEqual(config["watched_windows"], self.template["watched_windows"])
+
+    def test_mac_games_use_mac_process_names(self):
+        # Confirmed live: League's in-game process on macOS is LeagueofLegends (its bundle's
+        # CFBundleExecutable); the old shared list saved "league of legends.exe" on a Mac.
+        self.setUp_games(installer._COMMON_GAMES_MACOS)
+        config = installer.build_config(self.template, None, "pw", base_options(selected_games=["League of Legends"]))
+        self.assertEqual(config["watched_games"], ["LeagueofLegends"])
+        # Wizard101 is the one .exe: its Mac app runs the Windows client under a bundled Wine.
+        exe_games = [g["name"] for g in installer._COMMON_GAMES_MACOS if g["process_name"].lower().endswith(".exe")]
+        self.assertEqual(exe_games, ["Wizard101"])
 
     def test_advanced_options_all_apply_when_enabled(self):
         options = base_options(
@@ -107,8 +133,16 @@ class BuildConfigTests(unittest.TestCase):
 class IsObsRunningTests(unittest.TestCase):
     def make_fake_proc(self, name):
         proc = unittest.mock.Mock()
-        proc.info = {"name": name}
+        proc.name.return_value = name
         return proc
+
+    def test_a_process_whose_name_raises_systemerror_is_skipped(self):
+        # Confirmed live in the app on macOS: a sandboxed helper process can make psutil raise
+        # SystemError reading its name; that must not crash the installer's check.
+        broken = unittest.mock.Mock()
+        broken.name.side_effect = SystemError("proc_cmdline returned a result with an exception set")
+        with patch.object(installer.psutil, "process_iter", return_value=[broken, self.make_fake_proc("OBS")]):
+            self.assertTrue(installer.is_obs_running())
 
     def test_true_for_windows_process_names(self):
         for name in ("obs64.exe", "OBS32.EXE"):
@@ -190,3 +224,142 @@ class EnsureFfmpegTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MacTemplateConfigTests(unittest.TestCase):
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def load(self, name):
+        with open(os.path.join(self.REPO, name), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_mac_template_has_every_key_the_general_one_has(self):
+        def keys(d, prefix=""):
+            out = set()
+            for k, v in d.items():
+                out.add(prefix + k)
+                if isinstance(v, dict):
+                    out |= keys(v, prefix + k + ".")
+            return out
+        missing = keys(self.load("config.example.json")) - keys(self.load("config.example.mac.json"))
+        self.assertEqual(missing, set())
+
+    def test_mac_template_uses_mac_values(self):
+        mac = self.load("config.example.mac.json")
+        self.assertEqual(mac["obs"]["process_name"], "OBS")
+        self.assertTrue(mac["obs"]["path"].startswith("/Applications/OBS.app"))
+        self.assertFalse(any(g.lower().endswith(".exe") for g in mac["watched_games"]))
+        self.assertFalse(any(len(d) == 1 for d in mac["steam"]["allowed_drives"]))
+        self.assertIn({"input_name": "macOS Screen Capture", "track": 1}, mac["obs"]["multi_track_audio"]["tracks"])
+
+    def test_mac_template_builds_a_config(self):
+        config = installer.build_config(self.load("config.example.mac.json"), None, "pw", base_options())
+        self.assertEqual(config["obs"]["websocket"]["password"], "pw")
+
+    def test_installer_picks_the_mac_template_on_macos(self):
+        with patch.object(installer.sys, "platform", "darwin"), \
+                patch.object(installer, "resource_path", side_effect=lambda name: os.path.join(self.REPO, name)):
+            self.assertTrue(installer.template_config_path().endswith("config.example.mac.json"))
+        with patch.object(installer.sys, "platform", "win32"), \
+                patch.object(installer, "resource_path", side_effect=lambda name: os.path.join(self.REPO, name)):
+            self.assertTrue(installer.template_config_path().endswith("config.example.json"))
+
+    def test_falls_back_when_the_mac_template_is_missing(self):
+        with patch.object(installer.sys, "platform", "darwin"), \
+                patch.object(installer, "resource_path", side_effect=lambda name: os.path.join("/nonexistent", name)):
+            self.assertTrue(installer.template_config_path().endswith("config.example.json"))
+
+
+@unittest.skipUnless(sys.platform == "darwin", "exercises macOS's own ditto")
+class MacInstallExtractionTests(unittest.TestCase):
+    # Confirmed with a real build: zipfile.extractall dropped the app executable's +x bit and all
+    # of the bundle's symlinks, so the installed app couldn't launch ("Launchd job spawn failed").
+    def test_installed_app_keeps_executable_bit_and_symlinks(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            app = os.path.join(tmp, "src", installer.APP_BUNDLE_NAME, "Contents", "MacOS")
+            os.makedirs(app)
+            exe = os.path.join(app, installer.EXE_NAME)
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(exe, 0o755)
+            os.symlink(installer.EXE_NAME, os.path.join(app, "link"))
+            zip_path = os.path.join(tmp, "app.zip")
+            subprocess.run(["zip", "-qry", zip_path, installer.APP_BUNDLE_NAME], cwd=os.path.join(tmp, "src"), check=True)
+            target = os.path.join(tmp, "install")
+            with patch.object(installer, "resource_path", return_value=zip_path), \
+                    patch.object(installer, "ensure_ffmpeg", return_value="ok"):
+                installer.do_install(target, None, {}, lambda message: None, write_config=False)
+            installed = os.path.join(target, installer.app_relative_path())
+            self.assertTrue(os.access(installed, os.X_OK))
+            self.assertTrue(os.path.islink(os.path.join(os.path.dirname(installed), "link")))
+
+
+class AppLaunchCommandTests(unittest.TestCase):
+    def test_macos_launches_through_open_so_permissions_belong_to_the_app(self):
+        with patch.object(installer.sys, "platform", "darwin"):
+            self.assertEqual(
+                installer.app_launch_command("/Apps/OAR"),
+                ["open", "-a", os.path.join("/Apps/OAR", installer.APP_BUNDLE_NAME)],
+            )
+
+    def test_macos_accessibility_request_opens_a_new_copy_with_the_flag(self):
+        with patch.object(installer.sys, "platform", "darwin"):
+            command = installer.accessibility_request_command("/Apps/OAR", "/tmp/status")
+        self.assertEqual(
+            command,
+            ["open", "-n", "-a", os.path.join("/Apps/OAR", installer.APP_BUNDLE_NAME),
+             "--args", "--request-accessibility", "/tmp/status"],
+        )
+
+    def test_other_platforms_run_the_executable_directly(self):
+        with patch.object(installer.sys, "platform", "win32"):
+            self.assertEqual(
+                installer.app_launch_command("C:\\OAR"),
+                [os.path.join("C:\\OAR", installer.app_relative_path())],
+            )
+
+    def test_flag_matches_the_app(self):
+        source = open(os.path.join(os.path.dirname(installer.__file__), "autostart_script.py"), encoding="utf-8").read()
+        self.assertIn(f'ACCESSIBILITY_REQUEST_FLAG = "{installer.ACCESSIBILITY_REQUEST_FLAG}"', source)
+
+
+class UninstallGameAudioDeviceTests(unittest.TestCase):
+    """macOS: the uninstaller also removes the Wine & Java game audio device."""
+
+    def run_uninstall(self, installed, removed=True):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(installer.platform_common, "disable_autostart"), \
+                patch.object(installer, "get_desktop_shortcut_path", return_value=None), \
+                patch.object(installer.platform_common, "game_audio_device_installed", return_value=installed), \
+                patch.object(installer.platform_common, "uninstall_game_audio_device", return_value=removed) as uninstall:
+            result = installer.do_uninstall(tmp, keep_config=False, on_progress=lambda _m: None)
+        return result, uninstall
+
+    def test_removes_the_device_when_installed(self):
+        result, uninstall = self.run_uninstall(installed=True)
+        uninstall.assert_called_once()
+        self.assertFalse(result["game_audio_device_left"])
+
+    def test_reports_a_device_left_behind_when_removal_is_cancelled(self):
+        result, _ = self.run_uninstall(installed=True, removed=False)
+        self.assertTrue(result["game_audio_device_left"])
+
+    def test_leaves_the_device_alone_when_not_installed(self):
+        result, uninstall = self.run_uninstall(installed=False)
+        uninstall.assert_not_called()
+        self.assertFalse(result["game_audio_device_left"])
+
+
+class PermissionRequestCommandTests(unittest.TestCase):
+    def test_screen_recording_request_opens_a_new_copy_with_its_flag(self):
+        with patch.object(installer.sys, "platform", "darwin"):
+            command = installer.app_permission_request_command("/Apps/OAR", "screen_recording", "/tmp/s")
+        self.assertEqual(command[-2:], ["--request-screen-recording", "/tmp/s"])
+        self.assertIn("-n", command)
+
+    def test_flags_match_the_app(self):
+        source = open(os.path.join(os.path.dirname(installer.__file__), "autostart_script.py"), encoding="utf-8").read()
+        self.assertIn(f'SCREEN_RECORDING_REQUEST_FLAG = "{installer.PERMISSION_REQUEST_FLAGS["screen_recording"]}"', source)
+        self.assertIn(f'ACCESSIBILITY_REQUEST_FLAG = "{installer.PERMISSION_REQUEST_FLAGS["accessibility"]}"', source)
