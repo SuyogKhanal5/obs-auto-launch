@@ -799,6 +799,27 @@ def release_obs_after_task(client, obs_config, started_here):
         pass
 
 
+def make_obs_client_thread_safe(client):
+    """obsws_python's ReqClient shares one request/response channel with no locking of its own --
+    confirmed live: the custom-keybind listener thread and the main watcher loop both issuing a
+    request on the same shared client (runtime_state["obs_client"]) at the same moment can cross
+    wires, with one caller getting back the OTHER call's response entirely -- observed get_record_
+    status() (from "Add Marker") returning a GetSourceScreenshotDataclass instead, from the
+    frozen-capture health check's periodic screenshot request landing on the connection at the
+    same instant. Wraps the one real chokepoint every request goes through (every convenience
+    method -- get_record_status(), get_scene_list(), etc. -- ultimately calls self.send()) with a
+    lock, so this app's own multiple threads can never interleave two requests on one connection,
+    regardless of which ones."""
+    lock = threading.Lock()
+    original_send = client.send
+
+    def locked_send(*args, **kwargs):
+        with lock:
+            return original_send(*args, **kwargs)
+
+    client.send = locked_send
+
+
 def connect_obs(ws_config, retries=5, delay=2):
     for attempt in range(1, retries + 1):
         try:
@@ -808,6 +829,7 @@ def connect_obs(ws_config, retries=5, delay=2):
                 password=ws_config["password"],
                 timeout=3,
             )
+            make_obs_client_thread_safe(client)
             logging.info("Connected to OBS WebSocket at %s:%s", ws_config["host"], ws_config["port"])
             return client
         except Exception as exc:

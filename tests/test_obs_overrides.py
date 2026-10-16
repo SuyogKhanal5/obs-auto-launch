@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -1079,3 +1080,61 @@ class NotifyTests(unittest.TestCase):
         icon.notify.side_effect = RuntimeError("boom")
         with self.assertLogs(level="WARNING"):
             a.notify(icon, {"enabled": True}, "t", "m")
+
+
+class MakeObsClientThreadSafeTests(unittest.TestCase):
+    # Confirmed live: the custom-keybind listener thread and the main watcher loop both issuing a
+    # request on the same shared client at the same moment crossed wires -- one caller (Add
+    # Marker's get_record_status()) got back an entirely different call's response
+    # (GetSourceScreenshotDataclass, from the frozen-capture health check's periodic screenshot
+    # request). make_obs_client_thread_safe's whole job is making that interleaving impossible.
+
+    def test_concurrent_calls_from_two_threads_never_overlap(self):
+        client = unittest.mock.Mock()
+        intervals = []
+        intervals_lock = threading.Lock()
+
+        def fake_send(request_name):
+            start = time.monotonic()
+            time.sleep(0.05)  # long enough that two real threads would overlap without the lock
+            end = time.monotonic()
+            with intervals_lock:
+                intervals.append((start, end))
+            return request_name
+
+        client.send = fake_send
+        a.make_obs_client_thread_safe(client)
+
+        threads = [threading.Thread(target=client.send, args=(f"Request{i}",)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(intervals), 4)
+        intervals.sort()
+        for (_s1, e1), (s2, _e2) in zip(intervals, intervals[1:]):
+            self.assertLessEqual(e1, s2)  # no overlap: each call fully finishes before the next starts
+
+    def test_return_value_and_arguments_pass_through_unchanged(self):
+        client = unittest.mock.Mock()
+        underlying_send = unittest.mock.Mock(return_value="the real response")
+        client.send = underlying_send
+        a.make_obs_client_thread_safe(client)
+        result = client.send("GetRecordStatus", {"some": "data"})
+        self.assertEqual(result, "the real response")
+        underlying_send.assert_called_once_with("GetRecordStatus", {"some": "data"})
+
+    def test_a_raised_exception_still_releases_the_lock(self):
+        client = unittest.mock.Mock()
+
+        def failing_send(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        client.send = failing_send
+        a.make_obs_client_thread_safe(client)
+        with self.assertRaises(RuntimeError):
+            client.send("GetRecordStatus")
+        # If the lock leaked held, this second call would hang forever instead of also raising.
+        with self.assertRaises(RuntimeError):
+            client.send("GetRecordStatus")
