@@ -158,9 +158,15 @@ jobs:
         # install time instead of a plain directory copy (see its own app_relative_path()).
         run: (cd dist && zip -r -y OBSAutoRecorder-app.zip OBSAutoRecorder.app)
 
-      - name: Build installer binary (macOS)
+      - name: Build installer app and DMG (macOS)
         if: runner.os == 'macOS'
-        run: pyinstaller --onefile --name "OBSAutoRecorderInstaller-macos-${MACOS_ARCH}" --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder-app.zip:." --add-data "${{ github.workspace }}/config.example.json:." --add-data "${{ github.workspace }}/config.example.mac.json:." installer.py
+        # A .app in a DMG, not a bare onefile binary: double-clicking a downloaded bare binary
+        # opened it in a text viewer (confirmed live), since it has neither +x nor an app wrapper.
+        # install-macos.sh (the one-line Terminal install) downloads this same DMG.
+        run: |
+          pyinstaller --windowed --name "OBS Auto Recorder Installer" --osx-bundle-identifier com.obsautorecorder.installer --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder-app.zip:." --add-data "${{ github.workspace }}/config.example.json:." --add-data "${{ github.workspace }}/config.example.mac.json:." installer.py
+          mkdir -p installer-dmg && ditto "dist/OBS Auto Recorder Installer.app" "installer-dmg/OBS Auto Recorder Installer.app"
+          hdiutil create -volname "OBS Auto Recorder Installer" -srcfolder installer-dmg -ov -format UDZO "dist/OBSAutoRecorderInstaller-macos-${MACOS_ARCH}.dmg"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
