@@ -50,10 +50,10 @@ This is the whole setup for most people — five minutes, no file editing, nothi
    - **macOS (easiest)**: open Terminal and paste this one line — it downloads the right installer for your Mac (Apple Silicon or Intel) and opens it:
 
      ```sh
-     curl -fsSL https://raw.githubusercontent.com/SuyogKhanal5/obs-auto-launch/main/install-macos.sh | sh
+     curl -fsSL https://github.com/SuyogKhanal5/obs-auto-launch/releases/latest/download/install-macos.sh | sh
      ```
 
-     The app isn't signed with an Apple developer certificate, so a copy downloaded in a browser is blocked by macOS until you approve it (below); downloaded this way, it isn't, so it opens straight away.
+     The app isn't signed with an Apple Developer ID, so a copy downloaded in a browser is blocked by macOS until you approve it (below); downloaded this way it isn't, so the script checks the download itself before opening it — against the checksum published with the release, and against the project's signing certificate.
    - **macOS (without Terminal)**: download `OBSAutoRecorderInstaller-macos-arm64.dmg` (Apple Silicon) or `OBSAutoRecorderInstaller-macos-x86_64.dmg` (Intel) from the [Releases page](../../releases/latest), open it, and double-click **OBS Auto Recorder Installer**. macOS blocks it the first time ("Apple could not verify…" — click **Done**, not Move to Trash): open **System Settings → Privacy & Security**, scroll down to **Security**, click **Open Anyway** next to the installer, confirm with your password, then double-click it again. That's needed once, for the installer only — the app it installs doesn't need approving again.
 3. Click through the wizard:
    - **Choose where to install** — the default (Program Files on Windows, `~/.local/share/OBSAutoRecorder` on Linux, `~/Applications/OBSAutoRecorder` on macOS) is fine for almost everyone; none of these need admin/root access for the app install itself.
@@ -232,12 +232,15 @@ pyinstaller --onedir --noconsole --name OBSAutoRecorder --distpath . --workpath 
 pyinstaller --onedir --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py               # Linux
 pyinstaller --windowed --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py             # macOS (produces OBSAutoRecorder.app)
 macos/build.sh                                                                                                       # macOS: builds the Wine & Java game audio helper + driver into macos/build
+eval "$(ci/import_macos_signing_identity.sh <signing.p12> <password file> <keychain path>)"                              # macOS, release builds only: sign with the project certificate (see below)
 python ci/finalize_macos_app.py OBSAutoRecorder.app macos/build                                                          # macOS: names it "OBS Auto Recorder", adds those, and re-signs it
 ```
 
 On Windows/Linux this produces an `OBSAutoRecorder/` folder (an exe/binary plus an `_internal/` support-files folder — both required, don't separate them); on macOS, an `OBSAutoRecorder.app` bundle. `config.json` is read from that same folder (or `OBSAutoRecorder.app/Contents/MacOS/` on macOS). Rebuild any time you change `autostart_script.py`.
 
 On macOS specifically, this produces a binary for whichever architecture you run it *on* (no cross-compiling to the other one) — there's no universal2 wheel for `numpy`, so build on an Apple Silicon Mac for an Apple Silicon build, or an Intel Mac for an Intel one; the release workflow does exactly this by running on both a `macos-latest` (Apple Silicon) and a `macos-15-intel` (Intel) runner.
+
+**macOS signing.** The app holds Accessibility (it sees every keystroke), Screen Recording and System Audio Recording, so its signature is what stops other programs borrowing those permissions. Release builds are signed with the project's own certificate (created once with `ci/create_macos_signing_identity.sh`, kept private, and given to CI as the `MACOS_SIGNING_P12_BASE64` / `MACOS_SIGNING_P12_PASSWORD` Actions secrets), with the hardened runtime: permission grants then require that certificate, so they survive updates and can't be inherited by an app merely claiming the same bundle id. Without the certificate (forks, local test builds) `finalize_macos_app.py` signs ad hoc instead — still safe, but each new build has to be granted its permissions again.
 
 Built as onedir/`.app` rather than onefile deliberately: a onefile build re-extracts itself to a fresh temp folder on *every single launch*, and on Windows, antivirus real-time scanning can intermittently fail to release a newly-extracted file in time for that folder to be cleaned up afterward — a widely-reported PyInstaller/Windows Defender interaction, not a bug specific to this app, but one this app hits particularly often since it relaunches itself on every settings save (the Settings editor's "Save and Restart", and "Restart App" from the tray menu). Onedir/`.app` runs directly from wherever it's installed, so that whole failure mode doesn't exist. The tradeoff is a folder instead of a single file — the installer hides that from end users by embedding and installing the whole thing, so downloading and running the installer is still a one-file experience.
 

@@ -58,6 +58,10 @@ def app_launch_command(install_dir, args=()):
     """Command that starts the installed app. On macOS it goes through `open` so the app runs as
     itself: started as this installer's child, macOS would attribute its permission requests
     (Accessibility, Screen Recording) to the installer instead."""
+    if sys.platform == "win32" and not args:
+        # Through Explorer, so the app runs with the user's normal rights: started directly from
+        # this installer, which runs as administrator, it inherited administrator rights.
+        return ["explorer.exe", os.path.join(install_dir, app_relative_path())]
     if sys.platform == "darwin":
         bundle = os.path.join(install_dir, APP_BUNDLE_NAME)
         if not args:
@@ -280,8 +284,7 @@ def try_configure_obs_websocket(password):
         ws_config["server_password"] = password
         ws_config["server_port"] = 4455
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(ws_config, f, indent=4)
+        platform_common.write_private_text(path, json.dumps(ws_config, indent=4))
         return True, None
     except (OSError, json.JSONDecodeError) as exc:
         return False, str(exc)
@@ -344,23 +347,20 @@ def is_existing_install(install_dir):
     return os.path.isfile(os.path.join(install_dir, app_relative_path()))
 
 
-def grant_user_write_access(install_dir):
-    """Windows only: grants the built-in Users group Modify rights on install_dir, recursively.
-    Confirmed live: the default install location (Program Files) inherits Windows' standard
-    TrustedInstaller-owned ACL, which gives standard (non-elevated) processes only Read+Execute --
-    no write. Since this installer itself always runs elevated (--uac-admin) but the app it
-    installs normally runs NON-elevated afterward (a plain double-click or the autostart shortcut,
-    never elevated again), every later run was silently unable to write config.json OR its own
-    log file, with no visible error (a --noconsole build has nowhere for the resulting exception to
-    even go). Best-effort and non-fatal: a failure here still leaves a working install, just with
-    the same silent-write-failure bug as before, so it's logged via on_progress rather than raised.
-    Uses the well-known Users SID (S-1-5-32-545) instead of the localized "Users" group name so
-    this works the same on any Windows display-language install."""
+def remove_user_write_access(install_dir):
+    """Windows only: removes the Users group's explicit write access from install_dir that earlier
+    versions granted, restoring Program Files' default (Users: read and run only). That grant let
+    any local account replace the app's executable or DLLs, or point its config's OBS path at a
+    program of their own -- run as whoever starts the app, as administrator when this installer's
+    "Launch now" started it. Settings and logs now live per user in %APPDATA% instead (see
+    platform_windows.app_data_dir), so nothing needs the folder writable. Best-effort: there's
+    nothing to remove on a fresh install. Uses the well-known Users SID (S-1-5-32-545) so it works
+    in any Windows display language."""
     if sys.platform != "win32":
         return True
     try:
         result = subprocess.run(
-            ["icacls", install_dir, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/C", "/Q"],
+            ["icacls", install_dir, "/remove:g", "*S-1-5-32-545", "/T", "/C", "/Q"],
             capture_output=True, text=True, **platform_common.hide_console_subprocess_kwargs(),
         )
         return result.returncode == 0
@@ -400,13 +400,13 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
         shutil.copytree(resource_path(APP_FOLDER_NAME), install_dir, dirs_exist_ok=True)
 
     if sys.platform == "win32":
-        on_progress("Setting folder permissions...")
-        if not grant_user_write_access(install_dir):
-            on_progress(
-                "Warning: could not grant standard-user write access to the install folder -- "
-                "config saves and logging may silently fail once the app is run without "
-                "administrator rights."
-            )
+        on_progress("Securing folder permissions...")
+        remove_user_write_access(install_dir)
+    if sys.platform == "darwin":
+        # This build is signed so a permission grant requires its signature; clear grants left
+        # with earlier builds' weaker rule before the finish page asks again -- see
+        # platform_macos.reset_permissions_once.
+        platform_common.reset_permissions_once(install_dir)
 
     password = None
     obs_ws_configured = None
@@ -417,9 +417,11 @@ def do_install(install_dir, obs_path, options, on_progress, write_config=True):
             template = json.load(f)
         password = secrets.token_urlsafe(12)
         config = build_config(template, obs_path, password, options)
-        config_path = os.path.join(install_dir, "config.json")
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4)
+        config_text = json.dumps(config, indent=4)
+        platform_common.write_private_text(os.path.join(install_dir, "config.json"), config_text)
+        data_dir = platform_common.app_data_dir(install_dir)
+        if data_dir != install_dir:
+            platform_common.write_private_text(os.path.join(data_dir, "config.json"), config_text)
 
         if is_obs_running():
             on_progress("Closing OBS so its WebSocket server can be configured automatically...")
@@ -484,12 +486,21 @@ def do_uninstall(install_dir, keep_config, on_progress):
             pass
 
     if not keep_config:
-        try:
-            config_path = os.path.join(install_dir, "config.json")
-            if os.path.isfile(config_path):
-                os.remove(config_path)
-        except OSError:
-            pass
+        data_dir = platform_common.app_data_dir(install_dir)
+        for folder in {install_dir, data_dir}:
+            for name in ("config.json", ".obs_state_cache.json", ".active_recording_session.json",
+                         "autostart_script.log", ".permissions_reset_v1"):
+                try:
+                    path = os.path.join(folder, name)
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+        if data_dir != install_dir:
+            try:
+                os.rmdir(data_dir)
+            except OSError:
+                pass
 
     try:
         if not os.listdir(install_dir):
@@ -1106,7 +1117,7 @@ def main():
 
         def worker():
             installed = platform_common.game_audio_device_installed() or platform_common.install_game_audio_device(
-                installed_game_audio_driver_path(install_dir)
+                installed_game_audio_driver_path(install_dir), os.path.join(install_dir, APP_BUNDLE_NAME),
             )
             if installed:
                 try:

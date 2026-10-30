@@ -313,11 +313,19 @@ class AppLaunchCommandTests(unittest.TestCase):
              "--args", "--request-accessibility", "/tmp/status"],
         )
 
-    def test_other_platforms_run_the_executable_directly(self):
+    def test_windows_launches_through_explorer_so_it_isnt_elevated(self):
+        # The installer runs as administrator; started directly, the app inherited that.
         with patch.object(installer.sys, "platform", "win32"):
             self.assertEqual(
                 installer.app_launch_command("C:\\OAR"),
-                [os.path.join("C:\\OAR", installer.app_relative_path())],
+                ["explorer.exe", os.path.join("C:\\OAR", installer.app_relative_path())],
+            )
+
+    def test_linux_runs_the_executable_directly(self):
+        with patch.object(installer.sys, "platform", "linux"):
+            self.assertEqual(
+                installer.app_launch_command("/opt/OAR"),
+                [os.path.join("/opt/OAR", installer.app_relative_path())],
             )
 
     def test_flag_matches_the_app(self):

@@ -10,6 +10,7 @@ import os
 import platform
 import plistlib
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -1005,30 +1006,65 @@ def process_audio_tap_available():
     return bool(process_audio_tap_helper_path()) and game_audio_device_installed()
 
 
-def game_audio_driver_install_command(driver_path):
+def game_audio_driver_install_command(driver_path, requirement=None):
     """Shell command that installs driver_path as the Game Audio device and restarts Core Audio
-    so it loads (all sound cuts out for a second or two)."""
+    so it loads (all sound cuts out for a second or two).
+
+    requirement (a code-signing requirement, see signing_certificate_requirement): the installed
+    copy must satisfy it or it's removed and the command fails. Checked after the copy is root-
+    owned, so nothing running as the user can swap the driver between the check and Core Audio
+    loading it -- the driver is copied from the app's own folder, which the user (and any program
+    running as them) can write to, and it runs inside Core Audio's driver host."""
     # posixpath, not os.path: this always runs on macOS, but the tests also run on Windows CI.
     target = posixpath.join(GAME_AUDIO_DRIVER_DIR, GAME_AUDIO_DRIVER_NAME)
-    return (
+    command = (
         f"rm -rf {_shell_quote(target)} && mkdir -p {_shell_quote(GAME_AUDIO_DRIVER_DIR)} && "
         f"ditto {_shell_quote(driver_path)} {_shell_quote(target)} && "
-        f"chown -R root:wheel {_shell_quote(target)} && killall coreaudiod"
+        f"chown -R root:wheel {_shell_quote(target)} && "
     )
+    if requirement:
+        command += (
+            f"{{ codesign --verify --strict -R={_shell_quote(requirement)} {_shell_quote(target)} "
+            f"|| {{ rm -rf {_shell_quote(target)}; exit 1; }}; }} && "
+        )
+    return command + "killall coreaudiod"
+
+
+def signing_certificate_requirement(bundle_path):
+    """'certificate leaf = H"<sha1>"' for the certificate bundle_path is signed with, or None if
+    it's ad hoc (no certificate) or unreadable."""
+    try:
+        result = subprocess.run(["codesign", "-d", "-r-", bundle_path], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r'certificate leaf = H"([0-9a-fA-F]{40})"', result.stdout + result.stderr)
+    return f'certificate leaf = H"{match.group(1).lower()}"' if match else None
+
+
+def own_app_bundle():
+    """This app's .app bundle when running packaged, else None."""
+    if not getattr(sys, "frozen", False):
+        return None
+    bundle = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))
+    return bundle if bundle.endswith(".app") else None
 
 
 def _shell_quote(text):
     return "'" + text.replace("'", "'\\''") + "'"
 
 
-def install_game_audio_device(driver_path=None):
+def install_game_audio_device(driver_path=None, app_bundle=None):
     """Installs the Game Audio device, asking for an administrator password through macOS's own
-    prompt. Returns True once installed; False if cancelled or it failed."""
+    prompt. Returns True once installed; False if cancelled or it failed. The driver must be
+    signed with the same certificate as app_bundle (default: this app) -- see
+    game_audio_driver_install_command; an ad hoc build has no certificate to check against."""
     driver_path = driver_path or bundled_game_audio_driver_path()
     if not driver_path:
         logging.warning("The Game Audio device isn't bundled with this copy of the app.")
         return False
-    command = game_audio_driver_install_command(driver_path).replace("\\", "\\\\").replace('"', '\\"')
+    app_bundle = app_bundle or own_app_bundle()
+    requirement = signing_certificate_requirement(app_bundle) if app_bundle else None
+    command = game_audio_driver_install_command(driver_path, requirement).replace("\\", "\\\\").replace('"', '\\"')
     script = (
         f'do shell script "{command}" with prompt "OBS Auto Recorder wants to install its Game '
         'Audio device, so audio from Wine and Java games can be recorded on its own track." '
@@ -1130,6 +1166,40 @@ def open_system_audio_recording_settings():
         subprocess.run(["open", SYSTEM_AUDIO_RECORDING_SETTINGS_URL], check=False)
     except Exception as exc:
         logging.warning("Could not open System Audio Recording settings: %s", exc)
+
+
+def app_data_dir(install_dir):
+    """The install folder is already per-user (~/Applications/OBSAutoRecorder)."""
+    return install_dir
+
+
+APP_BUNDLE_ID = "com.obsautorecorder.app"
+PERMISSION_SERVICES = ("Accessibility", "ScreenCapture", "AudioCapture")
+PERMISSIONS_RESET_MARKER = ".permissions_reset_v1"
+
+
+def reset_permissions_once(data_dir):
+    """Clears this app's Accessibility, Screen Recording and System Audio Recording grants once,
+    so each is asked for again. Earlier builds were signed so that macOS stored grants as "any
+    app with bundle id com.obsautorecorder.app" -- confirmed live that an impostor claiming that
+    id then got Accessibility (every keystroke) and Screen Recording with no prompt, and a stored
+    grant keeps that rule until it's removed. Re-granted to a build signed with the project's
+    certificate (or ad hoc), the new grant requires that signature. Returns True if it reset."""
+    marker = os.path.join(data_dir, PERMISSIONS_RESET_MARKER)
+    if os.path.exists(marker):
+        return False
+    for service in PERMISSION_SERVICES:
+        try:
+            subprocess.run(["tccutil", "reset", service, APP_BUNDLE_ID], capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logging.warning("Could not reset the %s permission: %s", service, exc)
+    try:
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("permissions reset for the signed build\n")
+    except OSError:
+        pass
+    logging.info("Reset this app's permissions once for its new signature; macOS will ask for them again.")
+    return True
 
 
 def screen_recording_permission_granted():

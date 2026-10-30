@@ -1094,18 +1094,9 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
             try:
                 if n_code == HC_ACTION and lparam:
                     info = lparam.contents
-                    if info.vkCode == VK_SPACE and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                        # Logged unconditionally (matched or not) ONLY for the space bar itself,
-                        # never for other keys -- this hook sees every keystroke system-wide, and
-                        # logging all of them would both flood the log and capture keystrokes typed
-                        # into completely unrelated apps. There was no evidence at all in the log
-                        # of what happened after shipping this once already (not even an install
-                        # failure warning), so this is deliberately verbose the first time back.
-                        fg = user32.GetForegroundWindow()
-                        logging.info(
-                            "Clip editor: space bar seen (foreground=%s, editor=%s, match=%s).",
-                            fg, editor_hwnd, fg == editor_hwnd,
-                        )
+                    # Nothing about keystrokes is logged here: this hook sees every key pressed
+                    # anywhere, and an earlier per-press space-bar log line recorded typing rhythm
+                    # (and the foreground window) system-wide while the editor was open.
                     if is_space_bar_toggle_event(n_code, wparam, info.vkCode, user32.GetForegroundWindow(), editor_hwnd):
                         on_toggle()
             except Exception:
@@ -1224,6 +1215,32 @@ def request_system_audio_recording_permission():
 
 def open_system_audio_recording_settings():
     pass
+
+
+def _program_files_dirs():
+    names = ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432")
+    return [os.path.normcase(os.path.abspath(os.environ[n])) for n in names if os.environ.get(n)]
+
+
+def app_data_dir(install_dir):
+    """Per-user %APPDATA%\\OBSAutoRecorder for an install under Program Files, else install_dir
+    (a portable copy keeps its files beside it). Program Files must stay writable by admins only:
+    granting the Users group write access there (as an earlier version did) let any local account
+    replace the app's executable or DLLs, or point its config's OBS path at their own program --
+    which would then run as whoever starts the app, as administrator when the installer's
+    "Launch now" started it elevated."""
+    install = os.path.normcase(os.path.abspath(install_dir))
+    if not any(install == d or install.startswith(d + os.sep) for d in _program_files_dirs()):
+        return install_dir
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+    path = os.path.join(base, "OBSAutoRecorder")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def reset_permissions_once(data_dir):
+    """No-op: only macOS ties permission grants to a code signature."""
+    return False
 
 
 def screen_recording_permission_granted():

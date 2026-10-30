@@ -470,10 +470,13 @@ def game_audio_device_installed(platform_name=None):
     return _select_backend(platform_name).game_audio_device_installed()
 
 
-def install_game_audio_device(driver_path=None, platform_name=None):
+def install_game_audio_device(driver_path=None, app_bundle=None, platform_name=None):
     """Installs the Game Audio device (macOS asks for an admin password). True if installed.
-    driver_path defaults to the copy bundled with this app."""
-    return _select_backend(platform_name).install_game_audio_device(driver_path)
+    driver_path defaults to the copy bundled with this app; app_bundle (default: this app) is the
+    app whose signing certificate the driver must also be signed with."""
+    if app_bundle is None:
+        return _select_backend(platform_name).install_game_audio_device(driver_path)
+    return _select_backend(platform_name).install_game_audio_device(driver_path, app_bundle)
 
 
 def uninstall_game_audio_device(platform_name=None):
@@ -505,6 +508,33 @@ def screen_recording_permission_granted(platform_name=None):
 
 def request_screen_recording_permission(platform_name=None):
     return _select_backend(platform_name).request_screen_recording_permission()
+
+
+def app_data_dir(install_dir, platform_name=None):
+    """Where the app keeps its settings, logs and state for the current user: install_dir itself,
+    except a Windows install under Program Files, which uses %APPDATA%\\OBSAutoRecorder -- see
+    platform_windows.app_data_dir."""
+    return _select_backend(platform_name).app_data_dir(install_dir)
+
+
+def write_private_text(path, text):
+    """Writes text to path readable only by the current user (0600 on macOS/Linux; on Windows the
+    per-user data folder is private already). config.json holds the OBS WebSocket password, which
+    gives full control of OBS, screenshots included -- with the default 0644 any other account on
+    the machine could read it."""
+    if os.name == "posix":
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)  # tighten a file that already existed with wider permissions
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def reset_permissions_once(data_dir, platform_name=None):
+    """macOS: clears this app's permission grants once (see platform_macos's notes); no-op elsewhere."""
+    return _select_backend(platform_name).reset_permissions_once(data_dir)
 
 
 def accessibility_permission_granted(platform_name=None):

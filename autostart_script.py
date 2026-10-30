@@ -45,10 +45,31 @@ def resolve_script_dir(frozen, executable, script_file):
 
 
 SCRIPT_DIR = resolve_script_dir(getattr(sys, "frozen", False), sys.executable, __file__)
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+# Settings, logs and state: SCRIPT_DIR, except a Windows install under Program Files, which keeps
+# them per user in %APPDATA% -- see platform_windows.app_data_dir for why Program Files stays
+# admin-only.
+DATA_DIR = platform_common.app_data_dir(SCRIPT_DIR)
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+
+
+def seed_config_from_install_dir():
+    """First run with a separate data folder: start from the config the installer wrote beside
+    the app (or an older version's), which is read-only for this user."""
+    seed = os.path.join(SCRIPT_DIR, "config.json")
+    if DATA_DIR != SCRIPT_DIR and not os.path.isfile(CONFIG_PATH) and os.path.isfile(seed):
+        with open(seed, "r", encoding="utf-8") as f:
+            platform_common.write_private_text(CONFIG_PATH, f.read())
+        logging.info("Copied settings from %s to %s.", seed, CONFIG_PATH)
 
 
 def load_config():
+    seed_config_from_install_dir()
+    if os.name == "posix":
+        # Holds the OBS WebSocket password; earlier versions wrote it readable by every account.
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
     ensure_game_audio_track(config)
@@ -128,6 +149,13 @@ class LineCappedFileHandler(logging.Handler):
         self.filename = filename
         self.max_lines = max_lines
         self.encoding = encoding
+        # The log names games, windows and folders -- readable only by this user (it was 0644).
+        if os.name == "posix":
+            try:
+                os.close(os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+                os.chmod(filename, 0o600)
+            except OSError:
+                pass
 
     def emit(self, record):
         try:
@@ -5235,7 +5263,7 @@ def set_status(icon, status, text):
     icon.icon = build_tray_image(current_color(status))
 
 
-ACTIVE_SESSION_MARKER_PATH = os.path.join(SCRIPT_DIR, ".active_recording_session.json")
+ACTIVE_SESSION_MARKER_PATH = os.path.join(DATA_DIR, ".active_recording_session.json")
 
 
 def write_active_session_marker(display_name):
@@ -8944,8 +8972,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             status_label.config(fg="#ef4444", text="")
 
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(new_config, f, indent=4)
+            platform_common.write_private_text(CONFIG_PATH, json.dumps(new_config, indent=4))
         except OSError as exc:
             messagebox.showerror("Save failed", f"Could not write config.json:\n{exc}", parent=root)
             return
@@ -9019,7 +9046,7 @@ def get_quality_scale_height(quality_choice):
     return CLIP_EDITOR_QUALITY_HEIGHTS.get(quality_choice)
 
 
-OBS_STATE_CACHE_PATH = os.path.join(SCRIPT_DIR, ".obs_state_cache.json")
+OBS_STATE_CACHE_PATH = os.path.join(DATA_DIR, ".obs_state_cache.json")
 
 
 def read_obs_state_cache():
@@ -9039,8 +9066,7 @@ def update_obs_state_cache(**values):
     data = read_obs_state_cache()
     data.update({k: v for k, v in values.items() if v})
     try:
-        with open(OBS_STATE_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        platform_common.write_private_text(OBS_STATE_CACHE_PATH, json.dumps(data))
     except Exception:
         logging.exception("Could not save the OBS state cache.")
 
@@ -11455,7 +11481,7 @@ def main():
     if config.get("log_file"):
         log_path = config["log_file"]
         if not os.path.isabs(log_path):
-            log_path = os.path.join(SCRIPT_DIR, log_path)
+            log_path = os.path.join(DATA_DIR, log_path)
         handlers.append(LineCappedFileHandler(log_path))
 
     # force=True: load_config() above can already log (ensure_game_audio_track), and a
@@ -11473,6 +11499,8 @@ def main():
     logging.getLogger("obsws_python.reqs").setLevel(logging.CRITICAL)
     logging.getLogger("obsws_python.baseclient").setLevel(logging.WARNING)
     cleanup_orphaned_pyinstaller_temp_dirs()
+    if getattr(sys, "frozen", False):
+        platform_common.reset_permissions_once(DATA_DIR)
 
     status = {"text": "Starting...", "recording": False}
     stop_event = threading.Event()
@@ -11548,7 +11576,7 @@ def main():
             logging.warning("No log file configured.")
             return
         if not os.path.isabs(log_path):
-            log_path = os.path.join(SCRIPT_DIR, log_path)
+            log_path = os.path.join(DATA_DIR, log_path)
         if not os.path.isfile(log_path):
             logging.warning("Log file does not exist yet: %s", log_path)
             return

@@ -682,6 +682,16 @@ def open_system_audio_recording_settings():
     pass
 
 
+def app_data_dir(install_dir):
+    """The install folder is already per-user (~/.local/share/OBSAutoRecorder)."""
+    return install_dir
+
+
+def reset_permissions_once(data_dir):
+    """No-op: only macOS ties permission grants to a code signature."""
+    return False
+
+
 def screen_recording_permission_granted():
     return True
 
