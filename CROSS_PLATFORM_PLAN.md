@@ -517,3 +517,79 @@ If working through this with limited time, the highest-value-per-effort ordering
 
 - **Game audio isolation for games that aren't native app bundles — macOS done, Linux open.** OBS's Application Audio Capture targets apps only by bundle identifier, and Wine games / Java Minecraft run as processes without one. Detection is solved for Wine: each Windows program runs as a `wine64-preloader`/`wine32on64-preloader` process whose first argument is the .exe path, so `get_running_processes` reports the .exe name (Wizard101's Mac app, a bundled CrossOver, matches `WizardGraphicalClient.exe` like on Windows). **macOS audio (implemented):** a Core Audio process tap (macOS 14.2+) captures the game by pid. OBS can't read a tap itself — macOS hands tap audio only to apps declaring `NSAudioCaptureUsageDescription`, and OBS doesn't (current master included; its maintainers declined moving to taps, obsproject/obs-studio#10401), so a tap OBS read directly was silent. Instead the app's helper (`macos/process_audio_tap.swift`, permission declared in the app's Info.plist) reads the tap and plays it into a loopback device (`macos/game_audio_driver`, adapted from Apple's MIT-licensed NullAudio sample; BlackHole was ruled out as GPL-3.0), which OBS records as "Game Audio (Wine & Java)" on Game Audio's track. Confirmed live: −43.6 dB tapped from Wizard101's client; a full session with a bundle-less process put its audio on track 3 only (−43.3 dB, tracks 4–6 silent). Costs to the user: one admin-password driver install and one System Audio Recording permission, both offered when game audio isolation is turned on (Settings, installer). **Linux:** still open — the PipeWire Audio Capture plugin (obsproject.com/forum/resources/pipewire-audio-capture.1458) adds per-app capture to OBS and is the first thing to evaluate.
 
+
+## 11. Handoff to the Windows and Linux agents (written on macOS, 2026-10-30)
+
+macOS is feature-complete and verified on real hardware (§5.22, §6.2, §10). A security review then changed code that runs on **every** OS (commit "Security: stop other programs borrowing the app's permissions; lock down files"). Below: what each agent should verify or build, and the rules that must keep holding. Work top to bottom; mark items done in this file (strike through, add a one-line result) and push, the same way earlier phases were recorded.
+
+### 11.1 Security rules all platforms must keep
+
+These are enforced by `tests/test_security.py`; don't weaken them to make something else work.
+
+1. **Never log, store or send keystrokes.** Keyboard hooks/taps may only compare a key against the configured bindings. (A Windows clip-editor log line that recorded every space-bar press system-wide, with the foreground window, was removed.) Exception tracebacks are fine; key codes or characters in logs are not.
+2. **Custom keybinds swallow only their exact combination**, everything else passes through untouched.
+3. **The install folder must not be writable by other accounts.** Anything the app writes at runtime (config, log, caches, markers) goes in `platform_common.app_data_dir(install_dir)`.
+4. **Secrets are owner-only.** `config.json` holds the OBS WebSocket password, which gives full control of OBS including screenshots. Write it, OBS's WebSocket config, and the log with `platform_common.write_private_text` (0600 on POSIX). The log handler and `load_config` tighten existing files.
+5. **Nothing the installer runs as administrator/root should keep running elevated afterwards** (see 11.2.4).
+6. **No `shell=True`/`os.system`**, and any path passed to a privileged command is quoted (see `platform_macos._shell_quote`).
+
+### 11.2 Windows agent: verify the security changes (couldn't be run on macOS)
+
+The installer runs elevated (`--uac-admin`); the app runs as the normal user. Previously `installer.grant_user_write_access` gave the Users group **Modify** on `C:\Program Files\OBSAutoRecorder` recursively, so the app could save its config. That let any local account:
+- replace the exe or a DLL in `_internal\`;
+- point `config.json`'s `obs.path` at their own program, which then ran as whoever started the app;
+- run as administrator through the installer's "Launch now", which started the app elevated.
+
+Now:
+- `platform_windows.app_data_dir` sends runtime files for a Program Files install to `%APPDATA%\OBSAutoRecorder`. Portable copies keep them beside the exe.
+- `installer.remove_user_write_access` strips the old grant: `icacls … /remove:g *S-1-5-32-545`.
+- "Launch now" goes through `explorer.exe`.
+
+Test each on a real Windows machine, ideally with a second standard (non-admin) account:
+
+1. **Upgrade an existing install** that has the old grant (install a pre-change build first, or grant it by hand: `icacls "C:\Program Files\OBSAutoRecorder" /grant *S-1-5-32-545:(OI)(CI)M /T`). Run the new installer → Update. Then:
+   - `icacls "C:\Program Files\OBSAutoRecorder"` and one file inside must show **no** `BUILTIN\Users:(…)(M)` entry; inherited `(RX)` is expected.
+   - As a standard user, writing a file into the folder must fail with access denied.
+2. **Settings migrate and save:**
+   - The first run after the update copies the old `C:\Program Files\OBSAutoRecorder\config.json` to `%APPDATA%\OBSAutoRecorder\config.json` (look for "Copied settings from …" in the log). Existing settings must be intact.
+   - Change a setting in Settings → Save → restart: it persists, and `config.json` in Program Files is unchanged.
+   - Log, `.obs_state_cache.json` and `.active_recording_session.json` are written in `%APPDATA%\OBSAutoRecorder`.
+   - Tray → Open Log File opens that log.
+3. **Fresh install:**
+   - The installer writes `config.json` both to the install folder (the read-only seed for other accounts) and to the installing user's `%APPDATA%\OBSAutoRecorder`.
+   - The generated WebSocket password matches OBS's (`%APPDATA%\obs-studio\plugin_config\obs-websocket\config.json`), and recording works on first launch.
+   - **Edge case to check:** if the installer was elevated with a *different* admin account's credentials, `%APPDATA%` resolves to that account. Confirm the logged-in user's app still gets settings, seeded from the install folder on first run. If not, fix the seeding rather than re-granting folder write access.
+4. **"Launch now" is not elevated:**
+   - After Finish, Task Manager → Details → add the "Elevated" column: OBSAutoRecorder.exe must show **No**.
+   - Also check `explorer.exe` with a path containing spaces launches it at all.
+5. **Uninstall** with "keep settings" unchecked removes `%APPDATA%\OBSAutoRecorder` (if empty afterwards) as well as the install folder.
+6. **Regressions after the security commit:**
+   - Custom keybinds in all three `obs.custom_keybind_hotkey_mode`s still fire (Add Marker during a recording → marker saved).
+   - The clip editor's space bar still toggles play/pause.
+   - The log contains nothing per keypress.
+7. If any of this needs a code change, keep rule 11.1.3. Don't bring back write access to Program Files.
+
+### 11.3 Linux agent: work items
+
+macOS added several things Linux still lacks or hasn't verified. Linux backends today are stubs or no-ops for: per-app audio capture (`PROCESS_AUDIO_CAPTURE_KIND = None`), the process-tap functions, and Screen Recording / Accessibility permissions (always "granted").
+
+1. **Verify the security changes on Linux:**
+   - After install, `config.json` and `autostart_script.log` in `~/.local/share/OBSAutoRecorder` are mode `0600`.
+   - OBS's WebSocket config written by the installer is `0600`.
+   - `app_data_dir` returns the install folder (already per-user).
+   - Run `tests/test_security.py` natively.
+2. **Wine / Proton game detection.** On macOS, Wine runs each Windows program as `wine64-preloader` with the `.exe` path as `argv[1]`, and `get_running_processes` maps that back to the `.exe` name (`wine_program_name`, `WINE_PRELOADER_SUFFIX`).
+   - On Linux, check what psutil reports for a Wine/Proton game. The kernel's `comm` is truncated to 15 characters (e.g. `WizardGraphical`), and Proton launches via `wine64`/`wine-preloader`/`pressure-vessel`.
+   - Extend `wine_program_name` so the same `.exe` names used on Windows (e.g. `WizardGraphicalClient.exe`) match. Test with a real Wine program, and add a unit test with the real argv shapes, as the macOS one does.
+3. **Per-app game audio on Linux (the §10 backlog item).**
+   - Evaluate the PipeWire Audio Capture OBS plugin (obsproject.com/forum/resources/pipewire-audio-capture.1458; github.com/dimtpap/obs-pipewire-audio-capture). Can it target an application by name or PID? What input kind and settings does it expose (`GetInputKindList`, `GetInputDefaultSettings`, as §6.1 did for macOS)? How do apps that start mid-recording behave?
+   - If it works, implement `platform_linux.process_audio_capture_kind`/`process_audio_capture_settings` so `set_game_audio_capture_target` and app captures work as on Windows/macOS. Cover Wine/Proton games too, which on macOS needed a separate process-tap path.
+   - Record the confirmed schema in §6.1, the way macOS's is recorded.
+4. **Window-title rules** (GeForce NOW, Minecraft's `java` + title): confirm they work on X11. On Wayland, `get_window_titles` returns `{}` by design; make sure the Settings UI or log says so, rather than the rule silently never matching.
+5. **Custom keybinds on X11** (`XGrabKey`): confirm they work, and that only the configured combinations are grabbed (rule 11.1.2). On Wayland they're a logged no-op, which should stay clearly logged.
+6. **Packaging:** build with `.github/workflows/build-release.yml`'s Linux steps (tar.gz, AppImage, installer). Run a fresh install → record → clip editor trim → uninstall on a real desktop, and check every audio track of the export against the source. On macOS this was done with a distinct tone per app, measuring each track with band-pass filters plus sample-accurate cross-correlation; the same approach works here.
+
+### 11.4 Notes for whoever cuts the next release
+
+- **macOS signing:** add the repo's Actions secrets `MACOS_SIGNING_P12_BASE64` and `MACOS_SIGNING_P12_PASSWORD` (from `ci/create_macos_signing_identity.sh`; the maintainer's copy is in `~/.obsautorecorder-signing` on the Mac). Without them, macOS builds are ad hoc: safe, but users re-grant permissions after every update, and the one-line installer can't pin a certificate.
+- **The one-line Mac install** (`install-macos.sh`) is now a release asset with the certificate pinned at release time. The README points at `releases/latest/download/install-macos.sh`, so it only works once a tagged release containing it exists.
