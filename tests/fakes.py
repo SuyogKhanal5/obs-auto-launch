@@ -17,8 +17,11 @@ class FakeObsError(Exception):
 
 
 class FakeObsClient:
-    def __init__(self, profile_name="Untitled", inputs=None, current_scene="Screen"):
+    def __init__(self, profile_name="Untitled", inputs=None, current_scene="Screen", listed_apps=()):
         self.current_scene = current_scene
+        # What a macOS app-capture source lists as capturable (bundle ids) -- see
+        # get_input_properties_list_property_items.
+        self.listed_apps = list(listed_apps)
         self.profiles = {
             profile_name: {
                 "video": SimpleNamespace(
@@ -35,6 +38,7 @@ class FakeObsClient:
         self.inputs = inputs or {}
         self.calls = []
         self.recording_active = False
+        self.record_duration_ms = 0
 
     def _profile(self):
         return self.profiles[self.current_profile]
@@ -125,7 +129,15 @@ class FakeObsClient:
         return SimpleNamespace(input_audio_sync_offset=self.inputs[name].get("sync_offset", 0))
 
     def get_record_status(self):
-        return SimpleNamespace(output_active=self.recording_active)
+        return SimpleNamespace(output_active=self.recording_active, output_duration=self.record_duration_ms)
+
+    def get_stream_status(self):
+        return SimpleNamespace(output_active=getattr(self, "streaming_active", False))
+
+    def get_replay_buffer_status(self):
+        if not getattr(self, "replay_buffer_available", True):
+            raise OBSSDKRequestError("GetReplayBufferStatus", 604, "Replay buffer is not available.")
+        return SimpleNamespace(output_active=getattr(self, "replay_buffer_active", False))
 
     def set_input_audio_sync_offset(self, name, offset):
         if name not in self.inputs:
@@ -141,6 +153,16 @@ class FakeObsClient:
                 "GetInputSettings", RESOURCE_NOT_FOUND_CODE, f"No source was found by the name of `{name}`"
             )
         return SimpleNamespace(input_settings=dict(self.inputs[name].get("settings", {})))
+
+    def get_input_properties_list_property_items(self, name, prop):
+        if name not in self.inputs:
+            raise OBSSDKRequestError(
+                "GetInputPropertiesListPropertyItems", RESOURCE_NOT_FOUND_CODE, f"No source was found by the name of `{name}`"
+            )
+        self.calls.append(("get_input_properties_list_property_items", name, prop))
+        return SimpleNamespace(property_items=[
+            {"itemName": value, "itemValue": value, "itemEnabled": True} for value in self.listed_apps
+        ])
 
     def set_input_settings(self, name, settings, overlay):
         if name not in self.inputs:

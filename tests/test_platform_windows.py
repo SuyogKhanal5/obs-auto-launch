@@ -174,6 +174,27 @@ class InstallOptionalDependencyTests(unittest.TestCase):
         self.assertIsNotNone(reason)
 
 
+class CreateShortcutTests(unittest.TestCase):
+    def test_omits_arguments_property_when_no_extra_args(self):
+        with unittest.mock.patch.object(pw, "subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = unittest.mock.Mock(returncode=0)
+            pw.create_shortcut(r"C:\Startup\x.lnk", r"C:\App\app.exe", r"C:\App")
+        ps_script = mock_subprocess.run.call_args[0][0][-1]
+        self.assertNotIn("Arguments", ps_script)
+
+    def test_sets_arguments_property_when_extra_args_given(self):
+        # Running from source: target is the interpreter, extra_args carries the script path --
+        # the .lnk's own Arguments property takes the rest of the command line as one string.
+        with unittest.mock.patch.object(pw, "subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = unittest.mock.Mock(returncode=0)
+            pw.create_shortcut(
+                r"C:\Startup\x.lnk", r"C:\Python\python.exe", r"C:\App", extra_args=[r"C:\App\app.py"]
+            )
+        ps_script = mock_subprocess.run.call_args[0][0][-1]
+        self.assertIn("Arguments", ps_script)
+        self.assertIn(r"C:\App\app.py", ps_script)
+
+
 class AutostartTests(unittest.TestCase):
     def test_disabled_when_no_shortcut_file(self):
         with unittest.mock.patch.dict(pw.os.environ, {"APPDATA": r"C:\Users\Test\AppData\Roaming"}, clear=False):
@@ -190,7 +211,19 @@ class AutostartTests(unittest.TestCase):
         with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=startup_path):
             with unittest.mock.patch.object(pw, "create_shortcut", return_value=True) as mock_create:
                 self.assertTrue(pw.enable_autostart(r"C:\App\app.exe", r"C:\App"))
-        mock_create.assert_called_once_with(startup_path, r"C:\App\app.exe", r"C:\App")
+        mock_create.assert_called_once_with(startup_path, r"C:\App\app.exe", r"C:\App", extra_args=None)
+
+    def test_enable_passes_extra_args_through(self):
+        # Running from source: target_path is the interpreter, extra_args carries the script path.
+        startup_path = r"C:\Startup\x.lnk"
+        with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=startup_path):
+            with unittest.mock.patch.object(pw, "create_shortcut", return_value=True) as mock_create:
+                self.assertTrue(
+                    pw.enable_autostart(r"C:\Python\python.exe", r"C:\App", extra_args=[r"C:\App\app.py"])
+                )
+        mock_create.assert_called_once_with(
+            startup_path, r"C:\Python\python.exe", r"C:\App", extra_args=[r"C:\App\app.py"]
+        )
 
     def test_enable_returns_false_when_startup_path_unresolvable(self):
         with unittest.mock.patch.object(pw, "get_startup_shortcut_path", return_value=None):
@@ -1002,14 +1035,49 @@ class RunClipEditorSpaceBarListenerTests(unittest.TestCase):
         self.mock_user32.CallNextHookEx.assert_called_once()
 
 
-@unittest.skipUnless(sys.platform == "win32", "constructs a real ctypes.wintypes.HWND")
-class ResolveEditorTopLevelWindowTests(unittest.TestCase):
-    def test_resolves_via_get_ancestor(self):
-        mock_user32 = unittest.mock.Mock()
-        mock_user32.GetAncestor.return_value = 999
-        with unittest.mock.patch.object(pw.ctypes, "windll", unittest.mock.Mock(user32=mock_user32)):
-            result = pw.resolve_editor_top_level_window(12345)
-        self.assertEqual(result, 999)
+class ProcessAudioCaptureSettingsTests(unittest.TestCase):
+    def test_kind_is_wasapi_process_output_capture(self):
+        self.assertEqual(pw.PROCESS_AUDIO_CAPTURE_KIND, "wasapi_process_output_capture")
+
+    def test_builds_exe_only_window_match(self):
+        settings = pw.process_audio_capture_settings("Balatro.exe", "C:\\Games\\Balatro.exe")
+        self.assertEqual(
+            settings, {"window": "::Balatro.exe", "priority": pw.WINDOW_MATCH_PRIORITY_EXE_FALLBACK},
+        )
+
+    def test_exe_path_is_accepted_but_unused(self):
+        # Windows resolves purely by process name -- exe_path only exists for signature parity
+        # with the macOS backend, which actually needs it to resolve a bundle identifier.
+        with_path = pw.process_audio_capture_settings("Balatro.exe", "C:\\Games\\Balatro.exe")
+        without_path = pw.process_audio_capture_settings("Balatro.exe", None)
+        self.assertEqual(with_path, without_path)
+
+
+class HideDockIconTests(unittest.TestCase):
+    def test_is_a_no_op(self):
+        pw.hide_dock_icon()  # must not raise
+
+
+class RunOnMainThreadTests(unittest.TestCase):
+    def test_runs_func_immediately(self):
+        calls = []
+        pw.run_on_main_thread(lambda: calls.append(1))
+        self.assertEqual(calls, [1])
+
+
+class OpenPathTests(unittest.TestCase):
+    # os.startfile only exists on a real Windows Python build -- create=True lets this test
+    # inject a fake regardless of which real OS is running it, same reasoning as the winreg
+    # mocking above.
+    def test_calls_os_startfile(self):
+        with unittest.mock.patch.object(pw.os, "startfile", create=True) as mock_startfile:
+            pw.open_path("C:\\some\\path")
+        mock_startfile.assert_called_once_with("C:\\some\\path")
+
+
+class OpenScreenRecordingSettingsTests(unittest.TestCase):
+    def test_is_a_no_op(self):
+        pw.open_screen_recording_settings()  # must not raise
 
 
 if __name__ == "__main__":

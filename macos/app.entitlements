@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hardened runtime exceptions the app needs; see ci/finalize_macos_app.py. Deliberately NOT
+	     com.apple.security.cs.allow-dyld-environment-variables: refusing DYLD_INSERT_LIBRARIES is
+	     what stops other programs injecting code into this app to use its permissions. -->
+	<!-- Bundled Python libraries and VLC's (clip editor) aren't signed with this app's certificate. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<!-- pyobjc/ctypes callbacks (event taps, AppKit) need writable executable memory. -->
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+</dict>
+</plist>

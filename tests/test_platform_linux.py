@@ -231,6 +231,18 @@ class AutostartTests(unittest.TestCase):
         with unittest.mock.patch.object(pl.os, "makedirs", side_effect=OSError("boom")):
             self.assertFalse(pl.enable_autostart("/opt/app/app", "/opt/app"))
 
+    def test_extra_args_appended_to_exec_line(self):
+        # Running from source: target_path is just the Python interpreter, with the script's own
+        # path passed as extra_args -- the same shape set_startup_shortcut_enabled uses in that
+        # case. Each token is quoted separately per the XDG desktop-entry spec.
+        self.assertTrue(
+            pl.enable_autostart("/usr/bin/python3", "/opt/app", extra_args=["/opt/app/autostart_script.py"])
+        )
+        desktop_path = os.path.join(self.tmp_dir, "autostart", "OBSAutoRecorder.desktop")
+        with open(desktop_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn('Exec="/usr/bin/python3" "/opt/app/autostart_script.py"', content)
+
 
 class EmbedVideoPlayerTests(unittest.TestCase):
     def test_calls_set_xwindow_with_widgets_winfo_id(self):
@@ -419,12 +431,13 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
                             [binding], get_client="get_client", get_manual_split_buffer_seconds="get_seconds",
                             fire_keybind=fire_keybind, describe_keybind=describe_keybind, notify=notify,
                             icon="icon", notifications_config="notif_cfg", status="status",
+                            recording_state="rec_state",
                         )
 
         fake_root.grab_key.assert_called_once_with(39, 0x4, True, 0x1, 0x1)
         mock_thread_cls.assert_called_once_with(
             target=fire_keybind,
-            args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status"),
+            args=(binding, "get_client", "get_seconds", "icon", "notif_cfg", "status", "rec_state"),
             daemon=True,
         )
         fake_thread.start.assert_called_once()
@@ -498,6 +511,41 @@ class RunCustomKeybindListenerTests(unittest.TestCase):
                         get_manual_split_buffer_seconds=lambda: 0, fire_keybind=unittest.mock.Mock(),
                         describe_keybind=unittest.mock.Mock(), notify=unittest.mock.Mock(),
                     )  # must not raise
+
+
+class ProcessAudioCaptureSettingsTests(unittest.TestCase):
+    # Confirmed negative finding, not an unimplemented feature -- CROSS_PLATFORM_PLAN.md §6.1: a
+    # real CI spike found no per-application audio capture kind exists under PulseAudio.
+    def test_kind_is_none(self):
+        self.assertIsNone(pl.PROCESS_AUDIO_CAPTURE_KIND)
+
+    def test_settings_is_always_none(self):
+        self.assertIsNone(pl.process_audio_capture_settings("Balatro", "/usr/bin/balatro"))
+        self.assertIsNone(pl.process_audio_capture_settings("Balatro", None))
+
+
+class HideDockIconTests(unittest.TestCase):
+    def test_is_a_no_op(self):
+        pl.hide_dock_icon()  # must not raise
+
+
+class RunOnMainThreadTests(unittest.TestCase):
+    def test_runs_func_immediately(self):
+        calls = []
+        pl.run_on_main_thread(lambda: calls.append(1))
+        self.assertEqual(calls, [1])
+
+
+class OpenPathTests(unittest.TestCase):
+    def test_calls_xdg_open(self):
+        with unittest.mock.patch.object(pl.subprocess, "run") as mock_run:
+            pl.open_path("/some/path")
+        mock_run.assert_called_once_with(["xdg-open", "/some/path"])
+
+
+class OpenScreenRecordingSettingsTests(unittest.TestCase):
+    def test_is_a_no_op(self):
+        pl.open_screen_recording_settings()  # must not raise
 
 
 if __name__ == "__main__":

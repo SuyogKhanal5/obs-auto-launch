@@ -31,6 +31,11 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
+    env:
+      # The macOS signing certificate (see ci/create_macos_signing_identity.sh). Unset in forks and
+      # pull requests, where macOS builds fall back to ad hoc signing.
+      MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+      MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -129,9 +134,32 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "MACOS_ARCH=$(uname -m)" >> "$GITHUB_ENV"
 
+      - name: Load the macOS signing certificate
+        if: runner.os == 'macOS' && env.MACOS_SIGNING_P12_BASE64 != ''
+        # Signing with the project's certificate is what stops other programs borrowing the app's
+        # permissions (Accessibility sees every keystroke) -- see ci/finalize_macos_app.py.
+        run: |
+          printf '%s' "$MACOS_SIGNING_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          printf '%s' "$MACOS_SIGNING_P12_PASSWORD" > "$RUNNER_TEMP/signing.p12.password"
+          ci/import_macos_signing_identity.sh "$RUNNER_TEMP/signing.p12" "$RUNNER_TEMP/signing.p12.password" "$RUNNER_TEMP/signing.keychain-db" \
+            | sed -e 's/^export //' -e 's/"//g' >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/signing.p12" "$RUNNER_TEMP/signing.p12.password"
+
       - name: Build app (.app bundle, native arch)
         if: runner.os == 'macOS'
         run: pyinstaller --windowed --name OBSAutoRecorder --distpath dist --workpath build --specpath build autostart_script.py
+
+      - name: Build the Wine & Java game audio helper and driver (macOS)
+        if: runner.os == 'macOS'
+        run: macos/build.sh macos/build
+
+      - name: Name and sign the app bundle (macOS)
+        if: runner.os == 'macOS'
+        # Shows as "OBS Auto Recorder" (com.obsautorecorder.app) in macOS's permission lists
+        # instead of PyInstaller's bare "OBSAutoRecorder", adds the game audio helper and driver
+        # to Contents/Resources, and signs with the hardened runtime (and the certificate, if
+        # loaded above) -- see ci/finalize_macos_app.py.
+        run: python ci/finalize_macos_app.py dist/OBSAutoRecorder.app macos/build
 
       - name: Package DMG (macOS)
         if: runner.os == 'macOS'
@@ -147,9 +175,29 @@ jobs:
         # install time instead of a plain directory copy (see its own app_relative_path()).
         run: (cd dist && zip -r -y OBSAutoRecorder-app.zip OBSAutoRecorder.app)
 
-      - name: Build installer binary (macOS)
+      - name: Build installer app and DMG (macOS)
         if: runner.os == 'macOS'
-        run: pyinstaller --onefile --name "OBSAutoRecorderInstaller-macos-${MACOS_ARCH}" --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder-app.zip:." --add-data "${{ github.workspace }}/config.example.json:." installer.py
+        # A .app in a DMG, not a bare onefile binary: double-clicking a downloaded bare binary
+        # opened it in a text viewer (confirmed live), since it has neither +x nor an app wrapper.
+        # install-macos.sh (the one-line Terminal install) downloads this same DMG.
+        run: |
+          pyinstaller --windowed --name "OBS Auto Recorder Installer" --osx-bundle-identifier com.obsautorecorder.installer --distpath dist --workpath build --specpath build --add-data "${{ github.workspace }}/dist/OBSAutoRecorder-app.zip:." --add-data "${{ github.workspace }}/config.example.json:." --add-data "${{ github.workspace }}/config.example.mac.json:." installer.py
+          python ci/finalize_macos_app.py --sign-only "dist/OBS Auto Recorder Installer.app"
+          mkdir -p installer-dmg && ditto "dist/OBS Auto Recorder Installer.app" "installer-dmg/OBS Auto Recorder Installer.app"
+          hdiutil create -volname "OBS Auto Recorder Installer" -srcfolder installer-dmg -ov -format UDZO "dist/OBSAutoRecorderInstaller-macos-${MACOS_ARCH}.dmg"
+
+      - name: Checksums and the one-line installer script (macOS)
+        if: runner.os == 'macOS'
+        # install-macos.sh skips Gatekeeper (curl downloads aren't marked), so it verifies the DMG
+        # against these checksums and the installer against the certificate pinned here.
+        run: |
+          (cd dist && for f in OBSAutoRecorder-macos-*.dmg OBSAutoRecorderInstaller-macos-*.dmg; do shasum -a 256 "$f" > "$f.sha256"; done)
+          CERT_SHA1="$(printf '%s' "${OAR_MACOS_SIGNING_IDENTITY:-}" | tr 'A-F' 'a-f')"
+          if [ -n "$CERT_SHA1" ]; then
+            sed "s/@SIGNING_CERT_SHA1@/$CERT_SHA1/" install-macos.sh > dist/install-macos.sh
+          else
+            cp install-macos.sh dist/install-macos.sh
+          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -164,7 +212,10 @@ jobs:
             dist/OBSAutoRecorderInstaller-linux
             dist/OBSAutoRecorder-macos-*.dmg
             dist/OBSAutoRecorderInstaller-macos-*
+            dist/*.sha256
+            dist/install-macos.sh
             config.example.json
+            config.example.mac.json
 
   release:
     needs: build
@@ -181,7 +232,7 @@ jobs:
       - name: Flatten artifacts into one release-assets folder
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name "*.zip" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.dmg" -o -name "OBSAutoRecorderInstaller-linux" -o -name "OBSAutoRecorderInstaller-macos-*" \) -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name "*.zip" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.dmg" -o -name "OBSAutoRecorderInstaller-linux" -o -name "OBSAutoRecorderInstaller-macos-*" -o -name "*.sha256" -o -name "install-macos.sh" \) -exec cp {} release-assets/ \;
           ls -la release-assets
 
       - name: Create versioned GitHub release
@@ -194,9 +245,9 @@ jobs:
         # be overwritten (or removed) before the next tag, not accumulated release-over-release.
         run: |
           if [ -f RELEASE_NOTES.md ]; then
-            gh release create "${{ github.ref_name }}" release-assets/* config.example.json --title "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
+            gh release create "${{ github.ref_name }}" release-assets/* config.example.json config.example.mac.json --title "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
           else
-            gh release create "${{ github.ref_name }}" release-assets/* config.example.json --title "${{ github.ref_name }}" --generate-notes
+            gh release create "${{ github.ref_name }}" release-assets/* config.example.json config.example.mac.json --title "${{ github.ref_name }}" --generate-notes
           fi
 
       - name: Publish rolling "latest" build (main branch)
@@ -207,7 +258,7 @@ jobs:
           git tag -f latest
           git push origin latest --force
           gh release delete latest --yes || true
-          gh release create latest release-assets/* config.example.json \
+          gh release create latest release-assets/* config.example.json config.example.mac.json \
             --title "Latest build (main)" \
             --notes "Automatically built from the latest commit on main (${{ github.sha }}). May be less stable than a tagged release." \
             --prerelease

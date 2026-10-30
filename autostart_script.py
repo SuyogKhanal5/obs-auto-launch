@@ -1,5 +1,7 @@
+import base64
 import ctypes
 import glob
+import hashlib
 import json
 import logging
 import math
@@ -24,16 +26,116 @@ from PIL import Image, ImageColor, ImageDraw, ImageTk
 
 import platform_common
 
-if getattr(sys, "frozen", False):
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+def resolve_script_dir(frozen, executable, script_file):
+    """Folder holding config.json and the log. A built macOS app's executable is inside its
+    bundle (X.app/Contents/MacOS/), but the installer writes config.json next to X.app -- and
+    writing into a signed bundle would break its signature -- so use the bundle's parent."""
+    if not frozen:
+        return os.path.dirname(os.path.abspath(script_file))
+    exe_dir = os.path.dirname(os.path.abspath(executable))
+    contents = os.path.dirname(exe_dir)
+    bundle = os.path.dirname(contents)
+    if (
+        os.path.basename(exe_dir) == "MacOS"
+        and os.path.basename(contents) == "Contents"
+        and bundle.endswith(".app")
+    ):
+        return os.path.dirname(bundle)
+    return exe_dir
+
+
+SCRIPT_DIR = resolve_script_dir(getattr(sys, "frozen", False), sys.executable, __file__)
+# Settings, logs and state: SCRIPT_DIR, except a Windows install under Program Files, which keeps
+# them per user in %APPDATA% -- see platform_windows.app_data_dir for why Program Files stays
+# admin-only.
+DATA_DIR = platform_common.app_data_dir(SCRIPT_DIR)
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+
+
+def seed_config_from_install_dir():
+    """First run with a separate data folder: start from the config the installer wrote beside
+    the app (or an older version's), which is read-only for this user."""
+    seed = os.path.join(SCRIPT_DIR, "config.json")
+    if DATA_DIR != SCRIPT_DIR and not os.path.isfile(CONFIG_PATH) and os.path.isfile(seed):
+        with open(seed, "r", encoding="utf-8") as f:
+            platform_common.write_private_text(CONFIG_PATH, f.read())
+        logging.info("Copied settings from %s to %s.", seed, CONFIG_PATH)
 
 
 def load_config():
+    seed_config_from_install_dir()
+    if os.name == "posix":
+        # Holds the OBS WebSocket password; earlier versions wrote it readable by every account.
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+    ensure_game_audio_track(config)
+    return config
+
+
+# Quick Setup's slot for game audio (desktop+mic 1, mic 2, game 3, voice 4, music 5, browser 6).
+GAME_AUDIO_DEFAULT_TRACK = 3
+
+
+def ensure_game_audio_track(config):
+    """With game audio isolation and multi-track audio both on, makes sure the Game Audio input
+    has a track in multi_track_audio.tracks -- otherwise routing treats it as unmapped and strips
+    it off every track, so game audio silently never reaches the recording. Uses track 3 if
+    nothing else is on it, else the lowest free track; leaves the config alone if all six are
+    taken. Mutates and returns config."""
+    obs_config = config.get("obs", {})
+    game_audio_config = obs_config.get("game_audio_capture", {})
+    multi_track_config = obs_config.get("multi_track_audio", {})
+    if not game_audio_config.get("enabled") or not multi_track_config.get("enabled"):
+        return config
+    input_name = game_audio_config.get("input_name") or "Game Audio"
+    tracks = multi_track_config.setdefault("tracks", [])
+    if any(t.get("input_name") == input_name for t in tracks):
+        sync_process_tap_track(game_audio_config, tracks)
+        return config
+    used = {t.get("track") for t in tracks}
+    free = [GAME_AUDIO_DEFAULT_TRACK] if GAME_AUDIO_DEFAULT_TRACK not in used else [
+        n for n in range(1, 7) if n not in used
+    ]
+    if not free:
+        logging.warning(
+            "Game audio isolation is on, but all 6 recording tracks are already in use -- add "
+            "'%s' to a track in Settings > Multi-Track Audio for it to be recorded.", input_name,
+        )
+        return config
+    tracks.append({"input_name": input_name, "track": free[0]})
+    logging.info("Added '%s' to multi-track audio on track %d (game audio isolation is on).", input_name, free[0])
+    sync_process_tap_track(game_audio_config, tracks)
+    return config
+
+
+# macOS: games without an app bundle (Wine, Java Minecraft) reach OBS through the Game Audio
+# device instead of Game Audio's own per-app capture -- see platform_macos's process tap notes.
+PROCESS_TAP_INPUT_SUFFIX = " (Wine & Java)"
+
+
+def process_tap_input_name(game_audio_config):
+    return (game_audio_config.get("input_name") or "Game Audio") + PROCESS_TAP_INPUT_SUFFIX
+
+
+def sync_process_tap_track(game_audio_config, tracks):
+    """Puts the process-tap input on the same track as Game Audio (it's the same game audio,
+    just for games per-app capture can't target), following Game Audio if its track changes."""
+    if not platform_common.process_audio_tap_available():
+        return
+    input_name = game_audio_config.get("input_name") or "Game Audio"
+    tap_name = process_tap_input_name(game_audio_config)
+    game_track = next((t.get("track") for t in tracks if t.get("input_name") == input_name), None)
+    if game_track is None:
+        return
+    tap_entries = [t for t in tracks if t.get("input_name") == tap_name]
+    if tap_entries and all(t.get("track") == game_track for t in tap_entries):
+        return
+    tracks[:] = [t for t in tracks if t.get("input_name") != tap_name]
+    tracks.append({"input_name": tap_name, "track": game_track})
 
 
 MAX_LOG_LINES = 10000
@@ -47,6 +149,13 @@ class LineCappedFileHandler(logging.Handler):
         self.filename = filename
         self.max_lines = max_lines
         self.encoding = encoding
+        # The log names games, windows and folders -- readable only by this user (it was 0644).
+        if os.name == "posix":
+            try:
+                os.close(os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+                os.chmod(filename, 0o600)
+            except OSError:
+                pass
 
     def emit(self, record):
         try:
@@ -140,15 +249,53 @@ def default_overlay_monitor_index(monitors):
 
 
 def get_running_processes():
+    # process_iter(["name", "exe"]) (the previous implementation) resolves those attrs eagerly as
+    # part of advancing the iterator itself -- confirmed live (a real crash) that this happens
+    # OUTSIDE any try/except in this function's own loop body, so a per-process error there took
+    # the whole watcher thread down with it rather than just skipping that one process. The
+    # specific crash: a macOS process name 15+ characters long (e.g. a sandboxed app's own helper
+    # process, "GeForceNOW Helper (Renderer)") makes psutil's Process.name() internally fall back
+    # to self.cmdline() to get the untruncated name (see psutil's own source) -- and for a
+    # process macOS's hardened runtime restricts PROCARGS2 access to, that raised a raw
+    # SystemError wrapping a PermissionError, a type psutil's own internal try/except around that
+    # fallback (AccessDenied/ZombieProcess only) doesn't catch either, let alone this function's.
+    # Iterating bare Process objects instead and calling .name()/.exe() explicitly moves that
+    # risky resolution inside a try/except this function actually controls, catching SystemError
+    # too so one inaccessible process can never crash the whole scan again.
     processes = []
-    for proc in psutil.process_iter(["name", "exe"]):
+    for proc in psutil.process_iter():
         try:
-            name = proc.info.get("name")
-            if name:
-                processes.append((name, proc.info.get("exe") or "", proc.pid))
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+            name = proc.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError, PermissionError):
+            continue
+        if not name:
+            continue
+        if name.endswith(WINE_PRELOADER_SUFFIX):
+            try:
+                name = wine_program_name(name, proc.cmdline())
+            except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError, PermissionError):
+                pass
+        try:
+            exe = proc.exe()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError, PermissionError):
+            exe = ""
+        processes.append((name, exe, proc.pid))
     return processes
+
+
+# Wine (and CrossOver-based wrappers like Wizard101's Mac app) runs every Windows program as a
+# "wine64-preloader"/"wine32on64-preloader" process whose first argument is the program's own path,
+# e.g. ["…/wine64-preloader", "C:\\…\\WizardGraphicalClient.exe"] (confirmed live with
+# Wizard101.app's bundled CrossOver). Reporting the program's name instead lets the same .exe
+# names used on Windows match here.
+WINE_PRELOADER_SUFFIX = "-preloader"
+
+
+def wine_program_name(name, cmdline):
+    """The Windows program a Wine preloader process is running, or name unchanged if unknown."""
+    if not name.endswith(WINE_PRELOADER_SUFFIX) or len(cmdline) < 2 or not cmdline[1]:
+        return name
+    return cmdline[1].replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def get_window_titles():
@@ -160,6 +307,18 @@ def get_window_titles():
     error) when this isn't supported in the current session at all -- e.g. a Wayland desktop,
     which has no unprivileged cross-compositor API for this."""
     return platform_common.get_window_titles()
+
+
+def watched_window_still_matches(pid, entry):
+    """True if entry's title_contains needle still appears in pid's current window titles --
+    used to detect a watched_windows session ending WITHOUT its process ever exiting. Confirmed
+    live: GeForce NOW's own process keeps running when you back out to its menu after a game,
+    only its window's title reverts from "<game> on GeForce NOW" back to the generic
+    "GeForce NOW" -- is_process_running alone (correct for Minecraft's javaw.exe, which really
+    does exit when the game closes) would otherwise never notice and just keep "recording"
+    straight through menu-browsing until the whole app is quit."""
+    needle = entry["title_contains"].lower()
+    return any(needle in t.lower() for t in get_window_titles().get(pid, []))
 
 
 def get_steam_install_path():
@@ -359,19 +518,36 @@ def find_game_by_install_dir(exe_path, manifest_games):
     return None
 
 
+def extract_display_name_from_title(title, needle):
+    """Everything in title before needle's first (case-insensitive) occurrence, trimmed --
+    confirmed live against a real GeForce NOW session that its window title changes from the
+    generic "GeForce NOW" (while idling at its own menu) to "<actual game> on GeForce NOW" the
+    moment a game actually loads, so title_contains="on GeForce NOW" both scopes detection to
+    real gameplay (not menu-browsing) AND, via this function, recovers the specific game's own
+    name for display/recording-filename purposes -- something a static configured display_name
+    can't do, since the game played changes session to session. Returns None (falls back to
+    whatever display_name is configured, if any) if needle isn't actually found in title, or if
+    everything before it is blank."""
+    idx = title.lower().find(needle.lower())
+    if idx == -1:
+        return None
+    extracted = title[:idx].strip()
+    return extracted or None
+
+
 def find_target_process(
     watched_games, root_common_dirs, root_exclude_keywords, manifest_games, watched_windows, processes
 ):
     for name, exe, pid in processes:
         if name.lower() in watched_games:
-            return name, exe, pid, None
+            return name, exe, pid, None, None
     for name, exe, pid in processes:
         if is_exe_under_dirs(exe, root_common_dirs, root_exclude_keywords):
-            return name, exe, pid, None
+            return name, exe, pid, None, None
     for name, exe, pid in processes:
         manifest_display_name = find_game_by_install_dir(exe, manifest_games)
         if manifest_display_name:
-            return name, exe, pid, manifest_display_name
+            return name, exe, pid, manifest_display_name, None
     if watched_windows:
         window_titles = get_window_titles()
         for name, exe, pid in processes:
@@ -380,9 +556,18 @@ def find_target_process(
                 if name_lower != entry["process_name"].lower():
                     continue
                 needle = entry["title_contains"].lower()
-                if any(needle in t.lower() for t in window_titles.get(pid, [])):
-                    return name, exe, pid, entry.get("display_name")
-    return None, None, None, None
+                matched_title = next(
+                    (t for t in window_titles.get(pid, []) if needle in t.lower()), None
+                )
+                if matched_title is None:
+                    continue
+                display_name = entry.get("display_name")
+                if entry.get("use_title_as_display_name"):
+                    extracted = extract_display_name_from_title(matched_title, entry["title_contains"])
+                    if extracted:
+                        display_name = extracted
+                return name, exe, pid, display_name, entry
+    return None, None, None, None, None
 
 
 INVALID_FILENAME_CHARS = '<>:"/\\|?*'
@@ -440,13 +625,30 @@ def clear_obs_crash_sentinel():
     if not obs_config_dir:
         return
     sentinel_dir = os.path.join(obs_config_dir, ".sentinel")
-    if not os.path.isdir(sentinel_dir):
-        return
-    for entry in os.listdir(sentinel_dir):
-        try:
-            os.remove(os.path.join(sentinel_dir, entry))
-        except OSError:
-            pass
+    if os.path.isdir(sentinel_dir):
+        for entry in os.listdir(sentinel_dir):
+            try:
+                os.remove(os.path.join(sentinel_dir, entry))
+            except OSError:
+                pass
+    # Confirmed live on a real macOS OBS install: this OBS version's actual unclean-shutdown
+    # marker isn't the .sentinel/ directory above at all (that directory never existed on this
+    # machine) -- it's a single plain empty file directly under obs_config_dir, "safe_mode",
+    # left behind by a prior run that didn't exit cleanly (including this app's own
+    # kill_process_by_name, used for its hung-OBS/memory-bloat recovery). Left in place, OBS's
+    # very next launch blocks on its own "Run in Safe Mode?" dialog before doing anything else --
+    # including starting obs-websocket's server -- and since that dialog needs a real GUI click
+    # to dismiss, every following connection attempt just times out with the process sitting
+    # there, unresponsive, looking exactly like a hang. Removed unconditionally alongside the
+    # .sentinel/ directory rather than replacing it, since nothing here has verified whether the
+    # directory form is real on any actually-tested Windows/Linux install either -- safest to
+    # clear both markers every launch regardless of which one(s) this OS/OBS version actually
+    # uses.
+    safe_mode_marker = os.path.join(obs_config_dir, "safe_mode")
+    try:
+        os.remove(safe_mode_marker)
+    except OSError:
+        pass
 
 
 def cleanup_orphaned_pyinstaller_temp_dirs():
@@ -494,31 +696,156 @@ def is_startup_shortcut_enabled():
 
 
 def set_startup_shortcut_enabled(enabled):
-    """Enables/disables autostart for THIS running app (sys.executable) -- see
-    is_startup_shortcut_enabled's own docstring for where the real per-OS work happens. Only
-    works from a built/frozen executable (nothing standalone to point an autostart entry at when
-    running from source -- sys.executable would just be the Python interpreter itself)."""
+    """Enables/disables autostart for THIS running app -- see is_startup_shortcut_enabled's own
+    docstring for where the real per-OS work happens. A frozen/built app's sys.executable is
+    directly runnable on its own, so that's the whole command. Running from source, sys.executable
+    is just the Python interpreter -- nothing to point an autostart entry at by itself -- so this
+    also passes this script's own path as an extra argument (the identical
+    [sys.executable, abspath(__file__)] shape do_restart() already uses to relaunch this app from
+    source) and SCRIPT_DIR as the working directory (sys.executable's own directory, the default
+    otherwise, would be wherever the interpreter binary happens to live, not this app's folder --
+    irrelevant to CONFIG_PATH, which is resolved from __file__ rather than the process's working
+    directory, but still the more correct value to put here)."""
     if not enabled:
         return platform_common.disable_autostart()
-    if not getattr(sys, "frozen", False):
-        logging.warning("Cannot enable autostart while running from source; use the built app.")
-        return False
-    return platform_common.enable_autostart()
+    if getattr(sys, "frozen", False):
+        return platform_common.enable_autostart()
+    return platform_common.enable_autostart(working_dir=SCRIPT_DIR, extra_args=[os.path.abspath(__file__)])
 
 
 def launch_obs(obs_config):
     path = obs_config["path"]
     if not os.path.isfile(path):
-        logging.error("OBS executable not found at %s", path)
-        return False
+        # The configured path can be stale rather than genuinely missing -- e.g. a config.json
+        # carried over from another OS (confirmed live: a Windows-created config's literal
+        # "C:\Program Files\obs-studio\bin\64bit\obs64.exe" path, opened as-is on macOS) or from
+        # before OBS was reinstalled elsewhere. find_obs_executable's own per-OS discovery (the
+        # same search installer.py already runs when creating a config from scratch) gives this
+        # a real second chance instead of failing outright whenever the exact configured path
+        # happens not to exist -- still returns None (falling through to the same error as
+        # before) if nothing can be found anywhere.
+        discovered = platform_common.find_obs_executable()
+        if not discovered:
+            logging.error("OBS executable not found at %s", path)
+            return False
+        logging.warning(
+            "Configured OBS path %s doesn't exist; found OBS at %s instead. Update it in "
+            "Settings to stop seeing this.", path, discovered,
+        )
+        path = obs_config["path"] = discovered
     clear_obs_crash_sentinel()
     logging.info("OBS not running, launching from %s", path)
     subprocess.Popen(
-        [path] + obs_config.get("launch_args", []),
+        platform_common.obs_launch_command(path, obs_config.get("launch_args", [])),
         cwd=os.path.dirname(path),
     )
     time.sleep(obs_config.get("startup_wait_seconds", 8))
     return True
+
+
+def obs_outputs_idle(client):
+    """True only if OBS is confirmed not recording, streaming, or running a replay buffer --
+    anything unknown counts as busy, so OBS is never closed out from under something."""
+    try:
+        if client.get_record_status().output_active or client.get_stream_status().output_active:
+            return False
+    except Exception:
+        return False
+    try:
+        return not client.get_replay_buffer_status().output_active
+    except obsws.error.OBSSDKRequestError:
+        return True  # no replay buffer configured at all
+    except Exception:
+        return False
+
+
+# How long after a game session ends to keep trying to close OBS (it has to finish stopping
+# the recording first) before leaving it open -- e.g. if the user started streaming meanwhile.
+OBS_IDLE_CLOSE_WINDOW_SECONDS = 60
+OBS_QUIT_WAIT_SECONDS = 10
+
+
+def close_obs_between_sessions(client, overlay_enabled, process_name=None):
+    """On macOS, closes OBS once a game session ends -- while OBS is open its ScreenCaptureKit
+    sources keep the menu-bar screen-sharing indicator on even with nothing being recorded.
+    Skipped while the audio mixer overlay needs OBS's meters, and whenever OBS is busy. No-op
+    on other OSes. Returns True if OBS was asked to quit."""
+    if overlay_enabled or not obs_outputs_idle(client):
+        return False
+    if not platform_common.quit_obs_gracefully():
+        return False
+    try:
+        client.disconnect()
+    except Exception:
+        pass
+    # Confirmed live: OBS treats an AppleScript quit as unclean and leaves its crash marker, so
+    # opening OBS by hand afterwards stopped at the "Run in Safe Mode?" prompt. This exit was
+    # requested, not a crash -- clear the marker once the process is actually gone.
+    if process_name:
+        deadline = time.time() + OBS_QUIT_WAIT_SECONDS
+        while is_obs_running(process_name, get_running_processes()) and time.time() < deadline:
+            time.sleep(0.5)
+        if not is_obs_running(process_name, get_running_processes()):
+            clear_obs_crash_sentinel()
+    logging.info("Closed OBS until the next game starts (no screen sharing while idle).")
+    return True
+
+
+def obs_process_name(obs_config):
+    """OBS's process name on this OS, self-healing a stale configured one (e.g. "obs64.exe" in a
+    config carried over from Windows) the same way the watcher does."""
+    found = platform_common.find_obs_executable(configured_path=obs_config.get("path"))
+    return os.path.basename(found) if found else obs_config.get("process_name", "")
+
+
+def connect_obs_for_task(obs_config, ws_config):
+    """Connects to OBS for a one-off task (audio sync calibration), starting OBS first if it isn't
+    running -- on macOS it's closed between games (see close_obs_between_sessions), which made
+    "Calibrate Audio Sync" fail with "could not connect" (confirmed live). Never launches a second
+    OBS when one is running but unreachable. Returns (client, started_here)."""
+    client = connect_obs(ws_config, retries=1, delay=0)
+    if client:
+        return client, False
+    if is_obs_running(obs_process_name(obs_config), get_running_processes()):
+        return None, False
+    logging.info("OBS isn't running; starting it for this task.")
+    if not launch_obs(obs_config):
+        return None, False
+    client = connect_obs(ws_config, retries=5, delay=2)
+    return client, client is not None
+
+
+def release_obs_after_task(client, obs_config, started_here):
+    """Disconnects after connect_obs_for_task, closing OBS again if this task started it and
+    OBS isn't meant to stay open between games."""
+    if started_here and not obs_config.get("keep_running_between_sessions", False):
+        if close_obs_between_sessions(client, False, obs_process_name(obs_config)):
+            return
+    try:
+        client.disconnect()
+    except Exception:
+        pass
+
+
+def make_obs_client_thread_safe(client):
+    """obsws_python's ReqClient shares one request/response channel with no locking of its own --
+    confirmed live: the custom-keybind listener thread and the main watcher loop both issuing a
+    request on the same shared client (runtime_state["obs_client"]) at the same moment can cross
+    wires, with one caller getting back the OTHER call's response entirely -- observed get_record_
+    status() (from "Add Marker") returning a GetSourceScreenshotDataclass instead, from the
+    frozen-capture health check's periodic screenshot request landing on the connection at the
+    same instant. Wraps the one real chokepoint every request goes through (every convenience
+    method -- get_record_status(), get_scene_list(), etc. -- ultimately calls self.send()) with a
+    lock, so this app's own multiple threads can never interleave two requests on one connection,
+    regardless of which ones."""
+    lock = threading.Lock()
+    original_send = client.send
+
+    def locked_send(*args, **kwargs):
+        with lock:
+            return original_send(*args, **kwargs)
+
+    client.send = locked_send
 
 
 def connect_obs(ws_config, retries=5, delay=2):
@@ -530,6 +857,7 @@ def connect_obs(ws_config, retries=5, delay=2):
                 password=ws_config["password"],
                 timeout=3,
             )
+            make_obs_client_thread_safe(client)
             logging.info("Connected to OBS WebSocket at %s:%s", ws_config["host"], ws_config["port"])
             return client
         except Exception as exc:
@@ -763,6 +1091,22 @@ def connect_obs_events(config, icon, status, audio_state, recording_state):
 
 DEFAULT_OBS_RECOVERY_COOLDOWN_SECONDS = 30
 DEFAULT_OBS_MEMORY_LIMIT_GB = 5
+# Confirmed live (not a guess): macOS's ScreenCaptureKit-backed Display Capture source can get
+# stuck serving a single stale frame indefinitely -- reproduced and root-caused against a real
+# recording that turned out to be the exact same frame, byte-for-byte unchanged in content, for
+# its entire ~90-second duration (confirmed via a timestamp visible in the captured desktop
+# itself, days out of date) -- without any other symptom: OBS stayed fully "healthy" by every
+# other check this app makes the whole time (process running, WebSocket responsive). Separately
+# confirmed empirically (GetSourceScreenshot, 2-second intervals, lossless PNG so no re-encoding
+# noise) that even an otherwise-idle desktop's content changes within a few seconds under normal
+# conditions -- 180 seconds of a genuinely unchanged scene is far longer than any legitimate
+# paused/loading screen during real gameplay would plausibly hold pixel-for-pixel still, while
+# comfortably clearing that bar is exactly what the real, confirmed bug did (unchanged for days).
+DEFAULT_OBS_FROZEN_CAPTURE_SECONDS = 180
+# How often to actually take a screenshot and compare -- frequent enough to catch the real bug
+# within a few minutes of a recording starting, infrequent enough not to spam OBS's WebSocket
+# with screenshot requests every single poll_interval tick (which can be as short as 1.5s).
+FROZEN_CAPTURE_CHECK_INTERVAL_SECONDS = 30
 
 
 def get_obs_recovery_cooldown_seconds(obs_config):
@@ -771,6 +1115,28 @@ def get_obs_recovery_cooldown_seconds(obs_config):
 
 def get_obs_memory_limit_bytes(obs_config):
     return obs_config.get("recovery", {}).get("memory_limit_gb", DEFAULT_OBS_MEMORY_LIMIT_GB) * 1024 ** 3
+
+
+def get_obs_frozen_capture_threshold_seconds(obs_config):
+    return obs_config.get("recovery", {}).get("frozen_capture_seconds", DEFAULT_OBS_FROZEN_CAPTURE_SECONDS)
+
+
+def get_scene_screenshot_hash(client, scene_name):
+    """A hash of the current program scene's actual rendered output, via OBS WebSocket's
+    GetSourceScreenshot -- a scene is itself a kind of source in OBS's own model, so this works
+    without this app needing to know anything about the user's own scene/source setup (which it
+    never touches -- see CROSS_PLATFORM_PLAN.md). A small, fixed size (320x180) keeps the request
+    cheap; lossless PNG (confirmed live) means two screenshots of genuinely unchanged content hash
+    identically, with no re-encoding noise to account for. Returns None on any failure (OBS not
+    reachable, no active scene, etc.) -- a transient hiccup here should never itself be treated as
+    "frozen", only a real, sustained run of identical hashes should be."""
+    try:
+        screenshot = client.get_source_screenshot(scene_name, "png", 320, 180, -1)
+        image_data = screenshot.image_data
+        b64 = image_data.split(",", 1)[1] if "," in image_data else image_data
+        return hashlib.sha256(base64.b64decode(b64)).hexdigest()
+    except Exception:
+        return None
 
 
 def ensure_obs_ready(config, processes, icon, status, audio_state, recording_state, obs_recovery_state):
@@ -799,30 +1165,20 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
     if not client:
         return None, None
 
-    # A profile-parameter write alone can't make OBS's replay buffer -- or the recording format
-    # markers need -- actually available in the *current* session (see
-    # apply_replay_buffer_settings / ensure_hybrid_mp4_for_markers); OBS only picks either up by
-    # reading its profile fresh at startup. Both checks run up front so one restart covers
-    # whichever actually needed a write, instead of restarting twice.
-    markers_wanted = wants_markers(obs_config.get("custom_keybinds"))
+    # A profile-parameter write alone can't make OBS's replay buffer actually available in the
+    # *current* session (see apply_replay_buffer_settings) -- OBS only picks it up by reading its
+    # profile fresh at startup.
     replay_buffer_restart_needed = apply_replay_buffer_settings(client, obs_config.get("replay_buffer", {}))
-    marker_restart_needed = ensure_hybrid_mp4_for_markers(client) if markers_wanted else False
 
     # Filters apply live -- unlike the profile-parameter writes above, this never needs OBS to
     # restart to take effect.
     apply_mic_boost_from_config(client, obs_config)
 
-    if replay_buffer_restart_needed or marker_restart_needed:
-        reasons = []
-        if replay_buffer_restart_needed:
-            reasons.append("replay buffer settings")
-        if marker_restart_needed:
-            reasons.append("recording format (Hybrid MP4, required for markers)")
-        reason_text = " and ".join(reasons)
-        logging.info("%s changed -- restarting OBS so the change actually takes effect.", reason_text.capitalize())
+    if replay_buffer_restart_needed:
+        logging.info("Replay buffer settings changed -- restarting OBS so the change actually takes effect.")
         notify(
             icon, config.get("notifications", {}), "OBS restarted",
-            f"{reason_text.capitalize()} changed; OBS was restarted so they'd take effect.",
+            "Replay buffer settings changed; OBS was restarted so they'd take effect.",
         )
         try:
             client.disconnect()
@@ -836,22 +1192,16 @@ def ensure_obs_ready(config, processes, icon, status, audio_state, recording_sta
         if not client:
             return None, None
 
+    ensure_game_audio_input_exists(client, obs_config.get("game_audio_capture", {}))
     sync_multi_track_audio(
         client, obs_config.get("multi_track_audio", {}),
         obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
     )
     apply_output_folder(client, obs_config.get("output_folder"))
+    apply_screen_fit(client, obs_config)
+    remember_obs_state(client)
     apply_recording_resolution(client, obs_config)
-    if markers_wanted:
-        configured_format = obs_config.get("recording_format")
-        if configured_format and configured_format != "hybrid_mp4":
-            logging.info(
-                "Ignoring configured recording format '%s' -- the \"Add Marker\" keybind is "
-                "enabled, and OBS only supports chapter markers with Hybrid MP4.", configured_format,
-            )
-        ensure_hybrid_mp4_for_markers(client)
-    else:
-        apply_recording_format(client, obs_config.get("recording_format"))
+    apply_recording_format(client, obs_config.get("recording_format"))
     event_client = connect_obs_events(config, icon, status, audio_state, recording_state)
     return client, event_client
 
@@ -905,37 +1255,273 @@ def start_recording(client, retries=6, delay=2):
 
 WINDOW_MATCH_PRIORITY_EXE_FALLBACK = 2
 OBS_RESOURCE_NOT_FOUND_CODE = 600
+# Exe name that never matches a real window -- see set_game_audio_capture_target's force_reattach.
+REATTACH_PLACEHOLDER_PROCESS_NAME = "obs-auto-recorder-reattach.exe"
 
 
-def set_game_audio_capture_target(client, input_name, process_name):
-    """Points the game-audio-isolation input at the detected game's process, creating that
-    Application Audio Capture input in OBS first if it doesn't exist yet -- so obs.game_audio_capture
-    works without needing to add the OBS source by hand first, the same way the multi-track
-    quick-setup wizard self-creates sources for common apps."""
-    settings = {"window": f"::{process_name}", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}
-    try:
-        client.set_input_settings(input_name, settings, True)
-        logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
+def resolve_process_audio_capture(process_name):
+    """Resolves the OBS input kind + settings dict needed to capture process_name's own audio on
+    this OS, via platform_common.process_audio_capture_kind()/process_audio_capture_settings()
+    -- see CROSS_PLATFORM_PLAN.md §6.1 for how each OS's values were confirmed (Windows and macOS
+    empirically against a real OBS instance, Linux a confirmed negative finding). Looks up
+    process_name's own live executable path itself (only macOS's backend actually needs it, to
+    resolve an app bundle identifier) so callers never have to supply one.
+
+    Returns (kind, settings). kind is None if this OS has no confirmed per-app audio capture kind
+    at all (Linux); settings is None if kind exists but process_name couldn't be resolved to
+    whatever it needs (e.g. it isn't currently running) -- callers should distinguish the two,
+    since they call for different log messages."""
+    kind = platform_common.process_audio_capture_kind()
+    if not kind:
+        return None, None
+    exe_path = next((exe for name, exe, _pid in get_running_processes() if name == process_name), None)
+    settings = platform_common.process_audio_capture_settings(process_name, exe_path)
+    return kind, settings
+
+
+def ensure_game_audio_input_exists(client, game_audio_config):
+    """Creates the game audio isolation input in OBS (untargeted -- set_game_audio_capture_target
+    points it at the game once one is detected) if it doesn't exist yet, so it's already there
+    when multi-track routing runs instead of first appearing mid-recording on OBS's default of
+    every track."""
+    if not game_audio_config.get("enabled"):
         return
+    kind = platform_common.process_audio_capture_kind()
+    if not kind:
+        return
+    input_name = game_audio_config.get("input_name") or "Game Audio"
+    try:
+        if input_name not in {i["inputName"] for i in client.get_input_list().inputs}:
+            scene = client.get_current_program_scene().current_program_scene_name
+            settings = platform_common.process_audio_capture_placeholder_settings() or {}
+            client.create_input(scene, input_name, kind, settings, True)
+            logging.info("Created game audio input '%s' in OBS.", input_name)
+    except Exception as exc:
+        logging.warning("Could not create game audio input '%s' in OBS: %s", input_name, exc)
+    # Checked even when Game Audio already exists (confirmed live: an early return here meant
+    # the Wine & Java input was never created for anyone who already had Game Audio).
+    ensure_process_tap_input_exists(client, game_audio_config)
+
+
+PROCESS_TAP_INPUT_KIND = "coreaudio_input_capture"
+
+
+def ensure_process_tap_input_exists(client, game_audio_config):
+    """Creates the input that records the Game Audio device (see PROCESS_TAP_INPUT_SUFFIX), when
+    that device is installed. It's silent except while a game without an app bundle is being
+    tapped, so it can stay in the scene permanently."""
+    if not platform_common.process_audio_tap_available():
+        return
+    input_name = process_tap_input_name(game_audio_config)
+    try:
+        if input_name in {i["inputName"] for i in client.get_input_list().inputs}:
+            return
+        scene = client.get_current_program_scene().current_program_scene_name
+        client.create_input(
+            scene, input_name, PROCESS_TAP_INPUT_KIND,
+            {"device_id": platform_common.game_audio_device_uid()}, True,
+        )
+        logging.info("Created game audio input '%s' in OBS.", input_name)
+    except Exception as exc:
+        logging.warning("Could not create game audio input '%s' in OBS: %s", input_name, exc)
+
+
+def start_game_audio_tap_if_needed(game_audio_config, process_name, pid):
+    """For a game per-app capture can't target (no app bundle: Wine, Java), starts feeding its
+    audio into the Game Audio device. Returns the tap handle, or None when not needed or not
+    available."""
+    if not game_audio_config.get("enabled") or not pid or not platform_common.process_audio_tap_available():
+        return None
+    kind, settings = resolve_process_audio_capture(process_name)
+    if not kind or settings is not None:
+        return None
+    handle = platform_common.start_process_audio_tap([pid])
+    if handle is not None:
+        logging.info(
+            "%s has no app bundle to capture directly; recording its audio through '%s'.",
+            process_name, process_tap_input_name(game_audio_config),
+        )
+    return handle
+
+
+# Per-app capture kinds whose list of capturable apps OBS caches; see set_game_audio_capture_target.
+PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND = {"sck_audio_capture": "application"}
+
+
+def capture_target_listed(items, target):
+    """Whether an app-capture source's application list (GetInputPropertiesListPropertyItems)
+    includes target."""
+    return any(item.get("itemValue") == target for item in items)
+
+
+def set_game_audio_capture_target(client, input_name, process_name, force_reattach=False):
+    """Points an app-audio input (Game Audio, or an app capture like Discord) at process_name's
+    app, creating that Application Audio Capture input in OBS first if it doesn't exist yet -- so
+    obs.game_audio_capture works without needing to add the OBS source by hand first, the same
+    way the multi-track quick-setup wizard self-creates sources for common apps.
+
+    Returns True once pointed at an app OBS can capture, False if pointed but macOS doesn't list
+    the app as capturable yet -- it only lists apps with a window, so an app caught right as it
+    launches records silence (confirmed live: Safari, pointed half a second after it started) --
+    and None when there's nothing to retry (no target, or the request failed). False means call
+    again shortly: re-pointing once the app is listed captures it.
+
+    force_reattach makes OBS re-find the target process even when the settings are unchanged --
+    OBS only restarts a process capture when its window/priority settings actually change, and
+    only notices its target died while audio is flowing, so an app that restarts while silent
+    (Discord auto-updating between calls) leaves the capture bound to the dead process forever.
+    Only implemented for Windows' wasapi_process_output_capture kind (the only one this was
+    confirmed against live) -- a kind with its own refresh_property (macOS) already gets an
+    equivalent real-change trick below regardless of force_reattach."""
+    kind, settings = resolve_process_audio_capture(process_name)
+    if not kind:
+        logging.warning(
+            "Per-app audio capture has no confirmed OBS source kind on this OS yet; '%s' was "
+            "left unchanged.", input_name,
+        )
+        return None
+    if settings is None:
+        # Make sure an input still on capture-everything defaults (e.g. created before its app
+        # ever ran) records nothing rather than the whole desktop mix. Overlay keeps any
+        # previous target, which is harmless while that app isn't running.
+        placeholder = platform_common.process_audio_capture_placeholder_settings()
+        if placeholder:
+            try:
+                client.set_input_settings(input_name, placeholder, True)
+            except Exception:
+                pass
+        logging.warning(
+            "Could not resolve an audio-capture target for %s (not currently running, or its "
+            "app isn't in a normal bundle); '%s' won't capture anything this time.", process_name, input_name,
+        )
+        return None
+    refresh_property = PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND.get(kind)
+    listed = True
+    try:
+        if refresh_property:
+            # OBS only finds apps that were running when the source last listed them (confirmed
+            # live: a source pointed at an app launched after that recorded silence, even after
+            # re-applying its settings). Reading the source's app list rebuilds it, and clearing
+            # the target first makes the write below a real change that restarts the capture.
+            # Best-effort: the listing itself fails while the screen is locked (ScreenCaptureKit
+            # lists nothing then -- confirmed live), which must not read as "input missing".
+            try:
+                items = client.get_input_properties_list_property_items(input_name, refresh_property).property_items
+                listed = capture_target_listed(items, settings.get(refresh_property))
+            except Exception:
+                pass
+            client.set_input_settings(input_name, {refresh_property: ""}, True)
+        elif force_reattach and kind == "wasapi_process_output_capture":
+            # Re-sending identical settings is a no-op on Windows too -- briefly pointing at a
+            # placeholder exe first forces OBS to register the later real write as a genuine
+            # change and actually restart the capture.
+            placeholder = {
+                "window": f"::{REATTACH_PLACEHOLDER_PROCESS_NAME}",
+                "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK,
+            }
+            client.set_input_settings(input_name, placeholder, True)
+        client.set_input_settings(input_name, settings, True)
+        if listed:
+            logging.info("Pointed '%s' audio capture at %s", input_name, process_name)
+        else:
+            logging.debug("%s isn't capturable yet (no window); '%s' will be pointed again.", process_name, input_name)
+        return listed
     except obsws.error.OBSSDKRequestError as exc:
         if exc.code != OBS_RESOURCE_NOT_FOUND_CODE:
             logging.warning("Could not point '%s' audio capture at %s: %s", input_name, process_name, exc)
-            return
+            return None
     except Exception as exc:
         logging.warning("Could not point '%s' audio capture at %s: %s", input_name, process_name, exc)
-        return
+        return None
 
     # Input doesn't exist yet -- create it with the target already set, instead of requiring it
     # be added by hand in OBS first.
     try:
         scene = client.get_current_program_scene().current_program_scene_name
-        client.create_input(scene, input_name, "wasapi_process_output_capture", settings, True)
+        client.create_input(scene, input_name, kind, settings, True)
         logging.info(
             "Created Application Audio Capture input '%s' in OBS and pointed it at %s.",
             input_name, process_name,
         )
+        return True
     except Exception as exc:
         logging.warning("Could not create '%s' audio capture input in OBS: %s", input_name, exc)
+        return None
+
+
+def app_capture_is_listed(client, input_name, process_name):
+    """Whether input_name's app is in its source's capturable list right now (always True where
+    the source kind has no such list, e.g. Windows) -- used at session start to tell which of
+    the app captures just pointed need pointing again once their app opens a window."""
+    kind, settings = resolve_process_audio_capture(process_name)
+    refresh_property = PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND.get(kind)
+    if not settings or not refresh_property:
+        return True
+    try:
+        items = client.get_input_properties_list_property_items(input_name, refresh_property).property_items
+    except Exception:
+        return True
+    return capture_target_listed(items, settings.get(refresh_property))
+
+
+def running_app_capture_processes(multi_track_config, processes):
+    """The multi_track_audio.app_captures process names that are running right now."""
+    if not multi_track_config.get("enabled"):
+        return set()
+    wanted = {ac.get("process_name") for ac in multi_track_config.get("app_captures", []) if ac.get("process_name")}
+    return {name for name, _exe, _pid in processes if name in wanted}
+
+
+def captured_app_captures(client, multi_track_config, processes):
+    """The running app captures already pointed at a capturable app -- what
+    point_newly_running_app_captures starts from at the beginning of a session."""
+    captured = set()
+    for process_name in running_app_capture_processes(multi_track_config, processes):
+        inputs = [
+            ac["input_name"] for ac in multi_track_config.get("app_captures", [])
+            if ac.get("process_name") == process_name and ac.get("input_name")
+        ]
+        if all(app_capture_is_listed(client, input_name, process_name) for input_name in inputs):
+            captured.add(process_name)
+    return captured
+
+
+# How often an app capture (or Game Audio) whose app isn't capturable yet is pointed again.
+CAPTURE_RETRY_SECONDS = 5
+
+
+def point_newly_running_app_captures(client, multi_track_config, captured, processes, offset_ms, retry_state=None):
+    """Points each running app capture that isn't captured yet at its app -- an app opened
+    partway through a recording (e.g. Discord joined mid-game), or one that had no window yet
+    when last pointed -- so it's captured from then on instead of only from the next recording.
+    captured is the set this returned last time; an app that quits and relaunches is picked up
+    again. retry_state (a dict kept across calls) spaces out attempts at an app that still isn't
+    capturable to every CAPTURE_RETRY_SECONDS."""
+    retry_state = {} if retry_state is None else retry_state
+    running = running_app_capture_processes(multi_track_config, processes)
+    now = time.time()
+    newly_captured = set()
+    for process_name in sorted(running - captured):
+        if now - retry_state.get(process_name, 0.0) < CAPTURE_RETRY_SECONDS:
+            continue
+        first_attempt = process_name not in retry_state
+        retry_state[process_name] = now
+        results = []
+        for app_capture in multi_track_config.get("app_captures", []):
+            if app_capture.get("process_name") == process_name and app_capture.get("input_name"):
+                if first_attempt:
+                    logging.info("%s is running; pointing '%s' at it.", process_name, app_capture["input_name"])
+                results.append(set_game_audio_capture_target(client, app_capture["input_name"], process_name))
+                apply_process_capture_sync_offset(client, app_capture["input_name"], offset_ms)
+        if all(result is not False for result in results):
+            newly_captured.add(process_name)
+            retry_state.pop(process_name, None)
+        elif first_attempt:
+            logging.info("%s has no window yet, so it can't be captured; trying again until it does.", process_name)
+    for process_name in list(retry_state):
+        if process_name not in running:
+            retry_state.pop(process_name)
+    return (captured & running) | newly_captured
 
 
 MIC_BOOST_VOICE_ISOLATION_FILTER_NAME = "OBS Auto Recorder - Mic Boost Voice Isolation"
@@ -1486,17 +2072,30 @@ def compute_process_capture_tracks(obs_config):
     return sorted({track for name, track in entries if name in process_capture_names})
 
 
-def compute_reference_track(obs_config, reference_input_name="Desktop Audio"):
-    """Returns the OBS track number reference_input_name is routed to in
-    obs.multi_track_audio.tracks, or None if it isn't configured there at all -- the same
-    reference run_audio_sync_calibration and apply_process_capture_sync_offset already correct
-    every process-capture input against. Used to know which track in an existing clip actually
-    holds the "ground truth" audio to measure a process-capture track's real lag against."""
+def compute_reference_track(obs_config, reference_input_name="Desktop Audio", input_kinds=None):
+    """Returns the track holding desktop audio -- the "ground truth" the clip editor's "Fix audio
+    track sync" aligns every process-capture track to. That's either a track routed from an
+    input named reference_input_name, or (via input_kinds, a live {input_name: input_kind} map
+    from resolve_input_kinds) one whose input is a desktop-audio kind -- on macOS that's usually
+    "macOS Screen Capture", since screen_capture carries system audio and there's no native
+    loopback device.
+
+    Deliberately never falls back to some other track like a mic: the measurement cross-
+    correlates the same sound captured two ways, and a mic doesn't carry the sound a
+    process-capture track does. Returns None (the checkbox stays disabled) when no desktop-audio
+    track can be identified."""
     entries = normalize_track_entries(obs_config.get("multi_track_audio", {}).get("tracks"))
     for name, track in entries:
         if name == reference_input_name:
             return track
-    return None
+    if not input_kinds:
+        return None
+    process_capture_tracks = set(compute_process_capture_tracks(obs_config))
+    desktop_tracks = sorted({
+        track for name, track in entries
+        if track not in process_capture_tracks and input_kinds.get(name) in DESKTOP_AUDIO_CAPTURE_KINDS
+    })
+    return desktop_tracks[0] if desktop_tracks else None
 
 
 def track_name_hints(obs_config):
@@ -2052,14 +2651,20 @@ def run_audio_sync_calibration(client, ffmpeg_path, target_input_name, reference
 
     Returns the measured offset in ms to apply to target_input_name (negative -- how much
     earlier it needs to shift to line back up with reference_input_name), or None if calibration
-    couldn't complete (ffplay not found, OBS not reachable, or too few clicks detected to be
-    confident). Restores every OBS setting it touches -- record directory, target_input_name's
-    window/priority, its sync offset, and its track routing -- before returning either way."""
-    ffplay_path = os.path.join(os.path.dirname(ffmpeg_path), "ffplay.exe")
-    if not os.path.isfile(ffplay_path):
-        logging.warning("Audio sync calibration: ffplay.exe not found next to ffmpeg; skipping.")
+    couldn't complete (ffplay not found, this OS's per-app audio capture can't be retargeted at
+    a plain spawned process, OBS not reachable, or too few clicks detected to be confident).
+    Restores every OBS setting it touches -- record directory, target_input_name's capture
+    settings, its sync offset, and its track routing -- before returning either way."""
+    if not platform_common.process_audio_capture_kind():
+        logging.warning(
+            "Audio sync calibration: this OS has no confirmed per-app audio capture kind to "
+            "calibrate against; skipping."
+        )
         return None
-
+    ffplay_path = platform_common.find_ffplay_executable(ffmpeg_path)
+    if not ffplay_path:
+        logging.warning("Audio sync calibration: ffplay not found next to ffmpeg; skipping.")
+        return None
     try:
         if client.get_record_status().output_active:
             logging.warning("Audio sync calibration: refusing to run while OBS is already recording.")
@@ -2074,35 +2679,70 @@ def run_audio_sync_calibration(client, ffmpeg_path, target_input_name, reference
         generate_calibration_tone(tone_path)
     except Exception as exc:
         logging.warning("Audio sync calibration: could not generate the test tone: %s", exc)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+    # macOS: a bundled copy, since OBS can only capture apps with a bundle id (see
+    # platform_macos.prepare_calibration_player). Its own file name is the process name a
+    # Windows exe-match needs ("ffplay.exe", not "ffplay").
+    player_path = platform_common.prepare_calibration_player(ffplay_path, tmp_dir)
+    kind = platform_common.process_audio_capture_kind()
+    ffplay_capture_settings = platform_common.process_audio_capture_settings(
+        os.path.basename(player_path), player_path,
+    )
+    if ffplay_capture_settings is None:
+        logging.warning(
+            "Audio sync calibration: this OS's per-app audio capture can't be pointed at the "
+            "test-tone player; skipping. The configured/default offset will keep being applied."
+        )
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
     try:
         orig_dir = client.get_record_directory().record_directory
+        input_kinds = {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
+        if reference_input_name not in input_kinds:
+            # e.g. macOS, where desktop audio usually comes from the screen capture source
+            # rather than an input named "Desktop Audio" (see DESKTOP_AUDIO_CAPTURE_KINDS).
+            reference_input_name = next(
+                (name for name, k in input_kinds.items() if k in DESKTOP_AUDIO_CAPTURE_KINDS), reference_input_name,
+            )
         orig_target_settings = client.get_input_settings(target_input_name).input_settings
         orig_target_offset = client.get_input_audio_sync_offset(target_input_name).input_audio_sync_offset
         orig_target_tracks = client.get_input_audio_tracks(target_input_name).input_audio_tracks
         ref_track = next((i for i in range(1, 7) if client.get_input_audio_tracks(reference_input_name).input_audio_tracks.get(str(i))), None)
     except Exception as exc:
         logging.warning("Audio sync calibration: could not read current OBS state: %s", exc)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
     if ref_track is None:
         logging.warning("Audio sync calibration: '%s' isn't routed to any track.", reference_input_name)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
+    # macOS's capture only sees apps already running when it's pointed (see
+    # PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND), so there the player starts first; the
+    # tone's first click is at 1s and there are 18, so the ~1s this costs only drops one or two.
+    refresh_property = PROCESS_AUDIO_CAPTURE_REFRESH_PROPERTY_BY_KIND.get(kind)
     proc = None
     measured_ms = None
     try:
-        client.set_input_settings(
-            target_input_name, {"window": "::ffplay.exe", "priority": WINDOW_MATCH_PRIORITY_EXE_FALLBACK}, True,
-        )
+        if not refresh_property:
+            client.set_input_settings(target_input_name, ffplay_capture_settings, True)
         client.set_input_audio_sync_offset(target_input_name, 0)
         target_tracks = {str(i): (i == CALIBRATION_TARGET_TRACK) for i in range(1, 7)}
         client.set_input_audio_tracks(target_input_name, target_tracks)
         client.set_record_directory(tmp_dir)
         client.start_record()
         time.sleep(1.0)
-        proc = subprocess.Popen([ffplay_path, "-autoexit", "-loglevel", "quiet", tone_path])
-        time.sleep(1.5)  # let the window actually appear before ffplay starts playing
+        proc = subprocess.Popen([player_path, "-autoexit", "-loglevel", "quiet", tone_path])
+        if refresh_property:
+            time.sleep(0.8)
+            client.get_input_properties_list_property_items(target_input_name, refresh_property)
+            client.set_input_settings(target_input_name, {refresh_property: ""}, True)
+            client.set_input_settings(target_input_name, ffplay_capture_settings, True)
+        else:
+            time.sleep(1.5)  # let the window actually appear before ffplay starts playing
         proc.wait(timeout=CALIBRATION_TONE_DURATION_SECONDS + 10)
         time.sleep(1.0)
     except Exception as exc:
@@ -2223,6 +2863,99 @@ def apply_recording_format(client, recording_format):
 
 OBS_RESOLUTION_OPTIONS = ["Match canvas (no scaling)", "1080p", "720p", "480p"]
 
+# How a full-display capture is fit into the recording (obs.screen_fit). "match_screen" sets the
+# canvas to the display's own shape so nothing is cut off and there are no bars; the others
+# keep a 16:9 canvas. Confirmed live on a 14" MacBook Pro: a 3024x1964 display scaled to fill a
+# 1920x1080 canvas's width lost the bottom ~13% of the game, and the notch strip recorded as a
+# black band across the top.
+SCREEN_FIT_LABELS = {
+    "match_screen": "Match screen shape (no bars, nothing cut off)",
+    "letterbox": "16:9 with side bars",
+    "fill": "16:9 filled (top and bottom cropped)",
+    "off": "Don't change OBS's layout",
+}
+SCREEN_FIT_BY_LABEL = {label: key for key, label in SCREEN_FIT_LABELS.items()}
+DEFAULT_SCREEN_FIT = "match_screen"
+SCREEN_FIT_CANVAS_WIDTH = 1920
+SCREEN_FIT_SOURCE_WAIT_SECONDS = 5
+# OBS's macOS display capture (ScreenCaptureKit); its "type" setting 0 means a whole display.
+DISPLAY_CAPTURE_KIND = "screen_capture"
+OBS_ALIGN_TOP_LEFT = 5  # OBS_ALIGN_LEFT | OBS_ALIGN_TOP
+OBS_ALIGN_CENTER = 0
+
+
+def compute_screen_fit(source_width, source_height, crop_top, mode):
+    """Returns ((canvas_width, canvas_height), scene_item_transform) fitting a display capture of
+    source_width x source_height -- minus crop_top rows (the notch strip, see
+    platform_common.display_top_inset_pixels) -- into the canvas according to mode."""
+    content_height = source_height - crop_top
+    if mode == "match_screen":
+        canvas = (SCREEN_FIT_CANVAS_WIDTH, round(SCREEN_FIT_CANVAS_WIDTH * content_height / source_width / 2) * 2)
+    else:
+        canvas = (SCREEN_FIT_CANVAS_WIDTH, round(SCREEN_FIT_CANVAS_WIDTH * 9 / 16 / 2) * 2)
+    transform = {
+        "cropTop": crop_top, "cropBottom": 0, "cropLeft": 0, "cropRight": 0,
+        "boundsType": "OBS_BOUNDS_SCALE_OUTER" if mode == "fill" else "OBS_BOUNDS_SCALE_INNER",
+        "boundsWidth": float(canvas[0]), "boundsHeight": float(canvas[1]),
+        "boundsAlignment": OBS_ALIGN_CENTER, "alignment": OBS_ALIGN_TOP_LEFT,
+        "positionX": 0.0, "positionY": 0.0, "rotation": 0.0,
+    }
+    return canvas, transform
+
+
+def apply_screen_fit(client, obs_config):
+    """Fits the current scene's whole-display capture into the canvas per obs.screen_fit (see
+    SCREEN_FIT_LABELS), cropping a notched Mac's black strip, and sets the canvas size to match.
+    Runs before apply_recording_resolution, which then scales the output from the new canvas.
+    Leaves everything alone for "off", or when there's no single display capture to fit."""
+    mode = obs_config.get("screen_fit", DEFAULT_SCREEN_FIT)
+    if mode not in SCREEN_FIT_LABELS or mode == "off":
+        return
+    try:
+        scene = client.get_current_program_scene().current_program_scene_name
+        captures = []
+        for item in client.get_scene_item_list(scene).scene_items:
+            if item.get("inputKind") != DISPLAY_CAPTURE_KIND:
+                continue
+            settings = client.get_input_settings(item["sourceName"]).input_settings
+            if settings.get("type", 0) == 0:
+                captures.append(item)
+        if len(captures) != 1:
+            return
+        item_id = captures[0]["sceneItemId"]
+        # OBS is launched fresh for each session on macOS (see close_obs_between_sessions), and a
+        # just-started capture reports a 0x0 size until its first frame arrives.
+        deadline = time.time() + SCREEN_FIT_SOURCE_WAIT_SECONDS
+        while True:
+            current = client.get_scene_item_transform(scene, item_id).scene_item_transform
+            source_width, source_height = int(current["sourceWidth"]), int(current["sourceHeight"])
+            if source_width and source_height:
+                break
+            if time.time() >= deadline:
+                logging.warning(
+                    "The screen capture isn't producing frames yet (screen locked or asleep?); "
+                    "left the recording layout unchanged this time."
+                )
+                return
+            time.sleep(0.5)
+        crop_top = platform_common.display_top_inset_pixels(source_width, source_height)
+        (canvas_width, canvas_height), transform = compute_screen_fit(source_width, source_height, crop_top, mode)
+
+        video = client.get_video_settings()
+        if (video.base_width, video.base_height) != (canvas_width, canvas_height):
+            client.set_video_settings(
+                video.fps_numerator, video.fps_denominator,
+                canvas_width, canvas_height, canvas_width, canvas_height,
+            )
+            logging.info(
+                "Set OBS's canvas to %dx%d to fit the %dx%d display (%s, %d notch rows cropped).",
+                canvas_width, canvas_height, source_width, source_height, mode, crop_top,
+            )
+        if any(current.get(key) != value for key, value in transform.items()):
+            client.set_scene_item_transform(scene, item_id, transform)
+    except Exception as exc:
+        logging.warning("Could not fit the screen capture into the recording: %s", exc)
+
 
 def resolve_recording_resolution(base_width, base_height, resolution_choice):
     """Resolves an OBS_RESOLUTION_OPTIONS choice to an explicit (width, height) output
@@ -2232,10 +2965,18 @@ def resolve_recording_resolution(base_width, base_height, resolution_choice):
     aspect ratio, scaling width from CLIP_EDITOR_QUALITY_HEIGHTS' height and rounding to the
     nearest even number, same convention build_trim_command's -2 scale filter already uses,
     since libx264 (what OBS's own encoders are built on too) requires even dimensions."""
+    # OBS itself rounds output dimensions to a multiple of 4 (confirmed live: asking for 770x480
+    # recorded 768x480, and 854x480 recorded 852x480), so sizes are computed that way here too --
+    # otherwise the requested size never matches what OBS reports back, and it's rewritten on
+    # every recording start.
+    custom = re.fullmatch(r"\s*(\d+)\s*[xX×]\s*(\d+)\s*", resolution_choice or "")
+    if custom:
+        width, height = (max(4, int(n) // 4 * 4) for n in custom.groups())
+        return width, height
     height = CLIP_EDITOR_QUALITY_HEIGHTS.get(resolution_choice)
     if height is None or not base_width or not base_height:
         return base_width, base_height
-    width = round(base_width * height / base_height / 2) * 2
+    width = int(base_width * height / base_height) // 4 * 4
     return width, height
 
 
@@ -2265,34 +3006,6 @@ def apply_recording_resolution(client, obs_config):
         logging.info("Set OBS's recording resolution to %dx%d.", target_width, target_height)
     except Exception as exc:
         logging.error("Could not set OBS's recording resolution to %dx%d: %s", target_width, target_height, exc)
-
-
-def wants_markers(custom_keybinds_config):
-    return any(
-        kb.get("enabled", True) and kb.get("action") == "add_marker" for kb in (custom_keybinds_config or [])
-    )
-
-
-def ensure_hybrid_mp4_for_markers(client):
-    """Chapter markers (this app's "Add Marker" keybind -> OBS's CreateRecordChapter) only work
-    when the recording format is Hybrid MP4 -- confirmed via python-vlc's own docstring and live
-    testing (every other format fails with OBS_CHAPTER_NOT_SUPPORTED_CODE). Forces that format,
-    overriding obs.recording_format if it's set to anything else, since markers simply don't work
-    otherwise. Returns True when a write actually happened -- same "OBS needs a restart to pick
-    this up" limitation as apply_replay_buffer_settings, so callers restart OBS when this does."""
-    current = (
-        get_profile_parameter_value(client, "AdvOut", "RecFormat2")
-        or get_profile_parameter_value(client, "AdvOut", "RecFormat")
-    )
-    if current == "hybrid_mp4":
-        return False
-    try:
-        client.set_profile_parameter("AdvOut", "RecFormat2", "hybrid_mp4")
-        logging.info("Set OBS's recording format to Hybrid MP4 (required for the \"Add Marker\" keybind).")
-        return True
-    except Exception as exc:
-        logging.warning("Could not set OBS's recording format to Hybrid MP4 for markers: %s", exc)
-        return False
 
 
 def apply_replay_buffer_settings(client, replay_buffer_config):
@@ -2338,8 +3051,12 @@ def apply_replay_buffer_settings(client, replay_buffer_config):
 DEFAULT_MULTI_TRACK_PROFILE_NAME = "OBS Auto Recorder"
 # Formats OBS has reliably muxed every enabled recording track into. Others (mp4, mov, flv, ...)
 # have historically only embedded track 1 in some OBS versions -- routing still happens either way,
-# this is just used to decide whether to warn about it.
-MULTI_TRACK_SAFE_FORMATS = {"mkv", "fragmented_mkv", "hybrid_mp4"}
+# this is just used to decide whether to warn about it. hybrid_mp4 deliberately isn't here even
+# though it's MP4-based: confirmed live (CROSS_PLATFORM_PLAN.md §5.21) that it only ever embeds
+# ONE audio track into the output regardless of how many are configured/routed in OBS, on a real
+# OBS 30.2.3 instance -- the exact same single-track-only behavior as plain mp4/mov, not the
+# mkv-like multi-track-safe behavior its name might suggest.
+MULTI_TRACK_SAFE_FORMATS = {"mkv", "fragmented_mkv"}
 
 
 def normalize_track_entries(tracks_config):
@@ -2501,15 +3218,41 @@ def sync_multi_track_output_settings(client, entries, profile_name):
     return True
 
 
+# Whole-device audio capture kinds, one set per device type, covering every OS this app
+# actually ports to -- confirmed directly against a real OBS instance on each OS (Windows:
+# wasapi_*; macOS: coreaudio_*, confirmed live against this very machine's own "Mic/Aux" input
+# while investigating a real "default mic not detected in Quick Setup" report, see
+# CROSS_PLATFORM_PLAN.md; Linux: pulse_*/alsa_input_capture, confirmed via the §6.1 CI spike).
+# Used wherever this app needs to recognize "some real desktop-audio/microphone device input",
+# e.g. the Quick Setup wizard's desktop/mic dropdowns -- a single hardcoded "wasapi_..." string
+# equality check here is exactly the bug that made Quick Setup's microphone dropdown always come
+# up empty on macOS, even though the real mic input was right there in OBS under a different
+# (also real, also confirmed) kind name.
+DESKTOP_AUDIO_CAPTURE_KINDS = {
+    "wasapi_output_capture", "coreaudio_output_capture", "pulse_output_capture",
+    # macOS-only, confirmed live: GetInputDefaultSettings for "screen_capture" has no
+    # audio-related field at all -- ScreenCaptureKit bundles system audio into it
+    # unconditionally, with no separate toggle. In practice this is the de facto way most Mac
+    # OBS setups get "desktop audio" into a recording at all, since macOS has no native
+    # system-audio loopback device the way wasapi_output_capture/coreaudio_output_capture
+    # assume -- confirmed via a real user's own OBS instance, which has no coreaudio_output_capture
+    # input configured at all, only a "macOS Screen Capture" (screen_capture) source. This kind
+    # string is macOS-specific (Windows/Linux use entirely different kind names for screen
+    # capture), so it can never falsely match on those OSes.
+    "screen_capture",
+}
+MIC_AUDIO_CAPTURE_KINDS = {
+    "wasapi_input_capture", "coreaudio_input_capture", "pulse_input_capture", "alsa_input_capture",
+}
+
 # Input kinds whose track routing this feature manages. Used to clear stale routing left over
 # on an input that used to be listed in obs.multi_track_audio.tracks and no longer is -- without
 # this, removing a mapping in Settings has no effect in OBS, since SetInputAudioTracks is only
 # ever called for inputs actually listed. Deliberately narrow (not every input kind) so a device
 # with no business being track-routed (e.g. a pure video source) is never touched.
-AUDIO_TRACK_MANAGED_KINDS = {
-    "wasapi_output_capture",  # Desktop Audio
-    "wasapi_input_capture",  # Mic/Aux and other microphone devices
-    "wasapi_process_output_capture",  # Application Audio Capture (Discord, Spotify, browsers, ...)
+AUDIO_TRACK_MANAGED_KINDS = DESKTOP_AUDIO_CAPTURE_KINDS | MIC_AUDIO_CAPTURE_KINDS | {
+    "wasapi_process_output_capture",  # Application Audio Capture (Discord, Spotify, browsers, ...) -- Windows
+    "sck_audio_capture",  # Application Audio Capture -- macOS counterpart, see CROSS_PLATFORM_PLAN.md §6.1
 }
 
 
@@ -2586,16 +3329,30 @@ def sync_multi_track_audio(client, multi_track_config, process_capture_sync_offs
         # current server/channel name) -- exactly what "isolation randomly stops working" turns
         # out to be. This re-point isn't a one-time fix, it runs on every recording start, same as
         # obs.game_audio_capture already gets. The sync-offset correction rides along with it for
-        # the same reason -- see DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS.
+        # the same reason -- see DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS. force_reattach covers
+        # the other way isolation silently dies: the app restarted (e.g. Discord auto-updated)
+        # while OBS stayed open, and OBS is still bound to the dead process.
         for app_capture in multi_track_config.get("app_captures", []):
             input_name = app_capture.get("input_name")
             process_name = app_capture.get("process_name")
             if input_name and process_name:
-                set_game_audio_capture_target(client, input_name, process_name)
+                set_game_audio_capture_target(client, input_name, process_name, force_reattach=True)
                 apply_process_capture_sync_offset(client, input_name, process_capture_sync_offset_ms)
         apply_multi_track_routing(client, entries)
     except Exception:
         logging.exception("Unexpected error while syncing multi-track audio settings.")
+
+
+def reapply_multi_track_routing(client, multi_track_config):
+    if not multi_track_config.get("enabled"):
+        return
+    entries = normalize_track_entries(multi_track_config.get("tracks"))
+    if not entries:
+        return
+    try:
+        apply_multi_track_routing(client, entries)
+    except Exception:
+        logging.exception("Unexpected error while re-applying multi-track routing.")
 
 
 DEFAULT_DISK_SPACE_MINIMUM_GB = 10
@@ -2784,50 +3541,63 @@ def save_replay_buffer(client):
         logging.error("Could not save replay buffer: %s", exc)
 
 
-# Confirmed live: OBS only supports CreateRecordChapter (this app's "Add Marker" keybind) when
-# the recording format is Hybrid MP4 -- every other format fails with this code (shared with
-# OBS_SPLIT_NOT_ENABLED_CODE numerically, but a separate name here since the two checks apply to
-# entirely different requests and just happen to reuse the same generic "unsupported" code).
+# OBS only supports its own CreateRecordChapter request when the recording format is Hybrid MP4
+# (shared numerically with OBS_SPLIT_NOT_ENABLED_CODE, but named separately here since the two
+# checks apply to entirely different requests and just happen to reuse the same generic
+# "unsupported" code) -- confirmed live, and the reason markers used to force the whole recording
+# onto Hybrid MP4. That forcing was removed (see add_recording_marker) after confirming live that
+# Hybrid MP4 has its own, separate problem: it only ever embeds ONE audio track into the output
+# file no matter how many are configured/routed in OBS, making it fundamentally incompatible with
+# multi-track audio (CROSS_PLATFORM_PLAN.md §5.21). CreateRecordChapter is still attempted below
+# on a pure best-effort basis (free native-chapter support for Premiere/etc. on whatever
+# recordings happen to already be Hybrid MP4), but its failure is no longer treated as this
+# feature failing at all, since this app's own clip editor never relies on it.
 OBS_CHAPTER_NOT_SUPPORTED_CODE = 702
-OBS_CHAPTER_NOT_SUPPORTED_HINT = (
-    "Markers aren't supported by this recording's video format -- OBS only supports them with "
-    "Hybrid MP4. Enabling the \"Add Marker\" custom keybind in Settings already forces this "
-    "format and restarts OBS to apply it; if you still see this, OBS may not have restarted yet."
-)
 
 
-def add_recording_marker(client, icon=None, notifications_config=None, status=None):
+def add_recording_marker(client, icon=None, notifications_config=None, status=None, recording_state=None):
+    """Records a marker at the recording's current elapsed time (via OBS's own GetRecordStatus,
+    so it's correct even across a pause/resume) into recording_state["markers"] -- this app's own,
+    format-independent marker mechanism, read by the clip editor and written out as a sidecar
+    file alongside the finished recording by stop_recording (see write_recording_markers). Also
+    tries OBS's own CreateRecordChapter on a best-effort basis (see OBS_CHAPTER_NOT_SUPPORTED_CODE
+    above for why its failure is expected and ignored on anything but Hybrid MP4)."""
     try:
-        client.create_record_chapter()
-        logging.info("Added a marker to the current recording.")
-        # Same flash treatment as a manual split or a replay-buffer save -- from the user's
-        # point of view, all three are "something just landed/happened, here's confirmation".
-        # Unlike those two, there's no OBS event for this (CreateRecordChapter doesn't emit
-        # one), so the flash has to be fired right here at the point of success instead.
-        if icon is not None and status is not None:
-            status["flash_until"] = time.time() + SPLIT_FLASH_SECONDS
-            icon.icon = build_tray_image(current_color(status))
-
-            def revert():
-                icon.icon = build_tray_image(current_color(status))
-
-            timer = threading.Timer(SPLIT_FLASH_SECONDS, revert)
-            timer.daemon = True
-            timer.start()
-        return True
-    except obsws.error.OBSSDKRequestError as exc:
-        if exc.code == OBS_CHAPTER_NOT_SUPPORTED_CODE:
-            logging.error("Could not add marker: %s", OBS_CHAPTER_NOT_SUPPORTED_HINT)
-            notify(
-                icon, notifications_config, "Marker not added",
-                "Markers don't work with this recording's video format -- only Hybrid MP4 supports them.",
-            )
-        else:
-            logging.error("Could not add marker: %s", exc)
-        return False
+        offset_seconds = client.get_record_status().output_duration / 1000.0
     except Exception as exc:
         logging.error("Could not add marker: %s", exc)
         return False
+
+    if recording_state is not None:
+        recording_state.setdefault("markers", []).append(offset_seconds)
+    logging.info("Added a marker to the current recording (at %.1fs).", offset_seconds)
+
+    try:
+        # Only worth asking on Hybrid MP4 -- anywhere else obsws_python logs the 702 rejection as
+        # an ERROR with a full traceback before we can catch it, on every single marker.
+        if get_profile_parameter_value(client, "AdvOut", "RecFormat2") == "hybrid_mp4":
+            client.create_record_chapter()
+    except obsws.error.OBSSDKRequestError as exc:
+        if exc.code != OBS_CHAPTER_NOT_SUPPORTED_CODE:
+            logging.debug("Could not add a native OBS chapter marker (non-fatal): %s", exc)
+    except Exception as exc:
+        logging.debug("Could not add a native OBS chapter marker (non-fatal): %s", exc)
+
+    # Same flash treatment as a manual split or a replay-buffer save -- from the user's point of
+    # view, all three are "something just landed/happened, here's confirmation". Unlike those
+    # two, there's no OBS event for this, so the flash has to be fired right here at the point of
+    # success instead.
+    if icon is not None and status is not None:
+        status["flash_until"] = time.time() + SPLIT_FLASH_SECONDS
+        icon.icon = build_tray_image(current_color(status))
+
+        def revert():
+            icon.icon = build_tray_image(current_color(status))
+
+        timer = threading.Timer(SPLIT_FLASH_SECONDS, revert)
+        timer.daemon = True
+        timer.start()
+    return True
 
 
 OBS_SPLIT_NOT_ENABLED_CODE = 702
@@ -2939,12 +3709,13 @@ def describe_keybind(binding):
 
 def perform_keybind_action(
     client, action, manual_split_buffer_seconds=0, icon=None, notifications_config=None, status=None,
+    recording_state=None,
 ):
     try:
         if action == "split_record_file":
             trigger_buffered_split(client, manual_split_buffer_seconds)
         elif action == "add_marker":
-            if not add_recording_marker(client, icon, notifications_config, status):
+            if not add_recording_marker(client, icon, notifications_config, status, recording_state):
                 # add_recording_marker already logged the specific reason (and toasted it, if the
                 # format is the culprit) -- returning here skips the misleading "performed" log.
                 return
@@ -2978,6 +3749,7 @@ def perform_keybind_action(
 
 def fire_custom_keybind(
     binding, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
+    recording_state=None,
 ):
     client = get_client()
     if not client:
@@ -2985,12 +3757,13 @@ def fire_custom_keybind(
         return
     perform_keybind_action(
         client, binding.get("action"), get_manual_split_buffer_seconds(), icon, notifications_config, status,
+        recording_state,
     )
 
 
 def run_custom_keybind_listener(
     bindings, get_client, get_manual_split_buffer_seconds, icon=None, notifications_config=None, status=None,
-    stop_event=None, hotkey_mode=None,
+    recording_state=None, stop_event=None, hotkey_mode=None,
 ):
     """Thin dispatcher -- the real per-OS implementation (RegisterHotKey or a selectable global
     WH_KEYBOARD_LL hook on Windows, XGrabKey/XNextEvent on Linux/X11, a CGEventTap/CFRunLoop on
@@ -2998,7 +3771,9 @@ def run_custom_keybind_listener(
     platform_common.run_custom_keybind_listener() / platform_windows.py / platform_linux.py /
     platform_macos.py, see CROSS_PLATFORM_PLAN.md Phase 3. fire_custom_keybind/describe_keybind/
     notify are passed in rather than imported by the backend modules, so those never depend on
-    this one (the dependency only ever goes the other way). stop_event: passed straight through so
+    this one (the dependency only ever goes the other way). recording_state lets
+    add_recording_marker record a marker's timestamp -- see its own docstring for why that's no
+    longer tied to OBS's own chapter mechanism at all. stop_event: passed straight through so
     platform_windows.py's backend can release its hook the moment shutdown is requested rather
     than waiting on process death -- see that function's own docstring for why this matters.
     hotkey_mode: passed straight through to platform_windows.py's own backend, which is currently
@@ -3006,8 +3781,8 @@ def run_custom_keybind_listener(
     input-lag-vs-fullscreen-games tradeoff behind the choice."""
     platform_common.run_custom_keybind_listener(
         bindings, get_client, get_manual_split_buffer_seconds, fire_custom_keybind, describe_keybind, notify,
-        icon=icon, notifications_config=notifications_config, status=status, stop_event=stop_event,
-        hotkey_mode=hotkey_mode,
+        icon=icon, notifications_config=notifications_config, status=status, recording_state=recording_state,
+        stop_event=stop_event, hotkey_mode=hotkey_mode,
     )
 
 
@@ -3019,13 +3794,28 @@ def run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_eve
     platform_common.run_clip_editor_space_bar_listener(editor_window_handle, on_toggle, stop_event)
 
 
-def notify(icon, notifications_config, title, message):
+# Confirmed live on macOS: notification banners are hidden while a fullscreen game is in front
+# AND while its Space is closing -- a banner sent ~0.3s after the game quit never appeared, one
+# sent 5s later did. Notifications fired the moment a game exits are delayed by this much there.
+MACOS_POST_GAME_NOTIFICATION_DELAY_SECONDS = 4
+
+
+def notify(icon, notifications_config, title, message, after_game_exit=False):
     if not (notifications_config or {}).get("enabled"):
         return
-    try:
-        icon.notify(message, title)
-    except Exception as exc:
-        logging.debug("Notification failed: %s", exc)
+
+    def show():
+        try:
+            icon.notify(message, title)
+        except Exception as exc:
+            logging.warning("Could not show the '%s' notification: %s", title, exc)
+
+    if after_game_exit and sys.platform == "darwin":
+        timer = threading.Timer(MACOS_POST_GAME_NOTIFICATION_DELAY_SECONDS, show)
+        timer.daemon = True
+        timer.start()
+    else:
+        show()
 
 
 def delete_recording_files(paths):
@@ -3418,10 +4208,25 @@ CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS = [
 # Performance is the safer default for the editor's own preview until that's understood better,
 # not "Best" despite the label. Never touches the exported file either way.
 CLIP_EDITOR_DEFAULT_PREVIEW_QUALITY = CLIP_EDITOR_PREVIEW_QUALITY_OPTIONS[2]
+# ":avcodec-hw=none" alone only disables hardware decode *within* the avcodec module's own
+# hwaccel path (DXVA2/D3D11VA on Windows, VAAPI on Linux) -- confirmed live that on macOS it has
+# no effect at all, because VLC doesn't decode h264 through avcodec's hwaccel there in the first
+# place: it picks its own separate "vt" (VideoToolbox) decoder module ahead of avcodec entirely,
+# which ":avcodec-*" options can't reach. That made "Performance (software decode)" a no-op on
+# macOS specifically -- confirmed by VLC's own log still showing "Using Video Toolbox to decode"
+# with every one of these flags set, and by a real stutter during playback (timestamps
+# repeating/jumping in an automated sampling test, matching VLC's own "picture is too late to be
+# displayed"/"pic_holder_wait timed out" warnings) that persisted regardless of this dropdown.
+# ":codec=avcodec" (confirmed live, same per-media :-prefixed override syntax as the flags below)
+# forces libvlc to use the plain avcodec module specifically, bypassing "vt" (and equally
+# bypassing whatever platform-specific module a future Linux hardware-decode path might add) --
+# the actual fix for "software decode" to mean software decode on every OS, not just Windows.
 CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS = {
     "Best (hardware decode)": [],
     "Balanced": [":avcodec-skiploopfilter=nonref"],
-    "Performance (software decode)": [":avcodec-hw=none", ":avcodec-skiploopfilter=all", ":avcodec-fast"],
+    "Performance (software decode)": [
+        ":codec=avcodec", ":avcodec-hw=none", ":avcodec-skiploopfilter=all", ":avcodec-fast",
+    ],
 }
 
 CLIP_EDITOR_TARGET_AUDIO_BITRATE_KBPS = 128
@@ -3517,6 +4322,7 @@ def build_audio_track_filter_args(audio_stream_count, shift_ms_by_track=None, mu
 
 def build_audio_routing_filter_args(
     audio_stream_count, routing=None, muted_destinations=None, shift_ms_by_track=None, gains_db=None,
+    mono_sources=None,
 ):
     """Builds (-filter_complex ..., -map ... -map ...) args for the clip editor's Track Routing
     dialog -- lets a user consolidate multiple source tracks into fewer output tracks (e.g. mix
@@ -3551,11 +4357,23 @@ def build_audio_routing_filter_args(
     different treatment depending on which output track it ends up in -- a per-source-only gain
     couldn't express that. A missing or 0 entry means no change for that pair.
 
+    mono_sources: SOURCE track numbers to force to dual-mono -- stereo output with both channels
+    set to the same equal-power average of the input channels (matching what OBS's own "Downmix
+    Mono" source flag does), NOT a true single-channel stream. Applied before any shifting, gain,
+    or mixing below. e.g. forcing a dedicated clean-mic track to mono regardless of which
+    destination(s) it's routed to, rather than per (destination, source) like gains_db, since a
+    source being mono isn't a property that should ever differ by destination. Deliberately keeps
+    the channel COUNT unchanged (2, not 1) -- confirmed live that actually reducing it shifted
+    every later track's channel indexing for anything reading this file with a fixed per-track
+    channel count assumption.
+
     Returns ([], []) if the result would be a pure identity passthrough with nothing muted,
-    shifted, or gained -- the caller falls back to its own plain "-map 0:a" wildcard (eligible for
-    a fast stream copy) in that case, same as build_audio_track_filter_args always has."""
+    shifted, gained, or forced mono -- the caller falls back to its own plain "-map 0:a" wildcard
+    (eligible for a fast stream copy) in that case, same as build_audio_track_filter_args always
+    has."""
     if not audio_stream_count:
         return [], []
+    mono_sources = set(mono_sources or [])
     identity_routing = {t: [t] for t in range(1, audio_stream_count + 1)}
     routing = routing if routing is not None else identity_routing
     muted_destinations = set(muted_destinations or [])
@@ -3565,7 +4383,13 @@ def build_audio_routing_filter_args(
         gains_db.get(dest, {}).get(s) for dest, sources in routing.items() for s in sources
     )
 
-    if not muted_destinations and not shift_by_source and not has_gains and routing == identity_routing:
+    referenced_mono_sources = mono_sources & {
+        s for sources in routing.values() for s in sources if 1 <= s <= audio_stream_count
+    }
+    if (
+        not muted_destinations and not shift_by_source and not has_gains
+        and not referenced_mono_sources and routing == identity_routing
+    ):
         return [], []
 
     referenced_sources = sorted({
@@ -3574,21 +4398,33 @@ def build_audio_routing_filter_args(
     if not referenced_sources:
         return [], []
 
-    # Stage 1: per-source filters (shift only -- destination muting happens after mixing, in
-    # stage 2 below, so it silences the COMBINED result of everything routed there rather than
-    # just one contributing source; gain happens in stage 2 too, and specifically NOT here,
-    # since gain can differ per destination for the very same source -- a single per-source
+    # Stage 1: per-source filters (shift and forced-mono only -- destination muting happens after
+    # mixing, in stage 2 below, so it silences the COMBINED result of everything routed there
+    # rather than just one contributing source; gain happens in stage 2 too, and specifically NOT
+    # here, since gain can differ per destination for the very same source -- a single per-source
     # filter here couldn't express "boost this source on destination 1 but not destination 2").
     filter_parts = []
     for s in referenced_sources:
         i = s - 1
         label = f"asrc{s}"
+        steps = []
         if s in shift_by_source:
             shift_ms = shift_by_source[s]
             if shift_ms > 0:
-                filter_parts.append(f"[0:a:{i}]adelay={int(round(shift_ms))}:all=1[{label}]")
+                steps.append(f"adelay={int(round(shift_ms))}:all=1")
             else:
-                filter_parts.append(f"[0:a:{i}]atrim=start={abs(shift_ms) / 1000:.6f},asetpts=PTS-STARTPTS[{label}]")
+                steps.append(f"atrim=start={abs(shift_ms) / 1000:.6f},asetpts=PTS-STARTPTS")
+        if s in mono_sources:
+            # Dual-mono (2 output channels, both carrying the same equal-power average of the
+            # input channels), NOT a true 1-channel reduction -- confirmed live that collapsing to
+            # a real mono stream shifted every LATER track's channel indexing for whatever reads
+            # this file with a fixed per-track channel count assumption (OBS's own audio pipeline
+            # works this same dual-mono way internally, never varying a source's channel count).
+            # A single real channel count across every track avoids that shift entirely, while c0
+            # and c1 being identical sounds indistinguishable from true mono either way.
+            steps.append("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1")
+        if steps:
+            filter_parts.append(f"[0:a:{i}]{','.join(steps)}[{label}]")
         else:
             filter_parts.append(f"[0:a:{i}]anull[{label}]")
 
@@ -3880,7 +4716,7 @@ def generate_waveform_image(ffmpeg_path, input_path, start_seconds, end_seconds,
 def build_trim_command(
     ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise=False, crf=None,
     scale_height=None, audio_shift_ms_by_track=None, audio_stream_count=None,
-    audio_routing=None, muted_destinations=None, gains_db=None,
+    audio_routing=None, muted_destinations=None, gains_db=None, mono_sources=None,
 ):
     """Builds the ffmpeg argv to cut [start_seconds, end_seconds) out of input_path. Always uses
     -t (duration) rather than -to (absolute end time) even though both express the same cut --
@@ -3914,18 +4750,19 @@ def build_trim_command(
     own ms amount (a per-track dict, since real process-capture tracks were confirmed live to
     each lag Desktop Audio by a genuinely different amount) to fix a clip whose isolated audio
     track(s) still sound a few ms out of sync with the rest. audio_routing/muted_destinations/
-    gains_db: the clip editor's Track Routing dialog -- consolidate multiple source tracks into
-    fewer output tracks, drop a source entirely, mute an output track, and/or boost/attenuate one
-    source's gain into one specific output track; see build_audio_routing_filter_args, which this
-    delegates to (and which also applies audio_shift_ms_by_track to the right SOURCE tracks before
-    any consolidation mixes them together). Requires audio_stream_count (e.g. from
-    probe_audio_stream_count) to correctly re-map every track; using any of this forces the AUDIO
-    side to re-encode (a filter graph can't be stream-copied) but never touches video's own
-    copy-vs-re-encode decision above."""
+    gains_db/mono_sources: the clip editor's Track Routing dialog -- consolidate multiple source
+    tracks into fewer output tracks, drop a source entirely, mute an output track, boost/attenuate
+    one source's gain into one specific output track, and/or force a source to mono; see
+    build_audio_routing_filter_args, which this delegates to (and which also applies
+    audio_shift_ms_by_track to the right SOURCE tracks before any consolidation mixes them
+    together). Requires audio_stream_count (e.g. from probe_audio_stream_count) to correctly
+    re-map every track; using any of this forces the AUDIO side to re-encode (a filter graph can't
+    be stream-copied) but never touches video's own copy-vs-re-encode decision above."""
     start_str = format_timestamp(start_seconds)
     duration_str = format_timestamp(end_seconds - start_seconds)
     filter_complex_args, shifted_audio_map_args = build_audio_routing_filter_args(
         audio_stream_count, audio_routing, muted_destinations, audio_shift_ms_by_track, gains_db,
+        mono_sources,
     )
     filtering_audio = bool(filter_complex_args)
     # Only video and audio -- not "-map 0" for every stream. OBS's Hybrid MP4 recordings carry
@@ -4145,14 +4982,14 @@ def trim_clip(
     input_path, start_seconds, end_seconds, output_path, ffmpeg_path="ffmpeg", precise=False,
     delete_original=False, icon=None, notifications_config=None, crf=None, scale_height=None,
     target_size_mb=None, audio_shift_ms_by_track=None, audio_routing=None, muted_destinations=None,
-    gains_db=None, progress_callback=None, cancel_event=None,
+    gains_db=None, mono_sources=None, progress_callback=None, cancel_event=None,
 ):
     """Runs the actual ffmpeg trim -- blocking, callers run this on a background thread the same
     way transcode_recording's callers do. Verifies the output file actually exists and has a
     nonzero size before reporting success or deleting the source; never deletes on a failed or
     suspicious-looking trim, same rule transcode_recording already follows.
 
-    audio_shift_ms_by_track/audio_routing/muted_destinations/gains_db: see
+    audio_shift_ms_by_track/audio_routing/muted_destinations/gains_db/mono_sources: see
     build_audio_routing_filter_args. Only probes the source's real audio track count (an extra
     ffprobe subprocess) when any of them is actually requested -- the common case (none) pays
     nothing extra. Not supported together with target_size_mb: a size-targeted export already
@@ -4181,9 +5018,9 @@ def trim_clip(
 
     passlog_prefix = None
     if target_size_mb:
-        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db:
+        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db or mono_sources:
             logging.warning(
-                "Clip editor: ignoring the audio sync shift/routing/mute/gain for %s -- a "
+                "Clip editor: ignoring the audio sync shift/routing/mute/gain/mono for %s -- a "
                 "size-targeted export only keeps the first audio track, so there's nothing left "
                 "to apply it to.",
                 basename,
@@ -4235,16 +5072,17 @@ def trim_clip(
         logging.info("Trimming %s (pass 2/2): %s", basename, " ".join(cmd))
     else:
         audio_stream_count = None
-        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db:
+        if audio_shift_ms_by_track or audio_routing or muted_destinations or gains_db or mono_sources:
             audio_stream_count = probe_audio_stream_count(ffmpeg_path, input_path)
             if not audio_stream_count:
                 logging.warning(
                     "Clip editor: could not determine %s's audio track count -- skipping the "
-                    "requested audio sync shift/routing/mute/gain.", basename,
+                    "requested audio sync shift/routing/mute/gain/mono.", basename,
                 )
         cmd = build_trim_command(
             ffmpeg_path, input_path, start_seconds, end_seconds, output_path, precise, crf, scale_height,
             audio_shift_ms_by_track, audio_stream_count, audio_routing, muted_destinations, gains_db,
+            mono_sources,
         )
         phase_text = "Encoding clip"
         logging.info("Trimming %s: %s", basename, " ".join(cmd))
@@ -4342,7 +5180,15 @@ def rename_with_game_prefix(
             target_dir = directory
 
     new_path = os.path.join(target_dir, new_name)
-    retries, delay = 5, 1
+    # Confirmed live (3 separate real sessions, all ending in the game crashing or being force-
+    # quit): OBS can still hold its own handle on output_path for well over 5 seconds after
+    # stop_record() has already returned -- WinError 32 ("used by another process") on every one
+    # of the old 5 retries (5s total), leaving the recording permanently unrenamed since nothing
+    # ever retries this later. A crashed/force-quit game seems to make OBS's own finalization
+    # (flushing the container's trailing index/chapter data) noticeably slower than a clean exit,
+    # though the exact worst case isn't known -- retries bumped to a much more generous budget
+    # instead of a value only proven to just barely not be enough.
+    retries, delay = 20, 1.5
     for attempt in range(1, retries + 1):
         try:
             os.rename(output_path, new_path)
@@ -4391,6 +5237,7 @@ def stop_recording(client, icon, game_display_name=None, recording_state=None, c
             notify(
                 icon, notifications_config, "Short clip deleted",
                 f"Recording of {game_display_name or 'game'} was under {minimum_seconds}s; deleted.",
+                after_game_exit=True,
             )
             return False
 
@@ -4401,6 +5248,9 @@ def stop_recording(client, icon, game_display_name=None, recording_state=None, c
     new_path = rename_with_game_prefix(output_path, game_display_name, split_part, silent, subfolders_enabled)
     if recording_state is not None and new_path:
         recording_state.setdefault("segment_files", []).append(new_path)
+        write_recording_markers(
+            new_path, recording_state.get("markers"), config.get("clip_editor", {}).get("markers_folder"),
+        )
 
     maybe_transcode(new_path, config.get("post_record_transcode", {}), icon, notifications_config)
     maybe_apply_audio_sync_shift(new_path, config.get("audio_sync_shift", {}), icon, notifications_config)
@@ -4413,7 +5263,7 @@ def set_status(icon, status, text):
     icon.icon = build_tray_image(current_color(status))
 
 
-ACTIVE_SESSION_MARKER_PATH = os.path.join(SCRIPT_DIR, ".active_recording_session.json")
+ACTIVE_SESSION_MARKER_PATH = os.path.join(DATA_DIR, ".active_recording_session.json")
 
 
 def write_active_session_marker(display_name):
@@ -4438,6 +5288,55 @@ def clear_active_session_marker():
         logging.exception("Could not clear active-recording marker.")
 
 
+def marker_sidecar_path(recording_path, markers_folder=None):
+    """Where a recording's markers file lives: in markers_folder (clip_editor.markers_folder) if
+    one is configured, otherwise right next to the recording."""
+    if markers_folder:
+        return os.path.join(markers_folder, os.path.basename(recording_path) + ".markers.json")
+    return recording_path + ".markers.json"
+
+
+def write_recording_markers(recording_path, markers, markers_folder=None):
+    """Persists the "Add Marker" keybind's timestamps (collected in recording_state["markers"]
+    over the course of one recording) to a small sidecar file -- see marker_sidecar_path -- so
+    the clip editor can show them regardless of recording format; this app no longer relies on
+    OBS's own CreateRecordChapter/Hybrid-MP4-only chapter mechanism for this at all (see
+    add_recording_marker). A no-op when there are no markers, so a recording nobody marked up
+    doesn't grow a stray sidecar file."""
+    if not recording_path or not markers:
+        return
+    path = marker_sidecar_path(recording_path, markers_folder)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"markers": markers}, f)
+    except Exception:
+        logging.exception("Could not write marker sidecar for %s.", recording_path)
+
+
+def read_recording_markers(recording_path, markers_folder=None):
+    """Returns the sorted marker timestamps (seconds) written by write_recording_markers for
+    recording_path, or None if there's no sidecar file at all -- lets the clip editor fall back
+    to reading a legacy recording's own embedded Hybrid MP4 chapters instead (see
+    refresh_markers), rather than treating "no sidecar" the same as "confirmed zero markers".
+    Checks markers_folder first, then next to the recording, so markers saved before the folder
+    setting was changed still show up."""
+    candidates = [marker_sidecar_path(recording_path, markers_folder)]
+    if markers_folder:
+        candidates.append(marker_sidecar_path(recording_path))
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        try:
+            return sorted(float(m) for m in data.get("markers", []))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def read_active_session_marker():
     try:
         with open(ACTIVE_SESSION_MARKER_PATH, "r", encoding="utf-8") as f:
@@ -4457,6 +5356,7 @@ def reset_recording_state(recording_state):
     recording_state["heard_any_audio"] = False
     recording_state["last_audio_peak_time"] = None
     recording_state["silent_warning_sent"] = False
+    recording_state["markers"] = []
 
 
 def watcher_loop(icon, status, audio_state, recording_state, runtime_state, stop_event):
@@ -4481,6 +5381,26 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     watched_windows = config.get("watched_windows", [])
     poll_interval = config.get("poll_interval_seconds", 1.5)
     obs_config = config["obs"]
+    # Self-heals a config.json carried over from another OS, the same way launch_obs's own
+    # fallback does for obs.path -- confirmed live (a real config with "obs64.exe" opened on
+    # macOS): is_obs_running/kill_process_by_name/get_process_memory_bytes all key off this exact
+    # string, so a Windows-only process_name here means this app can never recognize an OBS it
+    # (or the user) already launched. Left uncaught, that's not just cosmetic: every poll tick
+    # sees OBS as "not running" and calls launch_obs again, piling up a fresh duplicate OBS
+    # process every cycle instead of reusing the one already there. Fixed once, up front (rather
+    # than only inside launch_obs) so every check below sees the corrected name from the very
+    # first iteration, not just after the first launch.
+    resolved_obs_path = platform_common.find_obs_executable(configured_path=obs_config.get("path"))
+    if resolved_obs_path:
+        expected_process_name = os.path.basename(resolved_obs_path)
+        if obs_config.get("process_name", "").lower() != expected_process_name.lower():
+            logging.warning(
+                "Configured OBS process name %r doesn't match this OS's OBS (%r); using %r "
+                "instead. Update it in Settings to stop seeing this.",
+                obs_config.get("process_name"), expected_process_name, expected_process_name,
+            )
+            obs_config["process_name"] = expected_process_name
+        obs_config["path"] = resolved_obs_path
     steam_config = config.get("steam", {})
     xbox_config = config.get("xbox", {})
     battlenet_config = config.get("battlenet", {})
@@ -4503,11 +5423,31 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     notifications_config = config.get("notifications", {})
 
     logging.info("Watching for processes: %s", ", ".join(sorted(watched_games)))
+    if sys.platform == "darwin" and config.get("obs", {}).get("game_audio_capture", {}).get("enabled"):
+        logging.info(
+            "Wine & Java game audio: %s.",
+            "ready" if platform_common.process_audio_tap_available()
+            else "not set up (Settings > OBS > Set Up Wine & Java Game Audio...)",
+        )
     if watched_windows:
         logging.info(
             "Watching for window titles: %s",
             ", ".join(f"{w['process_name']} containing '{w['title_contains']}'" for w in watched_windows),
         )
+        if not platform_common.screen_recording_permission_granted():
+            # macOS hides other apps' window titles without it, so these rules would silently
+            # never match (confirmed live: 0 of 28 titles readable).
+            logging.warning(
+                "Window-title rules need Screen Recording permission for OBS Auto Recorder, which "
+                "it doesn't have -- asking now. Allow it in System Settings > Privacy & Security > "
+                "Screen & System Audio Recording, then restart the app."
+            )
+            platform_common.request_screen_recording_permission()
+            notify(
+                icon, notifications_config, "Screen Recording permission needed",
+                "To detect games by window title (e.g. GeForce NOW), allow OBS Auto Recorder in "
+                "Privacy & Security > Screen & System Audio Recording, then restart the app.",
+            )
     set_status(icon, status, "Watching")
 
     obs_client = None
@@ -4516,9 +5456,21 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
     active_pid = None
     active_display_name = None
     active_replay_buffer_only = False
+    # Set only when the active session was detected via a watched_windows rule (e.g. GeForce
+    # NOW) -- see the "is this session still active" check below for why that needs to also
+    # re-verify the title match on every tick, unlike a normal watched-process session.
+    active_window_entry = None
     obs_recovery_state = {"last_attempt": 0, "last_start_failure": 0}
     obs_running_last_known = None
     audio_overlay_launch_state = {"last_attempt": 0}
+    frozen_capture_state = {"last_hash": None, "unchanged_since": None, "last_check": 0.0}
+    obs_close_pending_since = None  # set when a session ends; see close_obs_between_sessions
+    app_captures_running = set()  # see point_newly_running_app_captures
+    game_audio_tap = None  # see start_game_audio_tap_if_needed
+    app_capture_retry_state = {}  # see point_newly_running_app_captures
+    # Game Audio was pointed at a game macOS didn't list as capturable yet (no window): retried
+    # every CAPTURE_RETRY_SECONDS -- see set_game_audio_capture_target.
+    game_audio_retry = {"waiting": False, "last_attempt": 0.0}
 
     # A recording this app started can be left running with nothing tracking it if the
     # previous instance was force-killed, crashed, or otherwise never reached the normal
@@ -4564,6 +5516,22 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
         enforce_storage_budget(storage_config, obs_config, recording_state, icon, notifications_config)
 
         if active_name is None:
+            if obs_close_pending_since is not None:
+                if (
+                    not obs_client
+                    or obs_config.get("keep_running_between_sessions", False)
+                    or time.time() - obs_close_pending_since > OBS_IDLE_CLOSE_WINDOW_SECONDS
+                ):
+                    obs_close_pending_since = None
+                elif close_obs_between_sessions(obs_client, audio_state.get("enabled"), obs_config["process_name"]):
+                    obs_close_pending_since = None
+                    if obs_event_client:
+                        try:
+                            obs_event_client.disconnect()
+                        except Exception:
+                            pass
+                    obs_client, obs_event_client = None, None
+                    runtime_state["obs_client"] = None
             # The recording-driven obs_event_client (established below once a watched game is
             # detected) also feeds the audio-mixer overlay, but while idle nothing has
             # established a connection yet -- without this, the overlay would show "No active
@@ -4653,7 +5621,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                     processes = get_running_processes()
                     set_status(icon, status, "Watching")
 
-            name, exe, pid, display_override = find_target_process(
+            name, exe, pid, display_override, window_entry = find_target_process(
                 watched_games, root_common_dirs, root_exclude_keywords, manifest_games, watched_windows, processes
             )
             if name:
@@ -4708,8 +5676,20 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                 )
                 if session_started:
                     active_name, active_pid = name, pid
+                    # Freeze detection measures "unchanged for N seconds" within this session --
+                    # left over from a previous one, a first screenshot matching that session's
+                    # last frame read as frozen since then (confirmed live: fired 2s into a
+                    # recording, claiming no change for over 180s).
+                    frozen_capture_state.update(last_hash=None, unchanged_since=None, last_check=0.0)
+                    # sync_multi_track_audio (in ensure_obs_ready) just pointed everything running
+                    # now; any whose app has no window yet are pointed again from the loop below.
+                    app_captures_running = captured_app_captures(
+                        obs_client, obs_config.get("multi_track_audio", {}), processes,
+                    )
+                    app_capture_retry_state = {}
                     active_display_name = display_name
                     active_replay_buffer_only = replay_buffer_only
+                    active_window_entry = window_entry
                     recording_state["display_name"] = active_display_name
                     # "recording" here specifically means a continuous file is being written --
                     # replay-buffer-only mode never does that, so it's left False (avoids e.g. the
@@ -4725,11 +5705,20 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                         if replay_buffer_mode == "with_recording":
                             start_replay_buffer(obs_client)
                     if game_audio_config.get("enabled"):
-                        set_game_audio_capture_target(obs_client, game_audio_config["input_name"], name)
+                        pointed = set_game_audio_capture_target(obs_client, game_audio_config["input_name"], name)
+                        game_audio_retry.update(waiting=pointed is False, last_attempt=time.time())
+                        if pointed is False:
+                            logging.info("%s has no window yet, so its audio can't be captured; trying again until it does.", name)
                         apply_process_capture_sync_offset(
                             obs_client, game_audio_config["input_name"],
                             obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS),
                         )
+                        # Routing already ran in ensure_obs_ready, before the game was known -- a
+                        # Game Audio input created just now would otherwise keep OBS's default of
+                        # every track for this whole recording (confirmed live), bleeding game
+                        # audio into the Discord/Spotify/browser tracks.
+                        reapply_multi_track_routing(obs_client, obs_config.get("multi_track_audio", {}))
+                        game_audio_tap = start_game_audio_tap_if_needed(game_audio_config, name, pid)
                 else:
                     obs_recovery_state["last_start_failure"] = now
                     logging.error("Could not get OBS ready to record; will keep retrying while %s runs.", exe or name)
@@ -4740,8 +5729,27 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
             elif status["text"].startswith("Error"):
                 set_status(icon, status, "Watching")
         else:
-            if not is_process_running(active_pid):
-                logging.info("%s has exited.", active_display_name or active_name)
+            process_exited = not is_process_running(active_pid)
+            # A watched_windows session (e.g. GeForce NOW) can end without its process ever
+            # exiting -- confirmed live: backing out to GeForce NOW's own menu after a game
+            # leaves the GeForceNOW process itself running, only its window's title reverts from
+            # "<game> on GeForce NOW" back to the generic "GeForce NOW". Checking only
+            # is_process_running (as every other detection path correctly can -- Minecraft's own
+            # javaw.exe really does exit when the game closes) would otherwise keep "recording"
+            # straight through menu-browsing after the game ends, until the whole app is quit.
+            window_no_longer_matches = (
+                not process_exited
+                and active_window_entry is not None
+                and not watched_window_still_matches(active_pid, active_window_entry)
+            )
+            if process_exited or window_no_longer_matches:
+                if process_exited:
+                    logging.info("%s has exited.", active_display_name or active_name)
+                else:
+                    logging.info(
+                        "%s's window no longer matches (likely returned to a menu); stopping.",
+                        active_display_name or active_name,
+                    )
                 if obs_client:
                     if active_replay_buffer_only:
                         stop_replay_buffer(obs_client)
@@ -4750,12 +5758,91 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
                             stop_replay_buffer(obs_client)
                         kept = stop_recording(obs_client, icon, active_display_name, recording_state, config)
                         if kept:
-                            notify(icon, notifications_config, "Recording stopped", active_display_name or active_name)
+                            notify(
+                                icon, notifications_config, "Recording stopped", active_display_name or active_name,
+                                after_game_exit=True,
+                            )
                 active_name, active_pid, active_display_name = None, None, None
+                platform_common.stop_process_audio_tap(game_audio_tap)
+                game_audio_tap = None
+                game_audio_retry["waiting"] = False
                 active_replay_buffer_only = False
+                active_window_entry = None
                 reset_recording_state(recording_state)
                 status["recording"] = False
                 set_status(icon, status, "Watching")
+                # Retried from the idle branch below: StopRecord finishes asynchronously, so
+                # right here OBS still reports the recording as active (confirmed live).
+                obs_close_pending_since = time.time()
+            elif obs_client:
+                offset_ms = obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS)
+                if not active_replay_buffer_only:
+                    app_captures_running = point_newly_running_app_captures(
+                        obs_client, obs_config.get("multi_track_audio", {}), app_captures_running, processes,
+                        offset_ms, app_capture_retry_state,
+                    )
+                if game_audio_retry["waiting"] and time.time() - game_audio_retry["last_attempt"] >= CAPTURE_RETRY_SECONDS:
+                    pointed = set_game_audio_capture_target(obs_client, game_audio_config["input_name"], active_name)
+                    apply_process_capture_sync_offset(obs_client, game_audio_config["input_name"], offset_ms)
+                    game_audio_retry.update(waiting=pointed is False, last_attempt=time.time())
+                now = time.time()
+                if now - frozen_capture_state["last_check"] >= FROZEN_CAPTURE_CHECK_INTERVAL_SECONDS:
+                    frozen_capture_state["last_check"] = now
+                    try:
+                        scene_name = obs_client.get_scene_list().current_program_scene_name
+                    except Exception:
+                        scene_name = None
+                    current_hash = get_scene_screenshot_hash(obs_client, scene_name) if scene_name else None
+                    if current_hash is None:
+                        pass  # Couldn't screenshot this round -- a transient hiccup, not "frozen".
+                    elif current_hash != frozen_capture_state["last_hash"]:
+                        frozen_capture_state["last_hash"] = current_hash
+                        frozen_capture_state["unchanged_since"] = now
+                    elif frozen_capture_state["unchanged_since"] is not None:
+                        threshold = get_obs_frozen_capture_threshold_seconds(obs_config)
+                        unchanged_for = now - frozen_capture_state["unchanged_since"]
+                        if (
+                            unchanged_for >= threshold
+                            and now - obs_recovery_state["last_attempt"] >= get_obs_recovery_cooldown_seconds(obs_config)
+                        ):
+                            obs_recovery_state["last_attempt"] = now
+                            logging.warning(
+                                "OBS's captured output hasn't changed in over %d seconds while "
+                                "recording %s -- its screen capture appears frozen (confirmed live: "
+                                "macOS's ScreenCaptureKit-backed Display Capture can get stuck "
+                                "serving a single stale frame indefinitely, surviving a sleep/wake "
+                                "cycle with no other symptom). Restarting OBS and resuming the "
+                                "recording.", threshold, active_display_name or active_name,
+                            )
+                            status["text"] = "Error - OBS capture frozen, restarting"
+                            icon.title = "OBS Auto Recorder - Error, capture frozen, restarting OBS"
+                            icon.icon = build_tray_image(ERROR_COLOR)
+                            notify(
+                                icon, notifications_config, "OBS capture frozen",
+                                f"OBS's screen capture appeared frozen for over {threshold}s -- "
+                                f"restarting OBS. The last few minutes of "
+                                f"{active_display_name or active_name} may be unusable.",
+                            )
+                            if active_replay_buffer_only:
+                                stop_replay_buffer(obs_client)
+                            else:
+                                if get_replay_buffer_mode(replay_buffer_config) == "with_recording":
+                                    stop_replay_buffer(obs_client)
+                                stop_recording(obs_client, icon, active_display_name, recording_state, config)
+                            kill_process_by_name(obs_config["process_name"])
+                            launch_obs(obs_config)
+                            processes = get_running_processes()
+                            obs_client = None
+                            active_name, active_pid, active_display_name = None, None, None
+                            platform_common.stop_process_audio_tap(game_audio_tap)
+                            game_audio_tap = None
+                            game_audio_retry["waiting"] = False
+                            active_replay_buffer_only = False
+                            active_window_entry = None
+                            reset_recording_state(recording_state)
+                            status["recording"] = False
+                            frozen_capture_state["last_hash"] = None
+                            frozen_capture_state["unchanged_since"] = None
 
         stop_event.wait(poll_interval)
 
@@ -4767,6 +5854,7 @@ def _watcher_loop_impl(icon, status, audio_state, recording_state, runtime_state
             if get_replay_buffer_mode(replay_buffer_config) == "with_recording":
                 stop_replay_buffer(obs_client)
             stop_recording(obs_client, icon, active_display_name, recording_state, config)
+    platform_common.stop_process_audio_tap(game_audio_tap)
 
 
 OVERLAY_SIZE = 26
@@ -4949,6 +6037,9 @@ def _run_overlay_impl(monitors, overlay_state, audio_state, status, stop_event, 
             root.destroy()
             return
         try:
+            tray_menu_request = overlay_state.pop("tray_menu_request", None)
+            if tray_menu_request:
+                show_macos_tray_menu(root, *tray_menu_request)
             poll_dot()
             poll_meters()
         except Exception:
@@ -4978,6 +6069,96 @@ DARK_BG = "#2b2b2b"
 DARK_FG = "#e6e6e6"
 DARK_ENTRY_BG = "#3c3c3c"
 DARK_MUTED_FG = "#888888"
+DARK_BUTTON_HOVER_BG = "#4a4a4a"
+
+
+def dark_button(parent, **kwargs):
+    """A button for the dark-themed windows. On macOS that's a ClickableLabel: Tk draws native
+    buttons there, which ignore bg and always draw a light gray bezel, so DARK_FG text on them
+    was nearly unreadable (confirmed live). Elsewhere a plain tk.Button takes the colors."""
+    kwargs.setdefault("bg", DARK_ENTRY_BG)
+    kwargs.setdefault("fg", DARK_FG)
+    kwargs.setdefault("activebackground", DARK_BUTTON_HOVER_BG if sys.platform == "darwin" else DARK_ENTRY_BG)
+    kwargs.setdefault("activeforeground", DARK_FG)
+    button_cls = ClickableLabel if sys.platform == "darwin" else tk.Button
+    return button_cls(parent, **kwargs)
+
+
+class ClickableLabel(tk.Label):
+    """A tk.Button substitute for the dark-themed editors, macOS only.
+
+    Confirmed live via screenshot: classic tk.Button ignores bg/activebackground on macOS's Aqua
+    theme -- it always draws the native button chrome (a light rounded rect) instead, regardless
+    of what's passed in. Against this app's dark custom theme that makes every button render as a
+    barely-legible light native button, with icon/text colors that don't reliably match either
+    (the clip editor's play/stop glyphs came out nearly invisible, a light gray shape on a light
+    background). Windows' classic tk.Button isn't native-chrome-constrained this way and already
+    renders bg/fg correctly there -- this class only replaces tk.Button on macOS (see dark_button
+    below), Windows/Linux keep the plain tk.Button they already had.
+
+    tk.Label doesn't have this problem (it's not drawn as native chrome at all) -- already the
+    mechanism this app's own custom tray-menu popup uses for exactly the same reason (see
+    show_macos_tray_menu's add_row). This reproduces just enough of tk.Button's interface --
+    text/state via .config(), a command callback, hover and pressed feedback -- to drop in at
+    every existing dark_button/fixed_size_button call site unchanged."""
+
+    def __init__(self, parent, text="", command=None, bg=DARK_ENTRY_BG, fg=DARK_FG,
+                 activebackground=None, activeforeground=None, disabledforeground=DARK_MUTED_FG,
+                 font=None, **kwargs):
+        self._command = command
+        self._normal_bg = bg
+        self._normal_fg = fg
+        self._active_bg = activebackground or bg
+        self._active_fg = activeforeground or fg
+        self._disabled_fg = disabledforeground
+        self._button_state = "normal"
+        super().__init__(
+            parent, text=text, bg=bg, fg=fg, font=font, relief="raised", borderwidth=1,
+            padx=6, pady=2, **kwargs
+        )
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def _on_click(self, _event=None):
+        if self._button_state == "disabled":
+            return
+        tk.Label.config(self, relief="sunken")
+        self.after(80, lambda: tk.Label.config(self, relief="raised"))
+        if self._command:
+            self._command()
+
+    def invoke(self):
+        """Matches tk.Button's own .invoke() -- runs the command directly (no-op while disabled,
+        confirmed against a real tk.Button that this is real Tk behavior, not an assumption)."""
+        if self._button_state != "disabled" and self._command:
+            self._command()
+
+    def _on_enter(self, _event=None):
+        if self._button_state != "disabled":
+            tk.Label.config(self, bg=self._active_bg, fg=self._active_fg)
+
+    def _on_leave(self, _event=None):
+        if self._button_state != "disabled":
+            tk.Label.config(self, bg=self._normal_bg, fg=self._normal_fg)
+
+    def config(self, **kwargs):
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "state" in kwargs:
+            self._button_state = kwargs.pop("state")
+            if self._button_state == "disabled":
+                tk.Label.config(self, fg=self._disabled_fg, bg=self._normal_bg, cursor="arrow")
+            else:
+                tk.Label.config(self, fg=self._normal_fg, bg=self._normal_bg, cursor="")
+        super().config(**kwargs)
+
+    configure = config
+
+    def cget(self, key):
+        if key == "state":
+            return self._button_state
+        return super().cget(key)
 
 
 def make_scrollable_tab(notebook, title):
@@ -5020,6 +6201,86 @@ def add_checkbox(parent, row, label_text, var, columnspan=2):
     ).grid(row=row, column=0, columnspan=columnspan, sticky="w", padx=10, pady=4)
 
 
+PROCESS_TAP_SETUP_EXPLANATION = (
+    "Wine games (like Wizard101) and Java Minecraft can't be captured app-by-app on macOS. To "
+    "record their audio on the Game Audio track too, OBS Auto Recorder installs a small "
+    "\"OBS Auto Recorder Game Audio\" device (macOS asks for your password) and needs permission "
+    "to record system audio (macOS asks once). Without it, their sound is still in desktop audio."
+)
+
+
+def process_tap_setup_status_text():
+    if platform_common.process_audio_tap_available():
+        return "Wine & Java games: set up ✓"
+    if platform_common.game_audio_device_installed():
+        return "Wine & Java games: device installed, helper missing from this copy of the app"
+    return "Wine & Java games: not set up"
+
+
+def set_up_process_tap(parent):
+    """Installs the Game Audio device if needed (password prompt), then asks for System Audio
+    Recording permission. Runs on the calling (Tk) thread's behalf in a worker; returns True if
+    the device ended up installed."""
+    if not platform_common.game_audio_device_installed():
+        if not platform_common.install_game_audio_device():
+            return False
+    platform_common.request_system_audio_recording_permission()
+    return platform_common.game_audio_device_installed()
+
+
+def add_process_tap_setup_row(parent, row, game_audio_enabled_var):
+    """macOS Settings row for recording Wine/Java games' audio (see PROCESS_TAP_INPUT_SUFFIX):
+    status, a setup button, and an offer to set it up when game audio isolation is turned on."""
+    status_label = tk.Label(parent, text=process_tap_setup_status_text(), anchor="w", fg=DARK_FG, bg=DARK_BG)
+    status_label.grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 2))
+    setup_button = dark_button(
+        parent, text="Set Up Wine & Java Game Audio...", bg=DARK_ENTRY_BG, fg=DARK_FG,
+        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
+    )
+    setup_button.grid(row=row + 1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
+    tk.Label(
+        parent, text="    " + PROCESS_TAP_SETUP_EXPLANATION,
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row + 2, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+
+    def run_setup():
+        setup_button.config(state="disabled")
+        status_label.config(text="Setting up... (macOS may ask for your password)")
+
+        def worker():
+            installed = set_up_process_tap(parent)
+
+            def finish():
+                setup_button.config(state="normal")
+                status_label.config(text=process_tap_setup_status_text())
+                if installed:
+                    messagebox.showinfo(
+                        "Wine & Java game audio",
+                        "Set up. If macOS asked to let OBS Auto Recorder record system audio, make sure "
+                        "it's allowed (System Settings > Privacy & Security > Screen & System Audio "
+                        "Recording). Save and restart the app to use it.",
+                        parent=parent,
+                    )
+
+            parent.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    setup_button.config(command=run_setup)
+
+    def offer_setup(*_args):
+        if not game_audio_enabled_var.get() or platform_common.game_audio_device_installed():
+            return
+        if messagebox.askyesno(
+            "Record Wine & Java games' audio too?", PROCESS_TAP_SETUP_EXPLANATION + "\n\nSet it up now?",
+            parent=parent,
+        ):
+            run_setup()
+
+    game_audio_enabled_var.trace_add("write", offer_setup)
+    return row + 3
+
+
 def add_browse_button(parent, row, var, mode="file", filetypes=None):
     filetypes = platform_common.executable_filetypes() if filetypes is None else filetypes
 
@@ -5028,7 +6289,7 @@ def add_browse_button(parent, row, var, mode="file", filetypes=None):
         if path:
             var.set(os.path.normpath(path))
 
-    tk.Button(
+    dark_button(
         parent, text="Browse...", command=browse, bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     ).grid(row=row, column=2, padx=(0, 10), pady=4)
@@ -5097,8 +6358,8 @@ def open_process_picker(parent, on_add, multiselect=True, already_selected=None)
 
     button_bar = tk.Frame(picker)
     button_bar.pack(fill="x", padx=10, pady=10)
-    tk.Button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
-    tk.Button(button_bar, text="Add Selected" if multiselect else "Select", command=add_selected).pack(
+    dark_button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
+    dark_button(button_bar, text="Add Selected" if multiselect else "Select", command=add_selected).pack(
         side="right", padx=8
     )
     listbox.bind("<Double-Button-1>", lambda e: add_selected())
@@ -5134,14 +6395,16 @@ _COMMON_GAMES_WINDOWS = [
     {"name": "Genshin Impact", "process_name": "GenshinImpact.exe"},
 ]
 
-# League of Legends and Roblox both ship real macOS clients; Valorant/Warframe/Apex/Genshin/
-# Wizard101 do not (no native Mac build, and several rely on kernel-level anti-cheat that
-# explicitly excludes macOS). Process names here are best-effort based on each game's typical
-# macOS bundle naming and haven't been confirmed against real hardware yet -- see
-# CROSS_PLATFORM_PLAN.md's open macOS unknowns. If one doesn't match, "Pick Running..." (while
-# the game is open) or typing the exact process name by hand still works.
+# League of Legends and Roblox both ship real macOS clients; Valorant/Warframe/Apex/Genshin do
+# not (no native Mac build, and several rely on kernel-level anti-cheat that excludes macOS).
+# Wizard101's Mac app runs its Windows client through a bundled CrossOver (Wine), which
+# get_running_processes reports under the client's own .exe name, same as on Windows. League's "LeagueofLegends" is confirmed from its
+# real installed bundle (LoL/Game/LeagueofLegends.app's CFBundleExecutable); Minecraft's and
+# Roblox's are still best-effort. If one doesn't match, "Pick Running..." (while the game is open)
+# or typing the exact process name by hand still works.
 _COMMON_GAMES_MACOS = [
     {"name": "League of Legends", "process_name": "LeagueofLegends"},
+    {"name": "Wizard101", "process_name": "WizardGraphicalClient.exe"},
     {"name": "Minecraft: Java Edition", "process_name": "java", "title_contains": "minecraft"},
     {"name": "Roblox", "process_name": "RobloxPlayer"},
 ]
@@ -5222,8 +6485,8 @@ def open_common_games_picker(parent, insert_unique, current_watched_lower, add_w
 
     button_bar = tk.Frame(picker)
     button_bar.pack(fill="x", padx=10, pady=10)
-    tk.Button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
-    tk.Button(button_bar, text="Add Selected", command=add_selected).pack(side="right", padx=8)
+    dark_button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
+    dark_button(button_bar, text="Add Selected", command=add_selected).pack(side="right", padx=8)
     listbox.bind("<Double-Button-1>", lambda e: add_selected())
     filter_entry.bind("<Return>", lambda e: add_selected())
 
@@ -5276,11 +6539,6 @@ def build_watched_games_editor(parent, initial_games, on_pick_common=None):
             already_selected=current_watched_lower,
         )
 
-    def dark_button(parent_, **kwargs):
-        return tk.Button(
-            parent_, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG, **kwargs
-        )
-
     dark_button(controls, text="Add", command=add_game).pack(fill="x")
     dark_button(controls, text="Remove Selected", command=remove_selected).pack(fill="x", pady=(4, 0))
     dark_button(controls, text="Pick Running...", command=pick_from_running).pack(fill="x", pady=(4, 0))
@@ -5292,11 +6550,6 @@ def build_watched_games_editor(parent, initial_games, on_pick_common=None):
 
 
 def build_watched_windows_editor(parent, initial_rows):
-    def dark_button(parent_, **kwargs):
-        return tk.Button(
-            parent_, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG, **kwargs
-        )
-
     tk.Label(
         parent,
         text=(
@@ -5316,7 +6569,7 @@ def build_watched_windows_editor(parent, initial_rows):
     container.pack(fill="x", padx=10)
     rows = []
 
-    def add_row(process="", title="", display=""):
+    def add_row(process="", title="", display="", extra=None):
         row_frame = tk.Frame(container, bg=DARK_BG)
         row_frame.pack(fill="x", pady=2)
         process_var = tk.StringVar(value=process)
@@ -5326,7 +6579,10 @@ def build_watched_windows_editor(parent, initial_rows):
             tk.Entry(
                 row_frame, textvariable=var, width=16, bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG,
             ).pack(side="left", padx=2)
-        entry = {"process": process_var, "title": title_var, "display": display_var}
+        # Options this editor has no column for (e.g. use_title_as_display_name, which names
+        # GeForce NOW recordings after the game) -- kept so saving doesn't silently drop them
+        # (confirmed live: a Settings save lost GeForce NOW's).
+        entry = {"process": process_var, "title": title_var, "display": display_var, "extra": dict(extra or {})}
 
         def pick():
             open_process_picker(
@@ -5343,7 +6599,8 @@ def build_watched_windows_editor(parent, initial_rows):
         rows.append(entry)
 
     for w in initial_rows:
-        add_row(w.get("process_name", ""), w.get("title_contains", ""), w.get("display_name", ""))
+        extra = {k: v for k, v in w.items() if k not in ("process_name", "title_contains", "display_name")}
+        add_row(w.get("process_name", ""), w.get("title_contains", ""), w.get("display_name", ""), extra)
 
     dark_button(parent, text="+ Add Window Rule", command=lambda: add_row()).pack(anchor="w", padx=10, pady=(4, 10))
     return rows, add_row
@@ -5354,9 +6611,16 @@ def build_watched_windows_editor(parent, initial_rows):
 # raw kind strings like "wasapi_input_capture" mean nothing to most users. Anything not listed
 # here just falls back to showing its raw kind string.
 INPUT_KIND_LABELS = {
-    "wasapi_output_capture": "Desktop Audio",
-    "wasapi_input_capture": "Microphone/Aux",
-    "wasapi_process_output_capture": "Application Audio Capture",
+    "wasapi_output_capture": "Desktop Audio",  # Windows
+    "wasapi_input_capture": "Microphone/Aux",  # Windows
+    "wasapi_process_output_capture": "Application Audio Capture",  # Windows
+    # macOS counterparts -- kind names confirmed live via GetInputKindList against a real OBS
+    # instance, see CROSS_PLATFORM_PLAN.md §6.1. Cosmetic only (this map just decides the input
+    # picker's display text); coreaudio_output_capture/coreaudio_input_capture aren't in
+    # AUDIO_TRACK_MANAGED_KINDS above since multi-track routing on macOS hasn't been verified.
+    "coreaudio_output_capture": "Desktop Audio",
+    "coreaudio_input_capture": "Microphone/Aux",
+    "sck_audio_capture": "Application Audio Capture",
     "dshow_input": "Video Capture Device",
     "browser_source": "Browser Source",
     "ffmpeg_source": "Media Source",
@@ -5424,8 +6688,8 @@ def open_obs_input_picker(parent, get_ws_config, on_pick):
 
     button_bar = tk.Frame(picker)
     button_bar.pack(fill="x", padx=10, pady=(0, 10))
-    tk.Button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
-    tk.Button(button_bar, text="Select", command=select).pack(side="right", padx=8)
+    dark_button(button_bar, text="Cancel", command=picker.destroy).pack(side="right")
+    dark_button(button_bar, text="Select", command=select).pack(side="right", padx=8)
     listbox.bind("<Double-Button-1>", lambda e: select())
 
 
@@ -5466,16 +6730,33 @@ def build_custom_keybinds_editor(parent, initial_rows):
             parent_, bg=DARK_BG, activebackground=DARK_BG, selectcolor=DARK_ENTRY_BG, **kwargs
         )
 
+    # Modifier column order/labels/defaults, macOS-specific: macOS has no physical Win key at all
+    # (labeling this checkbox "Win" there is just confusing) and Mac users reach for Cmd as their
+    # everyday modifier the way Windows/Linux users reach for Ctrl -- putting it first (and
+    # defaulting a new row to it) matches that convention instead of showing it last, under a
+    # Windows-centric name, as if it were a rarely-used option. The underlying stored modifier
+    # name stays "win" on every OS -- platform_macos.py's run_custom_keybind_listener already
+    # maps it to Cmd (kCGEventFlagMaskCommand), so this is a display/default change only, nothing
+    # about how a saved config.json is interpreted.
+    if sys.platform == "darwin":
+        MODIFIER_COLUMNS = [("win", "Cmd"), ("ctrl", "Ctrl"), ("alt", "Alt"), ("shift", "Shift")]
+        DEFAULT_KEYBIND_MODIFIERS = ["win", "alt"]
+    else:
+        MODIFIER_COLUMNS = [("ctrl", "Ctrl"), ("alt", "Alt"), ("shift", "Shift"), ("win", "Win")]
+        DEFAULT_KEYBIND_MODIFIERS = ["ctrl", "alt"]
+
     # A grid table (not pack) so header labels and row widgets share real column boundaries --
     # packing a Label(width=N) next to a Checkbutton(width=N) or Combobox(width=N) doesn't
     # actually line them up, since a Checkbutton's width includes its indicator box on top of the
     # same character-width unit, so identical widths still render as different pixel widths.
     table = tk.Frame(parent, bg=DARK_BG)
     table.pack(fill="x", padx=10)
-    for col, text in enumerate(["On", "Action", "Ctrl", "Alt", "Shift", "Win", "Key", ""]):
+    header_columns = ["On", "Action"] + [label for _name, label in MODIFIER_COLUMNS] + ["Key", ""]
+    for col, text in enumerate(header_columns):
         tk.Label(
             table, text=text, anchor="w", font=("Segoe UI", 9, "bold"), bg=DARK_BG, fg=DARK_FG,
         ).grid(row=0, column=col, sticky="w", padx=4, pady=(0, 4))
+    KEY_COLUMN = 2 + len(MODIFIER_COLUMNS)
 
     rows = []
 
@@ -5485,7 +6766,7 @@ def build_custom_keybinds_editor(parent, initial_rows):
                 widget.grid(row=i)
 
     def add_row(enabled=True, action="split_record_file", modifiers=None, key="S"):
-        modifiers = modifiers if modifiers is not None else ["ctrl", "alt"]
+        modifiers = modifiers if modifiers is not None else DEFAULT_KEYBIND_MODIFIERS
         r = len(rows) + 1
 
         enabled_var = tk.BooleanVar(value=enabled)
@@ -5499,31 +6780,27 @@ def build_custom_keybinds_editor(parent, initial_rows):
         )
         action_combo.grid(row=r, column=1, sticky="w", padx=4, pady=1)
 
-        ctrl_var = tk.BooleanVar(value="ctrl" in modifiers)
-        alt_var = tk.BooleanVar(value="alt" in modifiers)
-        shift_var = tk.BooleanVar(value="shift" in modifiers)
-        win_var = tk.BooleanVar(value="win" in modifiers)
-        ctrl_cb = dark_checkbutton(table, variable=ctrl_var)
-        ctrl_cb.grid(row=r, column=2, padx=4, pady=1)
-        alt_cb = dark_checkbutton(table, variable=alt_var)
-        alt_cb.grid(row=r, column=3, padx=4, pady=1)
-        shift_cb = dark_checkbutton(table, variable=shift_var)
-        shift_cb.grid(row=r, column=4, padx=4, pady=1)
-        win_cb = dark_checkbutton(table, variable=win_var)
-        win_cb.grid(row=r, column=5, padx=4, pady=1)
+        modifier_vars = {}
+        modifier_widgets = []
+        for col, (name, _label) in enumerate(MODIFIER_COLUMNS, start=2):
+            var = tk.BooleanVar(value=name in modifiers)
+            cb = dark_checkbutton(table, variable=var)
+            cb.grid(row=r, column=col, padx=4, pady=1)
+            modifier_vars[name] = var
+            modifier_widgets.append(cb)
 
         key_var = tk.StringVar(value=(key or "S").upper())
         key_combo = ttk.Combobox(
             table, textvariable=key_var, values=CUSTOM_KEYBIND_KEY_OPTIONS, state="readonly", width=4,
             style="Settings.TCombobox",
         )
-        key_combo.grid(row=r, column=6, padx=4, pady=1)
+        key_combo.grid(row=r, column=KEY_COLUMN, padx=4, pady=1)
 
-        widgets = [enabled_cb, action_combo, ctrl_cb, alt_cb, shift_cb, win_cb, key_combo]
+        widgets = [enabled_cb, action_combo] + modifier_widgets + [key_combo]
 
         entry = {
             "enabled": enabled_var, "action_label": action_label_var,
-            "ctrl": ctrl_var, "alt": alt_var, "shift": shift_var, "win": win_var,
+            **modifier_vars,
             "key": key_var, "widgets": widgets,
         }
 
@@ -5534,11 +6811,11 @@ def build_custom_keybinds_editor(parent, initial_rows):
             rows.remove(entry)
             renumber()
 
-        remove_btn = tk.Button(
+        remove_btn = dark_button(
             table, text="Remove", command=remove, bg=DARK_ENTRY_BG, fg=DARK_FG,
             activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
         )
-        remove_btn.grid(row=r, column=7, padx=4, pady=1)
+        remove_btn.grid(row=r, column=KEY_COLUMN + 1, padx=4, pady=1)
         widgets.append(remove_btn)
         rows.append(entry)
 
@@ -5548,7 +6825,7 @@ def build_custom_keybinds_editor(parent, initial_rows):
             kb.get("modifiers", []), kb.get("key", "S"),
         )
 
-    tk.Button(
+    dark_button(
         parent, text="+ Add Keybind", command=lambda: add_row(), bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     ).pack(anchor="w", padx=10, pady=(4, 10))
@@ -5559,21 +6836,52 @@ def build_custom_keybinds_editor(parent, initial_rows):
 # scheme the app's own author ended up hand-building: voice chat on one track, music on another,
 # browsers on a third. Not exhaustive -- anything not listed can still be added by hand via
 # "+ Add Track Mapping", this just covers what most people actually run.
+#
+# process_names is keyed by sys.platform ("win32"/"darwin") -- a running process's own name is
+# nothing like portable across OSes (Discord is "Discord.exe" on Windows but plain "Discord" on
+# macOS; Zoom is "zoom.us" on macOS, not "Zoom.exe" at all) -- confirmed for every app actually
+# installed on a real Mac during this port by reading its own .app bundle's CFBundleExecutable
+# directly (Discord/Spotify/Firefox/Apple Music/Safari), not guessed; Chrome/Edge/Slack use
+# their well-documented, stable bundle executable names (not independently installed on that
+# same machine to also confirm against). Deliberately no "linux" key anywhere: per
+# CROSS_PLATFORM_PLAN.md §6.1's confirmed negative finding, Linux has no per-app audio capture
+# kind at all, so a Linux process name here could never actually be used for anything -- see
+# resolve_common_audio_apps.
 COMMON_AUDIO_APPS = [
-    {"name": "Discord", "process_name": "Discord.exe", "category": "Voice Chat"},
-    {"name": "Slack", "process_name": "slack.exe", "category": "Voice Chat"},
-    {"name": "Zoom", "process_name": "Zoom.exe", "category": "Voice Chat"},
-    {"name": "Spotify", "process_name": "Spotify.exe", "category": "Music"},
-    {"name": "Apple Music", "process_name": "AppleMusic.exe", "category": "Music"},
+    {"name": "Discord", "process_names": {"win32": "Discord.exe", "darwin": "Discord"}, "category": "Voice Chat"},
+    {"name": "Slack", "process_names": {"win32": "slack.exe", "darwin": "Slack"}, "category": "Voice Chat"},
+    {"name": "Zoom", "process_names": {"win32": "Zoom.exe", "darwin": "zoom.us"}, "category": "Voice Chat"},
+    {"name": "Spotify", "process_names": {"win32": "Spotify.exe", "darwin": "Spotify"}, "category": "Music"},
+    {"name": "Apple Music", "process_names": {"win32": "AppleMusic.exe", "darwin": "Music"}, "category": "Music"},
     # YouTube Music deliberately excluded: it runs as a browser tab for most people, not a
     # standalone process, so it's already covered by the Browser category -- listing it
     # separately either does nothing (no such process to capture) or double-captures the same
     # audio once a browser is also selected.
-    {"name": "Chrome", "process_name": "chrome.exe", "category": "Browser"},
-    {"name": "Firefox", "process_name": "firefox.exe", "category": "Browser"},
-    {"name": "Edge", "process_name": "msedge.exe", "category": "Browser"},
+    {"name": "Chrome", "process_names": {"win32": "chrome.exe", "darwin": "Google Chrome"}, "category": "Browser"},
+    {"name": "Firefox", "process_names": {"win32": "firefox.exe", "darwin": "firefox"}, "category": "Browser"},
+    {"name": "Edge", "process_names": {"win32": "msedge.exe", "darwin": "Microsoft Edge"}, "category": "Browser"},
+    # Safari has no Windows build at all, so it's macOS-only -- the exact thing
+    # resolve_common_audio_apps's per-OS filtering exists for.
+    {"name": "Safari", "process_names": {"darwin": "Safari"}, "category": "Browser"},
 ]
 QUICK_SETUP_CATEGORY_TRACKS = {"Voice Chat": 4, "Music": 5, "Browser": 6}
+
+
+def resolve_common_audio_apps(platform_name=None):
+    """Filters/resolves COMMON_AUDIO_APPS down to the apps actually offered as quick-setup
+    checkboxes on this OS, each with a flat "process_name" key already resolved for it -- the
+    same shape compute_quick_setup_tracks and every other caller already expect, so they don't
+    need to know process_names is a per-OS dict at all. An app with no entry for this OS (Safari
+    anywhere but macOS, or literally anything on Linux) is left out entirely, rather than offered
+    with a process name that's guaranteed not to match anything real."""
+    platform_name = platform_name or sys.platform
+    resolved = []
+    for app in COMMON_AUDIO_APPS:
+        process_name = app["process_names"].get(platform_name)
+        if not process_name:
+            continue
+        resolved.append({"name": app["name"], "process_name": process_name, "category": app["category"]})
+    return resolved
 
 
 def compute_quick_setup_tracks(client, desktop_name, mic_name, game_audio_name, selected_apps):
@@ -5612,11 +6920,23 @@ def compute_quick_setup_tracks(client, desktop_name, mic_name, game_audio_name, 
     for app in selected_apps:
         name = app["name"]
         if name not in current_inputs:
-            client.create_input(
-                scene, name, "wasapi_process_output_capture",
-                {"window": f"::{app['process_name']}", "priority": 2}, True,
-            )
-            created.append(name)
+            kind, settings = resolve_process_audio_capture(app["process_name"])
+            if kind:
+                # settings is None when the app isn't running yet (macOS can't resolve a bundle
+                # identifier without a live process to read it from) -- created anyway, set to
+                # capture nothing (never the kind's bare defaults: on macOS those capture the
+                # whole desktop mix), so it exists in OBS at all; set_game_audio_capture_target
+                # re-points it for real the next time this app is actually detected running (the
+                # same self-healing re-point obs.game_audio_capture already gets on every recording
+                # start), rather than leaving the user to add the source by hand themselves.
+                fallback = platform_common.process_audio_capture_placeholder_settings() or {}
+                client.create_input(scene, name, kind, settings or fallback, True)
+                created.append(name)
+            else:
+                logging.warning(
+                    "Per-app audio capture has no confirmed OBS source kind on this OS yet; "
+                    "'%s' was not created.", name,
+                )
         tracks.append({"input_name": name, "track": QUICK_SETUP_CATEGORY_TRACKS[app["category"]]})
         app_captures[name] = app["process_name"]
 
@@ -5652,10 +6972,10 @@ def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_ap
         client.disconnect()
 
     desktop_options = ["(none)"] + sorted(
-        (n for n, k in inputs.items() if k == "wasapi_output_capture"), key=str.lower
+        (n for n, k in inputs.items() if k in DESKTOP_AUDIO_CAPTURE_KINDS), key=str.lower
     )
     mic_options = ["(none)"] + sorted(
-        (n for n, k in inputs.items() if k == "wasapi_input_capture"), key=str.lower
+        (n for n, k in inputs.items() if k in MIC_AUDIO_CAPTURE_KINDS), key=str.lower
     )
 
     dialog = tk.Toplevel(parent)
@@ -5707,7 +7027,7 @@ def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_ap
         )
         apps_row = tk.Frame(dialog)
         apps_row.pack(fill="x", padx=10)
-        for app in COMMON_AUDIO_APPS:
+        for app in resolve_common_audio_apps():
             if app["category"] != category:
                 continue
             var = tk.BooleanVar(value=False)
@@ -5752,16 +7072,11 @@ def open_multi_track_quick_setup(parent, get_ws_config, game_audio_config, on_ap
 
     button_bar = tk.Frame(dialog)
     button_bar.pack(fill="x", padx=10, pady=10, side="bottom")
-    tk.Button(button_bar, text="Cancel", command=dialog.destroy).pack(side="right")
-    tk.Button(button_bar, text="Apply", command=do_apply).pack(side="right", padx=8)
+    dark_button(button_bar, text="Cancel", command=dialog.destroy).pack(side="right")
+    dark_button(button_bar, text="Apply", command=do_apply).pack(side="right", padx=8)
 
 
 def build_multi_track_audio_editor(parent, initial_rows, get_ws_config):
-    def dark_button(parent_, **kwargs):
-        return tk.Button(
-            parent_, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG, **kwargs
-        )
-
     tk.Label(
         parent, text="Which input feeds which recording track, in the dedicated profile below", anchor="w",
         bg=DARK_BG, fg=DARK_FG,
@@ -6062,31 +7377,50 @@ def _run_config_editor(master_root, restart_callback, on_close):
     tk.Label(
         obs_tab,
         text=(
-            "    Leave blank to use whatever OBS already has set. mkv/hybrid_mp4 are the "
-            "reliable choices if multi-track audio is on; you can also type in any other format "
-            "code OBS supports."
+            "    Leave blank to use whatever OBS already has set. mkv (or fragmented_mkv) is the "
+            "reliable choice if multi-track audio is on -- confirmed live that hybrid_mp4 only "
+            "ever embeds one audio track no matter how many are configured. You can also type in "
+            "any other format code OBS supports."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+    screen_fit_var = tk.StringVar(
+        value=SCREEN_FIT_LABELS.get(obs_config.get("screen_fit", DEFAULT_SCREEN_FIT), SCREEN_FIT_LABELS[DEFAULT_SCREEN_FIT])
+    )
+    tk.Label(obs_tab, text="Fit screen into recording", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
+        row=row, column=0, sticky="w", padx=(10, 6), pady=4
+    )
+    ttk.Combobox(
+        obs_tab, textvariable=screen_fit_var, values=list(SCREEN_FIT_LABELS.values()),
+        state="readonly", width=40, style="Settings.TCombobox",
+    ).grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+    tk.Label(
+        obs_tab,
+        text=(
+            "    How a full-screen capture is laid out in the recording. Matching the screen's "
+            "shape avoids black bars and cut-off edges; on a MacBook with a notch, the black strip "
+            "beside the notch is cropped off either way."
         ),
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
     row += 1
     configured_resolution = obs_config.get("recording_resolution") or OBS_RESOLUTION_OPTIONS[0]
-    if configured_resolution not in OBS_RESOLUTION_OPTIONS:
-        configured_resolution = OBS_RESOLUTION_OPTIONS[0]
     recording_resolution_var = tk.StringVar(value=configured_resolution)
     tk.Label(obs_tab, text="Recording resolution", anchor="w", bg=DARK_BG, fg=DARK_FG).grid(
         row=row, column=0, sticky="w", padx=(10, 6), pady=4
     )
     ttk.Combobox(
         obs_tab, textvariable=recording_resolution_var, values=OBS_RESOLUTION_OPTIONS,
-        state="readonly", width=24, style="Settings.TCombobox",
+        width=24, style="Settings.TCombobox",
     ).grid(row=row, column=1, sticky="w", pady=4)
     row += 1
     tk.Label(
         obs_tab,
         text=(
-            "    OBS's actual Output (Scaled) Resolution -- this is what a recording is really "
-            "encoded at, independent of the canvas size. A named preset keeps the canvas's own "
-            "aspect ratio."
+            "    What a recording is actually encoded at. A preset keeps the canvas's own shape; "
+            "or type any size, e.g. 2560x1600."
         ),
         anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
     ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
@@ -6163,6 +7497,21 @@ def _run_config_editor(master_root, restart_callback, on_close):
     )
     add_labeled_entry(obs_tab, row, "Restart cooldown (seconds)", recovery_cooldown_var)
     row += 1
+    keep_obs_running_var = tk.BooleanVar(value=obs_config.get("keep_running_between_sessions", False))
+    if sys.platform == "darwin":
+        add_checkbox(obs_tab, row, "Keep OBS open between games", keep_obs_running_var)
+        row += 1
+        tk.Label(
+            obs_tab,
+            text=(
+                "    Off (default): OBS closes when a game ends, so macOS's purple screen-sharing "
+                "button goes away -- but the first ~15 seconds of each game aren't recorded while "
+                "OBS starts. On: recording starts almost immediately, and the purple button stays "
+                "in the menu bar whenever OBS is open."
+            ),
+            anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+        row += 1
 
     game_audio_config = obs_config.get("game_audio_capture", {})
     add_section_label(obs_tab, row, "Game Audio Isolation")
@@ -6173,12 +7522,14 @@ def _run_config_editor(master_root, restart_callback, on_close):
     game_audio_input_var = tk.StringVar(value=game_audio_config.get("input_name", "Game Audio"))
     add_labeled_entry(obs_tab, row, "Input source name", game_audio_input_var)
     row += 1
+    if sys.platform == "darwin":
+        row = add_process_tap_setup_row(obs_tab, row, game_audio_enabled_var)
     process_capture_sync_offset_var = tk.StringVar(
         value=str(obs_config.get("process_audio_capture_sync_offset_ms", DEFAULT_PROCESS_AUDIO_CAPTURE_SYNC_OFFSET_MS))
     )
     add_labeled_entry(obs_tab, row, "Audio capture sync offset (ms)", process_capture_sync_offset_var, width=10)
     row += 1
-    calibrate_button = tk.Button(
+    calibrate_button = dark_button(
         obs_tab, text="Calibrate Audio Sync...", bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     )
@@ -6202,7 +7553,8 @@ def _run_config_editor(master_root, restart_callback, on_close):
     row += 1
 
     def run_calibration_worker(ws_config, target_input):
-        client = connect_obs(ws_config, retries=1, delay=0)
+        task_obs_config = load_config().get("obs", {})
+        client, started_obs = connect_obs_for_task(task_obs_config, ws_config)
 
         def finish(result_ms, error_message):
             calibrate_button.config(state="normal", text="Calibrate Audio Sync...")
@@ -6212,7 +7564,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 messagebox.showwarning(
                     "Calibration inconclusive",
                     "Could not confidently measure the sync offset, so the current value was left "
-                    "unchanged. Make sure OBS is idle and ffplay.exe is installed alongside ffmpeg, "
+                    "unchanged. Make sure OBS is idle and ffplay is installed alongside ffmpeg, "
                     "then try again -- check the log for details.",
                     parent=obs_tab,
                 )
@@ -6233,13 +7585,13 @@ def _run_config_editor(master_root, restart_callback, on_close):
             return
         ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
         if not ffmpeg_path:
-            client.disconnect()
+            release_obs_after_task(client, task_obs_config, started_obs)
             obs_tab.after(0, finish, None, "ffmpeg isn't installed -- install it from Settings > Post-Processing first.")
             return
         try:
             result_ms = run_audio_sync_calibration(client, ffmpeg_path, target_input)
         finally:
-            client.disconnect()
+            release_obs_after_task(client, task_obs_config, started_obs)
         obs_tab.after(0, finish, result_ms, None)
 
     def start_calibration():
@@ -6273,17 +7625,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
     def pick_mic_boost_input():
         open_obs_input_picker(obs_tab, get_current_ws_config, on_pick=lambda name: mic_boost_input_var.set(name))
 
-    tk.Button(
-        obs_tab, text="Pick...", command=pick_mic_boost_input, bg=DARK_ENTRY_BG, fg=DARK_FG,
-        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
-    ).grid(row=row, column=2, padx=(0, 10), pady=4)
+    dark_button(obs_tab, text="Pick...", command=pick_mic_boost_input).grid(row=row, column=2, padx=(0, 10), pady=4)
     row += 1
     mic_boost_db_var = tk.StringVar(value=str(mic_boost_config.get("boost_db", 0.0)))
     add_labeled_entry(obs_tab, row, "Boost amount (dB)", mic_boost_db_var, width=10)
-    mic_boost_db_detect_button = tk.Button(
-        obs_tab, text="Auto-Detect...", bg=DARK_ENTRY_BG, fg=DARK_FG,
-        activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
-    )
+    mic_boost_db_detect_button = dark_button(obs_tab, text="Auto-Detect...")
     mic_boost_db_detect_button.grid(row=row, column=2, padx=(0, 10), pady=4)
     row += 1
     tk.Label(
@@ -6514,7 +7860,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             on_quick_setup_apply,
         )
 
-    tk.Button(
+    dark_button(
         obs_tab, text="Quick Setup...", command=open_quick_setup, bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     ).grid(row=row, column=0, sticky="w", padx=10, pady=(0, 6))
@@ -6712,7 +8058,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
                 parent=post_tab,
             )
 
-    tk.Button(
+    dark_button(
         transcode_options_frame, text="Auto-detect ffmpeg", command=detect_ffmpeg, bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
     ).grid(row=opt_row, column=0, sticky="w", padx=10, pady=(0, 6))
@@ -6742,7 +8088,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
         transcode_args_var.set(" ".join(MKV_TO_MP4_PRESERVE_TRACKS_ARGS))
         transcode_output_extension_var.set(MKV_TO_MP4_PRESERVE_TRACKS_EXTENSION)
 
-    tk.Button(
+    dark_button(
         transcode_options_frame, text="Use MKV → MP4 preset (preserve every audio track)",
         command=use_mkv_to_mp4_preset, bg=DARK_ENTRY_BG, fg=DARK_FG,
         activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
@@ -6851,7 +8197,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
         threading.Thread(target=worker, daemon=True).start()
 
     if has_winget():
-        winget_install_button = tk.Button(
+        winget_install_button = dark_button(
             ffmpeg_missing_frame, text="Install ffmpeg via winget", command=install_ffmpeg_via_winget,
             bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
         )
@@ -6880,6 +8226,21 @@ def _run_config_editor(master_root, restart_callback, on_close):
     clip_editor_tab.columnconfigure(1, weight=1)
     clip_editor_config = config.get("clip_editor", {})
     row = 0
+    add_section_label(clip_editor_tab, row, "Markers")
+    row += 1
+    markers_folder_var = tk.StringVar(value=clip_editor_config.get("markers_folder", "") or "")
+    add_labeled_entry(clip_editor_tab, row, "Markers folder (optional)", markers_folder_var)
+    add_browse_button(clip_editor_tab, row, markers_folder_var, mode="dir")
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Where the \"Add Marker\" keybind's markers are saved (one small .markers.json file "
+            "per recording). Leave blank to save them next to each recording."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
     add_section_label(clip_editor_tab, row, "Trimmed Clip Output")
     row += 1
     clip_output_folder_var = tk.StringVar(value=clip_editor_config.get("output_folder", "") or "")
@@ -7073,6 +8434,23 @@ def _run_config_editor(master_root, restart_callback, on_close):
             ).grid(row=row, column=src, padx=1, pady=1)
         row += 1
 
+    default_mono_sources_config = clip_editor_config.get("default_mono_sources") or []
+    default_mono_sources_var = tk.StringVar(value=", ".join(str(t) for t in default_mono_sources_config))
+    add_labeled_entry(clip_editor_tab, row, "Default mono source tracks (comma-separated)", default_mono_sources_var)
+    row += 1
+    tk.Label(
+        clip_editor_tab,
+        text=(
+            "    Pre-checks the Track Routing dialog's own \"Mono\" row for these SOURCE track "
+            "numbers whenever it's opened -- still freely changeable per trim from there. "
+            "Downmixes that source to mono (ffmpeg-side, baked into the exported file, the same "
+            "equal-power average OBS's own \"Downmix Mono\" does) before it's routed anywhere, "
+            "regardless of which output track(s) it ends up in."
+        ),
+        anchor="w", justify="left", wraplength=520, fg=DARK_MUTED_FG, bg=DARK_BG,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+    row += 1
+
     add_section_label(clip_editor_tab, row, "Video Preview (VLC)")
     row += 1
 
@@ -7134,7 +8512,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
         threading.Thread(target=worker, daemon=True).start()
 
     if has_winget():
-        winget_install_vlc_button = tk.Button(
+        winget_install_vlc_button = dark_button(
             vlc_missing_frame, text="Install VLC via winget", command=install_vlc_via_winget,
             bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
         )
@@ -7219,7 +8597,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             title = row_vars["title"].get().strip()
             if not process or not title:
                 continue
-            entry = {"process_name": process, "title_contains": title}
+            entry = {**row_vars.get("extra", {}), "process_name": process, "title_contains": title}
             display = row_vars["display"].get().strip()
             if display:
                 entry["display_name"] = display
@@ -7276,7 +8654,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
         # output = canvas resolution) rather than a "leave OBS's own value untouched" sentinel,
         # unlike recording_format's blank-Entry default. Once Settings has been saved once, this
         # is honored on every subsequent launch, same as every other field in this dialog.
-        obs["recording_resolution"] = recording_resolution_var.get()
+        resolution_value = recording_resolution_var.get().strip()
+        if resolution_value in OBS_RESOLUTION_OPTIONS or re.fullmatch(r"\d+\s*[xX×]\s*\d+", resolution_value):
+            obs["recording_resolution"] = resolution_value
+        else:
+            errors.append("'Recording resolution' must be a preset or a size like 2560x1600")
+        obs["screen_fit"] = SCREEN_FIT_BY_LABEL.get(screen_fit_var.get(), DEFAULT_SCREEN_FIT)
 
         ws = obs.setdefault("websocket", {})
         ws["host"] = ws_host_var.get().strip() or "localhost"
@@ -7335,6 +8718,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             recovery.get("cooldown_seconds", DEFAULT_OBS_RECOVERY_COOLDOWN_SECONDS),
         )
 
+        obs["keep_running_between_sessions"] = keep_obs_running_var.get()
         game_audio = obs.setdefault("game_audio_capture", {})
         game_audio["enabled"] = game_audio_enabled_var.get()
         game_audio["input_name"] = game_audio_input_var.get().strip() or "Game Audio"
@@ -7466,6 +8850,11 @@ def _run_config_editor(master_root, restart_callback, on_close):
             clip_editor["output_folder"] = clip_output_folder_value
         else:
             clip_editor.pop("output_folder", None)
+        markers_folder_value = markers_folder_var.get().strip()
+        if markers_folder_value:
+            clip_editor["markers_folder"] = markers_folder_value
+        else:
+            clip_editor.pop("markers_folder", None)
         clip_editor["output_suffix"] = clip_output_suffix_var.get()
         clip_editor["delete_original_after_trim"] = clip_delete_original_var.get()
         clip_editor["auto_fix_audio_sync"] = clip_auto_fix_sync_var.get()
@@ -7489,6 +8878,21 @@ def _run_config_editor(master_root, restart_callback, on_close):
             clip_editor["default_gains_db"] = default_gains_out
         else:
             clip_editor.pop("default_gains_db", None)
+        default_mono_sources_out = []
+        for text in default_mono_sources_var.get().split(","):
+            text = text.strip()
+            if not text:
+                continue
+            try:
+                track_num = int(text)
+            except ValueError:
+                errors.append(f"'Default mono source tracks': '{text}' must be a whole track number")
+                continue
+            default_mono_sources_out.append(track_num)
+        if default_mono_sources_out:
+            clip_editor["default_mono_sources"] = default_mono_sources_out
+        else:
+            clip_editor.pop("default_mono_sources", None)
         clip_editor["trim_mode"] = CLIP_EDITOR_TRIM_MODE_LABELS_BY_LABEL.get(trim_mode_var.get(), "precise")
         if clip_target_size_var.get().strip():
             target_size_value = read_float(clip_target_size_var, "Default target size", None)
@@ -7511,6 +8915,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
         else:
             clip_editor.pop("vlc_path", None)
 
+        ensure_game_audio_track(new_config)
         return new_config, errors
 
     def do_save(and_restart):
@@ -7540,17 +8945,17 @@ def _run_config_editor(master_root, restart_callback, on_close):
             )
             root.update_idletasks()
             target_input = new_config["obs"]["game_audio_capture"].get("input_name") or "Game Audio"
-            client = connect_obs(get_current_ws_config(), retries=1, delay=0)
+            client, started_obs = connect_obs_for_task(new_config["obs"], get_current_ws_config())
             result_ms = None
             if client:
                 ffmpeg_path = resolve_ffmpeg_path("ffmpeg")
-                if ffmpeg_path:
-                    try:
+                try:
+                    if ffmpeg_path:
                         result_ms = run_audio_sync_calibration(client, ffmpeg_path, target_input)
-                    finally:
-                        client.disconnect()
-                else:
-                    logging.warning("Could not auto-calibrate audio sync offset: ffmpeg isn't installed.")
+                    else:
+                        logging.warning("Could not auto-calibrate audio sync offset: ffmpeg isn't installed.")
+                finally:
+                    release_obs_after_task(client, new_config["obs"], started_obs)
             else:
                 logging.warning("Could not auto-calibrate audio sync offset: OBS is not reachable.")
             if result_ms is not None:
@@ -7567,8 +8972,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             status_label.config(fg="#ef4444", text="")
 
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(new_config, f, indent=4)
+            platform_common.write_private_text(CONFIG_PATH, json.dumps(new_config, indent=4))
         except OSError as exc:
             messagebox.showerror("Save failed", f"Could not write config.json:\n{exc}", parent=root)
             return
@@ -7587,10 +8991,7 @@ def _run_config_editor(master_root, restart_callback, on_close):
             root.destroy()
 
     def dark_settings_button(**kwargs):
-        return tk.Button(
-            button_bar, bg=DARK_ENTRY_BG, fg=DARK_FG, activebackground=DARK_ENTRY_BG, activeforeground=DARK_FG,
-            **kwargs
-        )
+        return dark_button(button_bar, **kwargs)
 
     button_bar = tk.Frame(root, bg=DARK_BG)
     button_bar.pack(fill="x", padx=10, pady=10)
@@ -7600,7 +9001,12 @@ def _run_config_editor(master_root, restart_callback, on_close):
 
 
 CLIP_EDITOR_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".flv", ".ts", ".webm", ".avi"}
-CLIP_EDITOR_MAX_RECENT_RECORDINGS = 30
+# High enough to just be "all of them" for any real recordings folder rather than a real cap --
+# confirmed live that 30 was too low (a real folder with 63 recordings made Previous dead-end
+# into "No older recordings" once the capped list ran out, 33 genuinely older files still sitting
+# right there on disk). Still bounded, not unlimited, so a folder with years of uncleaned
+# recordings can't make this list (and the dropdown built from it) grow without any limit at all.
+CLIP_EDITOR_MAX_RECENT_RECORDINGS = 500
 # First entry means "keep the source file's own extension" -- do_trim() checks for it by identity
 # rather than treating it as a real container, so it must stay first.
 CLIP_EDITOR_OUTPUT_FORMATS = ["Same as source", ".mp4", ".mkv", ".mov", ".avi", ".webm"]
@@ -7638,6 +9044,92 @@ def get_quality_scale_height(quality_choice):
     source" -- None specifically means "no explicit resize," which is what lets build_trim_command
     still choose a lossless stream copy when nothing else forces a re-encode."""
     return CLIP_EDITOR_QUALITY_HEIGHTS.get(quality_choice)
+
+
+OBS_STATE_CACHE_PATH = os.path.join(DATA_DIR, ".obs_state_cache.json")
+
+
+def read_obs_state_cache():
+    try:
+        with open(OBS_STATE_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def update_obs_state_cache(**values):
+    """Remembers things the clip editor needs from OBS -- its recordings folder and each input's
+    kind -- so it still has them while OBS is closed, which on macOS is whenever no game is
+    running (see close_obs_between_sessions; confirmed live: with OBS closed, the editor's
+    recordings dropdown disappeared)."""
+    data = read_obs_state_cache()
+    data.update({k: v for k, v in values.items() if v})
+    try:
+        platform_common.write_private_text(OBS_STATE_CACHE_PATH, json.dumps(data))
+    except Exception:
+        logging.exception("Could not save the OBS state cache.")
+
+
+def remember_obs_state(client):
+    try:
+        folder = client.get_record_directory().record_directory
+    except Exception:
+        folder = None
+    try:
+        kinds = {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
+    except Exception:
+        kinds = None
+    update_obs_state_cache(recording_folder=folder, input_kinds=kinds)
+
+
+def resolve_recent_recordings_folder(obs_config):
+    """Falls back to OBS's own live recording directory when obs.output_folder isn't explicitly
+    configured. output_folder only ever exists as an override for pointing recordings somewhere
+    OTHER than wherever OBS's active profile already records to -- most users never set it at
+    all -- so without this fallback, list_recent_recordings(None) always returns [], and the clip
+    editor's "recent recordings" dropdown never even gets created (see _run_clip_editor) no
+    matter how many real recordings exist. Best-effort: a short, single-attempt connection (the
+    editor's own UI construction would otherwise block for connect_obs's default ~10s retry
+    window if OBS happens to not be reachable right now), returning None on any failure so the
+    dropdown just doesn't appear rather than the whole editor hanging or crashing to open it."""
+    configured = obs_config.get("output_folder")
+    if configured:
+        return configured
+    client = connect_obs(obs_config.get("websocket"), retries=1, delay=0)
+    if client:
+        try:
+            folder = client.get_record_directory().record_directory
+            update_obs_state_cache(recording_folder=folder)
+            return folder
+        except Exception:
+            pass
+        finally:
+            client.disconnect()
+    # OBS closed (between games on macOS) or unreachable: the folder it last reported.
+    return read_obs_state_cache().get("recording_folder")
+
+
+def resolve_input_kinds(obs_config):
+    """Best-effort live {input_name: input_kind} map for every input OBS currently has -- lets
+    compute_reference_track tell a genuine device-output/desktop-audio capture apart from a
+    microphone (see its own docstring and DESKTOP_AUDIO_CAPTURE_KINDS). Same short,
+    single-attempt connection shape as resolve_recent_recordings_folder, for the same reason --
+    this runs synchronously while the clip editor's own UI is being built. Returns {} on any
+    failure (OBS unreachable, etc.); compute_reference_track treats that exactly like "kind
+    unknown" and falls back to its older, kind-blind heuristic rather than refusing to work."""
+    client = connect_obs(obs_config.get("websocket"), retries=1, delay=0)
+    if client:
+        try:
+            kinds = {i["inputName"]: i.get("inputKind", "") for i in client.get_input_list().inputs}
+            update_obs_state_cache(input_kinds=kinds)
+            return kinds
+        except Exception:
+            pass
+        finally:
+            client.disconnect()
+    # OBS closed (between games on macOS) or unreachable: the kinds it last reported.
+    return read_obs_state_cache().get("input_kinds") or {}
 
 
 def list_recent_recordings(folder, limit=CLIP_EDITOR_MAX_RECENT_RECORDINGS):
@@ -7692,8 +9184,20 @@ def open_clip_editor_window(editor_state, config, recording_state, overlay_state
             return
         logging.warning(
             "Clip editor has appeared open for over %d seconds without closing; assuming it's "
-            "stuck and allowing a new attempt.", EDITOR_STUCK_TIMEOUT_SECONDS,
+            "stuck and force-closing it before opening a new one.", EDITOR_STUCK_TIMEOUT_SECONDS,
         )
+        # Confirmed live (a real leak, not hypothetical): abandoning the old instance here instead
+        # of actually closing it left its VLC player running in the background indefinitely --
+        # cleanup() (stop playback, release the VLC instance) was never called, so it kept
+        # retrying a failing CoreAudio call every few minutes for days, and its window/NSView
+        # never went away either. force_close is the same function WM_DELETE_WINDOW/the in-app
+        # Close button already use, stashed by _run_clip_editor precisely for this path.
+        old_force_close = editor_state.get("force_close")
+        if old_force_close:
+            try:
+                old_force_close()
+            except Exception:
+                logging.exception("Could not force-close the stuck clip editor.")
 
     overlay_root = overlay_state.get("root")
     if not overlay_root:
@@ -7706,6 +9210,7 @@ def open_clip_editor_window(editor_state, config, recording_state, overlay_state
 
     def on_close():
         editor_state["open"] = False
+        editor_state["force_close"] = None
         # pystray only rebuilds the native tray menu right after a menu item is clicked (see the
         # matching comment in the watcher loop) -- without this, "Edit Clips..." stays greyed out
         # until some unrelated menu click happens to refresh it, even though the editor is long
@@ -7714,7 +9219,7 @@ def open_clip_editor_window(editor_state, config, recording_state, overlay_state
 
     def build():
         try:
-            _run_clip_editor(overlay_root, config, recording_state, on_close, icon)
+            _run_clip_editor(overlay_root, config, recording_state, on_close, icon, editor_state)
         except Exception:
             logging.exception("Clip editor crashed.")
             on_close()
@@ -7774,7 +9279,7 @@ def _open_vlc_missing_window(master_root, on_close):
         threading.Thread(target=worker, daemon=True).start()
 
     if has_winget():
-        install_button = tk.Button(frame, text="Install VLC via winget", command=install_via_winget)
+        install_button = dark_button(frame, text="Install VLC via winget", command=install_via_winget)
         install_button.pack(anchor="w", pady=(0, 8))
 
     download_link = tk.Label(
@@ -7784,10 +9289,10 @@ def _open_vlc_missing_window(master_root, on_close):
     download_link.pack(anchor="w")
     download_link.bind("<Button-1>", lambda _event: webbrowser.open(VLC_DOWNLOAD_URL))
 
-    tk.Button(root, text="Close", command=root.destroy).pack(anchor="e", padx=16, pady=16)
+    dark_button(root, text="Close", command=root.destroy).pack(anchor="e", padx=16, pady=16)
 
 
-def _run_clip_editor(master_root, config, recording_state, on_close, icon):
+def _run_clip_editor(master_root, config, recording_state, on_close, icon, editor_state):
     clip_editor_config = config.get("clip_editor", {})
     obs_config = config.get("obs", {})
     notifications_config = config.get("notifications", {})
@@ -7890,11 +9395,27 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         cleanup()
         root.destroy()
 
+    # Exposed so open_clip_editor_window's own "stuck" bypass (opening a second editor once the
+    # first has appeared open for over EDITOR_STUCK_TIMEOUT_SECONDS without closing) can actually
+    # tear this instance down first, rather than abandoning it -- confirmed live via the real log
+    # (two separate "Opening the clip editor" sessions days apart, neither followed by a matching
+    # "Clip editor closed.") that the old assume-stuck-and-open-a-new-one behavior leaked this
+    # session's VLC player/instance and its window indefinitely: cleanup() (which stops playback
+    # and releases the VLC instance) was never called, so the leaked player kept running in the
+    # background for days, repeatedly retrying (and failing) a CoreAudio device property
+    # registration every few minutes ("AudioObjectAddPropertyListener failed" in the log).
+    editor_state["force_close"] = close_editor
+
     root.protocol("WM_DELETE_WINDOW", close_editor)
     root.bind("<Destroy>", lambda event: on_close() if event.widget is root else None)
 
+    # ClickableLabel only on macOS -- see its own docstring for why: Windows' plain tk.Button
+    # already renders this editor's dark theme correctly (confirmed by years of real use there),
+    # so it stays completely unchanged rather than risk a needless visual regression.
+    _button_cls = ClickableLabel if sys.platform == "darwin" else tk.Button
+
     def dark_button(parent, **kwargs):
-        return tk.Button(parent, bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG, **kwargs)
+        return _button_cls(parent, bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG, **kwargs)
 
     def fixed_size_button(parent, text, width_px, height_px, command, font=("Segoe UI", 11)):
         # tk.Button's own width/height options are in text-grid units, not pixels, so identical
@@ -7914,13 +9435,13 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         open_row, text="📂", font=("Segoe UI", 11), command=lambda: browse_for_file(),
     ).pack(side="left")
 
-    recent_recordings = list_recent_recordings(config.get("obs", {}).get("output_folder"))
+    recent_recordings = list_recent_recordings(resolve_recent_recordings_folder(config.get("obs", {})))
     recent_var = tk.StringVar()
     if recent_recordings:
         recent_combo = ttk.Combobox(
             open_row, textvariable=recent_var,
             values=[os.path.basename(p) for p in recent_recordings],
-            state="readonly", width=40, style="ClipEditor.TCombobox",
+            state="readonly", width=60, height=20, style="ClipEditor.TCombobox",
         )
         recent_combo.pack(side="left", padx=(8, 0))
 
@@ -7957,6 +9478,21 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         dark_button(
             open_row, text="⏭", font=("Segoe UI", 11), command=lambda: step_recent_recording(1),
         ).pack(side="left", padx=(4, 0))
+
+    def open_export_folder():
+        folder = clip_editor_config.get("output_folder") or os.path.dirname(state["path"] or "") or None
+        if not folder or not os.path.isdir(folder):
+            status_label.config(fg=SEEKER_COLOR, text="Export folder isn't set yet -- configure one in Settings > Clip Editor.")
+            return
+        try:
+            os.startfile(folder)
+        except OSError as exc:
+            logging.error("Could not open clip editor export folder %s: %s", folder, exc)
+            status_label.config(fg=SEEKER_COLOR, text="Could not open the export folder -- see the log for details.")
+
+    dark_button(
+        open_row, text="📤", font=("Segoe UI", 11), command=open_export_folder,
+    ).pack(side="left", padx=(8, 0))
 
     audio_track_var = tk.StringVar()
     audio_track_ids = []
@@ -8486,10 +10022,24 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         draw_waveform_overlay()
 
     def refresh_markers():
-        # OBS chapter markers ("markers" in the app's own terminology) -- only ever present on a
-        # Hybrid MP4 recording; get_full_chapter_descriptions returns None until VLC has finished
-        # parsing the media (mirrors the audio-track-count pattern above), so this is retried from
-        # poll() until it stops being None rather than assumed to succeed on the first call.
+        # Markers ("Add Marker" keybind) are tracked by this app itself now, independently of
+        # OBS's own recording format (see add_recording_marker/write_recording_markers) -- a
+        # sidecar file next to the recording is the primary, authoritative source, read first.
+        sidecar_markers = (
+            read_recording_markers(state["path"], clip_editor_config.get("markers_folder"))
+            if state["path"] else None
+        )
+        if sidecar_markers is not None:
+            state["markers"] = sidecar_markers
+            state["markers_loaded"] = True
+            draw_timeline()
+            return
+
+        # Legacy fallback for a recording made before this app tracked its own markers: OBS's
+        # native chapters only ever existed on a Hybrid MP4 recording; get_full_chapter_descriptions
+        # returns None until VLC has finished parsing the media (mirrors the audio-track-count
+        # pattern above), so this is retried from poll() until it stops being None rather than
+        # assumed to succeed on the first call.
         try:
             descriptions = player.get_full_chapter_descriptions(-1)
         except Exception:
@@ -8883,7 +10433,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     start_var.trace_add("write", lambda *_args: draw_timeline())
     end_var.trace_add("write", lambda *_args: draw_timeline())
 
-    # --- Output format (same line as Resolution) + Close/Trim (same line as Output format) ---
+    # --- Output format (same line as Resolution) ---
     default_format = clip_editor_config.get("default_output_format", CLIP_EDITOR_OUTPUT_FORMATS[0])
     if default_format not in CLIP_EDITOR_OUTPUT_FORMATS:
         default_format = CLIP_EDITOR_OUTPUT_FORMATS[0]
@@ -8894,7 +10444,21 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         style="ClipEditor.TCombobox",
     ).pack(side="left", padx=(6, 0))
 
-    trim_button = dark_button(range_row, text="✂ Trim Clip", command=lambda: do_trim())
+    # A separate row for Trim Clip alone, deliberately not packed into range_row above alongside
+    # Start/End/Resolution/Limit-size/Output-format -- confirmed live that once every one of those
+    # widgets pack(side="left") along one row, their combined natural width (over 1400px) badly
+    # exceeds this window's own minsize(760, ...), and Tk's pack geometry manager doesn't wrap: it
+    # just stops giving room to whichever widgets were packed last once the row's cavity runs out,
+    # silently unmapping them entirely (winfo_ismapped() confirmed 0, not just visually clipped)
+    # rather than shrinking or reflowing them. Trim Clip -- the one button that actually matters --
+    # happened to be exactly what disappeared first, since it was packed last, side="right", into
+    # that same overloaded row. Giving it its own row means it never competes with the wider
+    # controls above for space, so it stays visible at any window width down to the app's own
+    # minsize. Close is fine staying in range_row and being squeezed out under the same
+    # conditions -- the window's own native close control covers that case.
+    actions_row = tk.Frame(root, bg=EDITOR_BG)
+    actions_row.pack(fill="x", padx=10, pady=(0, 4))
+    trim_button = dark_button(actions_row, text="✂ Trim Clip", command=lambda: do_trim())
     trim_button.pack(side="right")
     close_button = dark_button(range_row, text="✕ Close", command=close_editor)
     close_button.pack(side="right", padx=(0, 8))
@@ -8914,7 +10478,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     audio_tracks_row = tk.Frame(root, bg=EDITOR_BG)
     audio_tracks_row.pack(fill="x", padx=10, pady=4)
     fix_sync_tracks = compute_process_capture_tracks(obs_config)
-    fix_sync_reference_track = compute_reference_track(obs_config)
+    fix_sync_reference_track = compute_reference_track(obs_config, input_kinds=resolve_input_kinds(obs_config))
     fix_sync_var = tk.BooleanVar(value=clip_editor_config.get("auto_fix_audio_sync", False))
     fix_sync_checkbox = tk.Checkbutton(
         audio_tracks_row, text="Fix audio track sync", variable=fix_sync_var,
@@ -8930,8 +10494,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         ).pack(side="left")
     else:
         fix_sync_checkbox.config(state="disabled")
+        reason = (
+            "needs a desktop audio track in Multi-Track Audio" if fix_sync_tracks
+            else "not configured in Settings"
+        )
         tk.Label(
-            audio_tracks_row, text="  (not configured in Settings)", bg=EDITOR_BG, fg=MUTED_TEXT_COLOR,
+            audio_tracks_row, text=f"  ({reason})", bg=EDITOR_BG, fg=MUTED_TEXT_COLOR,
         ).pack(side="left")
 
     # --- Track Routing: consolidate multiple source tracks into fewer output tracks (e.g. mix
@@ -8973,6 +10541,13 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 for src in range(1, track_count + 1)
             }
             for dest in range(1, track_count + 1)
+        }
+        # Pre-fills from Settings > Clip Editor > "Default mono source tracks" -- a flat list of
+        # SOURCE track numbers, unlike gain_vars above, since being mono isn't a per-destination
+        # property (see build_audio_routing_filter_args' own mono_sources docstring).
+        default_mono_sources = set(clip_editor_config.get("default_mono_sources") or [])
+        routing_state["mono_vars"] = {
+            src: tk.BooleanVar(value=(src in default_mono_sources)) for src in range(1, track_count + 1)
         }
         track_routing_button.config(state="normal" if track_count else "disabled")
 
@@ -9040,8 +10615,24 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             row=header_row, column=n + 1, padx=(14, 10)
         )
 
+        mono_row = header_row + 1
+        tk.Label(dialog, text="Mono:", bg=EDITOR_BG, fg=EDITOR_FG, anchor="w").grid(
+            row=mono_row, column=0, sticky="w", padx=(10, 4), pady=(2, 8)
+        )
+        for src in range(1, n + 1):
+            # Downmixes this SOURCE to mono (ffmpeg-side, baked into the exported file) before
+            # it's routed/mixed below -- a property of the source itself, not any one
+            # destination, so it's its own row rather than living inside each dest/src cell the
+            # way gain does.
+            tk.Checkbutton(
+                dialog, variable=routing_state["mono_vars"][src],
+                indicatoron=False, width=2, height=1,
+                bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG,
+                selectcolor=START_MARKER_COLOR,
+            ).grid(row=mono_row, column=src, pady=(2, 8), padx=1)
+
         for dest in range(1, n + 1):
-            row = header_row + dest
+            row = mono_row + dest
             tk.Label(dialog, text=f"Output {dest}:", bg=EDITOR_BG, fg=EDITOR_FG, anchor="w").grid(
                 row=row, column=0, sticky="w", padx=(10, 4), pady=2
             )
@@ -9076,9 +10667,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 indicatoron=False, width=2, height=1,
                 bg=ENTRY_BG, fg=EDITOR_FG, activebackground=ENTRY_BG, activeforeground=EDITOR_FG,
                 selectcolor=END_MARKER_COLOR,
-            ).grid(row=row, column=n + 1, padx=(14, 10), pady=2)
+            # sticky="n" lines it up with the source toggles, which sit at the top of their
+            # (taller) toggle-over-gain-entry cells -- left centered, it floats between the two.
+            ).grid(row=row, column=n + 1, sticky="n", padx=(14, 10), pady=2)
 
         default_gains = clip_editor_config.get("default_gains_db") or {}
+        default_mono_sources = set(clip_editor_config.get("default_mono_sources") or [])
 
         def reset_to_defaults():
             for dest in range(1, n + 1):
@@ -9088,8 +10682,10 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                         str(default_gains.get(str(dest), {}).get(str(src)) or "")
                     )
                 routing_state["mute_vars"][dest].set(False)
+            for src in range(1, n + 1):
+                routing_state["mono_vars"][src].set(src in default_mono_sources)
 
-        button_row = header_row + n + 1
+        button_row = mono_row + n + 1
         dark_button(dialog, text="Reset to defaults", command=reset_to_defaults).grid(
             row=button_row, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 10)
         )
@@ -9137,33 +10733,9 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
             )
             return
         release_file_lock()
-        player.stop()
-        media = instance.media_new(path)
-        for option in CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS.get(preview_quality_var.get(), []):
-            media.add_option(option)
-        player.set_media(media)
-        player.audio_set_volume(volume_var.get())
-        player.play()
-        reclaim_focus_after_play()
-        acquire_file_lock(path)
 
-        # Pausing immediately after play() races VLC's own async open/buffer state -- called
-        # this early, pause() is liable to be silently dropped, leaving the clip playing all the
-        # way through instead of stopping on its first frame like a freshly-opened file should.
-        # Poll (on the Tk thread, not a VLC event callback, so there's nothing here that needs to
-        # worry about calling back into Tkinter from a non-Tk thread) until playback has actually
-        # started, then pause; gives up after ~5s so a genuinely broken file doesn't poll forever.
-        def pause_once_playing(attempts=0):
-            if not root.winfo_exists():
-                return
-            if player.get_state() == vlc_module.State.Playing:
-                player.pause()
-                update_play_pause_icon()
-            elif attempts < 50:
-                root.after(100, lambda: pause_once_playing(attempts + 1))
-
-        root.after(50, pause_once_playing)
-
+        # Instant feedback that a new file is loading, before any of VLC's own (potentially slow)
+        # work below even starts.
         state["path"] = path
         state["duration"] = 0.0
         state["tracks_loaded"] = False
@@ -9180,8 +10752,61 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         waveform_state["generation"] += 1
         show_waveform_placeholder("Loading waveform...")
         root.title(f"OBS Auto Recorder - Clip Editor - {os.path.basename(path)}")
-        logging.info("Clip editor: opened %s", os.path.basename(path))
         rebuild_routing_state(0)
+
+        # player.stop()/set_media() can genuinely block for several seconds on a long or
+        # complex recording -- confirmed live: picking a new video while one was already loaded
+        # froze the whole window long enough for Windows to kill the app as unresponsive. VLC's
+        # own teardown/open work happens off the Tk thread from here down so the window stays
+        # responsive regardless of how long it takes; load_generation guards against an earlier,
+        # still-in-flight load finishing after a newer one and clobbering it. Tk variables are
+        # read here, on the Tk thread, before handing off to the worker -- they aren't safe to
+        # read from a background thread.
+        media_options = list(CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS.get(preview_quality_var.get(), []))
+        volume = volume_var.get()
+        state["load_generation"] = state.get("load_generation", 0) + 1
+        this_load_generation = state["load_generation"]
+
+        def open_media_worker():
+            player.stop()
+            media = instance.media_new(path)
+            if getattr(player, "oar_audio_only", False):
+                media.add_option(":no-video")  # see platform_macos.embed_video_player
+            for option in media_options:
+                media.add_option(option)
+            player.set_media(media)
+            player.audio_set_volume(volume)
+            player.play()
+
+            def finish():
+                if state.get("load_generation") != this_load_generation or not root.winfo_exists():
+                    return
+                reclaim_focus_after_play()
+                acquire_file_lock(path)
+
+                # Pausing immediately after play() races VLC's own async open/buffer state --
+                # called this early, pause() is liable to be silently dropped, leaving the clip
+                # playing all the way through instead of stopping on its first frame like a
+                # freshly-opened file should. Poll until playback has actually started, then
+                # pause; gives up after ~5s so a genuinely broken file doesn't poll forever.
+                def pause_once_playing(attempts=0):
+                    if not root.winfo_exists() or state.get("load_generation") != this_load_generation:
+                        return
+                    if player.get_state() == vlc_module.State.Playing:
+                        player.pause()
+                        update_play_pause_icon()
+                    elif attempts < 50:
+                        root.after(100, lambda: pause_once_playing(attempts + 1))
+
+                root.after(50, pause_once_playing)
+                logging.info("Clip editor: opened %s", os.path.basename(path))
+
+            try:
+                root.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=open_media_worker, daemon=True).start()
         threading.Thread(target=probe_track_count_for_routing, args=(path,), daemon=True).start()
 
     def toggle_play_pause():
@@ -9225,6 +10850,12 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
         # after that fix had supposedly shipped. Excluding it explicitly (not just omitting it
         # from the tuple) is what actually works.
         widget = root.focus_get()
+        # macOS's key hook can only tell that this app is in front, not which of its windows
+        # (see platform_macos.run_clip_editor_space_bar_listener) -- so space also toggled
+        # playback while typing in Settings. Tk does know which of its windows has focus.
+        if widget is not None and widget.winfo_toplevel() is not root:
+            logging.info("Clip editor: space bar ignored -- another window of this app has focus.")
+            return
         if isinstance(widget, (tk.Entry, ttk.Entry)) and not isinstance(widget, ttk.Combobox):
             logging.info("Clip editor: space bar ignored -- %r currently has focus.", widget)
             return
@@ -9407,6 +11038,11 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 return
             if gains:
                 gains_db = gains
+        mono_sources = None
+        if n:
+            mono = {src for src, var in routing_state["mono_vars"].items() if var.get()}
+            if mono:
+                mono_sources = mono
         source_path = state["path"]
 
         # Measures a representative window starting at the trim's own start point -- but NOT
@@ -9579,7 +11215,7 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 notifications_config=notifications_config, scale_height=scale_height,
                 target_size_mb=target_size_mb, audio_routing=audio_routing,
                 muted_destinations=muted_destinations, audio_shift_ms_by_track=audio_shift_ms_by_track,
-                gains_db=gains_db, progress_callback=on_trim_progress, cancel_event=cancel_event,
+                gains_db=gains_db, mono_sources=mono_sources, progress_callback=on_trim_progress, cancel_event=cancel_event,
             )
 
             def finish():
@@ -9595,6 +11231,15 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 if success:
                     size_limit_note = " (audio: track 1 only, size-limited)" if target_size_mb else ""
                     status_label.config(fg=START_MARKER_COLOR, text=f"Saved to {output_path}{size_limit_note}")
+                    if target_size_mb:
+                        # "Limit size to" otherwise just stays checked indefinitely -- confirmed
+                        # live that it silently carried over into several LATER, unrelated trims
+                        # in the same editor session, each one quietly losing every audio track
+                        # but the first with no new indication why (the hint label next to the
+                        # checkbox only helps if it's actually still in view). Resetting it right
+                        # after a successful size-limited export makes that a one-shot, deliberate
+                        # choice instead of a silent standing mode.
+                        limit_size_var.set(False)
                 elif cancel_event.is_set():
                     status_label.config(fg=END_MARKER_COLOR, text="Trim cancelled.")
                 else:
@@ -9608,6 +11253,8 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
                 # (delete_original_after_trim).
                 if state["path"] == source_path and not delete_original and os.path.isfile(source_path):
                     media = instance.media_new(source_path)
+                    if getattr(player, "oar_audio_only", False):
+                        media.add_option(":no-video")
                     for option in CLIP_EDITOR_PREVIEW_QUALITY_MEDIA_OPTIONS.get(preview_quality_var.get(), []):
                         media.add_option(option)
                     player.set_media(media)
@@ -9679,6 +11326,152 @@ def _run_clip_editor(master_root, config, recording_state, on_close, icon):
     start_space_bar_listener()
 
 
+# --- macOS-only tray menu (see CROSS_PLATFORM_PLAN.md's Tk/AppKit menu-crash finding) ---
+# Confirmed live: pystray's native NSMenu (what every other OS uses unmodified) crashes Tk's own
+# macOS backend outright the instant that menu's tracking session ends -- a real SIGSEGV inside
+# Tk's own compiled code (RecursivelyClearActiveMenu/TkActivateMenuEntry), reacting to a global
+# AppKit notification about ANY menu closing, not just Tk's own. Not something a Python-level fix
+# to this app or a newer Tcl/Tk version resolves (tried Tcl/Tk 9.0.4 -- a different, earlier
+# startup crash instead). The only reliable fix: never let a native NSMenu exist at all -- this
+# app's tray Icon is constructed with menu=None on macOS specifically, and the exact same
+# pystray.Menu/MenuItem structure every other OS hands to pystray directly is instead rendered
+# here as a plain Tk popup, so all menu interaction stays inside Tk's own event handling.
+_MENU_BG = "#2b2b2b"
+_MENU_FG = "#eeeeee"
+_MENU_DISABLED_FG = "#777777"
+_MENU_HOVER_BG = "#3d6fd6"
+_MENU_SEPARATOR_COLOR = "#555555"
+
+
+TRAY_MENU_POINTER_AWAY_SECONDS = 1.5
+TRAY_MENU_WATCH_INTERVAL_MS = 250
+
+
+def show_macos_tray_menu(overlay_root, menu, icon):
+    """Renders a pystray.Menu as a plain Tk popup at the current mouse position, instead of a
+    native NSMenu. Submenus (this app only ever nests one level deep -- Overlay Monitor's list of
+    displays) navigate within the SAME window via a "Back" row rather than opening a second
+    Toplevel -- deliberately, since a second window stealing focus would fire the first one's own
+    <FocusOut>-triggered dismissal while the submenu is still open, closing everything prematurely
+    (a real Tk cross-window-focus quirk, not just a hypothetical one)."""
+    if overlay_root is None:
+        logging.warning("Overlay isn't ready yet; can't show the tray menu. Try again in a moment.")
+        return
+
+    x, y = overlay_root.winfo_pointerxy()
+    popup = tk.Toplevel(overlay_root)
+    popup.overrideredirect(True)
+    popup.attributes("-topmost", True)
+    popup.configure(bg=_MENU_BG)
+    popup.geometry(f"+{x}+{y}")
+
+    def close(_event=None):
+        try:
+            popup.destroy()
+        except tk.TclError:
+            pass
+
+    nav_stack = [menu]
+
+    def add_row(text, command, enabled=True):
+        row = tk.Label(
+            popup, text=text, anchor="w", bg=_MENU_BG, fg=_MENU_FG if enabled else _MENU_DISABLED_FG,
+            font=("Segoe UI", 12), padx=14, pady=5,
+        )
+        row.pack(fill="x")
+        if enabled and command:
+            row.bind("<Enter>", lambda _e: row.configure(bg=_MENU_HOVER_BG))
+            row.bind("<Leave>", lambda _e: row.configure(bg=_MENU_BG))
+            row.bind("<Button-1>", lambda _e: command())
+
+    def add_separator():
+        tk.Frame(popup, height=1, bg=_MENU_SEPARATOR_COLOR).pack(fill="x", padx=2, pady=4)
+
+    def enter_submenu(submenu):
+        nav_stack.append(submenu)
+        render()
+
+    def go_back():
+        nav_stack.pop()
+        render()
+
+    def activate(item):
+        def command():
+            close()
+            try:
+                item(icon)
+            except Exception:
+                logging.exception("Tray menu item '%s' failed.", item.text)
+        return command
+
+    def render():
+        for widget in popup.winfo_children():
+            widget.destroy()
+        if len(nav_stack) > 1:
+            add_row("◀ Back", go_back)
+            add_separator()
+        for item in nav_stack[-1]:
+            if item is pystray.Menu.SEPARATOR:
+                add_separator()
+                continue
+            if item.submenu is not None:
+                add_row(f"{item.text}  ▸", lambda item=item: enter_submenu(item.submenu), item.enabled)
+                continue
+            prefix = "✓ " if item.checked else ("   " if item.checked is not None else "")
+            add_row(prefix + item.text, activate(item), item.enabled)
+        popup.update_idletasks()
+
+    render()
+    popup.bind("<FocusOut>", close)
+    popup.bind("<Escape>", close)
+    # <Deactivate> fires when the whole app (not just this window) loses activation -- e.g.
+    # switching to a fullscreen game's own Space, a bigger context change than the plain
+    # cross-window focus shift <FocusOut> already covers. Confirmed live: a real report of this
+    # exact popup "keeps showing up in game" -- <FocusOut> alone wasn't reliably dismissing it
+    # once a fullscreen game (its own Space, floating windows like this -topmost popup can still
+    # render above it) took over, leaving it stuck on screen for the rest of the session. A hard
+    # timeout is the actual safety net regardless of which dismissal signal a given macOS version/
+    # window-manager state does or doesn't deliver: whatever else does or doesn't fire, this popup
+    # is now guaranteed to close itself within a few seconds no matter what.
+    popup.bind("<Deactivate>", close)
+    popup.after(20000, close)
+    popup.focus_force()
+
+    # Neither <FocusOut> nor <Deactivate> fires reliably for this borderless popup -- confirmed
+    # live, it stayed over a fullscreen game after a click on the menu-bar icon (which slides down
+    # over fullscreen apps). So also close it once another app comes to the front (after this one
+    # has been), or once the pointer has been off it for a moment.
+    watch_state = {"was_frontmost": False, "outside_since": None}
+
+    def watch():
+        try:
+            if not popup.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if platform_common.is_this_app_frontmost():
+            watch_state["was_frontmost"] = True
+        elif watch_state["was_frontmost"]:
+            close()
+            return
+        px, py = popup.winfo_pointerxy()
+        inside = (
+            popup.winfo_rootx() <= px <= popup.winfo_rootx() + popup.winfo_width()
+            and popup.winfo_rooty() <= py <= popup.winfo_rooty() + popup.winfo_height()
+        )
+        now = time.time()
+        if inside:
+            watch_state["outside_since"] = None
+        elif watch_state["outside_since"] is None:
+            watch_state["outside_since"] = now
+        elif now - watch_state["outside_since"] >= TRAY_MENU_POINTER_AWAY_SECONDS:
+            close()
+            return
+        popup.after(TRAY_MENU_WATCH_INTERVAL_MS, watch)
+
+    popup.after(TRAY_MENU_WATCH_INTERVAL_MS, watch)
+
+
 def main():
     config = load_config()
 
@@ -9688,15 +11481,26 @@ def main():
     if config.get("log_file"):
         log_path = config["log_file"]
         if not os.path.isabs(log_path):
-            log_path = os.path.join(SCRIPT_DIR, log_path)
+            log_path = os.path.join(DATA_DIR, log_path)
         handlers.append(LineCappedFileHandler(log_path))
 
+    # force=True: load_config() above can already log (ensure_game_audio_track), and a
+    # module-level logging call with no handlers yet installs a default stderr one -- without
+    # force, basicConfig then silently does nothing and the log file is never written.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=handlers,
+        force=True,
     )
+    # obsws_python logs every rejected request as an ERROR with a full traceback -- including the
+    # ones this app expects and handles itself (no replay buffer, chapters on non-Hybrid-MP4) --
+    # and its client logs the WebSocket password in plain text at INFO on every connection.
+    logging.getLogger("obsws_python.reqs").setLevel(logging.CRITICAL)
+    logging.getLogger("obsws_python.baseclient").setLevel(logging.WARNING)
     cleanup_orphaned_pyinstaller_temp_dirs()
+    if getattr(sys, "frozen", False):
+        platform_common.reset_permissions_once(DATA_DIR)
 
     status = {"text": "Starting...", "recording": False}
     stop_event = threading.Event()
@@ -9762,7 +11566,7 @@ def main():
             logging.warning("Recordings folder unknown (OBS not connected yet).")
             return
         try:
-            os.startfile(folder)
+            platform_common.open_path(folder)
         except OSError as exc:
             logging.error("Could not open recordings folder %s: %s", folder, exc)
 
@@ -9772,12 +11576,12 @@ def main():
             logging.warning("No log file configured.")
             return
         if not os.path.isabs(log_path):
-            log_path = os.path.join(SCRIPT_DIR, log_path)
+            log_path = os.path.join(DATA_DIR, log_path)
         if not os.path.isfile(log_path):
             logging.warning("Log file does not exist yet: %s", log_path)
             return
         try:
-            os.startfile(log_path)
+            platform_common.open_path(log_path)
         except OSError as exc:
             logging.error("Could not open log file %s: %s", log_path, exc)
 
@@ -9882,12 +11686,94 @@ def main():
     ]
     menu = pystray.Menu(*menu_items)
 
-    icon = pystray.Icon(
-        "OBSAutoRecorder",
-        icon=build_tray_image(IDLE_COLOR),
-        title="OBS Auto Recorder - Starting...",
-        menu=menu,
-    )
+    if platform_common.gui_requires_main_thread():
+        # A second, independent macOS constraint from the one gui_requires_main_thread's own
+        # docstring covers (confirmed live with a separate, minimal repro): Tk's own Cocoa
+        # integration must finish registering itself on the shared NSApplication *before*
+        # anything else (pystray.Icon() below, via PyObjC) touches it -- otherwise Tk's later
+        # widget creation calls an NSApplication method (added by Tk's own registration) that
+        # doesn't exist yet, crashing the whole process with an uncaught
+        # NSInvalidArgumentException. A throwaway Tk() that's never mapped to a real window (no
+        # mainloop, destroyed immediately) is enough to trigger that registration harmlessly.
+        primer = tk.Tk()
+        tk.Frame(primer)
+        primer.destroy()
+        # Must come after the priming Tk() above -- this also touches the shared NSApplication,
+        # and doing so before Tk registers itself reproduces the exact crash that priming step
+        # exists to avoid (see platform_macos.hide_dock_icon's own docstring). Without this, the
+        # app shows an unusable, generic Python/rocket Dock icon alongside its real, working
+        # menu-bar tray icon -- confirmed live, clicking it does nothing since there's no main
+        # window of its own.
+        platform_common.hide_dock_icon()
+
+        class _MacTrayIcon(pystray.Icon):
+            """Overrides what a click on the status item ends up calling. pystray's own
+            Icon.__call__ only ever does anything when self._menu is not None -- but giving the
+            Icon a real Menu at all makes pystray assign it as a native NSMenu (see this
+            section's own module-level comment for why that crashes Tk), so this Icon is always
+            constructed with menu=None. AppKit's status-item click routing falls back to the
+            button's plain action/target (this override, via IconDelegate.activate_button's
+            self.icon() call) once no native menu is attached to the status item at all.
+
+            Also overrides icon/title/visible -- confirmed live that this app's game-watcher
+            thread (a background thread) setting icon.icon/icon.title directly, exactly as this
+            file does throughout (set_status and its many call sites), crashed the whole process
+            with a SIGABRT inside Tk's own Cocoa event dispatch a few seconds later: those
+            setters call pystray's macOS backend's _update_icon()/_update_title(), which touch
+            AppKit's NSStatusItem/NSImage synchronously, and AppKit forbids that off the main
+            thread. platform_common.run_on_main_thread marshals the real update onto the main
+            thread instead, so every existing icon.icon =/icon.title = call site elsewhere in
+            this file keeps working unchanged. update_menu() is a plain no-op here rather than
+            marshaled: it exists purely to refresh a *native* NSMenu pystray cached from a
+            previous open, but this Icon never has one (menu=None, see above) -- the custom Tk
+            popup in show_macos_tray_menu always renders live state at popup-open time, so
+            there's nothing to refresh, and skipping it avoids yet another AppKit call
+            (_update_menu's own status_item.setMenu_(...)) from a non-main thread."""
+            def __call__(self):
+                # Runs inside AppKit's status-item callback, in the middle of Tk's own event
+                # processing. Building Tk widgets from here left tkinter's thread-state
+                # bookkeeping inconsistent, and a later event on the popup aborted the process
+                # ("PyEval_RestoreThread ... thread state is NULL" in a Tk binding, confirmed
+                # live). So only flag the request; the overlay's own poll opens the popup.
+                overlay_state["tray_menu_request"] = (menu, self)
+
+            @property
+            def icon(self):
+                return pystray.Icon.icon.fget(self)
+
+            @icon.setter
+            def icon(self, value):
+                platform_common.run_on_main_thread(lambda: pystray.Icon.icon.fset(self, value))
+
+            @property
+            def title(self):
+                return pystray.Icon.title.fget(self)
+
+            @title.setter
+            def title(self, value):
+                platform_common.run_on_main_thread(lambda: pystray.Icon.title.fset(self, value))
+
+            @property
+            def visible(self):
+                return pystray.Icon.visible.fget(self)
+
+            @visible.setter
+            def visible(self, value):
+                platform_common.run_on_main_thread(lambda: pystray.Icon.visible.fset(self, value))
+
+            def update_menu(self):
+                pass
+
+        icon = _MacTrayIcon(
+            "OBSAutoRecorder", icon=build_tray_image(IDLE_COLOR), title="OBS Auto Recorder - Starting...",
+        )
+    else:
+        icon = pystray.Icon(
+            "OBSAutoRecorder",
+            icon=build_tray_image(IDLE_COLOR),
+            title="OBS Auto Recorder - Starting...",
+            menu=menu,
+        )
 
     watcher_thread = threading.Thread(
         target=watcher_loop,
@@ -9907,7 +11793,7 @@ def main():
             target=run_custom_keybind_listener,
             args=(
                 custom_keybinds, lambda: runtime_state.get("obs_client"), lambda: manual_split_buffer_seconds,
-                icon, config.get("notifications", {}), status,
+                icon, config.get("notifications", {}), status, recording_state,
             ),
             kwargs={"stop_event": stop_event, "hotkey_mode": custom_keybind_hotkey_mode},
             daemon=True,
@@ -9916,25 +11802,137 @@ def main():
     def setup(icon):
         icon.visible = True
         watcher_thread.start()
-        overlay_thread.start()
+        # On macOS the overlay's Tk GUI runs directly on the real main thread instead (see
+        # platform_common.gui_requires_main_thread) -- started below, after icon.run_detached()
+        # returns, not here.
+        if not platform_common.gui_requires_main_thread():
+            overlay_thread.start()
         if keybind_thread:
             keybind_thread.start()
 
-    icon.run(setup=setup)
+    if platform_common.gui_requires_main_thread():
+        # AppKit requires all GUI work -- both pystray's own tray icon AND Tk's Aqua backend --
+        # to run on the real process main thread; confirmed live that the normal arrangement
+        # below (pystray owns the main thread via icon.run(), Tk runs on overlay_thread) crashes
+        # the whole process the instant anything actually pumps the main thread's Cocoa run
+        # loop. icon.run_detached() hands pystray's own event handling off to a background
+        # thread instead and returns immediately, freeing this (real main) thread to run the
+        # overlay's own Tk mainloop directly -- the same call overlay_thread would otherwise
+        # have made, just synchronous here instead of threaded.
+        icon.run_detached(setup=setup)
+        run_overlay(monitors, overlay_state, audio_state, status, stop_event)
+    else:
+        icon.run(setup=setup)
 
-    # icon.run() returns as soon as icon.stop() fires (from watcher_loop's finally, once
-    # stop_event is set), which can happen before the overlay thread's Tk mainloop -- polling
-    # stop_event only every 120ms -- has actually destroyed its root and released Tcl/Tk. Onefile
-    # PyInstaller builds extract their DLLs (including Tcl/Tk) to a temp dir and try to remove it
-    # right after the interpreter shuts down; if that thread (and its Tcl interpreter) is still
-    # winding down when the process exits, that removal can fail. Give both threads a moment to
-    # actually finish instead of leaving them to be hard-killed mid-shutdown.
+    # On Windows/Linux, icon.run() returns as soon as icon.stop() fires (from watcher_loop's
+    # finally, once stop_event is set), which can happen before overlay_thread's Tk mainloop --
+    # polling stop_event only every 120ms -- has actually destroyed its root and released
+    # Tcl/Tk. On macOS, run_overlay() above already blocked (on this same thread) until its own
+    # root.destroy() happened, so it's already fully wound down by this point -- this join is a
+    # no-op there, not a race. Onefile PyInstaller builds extract their DLLs (including Tcl/Tk)
+    # to a temp dir and try to remove it right after the interpreter shuts down; if a thread (and
+    # its Tcl interpreter) is still winding down when the process exits, that removal can fail --
+    # give watcher_thread a moment to actually finish instead of leaving it hard-killed mid-
+    # shutdown.
     stop_event.set()
     watcher_thread.join(timeout=5)
-    overlay_thread.join(timeout=5)
+    # On macOS, run_overlay() above already ran (and returned) directly on this thread instead
+    # of on overlay_thread, which was never started there -- nothing left to join.
+    if not platform_common.gui_requires_main_thread():
+        overlay_thread.join(timeout=5)
+
+
+# The installer opens the installed app with this flag so macOS asks for Accessibility for the
+# app itself: the permission belongs to whichever app asks, so the installer asking would only
+# have allowed the installer.
+ACCESSIBILITY_REQUEST_FLAG = "--request-accessibility"
+ACCESSIBILITY_CHECK_FLAG = "--check-accessibility"
+# Screen Recording, for this app itself: macOS hides other apps' window titles from apps without
+# it (confirmed live: 28 windows, 0 titles), so window-title rules (GeForce NOW, Minecraft) never
+# match. OBS needs its own separate grant to record the screen.
+SCREEN_RECORDING_REQUEST_FLAG = "--request-screen-recording"
+SCREEN_RECORDING_CHECK_FLAG = "--check-screen-recording"
+# Same idea for the Wine & Java game audio tap: macOS asks the app that reads the tap.
+SYSTEM_AUDIO_RECORDING_REQUEST_FLAG = "--request-system-audio-recording"
+ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS = 600
+ACCESSIBILITY_REQUEST_POLL_SECONDS = 2
+
+# kind -> (check flag, is it granted, show macOS's prompt)
+PERMISSION_REQUESTS = {
+    "accessibility": (
+        ACCESSIBILITY_CHECK_FLAG,
+        lambda: platform_common.accessibility_permission_granted(),
+        lambda: platform_common.request_accessibility_permission(),
+    ),
+    "screen_recording": (
+        SCREEN_RECORDING_CHECK_FLAG,
+        lambda: platform_common.screen_recording_permission_granted(),
+        lambda: platform_common.request_screen_recording_permission(),
+    ),
+}
+
+
+def permission_check_command(kind="accessibility"):
+    """Runs this app again just to report whether it holds a permission (exit code 0 = yes)."""
+    flag = PERMISSION_REQUESTS[kind][0]
+    if getattr(sys, "frozen", False):
+        return [sys.executable, flag]
+    return [sys.executable, os.path.abspath(__file__), flag]
+
+
+def accessibility_check_command():
+    return permission_check_command("accessibility")
+
+
+def permission_granted_in_fresh_process(kind="accessibility"):
+    """Whether a permission is granted now, asked from a new child process. A process keeps
+    the answer it got first (confirmed live: after the user allowed the app, the waiting process
+    still saw "not granted" while a fresh copy saw "granted"); a child counts as this app."""
+    try:
+        return subprocess.run(permission_check_command(kind), timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def accessibility_granted_in_fresh_process():
+    return permission_granted_in_fresh_process("accessibility")
+
+
+def run_permission_request(status_path, kind="accessibility", timeout=ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS):
+    """Shows macOS's prompt for one of this app's permissions, then waits for the user to allow
+    it, writing "granted" to status_path once they do (the installer watches that file).
+    Returns True if granted before the timeout."""
+    _flag, granted, request = PERMISSION_REQUESTS[kind]
+    if not granted():
+        request()
+        deadline = time.time() + timeout
+        while not permission_granted_in_fresh_process(kind):
+            if time.time() >= deadline:
+                return False
+            time.sleep(ACCESSIBILITY_REQUEST_POLL_SECONDS)
+    try:
+        with open(status_path, "w", encoding="utf-8") as f:
+            f.write("granted")
+    except OSError:
+        pass
+    return True
+
+
+def run_accessibility_request(status_path, timeout=ACCESSIBILITY_REQUEST_TIMEOUT_SECONDS):
+    return run_permission_request(status_path, "accessibility", timeout)
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == ACCESSIBILITY_REQUEST_FLAG:
+        sys.exit(0 if run_accessibility_request(sys.argv[2]) else 1)
+    if len(sys.argv) >= 2 and sys.argv[1] == SYSTEM_AUDIO_RECORDING_REQUEST_FLAG:
+        sys.exit(0 if platform_common.request_system_audio_recording_permission() else 1)
+    if len(sys.argv) >= 3 and sys.argv[1] == SCREEN_RECORDING_REQUEST_FLAG:
+        sys.exit(0 if run_permission_request(sys.argv[2], "screen_recording") else 1)
+    if len(sys.argv) >= 2 and sys.argv[1] == ACCESSIBILITY_CHECK_FLAG:
+        sys.exit(0 if platform_common.accessibility_permission_granted() else 1)
+    if len(sys.argv) >= 2 and sys.argv[1] == SCREEN_RECORDING_CHECK_FLAG:
+        sys.exit(0 if platform_common.screen_recording_permission_granted() else 1)
     try:
         main()
     except KeyboardInterrupt:

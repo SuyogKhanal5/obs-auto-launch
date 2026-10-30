@@ -7,3 +7,7 @@ dist/
 OBSAutoRecorder.exe
 OBSAutoRecorderInstaller*.exe
 .claude/
+venv/
+.obs_state_cache.json
+.active_recording_session.json
+macos/build/

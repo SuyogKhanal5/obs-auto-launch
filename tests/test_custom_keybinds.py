@@ -1,7 +1,9 @@
 import os
 import sys
 import unittest
+import tempfile
 import unittest.mock
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import autostart_script as a
@@ -56,8 +58,14 @@ class PerformKeybindActionTests(unittest.TestCase):
         # this catches a new action being added to the picker but never implemented.
         for action in a.CUSTOM_KEYBIND_ACTIONS:
             client = FakeObsClient()
-            a.perform_keybind_action(client, action)
-            self.assertTrue(client.calls, f"action '{action}' did not call anything on the client")
+            recording_state = {}
+            a.perform_keybind_action(client, action, recording_state=recording_state)
+            # add_marker's effect is this app's own marker list (OBS is only written to on Hybrid
+            # MP4 -- see add_recording_marker); every other action writes to OBS.
+            self.assertTrue(
+                client.calls or recording_state.get("markers"),
+                f"action '{action}' had no effect",
+            )
 
 
 class FireCustomKeybindTests(unittest.TestCase):
@@ -91,12 +99,13 @@ class RunCustomKeybindListenerDispatchTests(unittest.TestCase):
             a.run_custom_keybind_listener(
                 [{"enabled": True, "key": "S", "modifiers": []}], get_client="get_client",
                 get_manual_split_buffer_seconds="get_seconds", icon="icon",
-                notifications_config="notif_cfg", status="status",
+                notifications_config="notif_cfg", status="status", recording_state="rec_state",
             )
         mock_run.assert_called_once_with(
             [{"enabled": True, "key": "S", "modifiers": []}], "get_client", "get_seconds",
             a.fire_custom_keybind, a.describe_keybind, a.notify,
-            icon="icon", notifications_config="notif_cfg", status="status", stop_event=None, hotkey_mode=None,
+            icon="icon", notifications_config="notif_cfg", status="status", recording_state="rec_state", stop_event=None,
+            hotkey_mode=None,
         )
 
 
@@ -111,3 +120,70 @@ class RunClipEditorSpaceBarListenerDispatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunAccessibilityRequestTests(unittest.TestCase):
+    def test_already_granted_writes_status_without_prompting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status")
+            with patch.object(a.platform_common, "accessibility_permission_granted", return_value=True), \
+                    patch.object(a.platform_common, "request_accessibility_permission") as request:
+                self.assertTrue(a.run_accessibility_request(path))
+            request.assert_not_called()
+            self.assertEqual(open(path).read(), "granted")
+
+    def test_prompts_then_waits_until_granted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status")
+            # The wait re-checks in a fresh process: this one keeps its first answer.
+            with patch.object(a.platform_common, "accessibility_permission_granted", return_value=False), \
+                    patch.object(a, "permission_granted_in_fresh_process", side_effect=[False, True]), \
+                    patch.object(a.platform_common, "request_accessibility_permission") as request, \
+                    patch.object(a.time, "sleep"):
+                self.assertTrue(a.run_accessibility_request(path))
+            request.assert_called_once()
+            self.assertTrue(os.path.isfile(path))
+
+    def test_gives_up_after_timeout_without_writing_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status")
+            with patch.object(a.platform_common, "accessibility_permission_granted", return_value=False), \
+                    patch.object(a, "permission_granted_in_fresh_process", return_value=False), \
+                    patch.object(a.platform_common, "request_accessibility_permission"), \
+                    patch.object(a.time, "sleep"):
+                self.assertFalse(a.run_accessibility_request(path, timeout=0))
+            self.assertFalse(os.path.exists(path))
+
+    def test_fresh_process_check_uses_the_check_flag_and_exit_code(self):
+        with patch.object(a.subprocess, "run", return_value=unittest.mock.Mock(returncode=0)) as run:
+            self.assertTrue(a.accessibility_granted_in_fresh_process())
+        self.assertEqual(run.call_args[0][0][-1], a.ACCESSIBILITY_CHECK_FLAG)
+        with patch.object(a.subprocess, "run", return_value=unittest.mock.Mock(returncode=1)):
+            self.assertFalse(a.accessibility_granted_in_fresh_process())
+        with patch.object(a.subprocess, "run", side_effect=OSError("boom")):
+            self.assertFalse(a.accessibility_granted_in_fresh_process())
+
+    def test_frozen_app_checks_by_running_itself(self):
+        with patch.object(a.sys, "frozen", True, create=True), patch.object(a.sys, "executable", "/X.app/Contents/MacOS/X"):
+            self.assertEqual(a.accessibility_check_command(), ["/X.app/Contents/MacOS/X", a.ACCESSIBILITY_CHECK_FLAG])
+
+
+class ScreenRecordingRequestTests(unittest.TestCase):
+    """The installer asks the installed app for Screen Recording the same way as Accessibility:
+    window titles (GeForce NOW, Minecraft rules) are hidden from apps without it."""
+
+    def test_prompts_then_waits_using_the_screen_recording_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status")
+            with patch.object(a.platform_common, "screen_recording_permission_granted", return_value=False), \
+                    patch.object(a.platform_common, "request_screen_recording_permission") as request, \
+                    patch.object(a, "permission_granted_in_fresh_process", side_effect=[False, True]) as fresh, \
+                    patch.object(a.time, "sleep"):
+                self.assertTrue(a.run_permission_request(path, "screen_recording"))
+            request.assert_called_once()
+            self.assertEqual(fresh.call_args[0][0], "screen_recording")
+            self.assertTrue(os.path.isfile(path))
+
+    def test_check_command_uses_the_screen_recording_flag(self):
+        with patch.object(a.sys, "frozen", True, create=True), patch.object(a.sys, "executable", "/X.app/Contents/MacOS/X"):
+            self.assertEqual(a.permission_check_command("screen_recording"), ["/X.app/Contents/MacOS/X", a.SCREEN_RECORDING_CHECK_FLAG])

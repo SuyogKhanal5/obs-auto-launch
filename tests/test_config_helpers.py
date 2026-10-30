@@ -1,9 +1,10 @@
+import base64
 import os
 import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -105,6 +106,178 @@ class ObsRecoveryDefaultsTests(unittest.TestCase):
 
     def test_cooldown_uses_configured_value(self):
         self.assertEqual(a.get_obs_recovery_cooldown_seconds({"recovery": {"cooldown_seconds": 5}}), 5)
+
+    def test_frozen_capture_threshold_defaults_when_unset(self):
+        self.assertEqual(
+            a.get_obs_frozen_capture_threshold_seconds({}), a.DEFAULT_OBS_FROZEN_CAPTURE_SECONDS
+        )
+
+    def test_frozen_capture_threshold_uses_configured_value(self):
+        self.assertEqual(
+            a.get_obs_frozen_capture_threshold_seconds({"recovery": {"frozen_capture_seconds": 60}}), 60
+        )
+
+
+class GetSceneScreenshotHashTests(unittest.TestCase):
+    # Confirmed live against a real OBS instance: GetSourceScreenshot accepts a scene name directly
+    # (a scene is itself a kind of source in OBS's own model) and returns a lossless PNG, so two
+    # screenshots of genuinely unchanged content hash identically with no re-encoding noise --
+    # exactly what the frozen-capture detector in _watcher_loop_impl relies on.
+    def _fake_client(self, image_data):
+        client = Mock()
+        client.get_source_screenshot.return_value = Mock(image_data=image_data)
+        return client
+
+    def test_identical_content_hashes_identically(self):
+        data_uri = "data:image/png;base64," + base64.b64encode(b"not a real png but deterministic bytes").decode()
+        client1 = self._fake_client(data_uri)
+        client2 = self._fake_client(data_uri)
+        self.assertEqual(
+            a.get_scene_screenshot_hash(client1, "Scene"),
+            a.get_scene_screenshot_hash(client2, "Scene"),
+        )
+
+    def test_different_content_hashes_differently(self):
+        data_uri_a = "data:image/png;base64," + base64.b64encode(b"frame A").decode()
+        data_uri_b = "data:image/png;base64," + base64.b64encode(b"frame B").decode()
+        self.assertNotEqual(
+            a.get_scene_screenshot_hash(self._fake_client(data_uri_a), "Scene"),
+            a.get_scene_screenshot_hash(self._fake_client(data_uri_b), "Scene"),
+        )
+
+    def test_request_failure_returns_none_not_raise(self):
+        client = Mock()
+        client.get_source_screenshot.side_effect = Exception("OBS not reachable")
+        self.assertIsNone(a.get_scene_screenshot_hash(client, "Scene"))
+
+    def test_passes_scene_name_and_small_fixed_dimensions(self):
+        data_uri = "data:image/png;base64," + base64.b64encode(b"x").decode()
+        client = self._fake_client(data_uri)
+        a.get_scene_screenshot_hash(client, "My Scene")
+        client.get_source_screenshot.assert_called_once_with("My Scene", "png", 320, 180, -1)
+
+
+class SetStartupShortcutEnabledTests(unittest.TestCase):
+    # Confirmed live (a real report: "app did not open on restart automatically") that this
+    # install was running from source the whole time -- sys.frozen is only True in a built/
+    # PyInstaller app -- so the old "refuse outright when not frozen" behavior meant autostart
+    # could never actually be registered here no matter what the user did in Settings, with only
+    # a log-file warning (never surfaced in the UI) as any indication why.
+    def test_disable_always_dispatches_regardless_of_frozen_state(self):
+        with patch.object(a.platform_common, "disable_autostart", return_value=True) as mock_disable:
+            self.assertTrue(a.set_startup_shortcut_enabled(False))
+        mock_disable.assert_called_once_with()
+
+    def test_enable_when_frozen_uses_sys_executable_alone(self):
+        with patch.object(a.sys, "frozen", True, create=True):
+            with patch.object(a.platform_common, "enable_autostart", return_value=True) as mock_enable:
+                self.assertTrue(a.set_startup_shortcut_enabled(True))
+        mock_enable.assert_called_once_with()
+
+    def test_enable_when_running_from_source_passes_script_path_as_extra_arg(self):
+        with patch.object(a.sys, "frozen", False, create=True):
+            with patch.object(a.platform_common, "enable_autostart", return_value=True) as mock_enable:
+                self.assertTrue(a.set_startup_shortcut_enabled(True))
+        mock_enable.assert_called_once_with(
+            working_dir=a.SCRIPT_DIR, extra_args=[os.path.abspath(a.__file__)]
+        )
+
+
+class GetRunningProcessesTests(unittest.TestCase):
+    # Confirmed live (a real crash): process_iter(["name", "exe"]) -- the previous
+    # implementation -- resolves those attrs eagerly as part of advancing the iterator itself,
+    # outside any try/except this function's own loop body could reach. The specific trigger: a
+    # macOS process name 15+ characters long makes psutil's own Process.name() fall back to
+    # self.cmdline() internally, which raised a raw SystemError (wrapping a PermissionError from
+    # a sysctl(KERN_PROCARGS2) call macOS's hardened runtime denied) for a real sandboxed helper
+    # process -- a type neither psutil's own internal try/except nor the old code here caught.
+    def _fake_proc(self, name=None, exe="", pid=1, name_error=None, exe_error=None):
+        proc = Mock()
+        proc.pid = pid
+        if name_error:
+            proc.name.side_effect = name_error
+        else:
+            proc.name.return_value = name
+        if exe_error:
+            proc.exe.side_effect = exe_error
+        else:
+            proc.exe.return_value = exe
+        return proc
+
+    def test_normal_processes_are_collected(self):
+        procs = [
+            self._fake_proc(name="OBS", exe="/Applications/OBS.app/Contents/MacOS/OBS", pid=100),
+            self._fake_proc(name="Balatro", exe="/Users/x/Balatro.app/Contents/MacOS/love", pid=200),
+        ]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(
+            result,
+            [
+                ("OBS", "/Applications/OBS.app/Contents/MacOS/OBS", 100),
+                ("Balatro", "/Users/x/Balatro.app/Contents/MacOS/love", 200),
+            ],
+        )
+
+    def test_system_error_resolving_name_skips_that_process_not_the_whole_scan(self):
+        # The exact exception type confirmed live: a raw SystemError, not psutil.AccessDenied.
+        procs = [
+            self._fake_proc(name="OBS", exe="/Applications/OBS.app/Contents/MacOS/OBS", pid=100),
+            self._fake_proc(name_error=SystemError("boom"), pid=200),
+            self._fake_proc(name="Balatro", exe="/Users/x/Balatro.app/Contents/MacOS/love", pid=300),
+        ]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(
+            result,
+            [
+                ("OBS", "/Applications/OBS.app/Contents/MacOS/OBS", 100),
+                ("Balatro", "/Users/x/Balatro.app/Contents/MacOS/love", 300),
+            ],
+        )
+
+    def test_permission_error_resolving_exe_keeps_the_process_with_empty_exe(self):
+        procs = [self._fake_proc(name="Sandboxed Helper (GPU)", exe_error=PermissionError("boom"), pid=100)]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("Sandboxed Helper (GPU)", "", 100)])
+
+    def test_psutil_typed_exceptions_still_handled(self):
+        procs = [
+            self._fake_proc(name_error=a.psutil.NoSuchProcess(pid=1), pid=1),
+            self._fake_proc(name_error=a.psutil.AccessDenied(pid=2), pid=2),
+            self._fake_proc(name="OBS", exe="/x/OBS", pid=3),
+        ]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("OBS", "/x/OBS", 3)])
+
+    def test_blank_name_is_skipped(self):
+        procs = [self._fake_proc(name="", pid=1), self._fake_proc(name="OBS", exe="/x/OBS", pid=2)]
+        with patch.object(a.psutil, "process_iter", return_value=procs):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("OBS", "/x/OBS", 2)])
+
+    def test_wine_process_reports_the_windows_program_name(self):
+        # Argument shape confirmed live with Wizard101.app's bundled CrossOver.
+        preloader = "/Applications/Wizard101.app/Contents/SharedSupport/wizard101/Wizard101/wine64-preloader"
+        proc = self._fake_proc(name="wine64-preloader", exe=preloader, pid=7)
+        proc.cmdline.return_value = [preloader, "C:\\ProgramData\\KingsIsle Entertainment\\Wizard101\\Bin\\WizardGraphicalClient.exe"]
+        with patch.object(a.psutil, "process_iter", return_value=[proc]):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("WizardGraphicalClient.exe", preloader, 7)])
+
+    def test_wine_process_with_unreadable_cmdline_keeps_its_own_name(self):
+        proc = self._fake_proc(name="wine32on64-preloader", exe="/x/wine32on64-preloader", pid=8)
+        proc.cmdline.side_effect = a.psutil.AccessDenied(pid=8)
+        with patch.object(a.psutil, "process_iter", return_value=[proc]):
+            result = a.get_running_processes()
+        self.assertEqual(result, [("wine32on64-preloader", "/x/wine32on64-preloader", 8)])
+
+    def test_wine_program_name_handles_bare_names_and_missing_args(self):
+        self.assertEqual(a.wine_program_name("wine32on64-preloader", ["/x/p", "notepad.exe"]), "notepad.exe")
+        self.assertEqual(a.wine_program_name("wine64-preloader", ["/x/p"]), "wine64-preloader")
+        self.assertEqual(a.wine_program_name("OBS", ["/x/OBS", "C:\\a.exe"]), "OBS")
 
 
 class HasSufficientDiskSpaceTests(unittest.TestCase):
@@ -230,6 +403,22 @@ class ClearObsCrashSentinelTests(unittest.TestCase):
         with patch.object(a.platform_common, "obs_config_dir", return_value=self.tmpdir.name):
             a.clear_obs_crash_sentinel()  # must not raise
 
+    def test_removes_macos_safe_mode_marker_file(self):
+        # Confirmed live against a real macOS OBS install: this OBS version's actual
+        # unclean-shutdown marker is a plain empty file, "safe_mode", directly under
+        # obs_config_dir -- not the .sentinel/ directory above, which never existed on that
+        # machine at all. Left in place, OBS's next launch blocks on its own "Run in Safe Mode?"
+        # dialog before ever starting obs-websocket's server.
+        safe_mode_marker = os.path.join(self.tmpdir.name, "safe_mode")
+        open(safe_mode_marker, "w").close()
+        with patch.object(a.platform_common, "obs_config_dir", return_value=self.tmpdir.name):
+            a.clear_obs_crash_sentinel()
+        self.assertFalse(os.path.isfile(safe_mode_marker))
+
+    def test_missing_safe_mode_marker_does_not_raise(self):
+        with patch.object(a.platform_common, "obs_config_dir", return_value=self.tmpdir.name):
+            a.clear_obs_crash_sentinel()  # must not raise
+
     def test_unresolvable_obs_config_dir_does_not_raise(self):
         with patch.object(a.platform_common, "obs_config_dir", return_value=None):
             a.clear_obs_crash_sentinel()  # must not raise
@@ -319,3 +508,21 @@ class ResolveDefaultOverlayMonitorIndexTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolveScriptDirTests(unittest.TestCase):
+    # The macOS installer writes config.json next to OBSAutoRecorder.app; the built app used to
+    # look inside its own bundle (Contents/MacOS) and never found it.
+    def test_from_source_uses_the_script_folder(self):
+        self.assertEqual(
+            a.resolve_script_dir(False, "/usr/bin/python3", os.path.join("/repo", "autostart_script.py")),
+            os.path.abspath("/repo"),
+        )
+
+    def test_frozen_macos_app_uses_the_folder_holding_the_bundle(self):
+        exe = os.path.join("/Users/x/Applications", "OBSAutoRecorder.app", "Contents", "MacOS", "OBSAutoRecorder")
+        self.assertEqual(a.resolve_script_dir(True, exe, "unused"), os.path.abspath("/Users/x/Applications"))
+
+    def test_frozen_onedir_build_uses_the_executable_folder(self):
+        exe = os.path.join("/opt/OBSAutoRecorder", "OBSAutoRecorder")
+        self.assertEqual(a.resolve_script_dir(True, exe, "unused"), os.path.abspath("/opt/OBSAutoRecorder"))

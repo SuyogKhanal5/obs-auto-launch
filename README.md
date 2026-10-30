@@ -2,7 +2,7 @@
 
 A lightweight background watcher — for Windows, Linux, and macOS — that automatically starts and stops OBS recording when you launch or close a game. Runs from the system tray, launches OBS if it isn't already open, and renames finished recordings with the game's name.
 
-Windows has the fullest feature set (it's where this app started); Linux and macOS are fully supported for game detection, recording, and the clip editor, with a few gaps noted throughout this README and summarized in [Known limitations](#known-limitations) — global custom keybinds and Minecraft-style window-title rules need a real X11 session on Linux (no Wayland support yet) and Accessibility permission on macOS, and per-app game-audio isolation isn't available on either yet.
+Windows has the fullest feature set (it's where this app started); Linux and macOS are fully supported for game detection, recording, and the clip editor, with a few gaps noted throughout this README and summarized in [Known limitations](#known-limitations) — global custom keybinds and Minecraft-style window-title rules need a real X11 session on Linux (no Wayland support yet) and Accessibility permission on macOS, and per-app game-audio isolation works on Windows and macOS (14.4+) but isn't available on Linux yet.
 
 ## Features
 
@@ -45,22 +45,31 @@ Windows has the fullest feature set (it's where this app started); Linux and mac
 This is the whole setup for most people — five minutes, no file editing, nothing to type by hand. The wizard itself is the same on every OS; only where things land and how OBS/ffmpeg get installed differ, called out below.
 
 1. **Install OBS Studio first**, if you haven't already — [obsproject.com](https://obsproject.com/), or let the installer do it for you in step 3 below. You don't need to configure anything inside it yet.
-2. Download the installer for your OS from the [Releases page](../../releases/latest) and run it: `OBSAutoRecorderInstaller.exe` (Windows), `OBSAutoRecorderInstaller-linux` (Linux — mark it executable first, `chmod +x OBSAutoRecorderInstaller-linux`), or `OBSAutoRecorderInstaller-macos-arm64` / `OBSAutoRecorderInstaller-macos-x86_64` (macOS — arm64 for Apple Silicon, x86_64 for Intel; `chmod +x` it first, same as Linux).
+2. Get the installer for your OS:
+   - **Windows / Linux**: download it from the [Releases page](../../releases/latest) and run it: `OBSAutoRecorderInstaller.exe` (Windows) or `OBSAutoRecorderInstaller-linux` (Linux — mark it executable first, `chmod +x OBSAutoRecorderInstaller-linux`).
+   - **macOS (easiest)**: open Terminal and paste this one line — it downloads the right installer for your Mac (Apple Silicon or Intel) and opens it:
+
+     ```sh
+     curl -fsSL https://github.com/SuyogKhanal5/obs-auto-launch/releases/latest/download/install-macos.sh | sh
+     ```
+
+     The app isn't signed with an Apple Developer ID, so a copy downloaded in a browser is blocked by macOS until you approve it (below); downloaded this way it isn't, so the script checks the download itself before opening it — against the checksum published with the release, and against the project's signing certificate.
+   - **macOS (without Terminal)**: download `OBSAutoRecorderInstaller-macos-arm64.dmg` (Apple Silicon) or `OBSAutoRecorderInstaller-macos-x86_64.dmg` (Intel) from the [Releases page](../../releases/latest), open it, and double-click **OBS Auto Recorder Installer**. macOS blocks it the first time ("Apple could not verify…" — click **Done**, not Move to Trash): open **System Settings → Privacy & Security**, scroll down to **Security**, click **Open Anyway** next to the installer, confirm with your password, then double-click it again. That's needed once, for the installer only — the app it installs doesn't need approving again.
 3. Click through the wizard:
    - **Choose where to install** — the default (Program Files on Windows, `~/.local/share/OBSAutoRecorder` on Linux, `~/Applications/OBSAutoRecorder` on macOS) is fine for almost everyone; none of these need admin/root access for the app install itself.
    - **Locate OBS Studio** — it finds this automatically in the common install locations. If it can't:
      - **Windows/macOS**: an **Easy Install** button installs OBS Studio for you right there via `winget`/Homebrew, if available — otherwise click **Browse...** if it's already installed elsewhere, or use the download link on that page.
      - **Linux**: instead of a silent install, you get the exact command this app would run (preferring a Flatpak install of OBS, since many distros' own repo packages are outdated or missing WebSocket support) shown as read-only text, plus a **Run this command** button — nothing runs without you seeing it first and clicking that button, which prompts for your password via your desktop's normal graphical `pkexec` prompt.
    - **A few quick preferences** — plain yes/no toggles (split long recordings, delete accidental short clips, notifications, per-game folders). All changeable later.
-   - **Advanced options** — multi-track audio, game audio isolation (Windows only for now — see [Known limitations](#known-limitations)), the replay buffer, the disk space guard, a custom recording folder. Everything here is off by default and safe to skip entirely with the **Skip this page** link — come back to it later from **Edit Settings...** once you know you want one of these.
-4. Click **Install**, then **Finish** (leave "Launch OBS Auto Recorder now" checked).
+   - **Advanced options** — multi-track audio, game audio isolation (Windows and macOS 14.4+ for now — see [Known limitations](#known-limitations)), the replay buffer, the disk space guard, a custom recording folder. Everything here is off by default and safe to skip entirely with the **Skip this page** link — come back to it later from **Edit Settings...** once you know you want one of these.
+4. Click **Install**, then **Finish** (leave "Launch OBS Auto Recorder now" checked). On macOS the last page also asks for Accessibility (for keybinds like Add Marker) and Screen Recording (only so the app can see window titles, which detecting games like GeForce NOW needs — OBS does the actual recording), and, if you chose game audio isolation, offers the optional Wine & Java game audio device (asks for your password).
 5. **Check it worked**: launch any game installed via Steam (or, on Windows/macOS, Epic Games; Windows also gets GOG and the Xbox app — see [Optional: more launchers](#optional-more-launchers) for which launcher auto-detection exists on which OS) — these are auto-detected, nothing to configure first. The tray icon should turn red within a couple of seconds, and OBS should start recording. Close the game and confirm a new recording file appears, renamed with the game's name, in OBS's recording folder. (A game from somewhere else, e.g. Riot's client or a standalone installer? Add it via **Edit Settings... → Watched Games → Common Games...** or **Pick Running...** first — see [Optional: settings editor](#optional-settings-editor).)
 
 The installer also tries to configure OBS's WebSocket server for you automatically (needs OBS to have been run at least once already, and to not be running during install). If it can't, it tells you the one manual step left — see the [Steps to take inside OBS](#steps-to-take-inside-obs) table below for exactly what to click.
 
 It also installs `ffmpeg` for you automatically if it isn't already on your PC — via `winget` on Windows, Homebrew on macOS, or (on Linux) by showing you the exact command for your distro's package manager, the same transparent "show it, then click to run it" flow as OBS above — this only matters if you later turn on [post-record transcode](#optional-post-record-transcode) (e.g. to convert MKV recordings to MP4), so most people can ignore it entirely. Nothing found or nothing to run automatically? The Finish page just tells you where to grab it manually instead; nothing about the rest of setup depends on it.
 
-Running the installer again later lets you update or uninstall — it detects an existing install and asks which you want, and an update never touches your existing settings.
+Running the installer again later lets you update or uninstall — it detects an existing install and asks which you want, and an update never touches your existing settings. On macOS, uninstalling also removes the Wine & Java game audio device if it was set up (macOS asks for your password).
 
 Everything below is for people who want more control: what (if anything) needs setting up inside OBS itself, building from source, installing by hand, or understanding every `config.json` option (the same options are also available from the app's own **Edit Settings...** tray menu once it's running).
 
@@ -93,11 +102,12 @@ In OBS: **Tools → WebSocket Server Settings**
 
 ### 2. Configure
 
-Get `config.example.json` — it's attached to each [Release](../../releases/latest) alongside the app, or you can grab it from this repo. Put it next to the app and rename your copy to `config.json`:
+Get `config.example.json` (or `config.example.mac.json` on a Mac — it has OBS's Mac path, no Windows-only launchers or `.exe` game names, and "macOS Screen Capture" as desktop audio) — both are attached to each [Release](../../releases/latest) alongside the app, or you can grab them from this repo. Put it next to the app and rename your copy to `config.json`:
 
 ```
 copy config.example.json config.json      # Windows
-cp config.example.json config.json        # Linux/macOS
+cp config.example.json config.json        # Linux
+cp config.example.mac.json config.json    # macOS
 ```
 
 Edit `config.json`:
@@ -137,13 +147,19 @@ Edit `config.json`:
 | `post_record_transcode.suffix` | Appended to the filename (before the extension) for the transcoded output, so it doesn't collide with the original |
 | `post_record_transcode.delete_original` | Delete the original recording once the transcode succeeds |
 | `clip_editor.output_folder` | Where trimmed clips are saved (see [Optional: clip editor](#optional-clip-editor)). Leave blank to save next to the source recording |
+| `clip_editor.markers_folder` | Where the "Add Marker" keybind's markers are saved (a small `<recording>.markers.json` file per recording, which the clip editor reads to show them on the timeline). Leave blank to save them next to each recording; markers saved before you change this are still found there |
 | `clip_editor.delete_original_after_trim` | Delete the source recording once a trim succeeds. Never deletes on a failed trim |
 | `clip_editor.vlc_path` | Override which VLC install the clip editor uses, if you have more than one. Leave blank to auto-detect |
+| `clip_editor.auto_fix_audio_sync` | Pre-check the clip editor's **Fix audio track sync** box by default (see [Optional: clip editor](#optional-clip-editor)). Still toggleable per trim either way |
+| `clip_editor.default_gains_db` | Pre-fills the **Track Routing** dialog's per-track gain boxes, as `{"<output track>": {"<source track>": gain_db}}` (see [Optional: clip editor](#optional-clip-editor)). Still freely changeable or clearable per trim from there |
+| `clip_editor.default_mono_sources` | Source track numbers to pre-check as "Mono" in the **Track Routing** dialog, e.g. `[2]` (see [Optional: clip editor](#optional-clip-editor)). Still freely changeable per trim from there |
 | `obs.process_name` | Process name to watch for/kill when managing OBS, e.g. `"obs64.exe"` on Windows (`"obs"` on Linux, `"OBS"` on macOS — whichever your install actually uses) — only needs changing for a non-standard OBS build |
 | `obs.path` | Full path to the OBS executable (`obs64.exe` on Windows; the `obs` binary on Linux; `OBS.app/Contents/MacOS/OBS` on macOS) |
 | `obs.launch_args` | Extra command-line args OBS is launched with |
 | `obs.startup_wait_seconds` | How long to wait after launching OBS before trying to connect |
 | `obs.output_folder` | Recording output folder to enforce in OBS (created automatically if missing). Leave unset/blank to leave OBS's own recording folder setting alone |
+| `obs.screen_fit` | How a full-screen capture is laid out in recordings: `match_screen` (default — the canvas takes the screen's own shape, so there are no black bars and nothing is cut off), `letterbox` (16:9 with side bars), `fill` (16:9, top and bottom cropped), or `off` (leave OBS's layout alone). On a MacBook with a notch, the black strip fullscreen games leave beside it is cropped in every mode except `off`. Currently applies to macOS's display capture source |
+| `obs.recording_resolution` | What recordings are encoded at: `Match canvas (no scaling)`, a preset (`1080p`, `720p`, `480p` — these keep the canvas's shape), or any size such as `2560x1600` |
 | `obs.recording_format` | Recording container format to enforce in OBS, using OBS's own internal format code (`mp4`, `mkv`, `mov`, `hybrid_mp4`, `fragmented_mp4`, `fragmented_mov`, `flv`, `ts`, `hls`, or any other code your OBS version supports). Leave unset/blank to leave OBS's own format setting alone |
 | `obs.websocket.host` / `port` / `password` | Must match OBS's WebSocket Server Settings |
 | `obs.auto_split.enabled` | Set to `true` if you've enabled OBS's **Automatically split file** option (see below), so its splits aren't mislabeled as manual |
@@ -157,6 +173,7 @@ Edit `config.json`:
 | `obs.recovery.cooldown_seconds` | Minimum time between automatic OBS restarts, whether triggered by a hang or by memory. Defaults to `30` if omitted |
 | `obs.game_audio_capture.enabled` | Repoint an existing **Application Audio Capture** source at the detected game each time recording starts, to isolate its audio (see [Optional: isolate game audio](#optional-isolate-game-audio)) |
 | `obs.game_audio_capture.input_name` | Name of that source in your OBS scene, exactly as it appears in OBS |
+| `obs.process_audio_capture_sync_offset_ms` | Fixed millisecond offset applied to the live Game Audio capture to correct for its typical recording-time lag behind Desktop Audio. Defaults to a value measured on Windows (see [Known limitations](#known-limitations) for why that default is unverified on macOS) — use Settings → OBS tab → **Calibrate Audio Sync...** to measure your own machine's real offset instead of guessing |
 | `obs.multi_track_audio.enabled` | Route configured inputs to separate recording tracks, inside a dedicated OBS profile (see [Optional: multi-track audio](#optional-multi-track-audio)) |
 | `obs.multi_track_audio.profile_name` | Name of the dedicated OBS profile to create/use for this — created automatically the first time, cloned from whatever profile is active then. Defaults to `"OBS Auto Recorder"` if omitted |
 | `obs.multi_track_audio.tracks` | List of `{"input_name": "...", "track": N}` entries (`N` is `1`-`6`) — which OBS input feeds which recording track. Names must match an existing OBS input exactly |
@@ -182,6 +199,21 @@ Editing `config.json` never requires rebuilding `OBSAutoRecorder.exe` — it's a
 
 `display_name` is optional and controls the game name used in the recording filename and log messages; without it, the process name is used instead. This costs a little extra overhead per poll (a window-title scan), so it's only used as a fallback after `watched_games`, Steam detection, and Epic detection all miss.
 
+**`watched_windows` example** (GeForce NOW — cloud-streamed games have no local process of their own to detect, but GeForce NOW's own window title changes from the generic `"GeForce NOW"` while idling at its menu to `"<game> on GeForce NOW"` the moment a game actually loads):
+
+```json
+"watched_windows": [
+    {
+        "process_name": "GeForceNOW",
+        "title_contains": "on GeForce NOW",
+        "display_name": "GeForce NOW",
+        "use_title_as_display_name": true
+    }
+]
+```
+
+This does two things a plain `display_name` can't: it only starts recording once a game is actually loaded (not while browsing GeForce NOW's own menu, since the title doesn't match until then), and `use_title_as_display_name` recovers the *specific* game's name from the title for the recording filename — "Destiny 2 on GeForce NOW" becomes "Destiny 2" — rather than labeling every session with one fixed name regardless of which game was actually played. Recording also stops correctly when you back out to GeForce NOW's own menu after a game, even though the GeForce NOW process itself keeps running (only its title reverts) — a case a Minecraft-style entry doesn't need to handle, since `javaw.exe` really does exit when the game closes.
+
 ### 3. Get the app running
 
 **Option A — use the prebuilt build directly** (no installer, e.g. for a portable/USB setup):
@@ -199,11 +231,16 @@ pip install -r requirements.txt
 pyinstaller --onedir --noconsole --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py   # Windows
 pyinstaller --onedir --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py               # Linux
 pyinstaller --windowed --name OBSAutoRecorder --distpath . --workpath build --specpath build autostart_script.py             # macOS (produces OBSAutoRecorder.app)
+macos/build.sh                                                                                                       # macOS: builds the Wine & Java game audio helper + driver into macos/build
+eval "$(ci/import_macos_signing_identity.sh <signing.p12> <password file> <keychain path>)"                              # macOS, release builds only: sign with the project certificate (see below)
+python ci/finalize_macos_app.py OBSAutoRecorder.app macos/build                                                          # macOS: names it "OBS Auto Recorder", adds those, and re-signs it
 ```
 
 On Windows/Linux this produces an `OBSAutoRecorder/` folder (an exe/binary plus an `_internal/` support-files folder — both required, don't separate them); on macOS, an `OBSAutoRecorder.app` bundle. `config.json` is read from that same folder (or `OBSAutoRecorder.app/Contents/MacOS/` on macOS). Rebuild any time you change `autostart_script.py`.
 
 On macOS specifically, this produces a binary for whichever architecture you run it *on* (no cross-compiling to the other one) — there's no universal2 wheel for `numpy`, so build on an Apple Silicon Mac for an Apple Silicon build, or an Intel Mac for an Intel one; the release workflow does exactly this by running on both a `macos-latest` (Apple Silicon) and a `macos-15-intel` (Intel) runner.
+
+**macOS signing.** The app holds Accessibility (it sees every keystroke), Screen Recording and System Audio Recording, so its signature is what stops other programs borrowing those permissions. Release builds are signed with the project's own certificate (created once with `ci/create_macos_signing_identity.sh`, kept private, and given to CI as the `MACOS_SIGNING_P12_BASE64` / `MACOS_SIGNING_P12_PASSWORD` Actions secrets), with the hardened runtime: permission grants then require that certificate, so they survive updates and can't be inherited by an app merely claiming the same bundle id. Without the certificate (forks, local test builds) `finalize_macos_app.py` signs ad hoc instead — still safe, but each new build has to be granted its permissions again.
 
 Built as onedir/`.app` rather than onefile deliberately: a onefile build re-extracts itself to a fresh temp folder on *every single launch*, and on Windows, antivirus real-time scanning can intermittently fail to release a newly-extracted file in time for that folder to be cleaned up afterward — a widely-reported PyInstaller/Windows Defender interaction, not a bug specific to this app, but one this app hits particularly often since it relaunches itself on every settings save (the Settings editor's "Save and Restart", and "Restart App" from the tray menu). Onedir/`.app` runs directly from wherever it's installed, so that whole failure mode doesn't exist. The tradeoff is a folder instead of a single file — the installer hides that from end users by embedding and installing the whole thing, so downloading and running the installer is still a one-file experience.
 
@@ -289,13 +326,13 @@ Instead of hand-editing `config.json`, right-click the tray icon → **Edit Sett
 - On the Watched Games tab, **Pick Running...** opens a filterable list of currently running process names to add from, instead of typing an exact exe name from memory — processes already in your watched list are shown greyed out with an "(already watching)" marker. The same picker is available per-row on the window-title rules.
 - Also on the Watched Games tab, **Common Games...** opens a filterable list of popular games (League of Legends, Valorant, Wizard101, Warframe, Fortnite, Minecraft, etc.) to add with one click, without needing to have the game running first — useful for games this app's launcher auto-detection can't see (e.g. Riot's client) or that need a window-title rule (Minecraft: Java Edition). Not exhaustive; anything not listed can still be added via **Pick Running...** or by typing the exe name in by hand.
 - On the OBS tab's Multi-Track Audio section, **Pick...** (per row) connects to OBS live with whatever WebSocket settings are currently in the form and lists its actual current inputs to choose from, instead of typing a name from memory — each one is shown with its kind (e.g. "Scarlet — Microphone/Aux", "Discord — Application Audio Capture") so you can tell multiple similarly-named devices apart, such as two microphones, when deciding which one to route.
-- Also on the Multi-Track Audio section, **Quick Setup...** builds the whole track layout for you in one dialog — pick your desktop/mic devices from dropdowns and tick common apps (Discord, Spotify, Chrome, etc.), and it creates whatever OBS sources are missing and fills in the track list (see [Optional: multi-track audio](#optional-multi-track-audio)).
+- Also on the Multi-Track Audio section, **Quick Setup...** builds the whole track layout for you in one dialog — pick your desktop/mic devices from dropdowns and tick common apps (Discord, Spotify, Chrome, Safari on macOS, etc. — the exact list offered is OS-specific, since not every app exists on every OS), and it creates whatever OBS sources are missing and fills in the track list (see [Optional: multi-track audio](#optional-multi-track-audio)).
 
 The editor always reloads `config.json` fresh when opened and only overwrites the fields shown in the form, so any advanced/unlisted key you've hand-added is left untouched.
 
 ## Optional: isolate game audio
 
-**Windows only** for now — see [Known limitations](#known-limitations) for why Linux/macOS don't have this yet.
+**Windows and macOS (14.4+)** — see [Known limitations](#known-limitations) for why Linux doesn't have this yet.
 
 If your recordings pick up Discord, Spotify, or other background app audio alongside the game, OBS's **Application Audio Capture** source can isolate just the game's audio — it captures a chosen process's audio output directly, regardless of what else is playing. This script can optionally point that source at whichever game it just detected, so you don't have to re-target it by hand every time you switch games. Just set `obs.game_audio_capture.enabled` to `true` in `config.json` (or **Edit Settings... → OBS tab → Game Audio Isolation**) — the app creates the `Game Audio` **Application Audio Capture** source in OBS for you automatically the first time it's needed, nothing to add by hand. Set `obs.game_audio_capture.input_name` if you'd rather it use a different name (e.g. because you already have a similarly-purposed source under a different one).
 
@@ -303,13 +340,15 @@ From then on, whenever a watched game starts recording, the script repoints that
 
 Mute or remove your desktop/system audio source in OBS if you don't want it recorded alongside the isolated game audio.
 
+**If the isolated track sounds a little out of sync** with the rest of the recording: process-audio capture tends to lag desktop audio by a small, fairly consistent amount, which this app corrects for automatically using `obs.process_audio_capture_sync_offset_ms` (see the config table above). The shipped default was measured on Windows; **Edit Settings... → OBS tab → Calibrate Audio Sync...** measures your own machine's real offset instead of guessing — it briefly plays a short clicking sound while OBS records a test clip, then fills in the result for you.
+
 ## Optional: multi-track audio
 
 Records selected OBS inputs (mic, desktop audio, isolated game audio, Discord, etc.) each to their own separate audio track inside the recording, so you can mute/adjust/remove any one of them afterward in your editor instead of being stuck with a single pre-mixed track.
 
 **It never touches your existing OBS profile.** The first time it runs, the watcher creates a separate, dedicated OBS profile (named `obs.multi_track_audio.profile_name`, default `"OBS Auto Recorder"`) cloned from whatever profile was active at that moment — same recording folder, same quality, same file format — and only ever makes further changes inside that dedicated profile. Every time a watched game starts recording, OBS is switched into it first; your own profile(s) are left exactly as you set them up, and switching profiles doesn't touch your scenes/sources (those live in your scene collection, which is separate from profiles in OBS).
 
-**Quick setup (recommended):** in the settings editor's OBS tab → **Multi-Track Audio** → **Quick Setup...**, pick your desktop audio device and microphone from dropdowns (populated live from OBS), tick whichever common apps you use — Discord/Slack/Zoom, Spotify/Apple Music, Chrome/Firefox/Edge — and click **Apply**. It creates an Application Audio Capture source in OBS for any app you picked that doesn't already have one (reusing an existing one by name instead of duplicating it), fills in the track list below with the same layout below, and turns the feature on — no hand-typing input names or track numbers. Game audio is included automatically on track 3 if [game audio isolation](#optional-isolate-game-audio) is already enabled above; anything not in the common-apps list can still be added afterward with **+ Add Track Mapping**. While you're on that tab, also set **Recording format** to `mkv` — see below for why.
+**Quick setup (recommended):** in the settings editor's OBS tab → **Multi-Track Audio** → **Quick Setup...**, pick your desktop audio device and microphone from dropdowns (populated live from OBS), tick whichever common apps you use — Discord/Slack/Zoom, Spotify/Apple Music, Chrome/Firefox/Edge (plus Safari on macOS) — and click **Apply**. It creates an Application Audio Capture source in OBS for any app you picked that doesn't already have one (reusing an existing one by name instead of duplicating it), fills in the track list below with the same layout below, and turns the feature on — no hand-typing input names or track numbers. Game audio is included automatically on track 3 if [game audio isolation](#optional-isolate-game-audio) is already enabled above; anything not in the common-apps list can still be added afterward with **+ Add Track Mapping**. While you're on that tab, also set **Recording format** to `mkv` — see below for why.
 
 **Recommended track layout** (this is exactly what Quick Setup builds for you):
 
@@ -444,6 +483,8 @@ Right-click the tray icon → **Edit Clips...** for a simple built-in editor: pr
 - **Trim it** — **Trim Clip** runs in the background (the editor stays responsive) and saves to `clip_editor.output_folder` (or next to the source if left blank), never overwriting an existing file — a name collision gets ` (2)`, ` (3)`, etc. appended, the same convention Windows Explorer itself uses. A toast notification fires on completion if `notifications.enabled` is `true`, and either way the result also lands in `autostart_script.log`.
 - **Fast vs. Precise** — by default, trimming is a lossless, near-instant stream copy (no re-encoding), but the actual cut snaps to the nearest keyframe at or before your chosen start point, which can land a couple of seconds off depending on the recording's keyframe interval. Tick **Precise (slower, frame-accurate)** for an exact cut instead — it re-encodes across the cut, so it takes longer and isn't lossless.
 - **Deleting the original** — set `clip_editor.delete_original_after_trim` to `true` to remove the source recording once a trim succeeds. Exactly like [post-record transcode](#optional-post-record-transcode), the source is *never* deleted unless the trim actually verifiably succeeded (the output file exists and isn't empty) — a failed trim always leaves the original untouched.
+- **Fix audio track sync** — only shown enabled if [multi-track audio](#optional-multi-track-audio) has a desktop audio track configured. Tick it before trimming to measure that specific clip's own audio and align its process-capture tracks (game audio, Discord, etc.) against desktop audio in the export — each one can lag by a genuinely different, real amount, so this is measured fresh per clip rather than one fixed guess applied everywhere. `clip_editor.auto_fix_audio_sync` sets whether this starts checked.
+- **Track Routing...** — enabled once a multi-track recording is open (greyed out for a single-track file). Opens a checkbox matrix to remix tracks before exporting: check one or more source tracks (columns) under an output track (row) to route them there — check several under one output to mix them together (e.g. combine Spotify and Firefox), or leave a source unchecked everywhere to drop it from the export entirely. Each checked source gets its own dB gain box to boost/attenuate just that source into that one output; **Mute** keeps an output track present but silent; the **Mono** row forces a source to dual-mono (duplicated equally into both channels, not collapsed to a single true channel — so every other track's channel count stays exactly as it was). All of this is baked into the exported file by ffmpeg, separate from the **Preview** volume slider above it (which only ever changes what you hear while scrubbing here, never the output). `clip_editor.default_gains_db` and `clip_editor.default_mono_sources` set this dialog's starting point; **Reset to defaults** inside it restores them at any time.
 
 **Needs VLC** for the preview (nothing else in this app uses it — recording itself never requires VLC). If VLC isn't found, **Edit Clips...** opens a small install prompt instead of a broken editor: an **Install VLC** button (`winget` on Windows, Homebrew on macOS, when available) plus a manual download link, the same pattern as ffmpeg's install prompt in Post-Processing. Installing switches straight to the real editor, no need to try **Edit Clips...** a second time. To point at a specific install (e.g. you have more than one), set `clip_editor.vlc_path` to its folder in **Edit Settings... → Clip Editor**, otherwise it's auto-detected (via the registry key VLC itself writes on install, on Windows; via its usual install locations on Linux/macOS).
 
@@ -457,11 +498,10 @@ On Linux, this depends on your desktop environment actually having a notificatio
 
 **Cross-platform gaps** (Windows has full parity; these are Linux/macOS-specific):
 
-- **Game audio isolation** ([Optional: isolate game audio](#optional-isolate-game-audio)) is **Windows only** for now. It's built on OBS's WASAPI-specific process-audio-capture source, which has no drop-in equivalent on Linux or macOS yet: an investigation into the real per-OS OBS source-type schema found that OBS's own Linux build doesn't currently expose a distinct per-application audio-capture source at all under its own generic PulseAudio-compatible capture kinds, at least in the configuration tested. macOS has a real path forward that didn't exist when this app's Windows-only implementation was first built — Apple's Core Audio process taps (macOS 14.4+, which is why that's this app's macOS floor) and the OBS "Application Audio Capture" source built on them — but it hasn't been implemented yet; this needs the same empirical, don't-guess-the-source-kind approach used for Linux, on real Mac hardware, since GitHub's macOS CI runners can't run a real OBS instance at all. `obs.multi_track_audio.app_captures`-based routing has the same Windows-only dependency in the meantime.
+- **Game audio isolation** ([Optional: isolate game audio](#optional-isolate-game-audio)) works on **Windows and macOS (14.4+)**, not yet on Linux. On Windows it's built on OBS's WASAPI-specific process-audio-capture source; on macOS it's built on OBS's `sck_audio_capture` source (Apple's Core Audio process taps, macOS 14.4+, which is why that's this app's macOS floor — targeting a specific app there uses its bundle identifier, resolved automatically from the detected process, not something you need to look up yourself). Both were confirmed empirically against a real, running OBS instance rather than assumed from documentation — see [CROSS_PLATFORM_PLAN.md](CROSS_PLATFORM_PLAN.md) §6.2. Linux has no equivalent yet: an investigation into the real per-OS OBS source-type schema found that OBS's own Linux build doesn't currently expose a distinct per-application audio-capture source at all under its own generic PulseAudio-compatible capture kinds, at least in the configuration tested (§6.1). `obs.multi_track_audio.app_captures`-based routing has the same Linux gap in the meantime. One related rough edge on macOS: the small audio-track sync-offset correction this feature applies was measured specifically for Windows's WASAPI timing behavior and hasn't been separately measured for macOS's very different capture pipeline — it defaults to the Windows-measured value (harmless if it's simply not quite right, since it's just a starting point), but is fully overridable via `obs.process_audio_capture_sync_offset_ms` or this app's own live calibration flow if you want it tuned for real on your own Mac.
 - **Custom keybinds** and **Minecraft-style window-title rules** need a real **X11** session on Linux — Wayland has no unprivileged API for either a global hotkey or reading another window's title, so both quietly do nothing (logged once) under Wayland rather than crashing. On macOS, custom keybinds need **Accessibility permission** (System Settings → Privacy & Security → Accessibility); the app requests it and tells you clearly if it's still missing.
 - **macOS has no single universal binary** — `numpy` doesn't publish a universal2 (combined Intel + Apple Silicon) wheel at all, so Apple Silicon and Intel each get their own separately-built `.app`/installer instead of one download that works on both. Make sure you grab the right one for your Mac (see [Quick install](#quick-install-recommended)).
 - **Desktop shortcut** (an icon you double-click, separate from auto-start) is a **Windows-only** installer option right now; Linux/macOS don't get an equivalent yet. Auto-start-at-login itself (see [Run automatically at login](#4-run-automatically-at-login)) works on all 3 OSes.
-- The clip editor's video embedding on macOS uses a PyObjC bridge to get a real NSView from Tk's own window handle, which is the least-confidently-verified piece of this app's macOS port (not verified against real Mac hardware as of this writing) — if the video preview shows up blank on macOS, this is the most likely cause; the rest of the clip editor (trimming, file handling) is unaffected either way.
 - GOG Galaxy, the Xbox app/PC Game Pass, and Battle.net auto-detection are scoped to whichever OSes those launchers actually ship a native client for — see the config table above and [Optional: more launchers](#optional-more-launchers) for exactly which OS each one works on.
 
 **Everything else** (applies equally on every OS):
